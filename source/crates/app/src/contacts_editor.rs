@@ -1,10 +1,17 @@
-//! Modal contact editor (create/edit/delete) for the People module - the
-//! CardDAV counterpart of `event_editor.rs`'s event dialog.
+//! Contact editor (create/edit/delete) for the People module - the CardDAV
+//! counterpart of `event_editor.rs`'s event dialog.
+//!
+//! Two consumers share one form: the modal dialog here (`show_contact_editor`,
+//! used for "New contact" and the pop-out window), and the People screen's
+//! details pane, which edits a contact in place (UX-65). [`build_contact_form`]
+//! is the reusable half - it builds the field rows and returns a closure that
+//! reads them back into a [`VCard`] - and the dialog just wraps it with a
+//! footer.
 //!
 //! Data-in/callback-out like the event editor: the caller supplies the
 //! pickable address books (create mode), the contact being edited (if any)
 //! with its server-side `href`/`etag`, then registers `on_save` (create),
-//! `on_update` (edit in place) and `on_delete` callbacks - the dialog never
+//! `on_update` (edit in place) and `on_delete` callbacks - the form never
 //! talks to the network itself; the caller routes the produced [`VCard`] to
 //! the account's CardDAV command channel. The editor starts from a clone of
 //! the existing card and rewrites the fields it exposes (including
@@ -27,6 +34,21 @@ type CreateCallback = Rc<dyn Fn(String, VCard)>;
 type UpdateCallback = Rc<dyn Fn(String, Option<String>, VCard)>;
 /// The delete callback's target: the resource to remove.
 type DeleteCallback = Rc<dyn Fn(String, Option<String>)>;
+
+/// The reusable contact form: its field body (without a footer) plus the
+/// closure that reads the fields back into a card. The address-book picker is
+/// present only in create mode.
+pub struct ContactForm {
+    /// Every field row, ready to drop into a scroller or a pane.
+    pub body: gtk::Box,
+    /// Builds the card from the current field values; `None` on invalid input
+    /// (no name, bad date), in which case the caller just doesn't save.
+    pub build_card: Rc<dyn Fn() -> Option<VCard>>,
+    /// The address-book picker (create mode only).
+    pub book_dropdown: Option<gtk::DropDown>,
+    /// Parallel hrefs for `book_dropdown`'s entries.
+    pub book_hrefs: Vec<String>,
+}
 
 /// What to prefill the editor with.
 pub struct ContactEditorPrefill<'a> {
@@ -171,60 +193,33 @@ fn remove_button() -> gtk::Button {
     remove
 }
 
-/// Opens the contact editor as a modal dialog. `on_save` fires with the
-/// picked book's href and the finished card (new contact); `on_update` with
-/// the card's href/etag plus the edited card; `on_delete` with the delete
-/// target. All are responsible for routing to the owning account's session -
-/// the dialog only builds and validates the card.
-pub fn show_contact_editor(
-    window: &adw::ApplicationWindow,
-    prefill: ContactEditorPrefill,
-    on_save: impl Fn(String, VCard) + 'static,
-    on_update: impl Fn(String, Option<String>, VCard) + 'static,
-    on_delete: impl Fn(String, Option<String>) + 'static,
-) {
-    // Boxed as trait objects for the same reason `event_editor.rs` does:
-    // a closure capturing an `impl Fn` parameter can't implement `Fn` itself.
-    let on_save: CreateCallback = Rc::new(on_save);
-    let on_update: UpdateCallback = Rc::new(on_update);
-    let on_delete: DeleteCallback = Rc::new(on_delete);
-
-    let existing: Option<VCard> = prefill.existing.cloned();
-    let has_existing = existing.is_some();
-    // The form's seed: the real card for an edit, the caller's create-mode
-    // prefill otherwise - so a prefilled "new contact" (the reading pane's
-    // "View contact" create path) opens with its name/email rows populated.
-    let seed: Option<VCard> = existing.clone().or_else(|| prefill.prefill.cloned());
-    let href_owned = prefill.href.to_string();
-    let etag_owned = prefill.etag.map(str::to_string);
-    // Save is only possible when there's a write target: a real href for an
-    // edit, at least one book for a create.
-    let writable = (has_existing && !href_owned.is_empty()) || (!has_existing && !prefill.books.is_empty());
-
-    let dialog = adw::Window::builder()
-        .transient_for(window)
-        .modal(true)
-        .title(if has_existing { "Edit contact" } else { "New contact" })
-        .default_width(560)
-        .default_height(640)
-        .build();
+/// Builds the reusable contact form. `seed` is the card to prefill (the
+/// existing contact, or a create-mode prefill); `books` enables the
+/// address-book picker, locked when `lock_book` is set (editing an existing
+/// contact).
+pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)]>, lock_book: bool) -> ContactForm {
+    let seed: Option<VCard> = seed.cloned();
 
     // --- Address-book picker (create mode only): a `StringList` of labels
     // plus a parallel href vector, the same pattern as the event editor's
     // calendar picker. Locked while editing - moving a contact between books
     // is out of scope for this pass.
-    let book_labels: Vec<String> = prefill.books.iter().map(|(label, _)| label.clone()).collect();
-    let book_hrefs: Vec<String> = prefill.books.iter().map(|(_, href)| href.clone()).collect();
+    let book_labels: Vec<String> = books.map(|books| books.iter().map(|(label, _)| label.clone()).collect()).unwrap_or_default();
+    let book_hrefs: Vec<String> = books.map(|books| books.iter().map(|(_, href)| href.clone()).collect()).unwrap_or_default();
     let label_refs: Vec<&str> = book_labels.iter().map(String::as_str).collect();
     let string_list = gtk::StringList::new(&label_refs);
-    let book_dropdown = gtk::DropDown::builder()
-        .model(&string_list)
-        .selected(if book_hrefs.is_empty() { u32::MAX } else { 0 })
-        .sensitive(!has_existing)
-        .valign(gtk::Align::Center)
-        .build();
-    let book_row = adw::ActionRow::builder().title("Address book").build();
-    book_row.add_suffix(&book_dropdown);
+    let book_dropdown = if books.is_some() {
+        Some(
+            gtk::DropDown::builder()
+                .model(&string_list)
+                .selected(if book_hrefs.is_empty() { u32::MAX } else { 0 })
+                .sensitive(!lock_book)
+                .valign(gtk::Align::Center)
+                .build(),
+        )
+    } else {
+        None
+    };
 
     // --- Single-valued fields.
     let name_row = adw::EntryRow::new();
@@ -443,9 +438,8 @@ pub fn show_contact_editor(
     set_photo_button.connect_clicked({
         let photo_state = photo_state.clone();
         let refresh_photo = refresh_photo.clone();
-        let parent = dialog.clone();
-        move |_| {
-            let parent = parent.clone();
+        move |button| {
+            let parent = button.root().and_then(|root| root.downcast::<gtk::Window>().ok());
             let photo_state = photo_state.clone();
             let refresh_photo = refresh_photo.clone();
             glib::spawn_future_local(async move {
@@ -455,7 +449,7 @@ pub fn show_contact_editor(
                 let filters = gio::ListStore::new::<gtk::FileFilter>();
                 filters.append(&filter);
                 let picker = gtk::FileDialog::builder().title("Choose a photo").filters(&filters).build();
-                let Ok(file) = picker.open_future(Some(&parent)).await else { return };
+                let Ok(file) = picker.open_future(parent.as_ref()).await else { return };
                 let Ok((bytes, _etag)) = file.load_contents_future().await else { return };
                 let media_type = file
                     .query_info_future("standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
@@ -483,7 +477,7 @@ pub fn show_contact_editor(
         }
     });
 
-    // --- Assemble the form.
+    // --- Assemble the form body.
     let content_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
@@ -492,13 +486,6 @@ pub fn show_contact_editor(
         .margin_start(12)
         .margin_end(12)
         .build();
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&content_box)
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
-    content.append(&scroller);
 
     let photo_buttons = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).valign(gtk::Align::Center).build();
     photo_buttons.append(&set_photo_button);
@@ -507,7 +494,11 @@ pub fn show_contact_editor(
     photo_row.append(&photo_picture);
     photo_row.append(&photo_buttons);
 
-    content_box.append(&book_row);
+    if let Some(book_dropdown) = &book_dropdown {
+        let book_row = adw::ActionRow::builder().title("Address book").build();
+        book_row.add_suffix(book_dropdown);
+        content_box.append(&book_row);
+    }
     content_box.append(&section_header("Photo"));
     content_box.append(&photo_row);
     content_box.append(&name_row);
@@ -538,39 +529,12 @@ pub fn show_contact_editor(
     content_box.append(&notes_entry);
     content_box.append(&groups_row);
 
-    // --- Footer.
-    let cancel_button = gtk::Button::with_label("Cancel");
-    let save_button = gtk::Button::with_label(if has_existing { "Save" } else { "Create" });
-    save_button.add_css_class("suggested-action");
-    save_button.set_sensitive(writable);
-    let delete_button = gtk::Button::with_label("Delete");
-    delete_button.add_css_class("destructive-action");
-    delete_button.set_sensitive(has_existing && !href_owned.is_empty());
-
-    let footer = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    footer.set_margin_top(6);
-    footer.set_margin_bottom(12);
-    footer.set_margin_start(12);
-    footer.set_margin_end(12);
-    footer.set_halign(gtk::Align::End);
-    footer.append(&cancel_button);
-    if has_existing {
-        footer.prepend(&delete_button);
-    }
-    footer.append(&save_button);
-    content.append(&footer);
-
-    {
-        let dialog = dialog.clone();
-        cancel_button.connect_clicked(move |_| dialog.close());
-    }
-
-    // --- Build the card from the form (clone of the existing/prefill card,
-    // only the exposed fields rewritten). `None` on invalid input (no name,
-    // bad birthday) - the Save handler just doesn't fire. A create seeded
-    // from a prefill keeps that card's own UID (the caller's prefilled cards
-    // carry one); the blank form generates a fresh one.
-    let save_card: Rc<dyn Fn() -> Option<VCard>> = Rc::new(move || {
+    // --- Build the card from the form (clone of the seed card, only the
+    // exposed fields rewritten). `None` on invalid input (no name, bad
+    // birthday) - the caller just doesn't fire the save. A create seeded from
+    // a prefill keeps that card's own UID (the caller's prefilled cards carry
+    // one); the blank form generates a fresh one.
+    let build_card: Rc<dyn Fn() -> Option<VCard>> = Rc::new(move || {
         let mut card = seed.clone().unwrap_or_else(|| VCard {
             version: "4.0".to_string(),
             kind: None,
@@ -653,7 +617,7 @@ pub fn show_contact_editor(
         let note = notes_entry.text().trim().to_string();
         card.note = if note.is_empty() { None } else { Some(note) };
 
-        // Invalid date input fails the whole save (the handler just doesn't
+        // Invalid date input fails the whole save (the caller just doesn't
         // fire), matching the birthday behaviour.
         card.birthday = match parse_date_entry(birthday_row.text().as_str()) {
             Some(value) => value,
@@ -709,19 +673,107 @@ pub fn show_contact_editor(
         Some(card)
     });
 
+    ContactForm {
+        body: content_box,
+        build_card,
+        book_dropdown,
+        book_hrefs,
+    }
+}
+
+/// Opens the contact editor as a modal dialog. `on_save` fires with the
+/// picked book's href and the finished card (new contact); `on_update` with
+/// the card's href/etag plus the edited card; `on_delete` with the delete
+/// target. All are responsible for routing to the owning account's session -
+/// the dialog only builds and validates the card.
+pub fn show_contact_editor(
+    window: &adw::ApplicationWindow,
+    prefill: ContactEditorPrefill,
+    on_save: impl Fn(String, VCard) + 'static,
+    on_update: impl Fn(String, Option<String>, VCard) + 'static,
+    on_delete: impl Fn(String, Option<String>) + 'static,
+) {
+    // Boxed as trait objects for the same reason `event_editor.rs` does:
+    // a closure capturing an `impl Fn` parameter can't implement `Fn` itself.
+    let on_save: CreateCallback = Rc::new(on_save);
+    let on_update: UpdateCallback = Rc::new(on_update);
+    let on_delete: DeleteCallback = Rc::new(on_delete);
+
+    let has_existing = prefill.existing.is_some();
+    // The form's seed: the real card for an edit, the caller's create-mode
+    // prefill otherwise - so a prefilled "new contact" (the reading pane's
+    // "View contact" create path) opens with its name/email rows populated.
+    let seed: Option<VCard> = prefill.existing.cloned().or_else(|| prefill.prefill.cloned());
+    let href_owned = prefill.href.to_string();
+    let etag_owned = prefill.etag.map(str::to_string);
+    // Save is only possible when there's a write target: a real href for an
+    // edit, at least one book for a create.
+    let writable = (has_existing && !href_owned.is_empty()) || (!has_existing && !prefill.books.is_empty());
+
+    let dialog = adw::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title(if has_existing { "Edit contact" } else { "New contact" })
+        .default_width(560)
+        .default_height(640)
+        .build();
+
+    let form = build_contact_form(seed.as_ref(), Some(prefill.books), has_existing);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&form.body)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
+    content.append(&scroller);
+
+    // --- Footer.
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let save_button = gtk::Button::with_label(if has_existing { "Save" } else { "Create" });
+    save_button.add_css_class("suggested-action");
+    save_button.set_sensitive(writable);
+    let delete_button = gtk::Button::with_label("Delete");
+    delete_button.add_css_class("destructive-action");
+    delete_button.set_sensitive(has_existing && !href_owned.is_empty());
+
+    let footer = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    footer.set_margin_top(6);
+    footer.set_margin_bottom(12);
+    footer.set_margin_start(12);
+    footer.set_margin_end(12);
+    footer.set_halign(gtk::Align::End);
+    footer.append(&cancel_button);
+    if has_existing {
+        footer.prepend(&delete_button);
+    }
+    footer.append(&save_button);
+    content.append(&footer);
+
+    {
+        let dialog = dialog.clone();
+        cancel_button.connect_clicked(move |_| dialog.close());
+    }
+
     let on_save = on_save.clone();
     let on_update = on_update.clone();
+    let build_card = form.build_card.clone();
+    let book_dropdown = form.book_dropdown.clone();
+    let book_hrefs = form.book_hrefs.clone();
     save_button.connect_clicked({
         let dialog = dialog.clone();
-        let save_card = save_card.clone();
         let href_owned = href_owned.clone();
         let etag_owned = etag_owned.clone();
         move |_| {
-            let Some(card) = save_card() else { return };
+            let Some(card) = build_card() else { return };
             if has_existing {
                 on_update(href_owned.clone(), etag_owned.clone(), card);
             } else {
-                let book_href = book_hrefs.get(book_dropdown.selected() as usize).cloned().unwrap_or_default();
+                let book_href = book_dropdown
+                    .as_ref()
+                    .and_then(|dropdown| book_hrefs.get(dropdown.selected() as usize))
+                    .cloned()
+                    .unwrap_or_default();
                 on_save(book_href, card);
             }
             dialog.close();

@@ -995,6 +995,14 @@ pub(crate) struct UiState {
     /// the contacts widgets exist, and called by both the pane's own search
     /// box and the module-aware title-bar search. A no-op until wired.
     pub(crate) contacts_refresh: Option<Rc<dyn Fn()>>,
+    /// The People list's Filter menu options (UX-65): a category to narrow
+    /// to plus the "has email" / "has phone" quick filters, applied alongside
+    /// `contacts_filter` by `rebuild_contacts_list_ui`. Session state only.
+    pub(crate) contacts_filter_options: crate::contacts_view::ContactsFilterOptions,
+    /// Repaints the People details pane for the current list selection
+    /// (UX-65) - set once the details widgets exist, and called whenever the
+    /// selection changes or the list is rebuilt. A no-op until wired.
+    pub(crate) contacts_details_refresh: Option<Rc<dyn Fn()>>,
     /// The UI-state database backing `starred_contacts`, opened best-effort
     /// at startup. `None` when the database couldn't be opened - favourites
     /// then fall back to session-only, never an error.

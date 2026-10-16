@@ -63,6 +63,28 @@ Reasons:
   or
 - Real-time sync is judged unnecessary and a polling transport is acceptable.
 
+### 2.1 Spike result so far (item 5.7.1, offline only)
+
+5.7.1 was run **offline** — no live Microsoft 365 tenant was available — so its
+two evidence questions remain open:
+
+- **(a) MIME fidelity** and **(b) delta paging cost** could **not** be measured
+  against Graph. The spike landed the harness to measure them (§4, 5.7.1) and
+  its wiremock proof, but the go/no-go **cannot** be settled from fixtures alone:
+  the question is whether Graph's `/$value` bytes match the IMAP body, and only
+  a real mailbox can answer it.
+- **(c) Trigger review** — answered from Microsoft's published guidance rather
+  than a live test, and it **confirms the trigger has not fired**: Microsoft is
+  retiring **Basic authentication** for IMAP/POP/SMTP (final SMTP AUTH deadline
+  **30 April 2026**), **not** the IMAP protocol; OAuth `XOAUTH2` — which Lookout
+  already uses — stays the supported path, and no Exchange Online restriction of
+  IMAP keywords, `MOVE` or IDLE is announced. The one unverified trigger
+  candidate is unchanged: the shared-mailbox IMAP login form (M-42).
+
+**Net: 5.7 stays deferred, and 5.7.1 is complete only as far as a tenant-less
+spike can take it.** Re-running (a) and (b) against a tenant is what would move
+the decision.
+
 ## 3. Architecture if greenlit
 
 Mirror the existing Graph/DAV actors: a **second account-session actor** speaking
@@ -99,7 +121,7 @@ Effort: **S** ≤ 1 day · **M** ≤ 1 week · **L** multi-week.
 
 | # | Task | Scope | Effort |
 |---|---|---|---|
-| 5.7.1 | **Spike + go/no-go** | Verify against a live tenant + wiremock: (a) `/messages/{id}/$value` MIME fidelity for an iMIP invite, a TNEF message and an `Authentication-Results` message; (b) delta paging cost on a large mailbox and folder; (c) confirm the trigger has not fired. Capture fixtures in `source/test-fixtures/outlook/`. Record findings under §4.4/§9. | S |
+| 5.7.1 | **Spike + go/no-go** — 🟡 partial (offline only) | **Landed:** the harness to measure the two evidence questions — `MailClient::get_mime` (`GET /me/messages/{id}/$value`, `Prefer: IdType="ImmutableId"`), `MailClient::folder_delta` (`GET /me/mailFolders/{id}/messages/delta`) and `GraphClient::get_bytes_with_headers`, with wiremock tests and the `test-fixtures/outlook/messages-delta.json` page fixture. Question (c) is answered from Microsoft's published guidance (§2.1): Basic auth is going, IMAP is not. **Outstanding (needs a live tenant):** (a) `/$value` MIME fidelity for an iMIP invite, a TNEF message and an `Authentication-Results` message — diffed against the IMAP body; (b) delta paging cost on a large mailbox and folder. Capture those three `.eml` fixtures when a tenant is available. | S |
 | 5.7.2 | **Graph mail transport** | In `source/crates/graph/src/mail/`: own-mailbox `list_mail_folders` (fold/reuse the 5.6 `SharedMailFolder` shape), per-mailbox + per-folder `/messages/delta`, `get_message`, `get_mime`, `move`/`copy`/`delete`, `patch` (isRead / flag / categories / importance / inferenceClassification), attachment list + summary + `/$value`, create/reply/forward draft + send, folder create/rename/delete, limited `$search`. Pure mappers: Graph `mailFolder`/`message` ↔ `Mailbox` / `EmailSummary` / `EmailBody`. | M |
 | 5.7.3 | **Identity model** | Define `MailboxId = "{account}:{graph folder id}"` and a **stable synthetic `Uid(u32)`** assigned from a cached Graph-immutable-id → u32 map (reuse the 5.4 `message_graph_ids` idea). Decide `UidValidity` semantics on a delta reset (bump to invalidate). Document in SCAFFOLD §3/§4. **Risk centre.** | M |
 | 5.7.4 | **Cache strategy** | Either feed the existing `lookout_mail::Cache` synthetic summaries/bodies (keeps FTS5, conversation keys, overlays; may need a `PRAGMA user_version` migration), or add a separate Graph cache file. Prefer reuse to avoid duplicating search/conversation logic. | M |
@@ -124,10 +146,11 @@ for shared mailboxes).
 |---|---|---|---|
 | R1 | **No push.** Change notifications need a public HTTPS `notificationUrl`; desktop apps cannot host one. | Sync is poll-only; new-mail latency regresses vs IDLE. | Accept as a known regression, or **don't do 5.7**. Interval polling only. |
 | R2 | **Search.** Delta/`$filter` support a tiny subset; no `$search`. | Remote search can't match `search_query.rs`. | Rely on local FTS5 cache (as now); document the gap. |
-| R3 | **MIME fidelity.** Invite card, TNEF, `Authentication-Results`, read receipts, inline `cid:` depend on exact MIME. | CAL/M-45/S-03/read-receipt features could break on Graph bodies. | Gate on the 5.7.1 spike with fixtures. If MIME differs materially, stay on IMAP. |
+| R3 | **MIME fidelity.** Invite card, TNEF, `Authentication-Results`, read receipts, inline `cid:` depend on exact MIME. | CAL/M-45/S-03/read-receipt features could break on Graph bodies. | Gate on the 5.7.1 spike with fixtures. If MIME differs materially, stay on IMAP. **Still unvalidated** — 5.7.1 ran without a tenant (§2.1). |
 | R4 | **Identity model churn.** `Uid`/`UidValidity` are IMAP-shaped and used everywhere. | Large blast radius; undo/conversation/flagged/outbox correctness. | 5.7.3 as an isolated design step with tests before any feature wiring. |
-| R5 | **Throttling / cost.** Per-message body and attachment round trips. | Large mailboxes hit Graph throttling; slower first paint. | Batch, `$select` narrowly, rely on the client's `Retry-After` handling (already present). |
+| R5 | **Throttling / cost.** Per-message body and attachment round trips. | Large mailboxes hit Graph throttling; slower first paint. | Batch, `$select` narrowly, rely on the client's `Retry-After` handling (already present). **Cost still unmeasured** — question (b) needs a tenant (§2.1). |
 | R6 | **Feature regressions.** Sieve, `$Junk`/`$NotJunk`, keyword snooze, IMAP capability probes have no Graph equivalent. | Some M-rows degrade on Microsoft 365. | 5.7.7 reconciliation; hide/disable clearly (§10 "degrade softly"). |
+| R7 | **Spike can't reach go/no-go without a tenant.** 5.7.1's evidence questions (a) and (b) need a real Microsoft 365 mailbox; fixtures and wiremock pin the shape, not Graph's actual bytes or latency. | 5.7 stays deferred on an assumption rather than measured evidence. | Run the landed harness (`MailClient::get_mime`/`folder_delta`) against a tenant and capture the three `.eml` fixtures before any green-light. |
 
 ## 6. Non-goals
 

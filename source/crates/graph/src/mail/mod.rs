@@ -403,6 +403,36 @@ mod tests {
     }
 
     #[test]
+    fn the_captured_messages_delta_fixture_maps() {
+        let page: Value = serde_json::from_str(include_str!("../../../../test-fixtures/outlook/messages-delta.json")).unwrap();
+        let mut upserts = Vec::new();
+        let mut removals = Vec::new();
+        for item in page["value"].as_array().unwrap() {
+            if let Some(id) = removed_id(item) {
+                removals.push(id);
+            } else if let Some(properties) = message_properties_from_graph(item, None) {
+                upserts.push(properties);
+            }
+        }
+        assert_eq!(upserts.len(), 3);
+        assert_eq!(removals.len(), 1);
+        assert_eq!(upserts[0].message_id.as_deref(), Some("<contoso-invite-1@contoso.com>"));
+        assert_eq!(upserts[0].categories, vec!["Work".to_string(), "Projects".to_string()]);
+        assert_eq!(upserts[0].importance, Importance::High);
+        assert_eq!(upserts[0].classification, InferenceClassification::Focused);
+        assert_eq!(upserts[0].flag.as_ref().unwrap().due, Some(due(2026, 10, 16)));
+        // A properties-only record takes the defaults.
+        assert_eq!(upserts[1].importance, Importance::Normal);
+        assert!(upserts[1].categories.is_empty());
+        assert_eq!(upserts[1].flag, None);
+        assert_eq!(upserts[1].classification, InferenceClassification::Focused);
+        // The third is Other / low.
+        assert_eq!(upserts[2].importance, Importance::Low);
+        assert_eq!(upserts[2].classification, InferenceClassification::Other);
+        assert_eq!(removals[0], "AAMkADQ2YzM0ZTItMTIzNC00NTY3LThiOTAtYWJjZGVmMDEyMzQ1ABQgAAAAAAAAA=");
+    }
+
+    #[test]
     fn a_shared_mail_folder_without_an_id_or_name_is_skipped() {
         assert!(shared_mail_folder_from_graph(&json!({ "displayName": "No id" })).is_none());
         assert!(shared_mail_folder_from_graph(&json!({ "id": "f" })).is_none());

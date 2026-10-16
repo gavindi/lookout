@@ -85,9 +85,18 @@ impl GraphClient {
 
     /// A `GET` whose body is binary rather than JSON (`/photo/$value`),
     /// returning the raw bytes, or `None` when the resource carries no binary
-    /// content (Graph answers HTTP 404 for a contact/user with no photo).
+    /// content (Graph answers HTTP 404 for a contact/user with no photo). A
+    /// thin wrapper over [`Self::get_bytes_with_headers`] with no extra headers.
     pub async fn get_bytes(&self, path: &str) -> Result<Option<Vec<u8>>> {
-        match self.send_response(Method::GET, path, None, &[]).await {
+        self.get_bytes_with_headers(path, &[]).await
+    }
+
+    /// [`Self::get_bytes`] carrying extra request headers - the mail transport's
+    /// `Prefer: IdType="ImmutableId"` on a message's `/$value` MIME read
+    /// (MAIL_GRAPH_OVERVIEW.md item 5.7.1), so the id in the path is the stable
+    /// immutable id rather than one that changes on a folder move.
+    pub async fn get_bytes_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Result<Option<Vec<u8>>> {
+        match self.send_response(Method::GET, path, None, headers).await {
             Ok(response) => Ok(Some(response.bytes().await?.to_vec())),
             Err(GraphError::Status { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
@@ -563,6 +572,35 @@ mod tests {
             .mount(&server)
             .await;
         assert!(client(&server).get_bytes("me/contacts/c2/photo/$value").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_bytes_with_headers_sends_the_extra_header_and_reads_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/msg-1/$value"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"Message-ID: <a@b>\r\n".to_vec()))
+            .mount(&server)
+            .await;
+
+        let bytes = client(&server)
+            .get_bytes_with_headers("me/messages/msg-1/$value", &[("Prefer", "IdType=\"ImmutableId\"")])
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_deref(), Some(b"Message-ID: <a@b>\r\n".as_slice()));
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/gone/$value"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(client(&server)
+            .get_bytes_with_headers("me/messages/gone/$value", &[("Prefer", "IdType=\"ImmutableId\"")])
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

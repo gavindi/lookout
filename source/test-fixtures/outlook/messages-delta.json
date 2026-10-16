@@ -1,0 +1,32 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(message)",
+  "value": [
+    {
+      "id": "AAMkADQ2YzM0ZTItMTIzNC00NTY3LThiOTAtYWJjZGVmMDEyMzQ1ABEgAAAAAAAAA=",
+      "internetMessageId": "<contoso-invite-1@contoso.com>",
+      "categories": ["Work", "Projects"],
+      "importance": "high",
+      "inferenceClassification": "focused",
+      "flag": {
+        "flagStatus": "flagged",
+        "startDateTime": { "dateTime": "2026-10-13T00:00:00.0000000", "timeZone": "UTC" },
+        "dueDateTime": { "dateTime": "2026-10-16T00:00:00.0000000", "timeZone": "UTC" }
+      }
+    },
+    {
+      "id": "AAMkADQ2YzM0ZTItMTIzNC00NTY3LThiOTAtYWJjZGVmMDEyMzQ1ABIgAAAAAAAAA=",
+      "internetMessageId": "<contoso-plain-2@contoso.com>"
+    },
+    {
+      "id": "AAMkADQ2YzM0ZTItMTIzNC00NTY3LThiOTAtYWJjZGVmMDEyMzQ1ABMgAAAAAAAAA=",
+      "internetMessageId": "<contoso-flagged-3@contoso.com>",
+      "importance": "low",
+      "inferenceClassification": "other"
+    },
+    {
+      "id": "AAMkADQ2YzM0ZTItMTIzNC00NTY3LThiOTAtYWJjZGVmMDEyMzQ1ABQgAAAAAAAAA=",
+      "@removed": { "reason": "deleted" }
+    }
+  ],
+  "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/AAMkADQ2YzM0ZTItMTIzNC00NTY3LThiOTAtYWJjZGVmMDEyMzQ1AC4uAAAA/messages/delta?$deltatoken=aQvbzE1NlS8k"
+}

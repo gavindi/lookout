@@ -139,6 +139,47 @@ impl ContactsCategoryChoice {
     }
 }
 
+/// The People screen's list filter (UX-65): the category to narrow to, plus
+/// the "has email" / "has phone" quick filters, alongside the pane's search
+/// box. Session state held on `UiState` and applied by
+/// `rebuild_contacts_list_ui`.
+#[derive(Clone, Default)]
+pub struct ContactsFilterOptions {
+    /// A `CATEGORIES` tag to narrow to, or `None` for every contact.
+    pub category: Option<String>,
+    pub has_email: bool,
+    pub has_phone: bool,
+}
+
+impl ContactsFilterOptions {
+    /// Whether `card` passes the quick filters (the search box is applied
+    /// separately by `contact_matches_filter`).
+    pub fn matches(&self, card: &VCard) -> bool {
+        if let Some(category) = &self.category {
+            if !card.categories.iter().any(|tag| tag.eq_ignore_ascii_case(category)) {
+                return false;
+            }
+        }
+        if self.has_email && card.emails.is_empty() {
+            return false;
+        }
+        if self.has_phone && card.telephones.is_empty() {
+            return false;
+        }
+        true
+    }
+}
+
+/// The letter header a contact is filed under (UX-65): the uppercased first
+/// character of its sort key, or `#` for a blank or non-alphabetic key -
+/// Outlook's convention for digits, symbols and unnamed contacts.
+pub fn contact_letter(key: &str) -> char {
+    match key.trim().chars().next() {
+        Some(c) if c.is_alphabetic() => c.to_uppercase().next().unwrap_or('#'),
+        _ => '#',
+    }
+}
+
 #[derive(Clone)]
 pub struct ContactsListEntry {
     pub account_id: AccountId,
@@ -251,7 +292,7 @@ pub(crate) fn vcard_display_name(card: &VCard) -> String {
     card.emails.first().map(|email| email.address.clone()).unwrap_or_else(|| "(unnamed contact)".to_string())
 }
 
-fn vcard_primary_email(card: &VCard) -> String {
+pub(crate) fn vcard_primary_email(card: &VCard) -> String {
     card.emails.first().map(|email| email.address.clone()).unwrap_or_else(|| "No email address".to_string())
 }
 
@@ -482,6 +523,18 @@ fn route_contact_update(state: &Rc<RefCell<UiState>>, account_id: AccountId, hre
     send_contact_command(state, &account_id, toast_overlay, "Contact saved", "Couldn't save contact", move |reply| {
         ContactCommand::Update { href, etag, card, reply }
     });
+}
+
+/// Saves an edited contact back to its own account/session. The People
+/// details pane's inline editor (UX-65) uses this; the dialog goes through
+/// `route_contact_update` on the same path. A display-only entry (the Deleted
+/// bucket, `href` empty) can't be written and is skipped.
+pub fn save_contact_entry(state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, entry: &ContactsListEntry, card: VCard) {
+    if entry.href.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("This contact can't be saved here."));
+        return;
+    }
+    route_contact_update(state, entry.account_id.clone(), entry.href.clone(), entry.etag.clone(), card, toast_overlay);
 }
 
 /// Routes a deleted contact to its account's session (`Delete` with the
@@ -1296,6 +1349,7 @@ pub fn refresh_contacts_category_ui(
     selected_index: Option<i32>,
     selected: &Rc<RefCell<HashSet<(AccountId, String)>>>,
     refresh_actions: &Rc<dyn Fn()>,
+    details_refresh: &Rc<dyn Fn()>,
 ) {
     while let Some(child) = category_list.first_child() {
         category_list.remove(&child);
@@ -1315,26 +1369,78 @@ pub fn refresh_contacts_category_ui(
         // tag used by contacts in two different address books still gets
         // one combined row rather than one per account.
         let mut category_members: HashMap<String, Vec<(AccountId, String, lookout_dav::ContactRecord)>> = HashMap::new();
+        // The same three aggregates the fixed top-level buckets use, built
+        // while walking the accounts so the second pass doesn't re-derive them.
+        let mut all_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = Vec::new();
+        let mut all_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> = Vec::new();
+        let mut all_deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = Vec::new();
 
-        for (account_id, account) in accounts {
-            let all_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account
+        for &(account_id, account) in &accounts {
+            let account_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account
                 .contacts
                 .iter()
                 .map(|record| (account_id.clone(), account.display_name.clone(), record.clone()))
                 .collect();
 
-            for (_, _, record) in &all_contacts {
+            for (_, _, record) in &account_contacts {
                 for tag in &record.card.categories {
                     category_members
                         .entry(tag.clone())
                         .or_default()
                         .push((account_id.clone(), account.display_name.clone(), record.clone()));
                 }
+                if record.card.is_contact_list() {
+                    all_lists.push((account_id.clone(), account.display_name.clone(), record.clone()));
+                }
             }
+            all_contacts.extend(account_contacts);
 
-            // vCard v4's KIND:group cards (Apple's X-ADDRESSBOOKSERVER-KIND)
-            // represent a named contact list rather than a person.
-            let contact_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> = all_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
+            for card in st.deleted_contacts.get(account_id).into_iter().flatten() {
+                all_deleted.push((
+                    account_id.clone(),
+                    account.display_name.clone(),
+                    lookout_dav::ContactRecord {
+                        // Deleted-bucket cards are display-only (the diff
+                        // against a poll only kept the card, not its server
+                        // metadata): an empty href marks them as not writable,
+                        // and the editor's Delete is disabled for them.
+                        href: String::new(),
+                        etag: None,
+                        card: card.clone(),
+                    },
+                ));
+            }
+        }
+
+        // Outlook's fixed People rail, ahead of the per-account sections: the
+        // four buckets over every account at once (UX-65). Favourites keeps
+        // the full contact list - membership depends on `starred_contacts`,
+        // which changes without a resync - so the filter is applied live in
+        // `rebuild_contacts_list_ui`. The Directory row lands with 4.7.8.
+        for kind in [
+            ContactsBucketKind::Favourites,
+            ContactsBucketKind::AllContacts,
+            ContactsBucketKind::ContactLists,
+            ContactsBucketKind::Deleted,
+        ] {
+            let members = match kind {
+                ContactsBucketKind::Favourites | ContactsBucketKind::AllContacts => all_contacts.clone(),
+                ContactsBucketKind::ContactLists => all_lists.clone(),
+                ContactsBucketKind::Deleted => all_deleted.clone(),
+                ContactsBucketKind::Category(_) => continue,
+            };
+            let label = contacts_bucket_label(&kind);
+            rows.push(ContactsCategoryChoice { kind, contacts: members });
+            row_widgets.push((append_contacts_choice_row(category_list, &label), Some(rows.len() - 1)));
+        }
+
+        for &(account_id, account) in &accounts {
+            let account_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account
+                .contacts
+                .iter()
+                .map(|record| (account_id.clone(), account.display_name.clone(), record.clone()))
+                .collect();
+            let lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
             let deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = st
                 .deleted_contacts
                 .get(account_id)
@@ -1345,11 +1451,6 @@ pub fn refresh_contacts_category_ui(
                         account_id.clone(),
                         account.display_name.clone(),
                         lookout_dav::ContactRecord {
-                            // Deleted-bucket cards are display-only (the diff
-                            // against a poll only kept the card, not its
-                            // server metadata): an empty href marks them as
-                            // not writable, and the editor's Delete is
-                            // disabled for them.
                             href: String::new(),
                             etag: None,
                             card: card.clone(),
@@ -1372,7 +1473,7 @@ pub fn refresh_contacts_category_ui(
             for kind in [ContactsBucketKind::AllContacts, ContactsBucketKind::Favourites] {
                 rows.push(ContactsCategoryChoice {
                     kind: kind.clone(),
-                    contacts: all_contacts.clone(),
+                    contacts: account_contacts.clone(),
                 });
                 let label = contacts_bucket_label(&kind);
                 row_widgets.push((append_contacts_choice_row(category_list, &label), Some(rows.len() - 1)));
@@ -1380,7 +1481,7 @@ pub fn refresh_contacts_category_ui(
 
             rows.push(ContactsCategoryChoice {
                 kind: ContactsBucketKind::ContactLists,
-                contacts: contact_lists,
+                contacts: lists,
             });
             row_widgets.push((
                 append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::ContactLists)),
@@ -1426,6 +1527,7 @@ pub fn refresh_contacts_category_ui(
         contacts.borrow_mut().clear();
         selected.borrow_mut().clear();
         refresh_actions();
+        details_refresh();
         let label = gtk::Label::builder().label("No contacts available yet").xalign(0.0).css_classes(["dim-label"]).build();
         label.set_margin_start(10);
         label.set_margin_end(10);
@@ -1435,19 +1537,28 @@ pub fn refresh_contacts_category_ui(
         return;
     }
 
-    let desired = selected_index.unwrap_or(0).clamp(0, categories.borrow().len() as i32 - 1);
+    // Default to "Your contacts" (the first aggregate bucket) rather than the
+    // leading Favourites row, which is empty for most accounts.
+    let default_index = categories
+        .borrow()
+        .iter()
+        .position(|choice| matches!(choice.kind, ContactsBucketKind::AllContacts))
+        .unwrap_or(0) as i32;
+    let desired = selected_index.unwrap_or(default_index).clamp(0, categories.borrow().len() as i32 - 1);
     if let Some((row, _)) = row_widgets.iter().find(|(_, idx)| *idx == Some(desired as usize)) {
         category_list.select_row(Some(row));
     }
-    rebuild_contacts_list_ui(contact_list, categories, contacts, desired, state, selected, refresh_actions);
+    rebuild_contacts_list_ui(contact_list, categories, contacts, desired, state, selected, refresh_actions, details_refresh);
 }
 
-/// Rebuilds the People screen's right-hand contact list for whichever
-/// bucket is selected in the left pane. Takes `state` so each row can show
-/// (and toggle) its favourite star live - Favourites membership is
-/// evaluated here rather than pre-filtered in `refresh_contacts_category_ui`
-/// so starring/unstarring a contact doesn't require rebuilding the whole
-/// left pane, just this list.
+/// Rebuilds the People screen's middle contact list for whichever bucket is
+/// selected in the left pane. Takes `state` so each row can show (and toggle)
+/// its favourite star live - Favourites membership is evaluated here rather
+/// than pre-filtered in `refresh_contacts_category_ui` so starring/unstarring
+/// a contact doesn't require rebuilding the whole left pane, just this list.
+/// Rows are grouped under Outlook's alphabetical letter headers (UX-65), and
+/// the pane's Filter/Sort options (`ContactsFilterOptions`) are applied here.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_contacts_list_ui(
     contact_list: &gtk::ListBox,
     categories: &Rc<RefCell<Vec<ContactsCategoryChoice>>>,
@@ -1456,7 +1567,17 @@ pub fn rebuild_contacts_list_ui(
     state: &Rc<RefCell<UiState>>,
     selected: &Rc<RefCell<HashSet<(AccountId, String)>>>,
     refresh_actions: &Rc<dyn Fn()>,
+    details_refresh: &Rc<dyn Fn()>,
 ) {
+    // Remember which contact was showing before the rebuild so the details
+    // pane (and the list selection) can stay on it across a star toggle or a
+    // sync repaint.
+    let previous = contact_list
+        .selected_row()
+        .and_then(|row| unsafe { row.data::<usize>("contacts-entry-index") })
+        .map(|idx| unsafe { *idx.as_ref() })
+        .and_then(|idx| contacts.borrow().get(idx).map(|entry| (entry.account_id.clone(), contact_identity(&entry.card))));
+
     while let Some(child) = contact_list.first_child() {
         contact_list.remove(&child);
     }
@@ -1465,6 +1586,7 @@ pub fn rebuild_contacts_list_ui(
         contacts.borrow_mut().clear();
         selected.borrow_mut().clear();
         refresh_actions();
+        details_refresh();
         return;
     };
 
@@ -1472,14 +1594,15 @@ pub fn rebuild_contacts_list_ui(
     let favourites_only = matches!(choice.kind, ContactsBucketKind::Favourites);
     let contact_lists_only = matches!(choice.kind, ContactsBucketKind::ContactLists);
 
-    // The People pane's own search box (P-06) narrows the list; the query and
-    // the "File as" preference both live on the shared state, so the row
-    // callbacks that trigger a rebuild don't each have to thread them through.
-    let (filter, file_as) = {
+    // The People pane's own search box (P-06) and Filter menu (UX-65) narrow
+    // the list; the query, the filter options and the "File as" preference
+    // all live on the shared state, so the row callbacks that trigger a
+    // rebuild don't each have to thread them through.
+    let (filter, file_as, options) = {
         let st = state.borrow();
         let query = st.contacts_filter.trim().to_lowercase();
         let pref = crate::settings::contact_file_as(&st.settings.get_string(crate::settings::CONTACTS_FILE_AS));
-        (query, pref)
+        (query, pref, st.contacts_filter_options.clone())
     };
 
     let mut entries: Vec<ContactsListEntry> = {
@@ -1488,6 +1611,7 @@ pub fn rebuild_contacts_list_ui(
             .contacts
             .into_iter()
             .filter(|(account_id, _, record)| !favourites_only || st.starred_contacts.contains(&(account_id.clone(), contact_identity(&record.card))))
+            .filter(|(_, _, record)| options.matches(&record.card))
             .filter(|(_, _, record)| filter.is_empty() || contact_matches_filter(&record.card, &filter))
             .map(|(account_id, account_label, record)| ContactsListEntry {
                 account_id,
@@ -1572,10 +1696,23 @@ pub fn rebuild_contacts_list_ui(
         }
         contacts.borrow_mut().clear();
         refresh_actions();
+        details_refresh();
         return;
     }
 
-    for entry in &entries {
+    // Rows grouped under their letter header (UX-65). The entry's index in
+    // `entries` is stashed on its row because the widget position no longer
+    // matches once header rows are interleaved.
+    let mut row_widgets: Vec<(gtk::ListBoxRow, usize)> = Vec::new();
+    let mut current_letter: Option<char> = None;
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let sort_key = entry.card.file_as_key(file_as);
+        let letter = contact_letter(&sort_key);
+        if current_letter != Some(letter) {
+            append_contacts_header_row(contact_list, &letter.to_string());
+            current_letter = Some(letter);
+        }
+
         let name = gtk::Label::builder()
             .label(vcard_display_name(&entry.card))
             .xalign(0.0)
@@ -1641,6 +1778,7 @@ pub fn rebuild_contacts_list_ui(
             let contacts = contacts.clone();
             let selected = selected.clone();
             let refresh_actions = refresh_actions.clone();
+            let details_refresh = details_refresh.clone();
             let account_id = entry.account_id.clone();
             star_button.connect_toggled(move |btn| {
                 let key = (account_id.clone(), identity.clone());
@@ -1655,7 +1793,16 @@ pub fn rebuild_contacts_list_ui(
                 if let Some(db) = state.borrow().ui_db.clone() {
                     let _ = db.set_starred(&account_id, &identity, btn.is_active());
                 }
-                rebuild_contacts_list_ui(&contact_list, &categories, &contacts, selected_category_index, &state, &selected, &refresh_actions);
+                rebuild_contacts_list_ui(
+                    &contact_list,
+                    &categories,
+                    &contacts,
+                    selected_category_index,
+                    &state,
+                    &selected,
+                    &refresh_actions,
+                    &details_refresh,
+                );
             });
         }
 
@@ -1695,9 +1842,29 @@ pub fn rebuild_contacts_list_ui(
         row_box.append(&text_box);
         row_box.append(&star_button);
         contact_list.append(&row_box);
+        if let Some(row) = row_box.parent().and_then(|parent| parent.downcast::<gtk::ListBoxRow>().ok()) {
+            unsafe { row.set_data("contacts-entry-index", entry_index) };
+            row_widgets.push((row, entry_index));
+        }
     }
     *contacts.borrow_mut() = entries;
     refresh_actions();
+
+    // Keep the previous selection if it's still visible, else show the first
+    // contact so the details pane is never blank while contacts exist.
+    let target = previous
+        .as_ref()
+        .and_then(|key| {
+            row_widgets
+                .iter()
+                .find(|(_, idx)| contact_identity(&contacts.borrow()[*idx].card) == key.1 && contacts.borrow()[*idx].account_id == key.0)
+                .cloned()
+        })
+        .or_else(|| row_widgets.first().cloned());
+    if let Some((row, _)) = target {
+        contact_list.select_row(Some(&row));
+    }
+    details_refresh();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2698,6 +2865,46 @@ mod tests {
         assert!(contact_matches_filter(&card, "example.com"));
         assert!(contact_matches_filter(&card, "acme"));
         assert!(!contact_matches_filter(&card, "spock"));
+    }
+
+    #[test]
+    fn contact_letter_uppercases_and_buckets_non_alphabetic_under_hash() {
+        assert_eq!(contact_letter("doe, jane"), 'D');
+        assert_eq!(contact_letter("  aaron"), 'A');
+        assert_eq!(contact_letter("123 company"), '#');
+        assert_eq!(contact_letter("@acme"), '#');
+        assert_eq!(contact_letter(""), '#');
+        assert_eq!(contact_letter("  "), '#');
+    }
+
+    #[test]
+    fn contacts_filter_options_narrow_by_category_and_presence() {
+        let card = VCard::parse("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Jane Doe\r\nEMAIL:jane@example.com\r\nTEL:+15551234\r\nCATEGORIES:Friends,Work\r\nEND:VCARD\r\n").unwrap();
+        let bare = VCard::parse("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Anon\r\nEND:VCARD\r\n").unwrap();
+
+        assert!(ContactsFilterOptions::default().matches(&card));
+        assert!(ContactsFilterOptions::default().matches(&bare));
+
+        let friends = ContactsFilterOptions {
+            category: Some("friends".to_string()),
+            ..Default::default()
+        };
+        assert!(friends.matches(&card), "the category match is case-insensitive");
+        assert!(!friends.matches(&bare));
+
+        let with_email = ContactsFilterOptions {
+            has_email: true,
+            ..Default::default()
+        };
+        assert!(with_email.matches(&card));
+        assert!(!with_email.matches(&bare));
+
+        let with_phone = ContactsFilterOptions {
+            has_phone: true,
+            ..Default::default()
+        };
+        assert!(with_phone.matches(&card));
+        assert!(!with_phone.matches(&bare));
     }
 
     #[test]

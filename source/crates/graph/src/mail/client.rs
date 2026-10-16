@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use chrono::{DateTime, Utc};
 
-use crate::client::{page_items, GraphClient};
+use crate::client::{page_items, DeltaPage, GraphClient};
 use crate::error::{GraphError, Result};
 
 use super::{
@@ -79,18 +79,31 @@ impl MailClient {
     pub async fn property_delta(&self, cursor: Option<&str>, zone: Option<chrono_tz::Tz>) -> Result<MessageDelta> {
         let path = format!("me/messages/delta?{PROPERTY_SELECT}&$top=100");
         let page = self.graph.delta_with_headers(&path, cursor, &IMMUTABLE_ID).await?;
-        let mut delta = MessageDelta {
-            delta_link: page.delta_link,
-            ..Default::default()
-        };
-        for item in &page.items {
-            if let Some(id) = super::removed_id(item) {
-                delta.removals.push(id);
-            } else if let Some(properties) = super::message_properties_from_graph(item, zone) {
-                delta.upserts.push(properties);
-            }
-        }
-        Ok(delta)
+        Ok(delta_from_page(page, zone))
+    }
+
+    /// One step of a **folder-scoped** messages delta
+    /// (`GET /me/mailFolders/{folder_id}/messages/delta`), the per-folder read
+    /// the 5.7 spike measures and a Graph mail transport would drive
+    /// (MAIL_GRAPH_OVERVIEW.md items 5.7.1/5.7.2). `cursor` is a previously
+    /// returned [`MessageDelta::delta_link`]; `None` starts the initial read.
+    pub async fn folder_delta(&self, folder_id: &str, cursor: Option<&str>, zone: Option<chrono_tz::Tz>) -> Result<MessageDelta> {
+        let path = format!("me/mailFolders/{}/messages/delta?{PROPERTY_SELECT}&$top=100", encode_segment(folder_id));
+        let page = self.graph.delta_with_headers(&path, cursor, &IMMUTABLE_ID).await?;
+        Ok(delta_from_page(page, zone))
+    }
+
+    /// The raw MIME (`message/rfc822`) bytes of one message
+    /// (`GET /me/messages/{id}/$value`), or `None` when it no longer exists.
+    /// Carries `Prefer: IdType="ImmutableId"` for the same reason every other
+    /// message call does (see the module notes) - and because Graph rejects a
+    /// `/$value` read against a mutable id once the message has moved. This is
+    /// the read MAIL_GRAPH_OVERVIEW.md item 5.7.1 gates the deferred Graph mail
+    /// transport on: whether it reproduces the IMAP body byte for byte.
+    pub async fn get_mime(&self, graph_id: &str) -> Result<Option<Vec<u8>>> {
+        self.graph
+            .get_bytes_with_headers(&format!("me/messages/{}/$value", encode_segment(graph_id)), &IMMUTABLE_ID)
+            .await
     }
 
     /// Applies a partial `PATCH` to one message (categories, importance,
@@ -173,6 +186,23 @@ impl MailClient {
             .await
             .map(|_| ())
     }
+}
+
+/// Splits one delta read into live records and tombstones, carrying the fresh
+/// cursor. Shared by the mailbox-wide and folder-scoped deltas.
+fn delta_from_page(page: DeltaPage, zone: Option<chrono_tz::Tz>) -> MessageDelta {
+    let mut delta = MessageDelta {
+        delta_link: page.delta_link,
+        ..Default::default()
+    };
+    for item in &page.items {
+        if let Some(id) = super::removed_id(item) {
+            delta.removals.push(id);
+        } else if let Some(properties) = super::message_properties_from_graph(item, zone) {
+            delta.upserts.push(properties);
+        }
+    }
+    delta
 }
 
 /// Percent-encodes a path segment (a Graph message/override id), leaving RFC
@@ -293,6 +323,75 @@ mod tests {
         assert_eq!(delta.upserts[0].graph_id, "msg-1");
         assert_eq!(delta.removals, vec!["gone".to_string()]);
         assert_eq!(delta.delta_link.as_deref(), Some(format!("{}/v1.0/delta-cursor", server.uri()).as_str()));
+    }
+
+    #[tokio::test]
+    async fn folder_delta_is_scoped_to_the_folder_and_maps_the_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/mailFolders/inbox/messages/delta"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [message_json(), { "id": "gone", "@removed": { "reason": "deleted" } }],
+                "@odata.deltaLink": format!("{}/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=abc", server.uri())
+            })))
+            .mount(&server)
+            .await;
+
+        let delta = client(&server).folder_delta("inbox", None, None).await.unwrap();
+        assert_eq!(delta.upserts.len(), 1);
+        assert_eq!(delta.upserts[0].graph_id, "msg-1");
+        assert_eq!(delta.upserts[0].categories, vec!["Work".to_string()]);
+        assert_eq!(delta.removals, vec!["gone".to_string()]);
+        assert_eq!(
+            delta.delta_link.as_deref(),
+            Some(format!("{}/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=abc", server.uri()).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_delta_follows_a_supplied_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/mailFolders/inbox/messages/delta"))
+            .and(query_param("$deltatoken", "abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+            .mount(&server)
+            .await;
+
+        let delta = client(&server)
+            .folder_delta("inbox", Some(&format!("{}/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=abc", server.uri())), None)
+            .await
+            .unwrap();
+        assert!(delta.upserts.is_empty());
+        assert!(delta.removals.is_empty());
+        assert_eq!(delta.delta_link, None, "a page with neither cursor returns no delta link");
+    }
+
+    #[tokio::test]
+    async fn get_mime_returns_the_raw_bytes_and_sends_the_immutable_id_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/msg-1/$value"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"MIME-Version: 1.0\r\n\r\nbody".to_vec()))
+            .mount(&server)
+            .await;
+
+        let mime = client(&server).get_mime("msg-1").await.unwrap();
+        assert_eq!(mime.as_deref(), Some(b"MIME-Version: 1.0\r\n\r\nbody".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn get_mime_is_none_when_the_message_is_gone() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/msg-1/$value"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        assert!(client(&server).get_mime("msg-1").await.unwrap().is_none());
     }
 
     #[tokio::test]

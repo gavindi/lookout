@@ -67,6 +67,9 @@ pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
 pub const PANE_MESSAGE_LIST_HEIGHT_PCT: &str = "pane-message-list-height-percent";
 pub const PANE_CALENDAR_SIDEBAR_WIDTH_PCT: &str = "pane-calendar-sidebar-width-percent";
 pub const PANE_CONTACTS_SIDEBAR_WIDTH_PCT: &str = "pane-contacts-sidebar-width-percent";
+/// The People screen's details pane (UX-65) width, as a percentage of the
+/// window width; the inner divider of the three-pane People layout.
+pub const PANE_CONTACTS_DETAILS_WIDTH_PCT: &str = "pane-contacts-details-width-percent";
 pub const PANE_CONFIG_SIDEBAR_WIDTH_PCT: &str = "pane-config-sidebar-width-percent";
 pub const PANE_MAIL_OVERVIEW_WIDTH_PCT: &str = "pane-mail-overview-width-percent";
 /// Main window's last non-maximized width/height in pixels, and whether it
@@ -298,6 +301,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PANE_MESSAGE_LIST_HEIGHT_PCT, Value::Double(-1.0));
     map.insert(PANE_CALENDAR_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CONTACTS_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
+    map.insert(PANE_CONTACTS_DETAILS_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_CONFIG_SIDEBAR_WIDTH_PCT, Value::Double(-1.0));
     map.insert(PANE_MAIL_OVERVIEW_WIDTH_PCT, Value::Double(-1.0));
     map.insert(WINDOW_WIDTH, Value::Int(1600));
@@ -957,7 +961,7 @@ mod tests {
 
     #[test]
     fn every_pane_width_key_has_the_same_never_set_default() {
-        // All six must be declared in `defaults()`, not left to the getter's
+        // All seven must be declared in `defaults()`, not left to the getter's
         // catch-all: the memory backend is meant to mirror the schema exactly,
         // and a key missing here is indistinguishable from one that is present
         // until someone changes that catch-all.
@@ -967,6 +971,7 @@ mod tests {
             PANE_MESSAGE_LIST_WIDTH_PCT,
             PANE_CALENDAR_SIDEBAR_WIDTH_PCT,
             PANE_CONTACTS_SIDEBAR_WIDTH_PCT,
+            PANE_CONTACTS_DETAILS_WIDTH_PCT,
             PANE_CONFIG_SIDEBAR_WIDTH_PCT,
             PANE_MAIL_OVERVIEW_WIDTH_PCT,
         ] {

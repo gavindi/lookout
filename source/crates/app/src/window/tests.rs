@@ -725,6 +725,8 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         starred_contacts: HashSet::new(),
         contacts_filter: String::new(),
         contacts_refresh: None,
+        contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
+        contacts_details_refresh: None,
         ui_db: None,
         settings: Rc::new(crate::settings::resolve()),
         app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),

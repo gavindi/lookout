@@ -571,6 +571,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         starred_contacts,
         contacts_filter: String::new(),
         contacts_refresh: None,
+        contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
+        contacts_details_refresh: None,
         ui_db,
         settings: settings.clone(),
         app_config: Rc::new(RefCell::new(crate::app_config::load())),
@@ -3213,22 +3215,54 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .tooltip_text("Search contacts")
         .css_classes(["contacts-search-entry"])
         .build();
-    contacts_right_box.append(&contacts_search_entry);
+    contacts_search_entry.set_hexpand(true);
+    // The list's Filter/Sort control (UX-65), a ▾ menu beside the search box.
+    // Its contents are built and wired further down, once `refresh_contacts_ui`
+    // exists.
+    let contacts_filter_button = gtk::Button::builder()
+        .icon_name(themed_icon_name(&["funnel-symbolic", "view-sort-descending-symbolic", "view-list-symbolic"]))
+        .tooltip_text("Filter and sort contacts")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    let contacts_search_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    contacts_search_row.append(&contacts_search_entry);
+    contacts_search_row.append(&contacts_filter_button);
+    contacts_right_box.append(&contacts_search_row);
     contacts_right_box.append(&contacts_scroller);
 
     let contacts_left_card = card_section(&contacts_left_box);
     contacts_left_card.add_css_class("folder-pane");
     let contacts_right_card = card_section(&contacts_right_box);
     contacts_right_card.add_css_class("folder-pane");
+    // The right-hand details pane (UX-65): the selected contact's photo, name,
+    // actions and Overview / Contact info / Files / Emails tabs, refilled on
+    // every selection change.
+    let contacts_details = Rc::new(crate::contacts_details::ContactsDetailsPane::build());
+    let contacts_details_card = card_section(&contacts_details.root);
+    contacts_details_card.add_css_class("folder-pane");
+    // Middle list | details, then the whole of that behind the bucket rail -
+    // each divider is persisted separately.
+    let contacts_content_paned = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&contacts_right_card)
+        .end_child(&contacts_details_card)
+        .resize_start_child(true)
+        .resize_end_child(false)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(360)
+        .build();
+    contacts_content_paned.add_css_class("seamless-paned");
     let contacts_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .start_child(&contacts_left_card)
-        .end_child(&contacts_right_card)
+        .end_child(&contacts_content_paned)
         .resize_start_child(false)
         .resize_end_child(true)
         .shrink_start_child(false)
         .shrink_end_child(false)
-        .position(320)
+        .position(220)
         .build();
     contacts_paned.add_css_class("seamless-paned");
     root_stack.add_named(&contacts_status_page, Some("contacts-empty"));
@@ -4765,6 +4799,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let messages_reading_paned = messages_reading_paned.clone();
         let calendar_paned = calendar_paned.clone();
         let contacts_paned = contacts_paned.clone();
+        let contacts_content_paned = contacts_content_paned.clone();
         let config_paned = config_view.paned.clone();
         let content_and_overview_paned = content_and_overview_paned.clone();
         let state = state.clone();
@@ -4893,6 +4928,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 );
                 restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT), None, false);
                 restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT), None, false);
+                restore(&contacts_content_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_DETAILS_WIDTH_PCT), None, true);
                 restore(&config_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT), None, false);
             }
             // The flag is cleared from an idle, not here, so it also covers the
@@ -5052,6 +5088,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         );
         wire_pane_width_save(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT), false, false);
         wire_pane_width_save(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT), false, false);
+        wire_pane_width_save(
+            &contacts_content_paned,
+            PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_DETAILS_WIDTH_PCT),
+            true,
+            false,
+        );
         wire_pane_width_save(&config_view.paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT), false, false);
         wire_pane_width_save(
             &content_and_overview_paned,
@@ -5091,6 +5133,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         );
         wire_pane_width_restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT));
+        wire_pane_width_restore(&contacts_content_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_DETAILS_WIDTH_PCT));
         wire_pane_width_restore(&config_view.paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&content_and_overview_paned, PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT));
     }
@@ -6008,6 +6051,131 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             contacts_delete_button.set_sensitive(!selected_entries.is_empty() && selected_entries.iter().any(|entry| !entry.href.is_empty()));
         }
     });
+
+    // The details pane's actions (UX-65): the composer / event / message
+    // wiring is reused from the profile card's context (resolved lazily, so a
+    // trigger installed before the context exists still works), plus the
+    // pane's own inline edit, delete and URI opening.
+    let contacts_details_actions: crate::contacts_details::ContactsDetailsActions = {
+        let send_email: crate::profile_card::SendEmailFn = {
+            let provider = profile_card_provider.clone();
+            Rc::new(move |address, account| {
+                if let Some(ctx) = provider() {
+                    (ctx.actions.send_email)(address, account);
+                }
+            })
+        };
+        let schedule_meeting: crate::profile_card::PersonActionFn = {
+            let provider = profile_card_provider.clone();
+            Rc::new(move |address| {
+                if let Some(ctx) = provider() {
+                    (ctx.actions.schedule_meeting)(address);
+                }
+            })
+        };
+        let open_message: crate::profile_card::OpenMessageFn = {
+            let provider = profile_card_provider.clone();
+            Rc::new(move |summary| {
+                if let Some(ctx) = provider() {
+                    (ctx.actions.open_message)(summary);
+                }
+            })
+        };
+        let events_for_person: crate::profile_card::EventsForPersonFn = {
+            let provider = profile_card_provider.clone();
+            Rc::new(move |address| provider().map(|ctx| (ctx.actions.events_for_person)(address)).unwrap_or_default())
+        };
+        let edit: Rc<dyn Fn(&ContactsListEntry)> = {
+            let contacts_details = contacts_details.clone();
+            let state = state.clone();
+            let toast_overlay = toast_overlay.clone();
+            Rc::new(move |entry: &ContactsListEntry| {
+                let details = contacts_details.clone();
+                let entry_owned = entry.clone();
+                let on_save = {
+                    let details = details.clone();
+                    let state = state.clone();
+                    let toast = toast_overlay.clone();
+                    let entry = entry_owned.clone();
+                    move |card: lookout_core::VCard| {
+                        crate::contacts_view::save_contact_entry(&state, &toast, &entry, card);
+                        details.show_details();
+                        if let Some(refresh) = state.borrow().contacts_details_refresh.clone() {
+                            refresh();
+                        }
+                    }
+                };
+                let on_delete = {
+                    let details = details.clone();
+                    let state = state.clone();
+                    let toast = toast_overlay.clone();
+                    let entry = entry_owned.clone();
+                    move || {
+                        delete_contact_entries(&state, &toast, std::slice::from_ref(&entry));
+                        details.show_details();
+                        if let Some(refresh) = state.borrow().contacts_details_refresh.clone() {
+                            refresh();
+                        }
+                    }
+                };
+                let on_cancel = {
+                    let details = details.clone();
+                    move || details.show_details()
+                };
+                details.begin_edit(entry, on_save, on_delete, on_cancel);
+            })
+        };
+        let delete: Rc<dyn Fn(&ContactsListEntry)> = {
+            let state = state.clone();
+            let toast_overlay = toast_overlay.clone();
+            Rc::new(move |entry: &ContactsListEntry| {
+                delete_contact_entries(&state, &toast_overlay, std::slice::from_ref(entry));
+                if let Some(refresh) = state.borrow().contacts_details_refresh.clone() {
+                    refresh();
+                }
+            })
+        };
+        let open_uri: Rc<dyn Fn(&str)> = Rc::new(|uri: &str| crate::window::open_uri_in_default_browser(uri));
+        crate::contacts_details::ContactsDetailsActions {
+            send_email,
+            schedule_meeting,
+            open_message,
+            events_for_person,
+            edit,
+            delete,
+            open_uri,
+        }
+    };
+
+    // Repaints the details pane for whichever contact is selected in the
+    // middle list (UX-65). Reads the row's stashed index (letter headers mean
+    // the widget position no longer matches), and is skipped while the inline
+    // editor is open so a background sync can't discard the form.
+    let contacts_details_refresh: Rc<dyn Fn()> = Rc::new({
+        let contacts_details = contacts_details.clone();
+        let contacts_list = contacts_list.clone();
+        let contacts_entries = contacts_entries.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let actions = contacts_details_actions.clone();
+        move || {
+            if contacts_details.is_editing() {
+                return;
+            }
+            let entry = contacts_list
+                .selected_row()
+                .and_then(|row| unsafe { row.data::<usize>("contacts-entry-index") })
+                .map(|idx| unsafe { *idx.as_ref() })
+                .and_then(|idx| contacts_entries.borrow().get(idx).cloned());
+            contacts_details.set_contact(entry.as_ref(), &state, &worker, &actions);
+        }
+    });
+    state.borrow_mut().contacts_details_refresh = Some(contacts_details_refresh.clone());
+    {
+        let contacts_details_refresh = contacts_details_refresh.clone();
+        contacts_list.connect_row_selected(move |_list, _row| contacts_details_refresh());
+    }
+
     {
         let contacts_categories = contacts_categories.clone();
         let contacts_entries = contacts_entries.clone();
@@ -6015,6 +6183,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let contacts_selected = contacts_selected.clone();
         let refresh_contacts_actions = refresh_contacts_actions.clone();
+        let contacts_details_refresh = contacts_details_refresh.clone();
         let contacts_heading_label = contacts_heading_label.clone();
         contacts_category_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else { return };
@@ -6034,6 +6203,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &state,
                 &contacts_selected,
                 &refresh_contacts_actions,
+                &contacts_details_refresh,
             );
         });
     }
@@ -6045,6 +6215,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_entries = contacts_entries.clone();
         let contacts_selected = contacts_selected.clone();
         let refresh_contacts_actions = refresh_contacts_actions.clone();
+        let contacts_details_refresh = contacts_details_refresh.clone();
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
         let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
@@ -6062,6 +6233,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 selected_index,
                 &contacts_selected,
                 &refresh_contacts_actions,
+                &contacts_details_refresh,
             );
             // Contacts are the birthdays calendar's only data source, so
             // every snapshot (startup cache paint, poll tick, post-write
@@ -6104,6 +6276,127 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     refresh_contacts_ui(None);
+    // The Filter/Sort ▾ menu (UX-65), rebuilt on each open so the category
+    // list is always current. Sort writes the shared "File contacts as"
+    // preference; the filters live on `contacts_filter_options` and repaint
+    // the list in place via the `contacts_refresh` hook.
+    {
+        let state = state.clone();
+        let button = contacts_filter_button.clone();
+        let popover = gtk::Popover::builder().autohide(true).has_arrow(true).build();
+        popover.set_parent(&button);
+        button.connect_clicked(move |_| {
+            let content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(10)
+                .margin_top(10)
+                .margin_bottom(10)
+                .margin_start(10)
+                .margin_end(10)
+                .width_request(240)
+                .build();
+
+            content.append(&gtk::Label::builder().label("Sort by").xalign(0.0).css_classes(["heading"]).build());
+            let sort_dropdown = gtk::DropDown::from_strings(&crate::settings::CONTACT_FILE_AS_LABELS);
+            sort_dropdown.set_selected(crate::settings::contact_file_as_index(
+                &state.borrow().settings.get_string(crate::settings::CONTACTS_FILE_AS),
+            ));
+            {
+                let state = state.clone();
+                sort_dropdown.connect_selected_notify(move |dropdown| {
+                    let value = crate::settings::contact_file_as_at(dropdown.selected());
+                    state.borrow().settings.set_string(crate::settings::CONTACTS_FILE_AS, value);
+                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                        refresh();
+                    }
+                });
+            }
+            content.append(&sort_dropdown);
+            content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            content.append(&gtk::Label::builder().label("Filter").xalign(0.0).css_classes(["heading"]).build());
+            let mut categories: Vec<String> = state
+                .borrow()
+                .contacts_by_account
+                .values()
+                .flat_map(|account| account.contacts.iter())
+                .flat_map(|record| record.card.categories.iter().cloned())
+                .collect();
+            categories.sort_by_key(|name| name.to_lowercase());
+            categories.dedup();
+            let mut labels = vec!["All categories".to_string()];
+            labels.extend(categories.iter().cloned());
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let category_dropdown = gtk::DropDown::from_strings(&label_refs);
+            let selected_category = state.borrow().contacts_filter_options.category.clone();
+            let selected_index = selected_category
+                .as_ref()
+                .and_then(|current| categories.iter().position(|name| name.eq_ignore_ascii_case(current)))
+                .map(|position| position as u32 + 1)
+                .unwrap_or(0);
+            category_dropdown.set_selected(selected_index);
+            {
+                let state = state.clone();
+                let categories = categories.clone();
+                category_dropdown.connect_selected_notify(move |dropdown| {
+                    let selected = dropdown.selected();
+                    let value = if selected == 0 { None } else { categories.get(selected as usize - 1).cloned() };
+                    state.borrow_mut().contacts_filter_options.category = value;
+                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                        refresh();
+                    }
+                });
+            }
+            content.append(&category_dropdown);
+
+            let has_email = gtk::Switch::builder()
+                .valign(gtk::Align::Center)
+                .active(state.borrow().contacts_filter_options.has_email)
+                .build();
+            {
+                let state = state.clone();
+                has_email.connect_active_notify(move |switch| {
+                    state.borrow_mut().contacts_filter_options.has_email = switch.is_active();
+                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                        refresh();
+                    }
+                });
+            }
+            content.append(&contacts_filter_switch_row("Has email", &has_email));
+
+            let has_phone = gtk::Switch::builder()
+                .valign(gtk::Align::Center)
+                .active(state.borrow().contacts_filter_options.has_phone)
+                .build();
+            {
+                let state = state.clone();
+                has_phone.connect_active_notify(move |switch| {
+                    state.borrow_mut().contacts_filter_options.has_phone = switch.is_active();
+                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                        refresh();
+                    }
+                });
+            }
+            content.append(&contacts_filter_switch_row("Has phone", &has_phone));
+
+            let clear = gtk::Button::with_label("Clear filters");
+            {
+                let state = state.clone();
+                let popover = popover.clone();
+                clear.connect_clicked(move |_| {
+                    state.borrow_mut().contacts_filter_options = crate::contacts_view::ContactsFilterOptions::default();
+                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                        refresh();
+                    }
+                    popover.popdown();
+                });
+            }
+            content.append(&clear);
+
+            popover.set_child(Some(&content));
+            popover.popup();
+        });
+    }
     {
         let window = window.clone();
         let state = state.clone();
@@ -6150,7 +6443,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let toast_overlay = toast_overlay.clone();
         let contacts_entries = contacts_entries.clone();
         contacts_list.connect_row_activated(move |_list, row| {
-            let Some(entry) = contacts_entries.borrow().get(row.index() as usize).cloned() else {
+            let Some(entry) = (unsafe { row.data::<usize>("contacts-entry-index") })
+                .map(|idx| unsafe { *idx.as_ref() })
+                .and_then(|idx| contacts_entries.borrow().get(idx).cloned())
+            else {
                 return;
             };
             if entry.href.is_empty() {
@@ -10245,4 +10541,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     );
 
     window
+}
+
+/// A label-plus-switch row for the People Filter/Sort popover (UX-65).
+fn contacts_filter_switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
+    let text = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build();
+    row.append(&text);
+    row.append(switch);
+    row
 }

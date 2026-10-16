@@ -28,6 +28,7 @@ behaviour rather than an interpretation of the specs.
 | `calendar-permissions.json` | A Graph `GET /me/calendars/{id}/calendarPermissions` response: the owner's own grant plus two others at different roles — pins the sharing mapping (CAL-24, item 5.6). |
 | `delegated-calendars.json` | A Graph `GET /users/{id}/calendars` response, the calendars under another user's mailbox — pins the delegated-calendar mapping and its owner tag (CAL-25, item 5.6). |
 | `shared-mail-folders.json` | A Graph `GET /users/{id}/mailFolders` response, a shared mailbox's folders with their item counts — pins the shared-mailbox mapping (M-42, item 5.6). |
+| `messages-delta.json` | A Graph folder `GET /me/mailFolders/{id}/messages/delta` page: three live records (one carrying categories, importance, a flag and Focused/Other; one properties-only; one importance + Other) and a tombstone — pins the delta page's upsert/removal split and the value ↔ property mapping (A-06, item 5.7.1). |
 
 These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`,
 `[MS-OXTNEF]`, RFC 6047, the Microsoft Graph reference) and verified by
