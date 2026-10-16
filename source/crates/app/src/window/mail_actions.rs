@@ -88,7 +88,7 @@ pub(crate) fn show_create_task_for_email(
 ) {
     let mut calendars = pickable_task_calendars(calendar_state);
     if calendars.is_empty() {
-        calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
+        calendars.push(("Local · Tasks".to_string(), local_tasks_calendar_id()));
     }
     let (default_calendar, seed) = build_task_seed_for_email(calendar_state, summary, preferred_account, preferred_email);
     let categories = state.borrow().app_config.borrow().categories.clone();
@@ -124,8 +124,15 @@ pub(crate) fn open_task_editor_for(
     // the task into the first picker entry.
     let mut calendars = pickable_task_calendars(calendar_state);
     if !calendars.iter().any(|(_, id)| *id == task.calendar_id) {
-        if task.calendar_id == local_tasks_calendar_id() {
-            calendars.push(("Local (this device)".to_string(), task.calendar_id.clone()));
+        if let Some(list_id) = local_task_list_id(&task.calendar_id) {
+            let name = calendar_state
+                .borrow()
+                .local_task_lists
+                .iter()
+                .find(|l| l.id == list_id)
+                .map(|l| l.name.clone())
+                .unwrap_or_else(|| "Tasks".to_string());
+            calendars.push((format!("Local · {name}"), task.calendar_id.clone()));
         } else if let Some((handle, info)) = calendar_state
             .borrow()
             .accounts
@@ -172,7 +179,7 @@ pub(crate) fn open_task_editor_for(
 /// on-device store, the owning Google Tasks session, or the owning CalDAV
 /// account's session (the `route_calendar_save` counterpart).
 pub(crate) fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, calendar_id: CalendarId, task: CalendarTask) {
-    if calendar_id == local_tasks_calendar_id() {
+    if is_local_task_calendar(&calendar_id) {
         let mut st = calendar_state.borrow_mut();
         match st.local_tasks.iter_mut().find(|t| t.uid == task.uid) {
             Some(existing) => *existing = task.clone(),
@@ -247,7 +254,7 @@ pub(crate) fn route_task_delete(
     href: Option<String>,
     etag: Option<String>,
 ) {
-    if calendar_id == local_tasks_calendar_id() {
+    if is_local_task_calendar(&calendar_id) {
         let mut st = calendar_state.borrow_mut();
         if let Some(db) = &st.local_tasks_db {
             let _ = db.borrow().delete_local_task(&uid.0);

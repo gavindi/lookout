@@ -127,6 +127,15 @@ pub async fn run_calendar_session(
                     Ok(CalendarCommand::DeleteTask { .. }) => {
                         let _ = events.send(CalendarSessionEvent::Error("not connected - the task was not deleted".to_string())).await;
                     }
+                    Ok(CalendarCommand::CreateCalendar { .. }) => {
+                        let _ = events.send(CalendarSessionEvent::Error("not connected - the list was not created".to_string())).await;
+                    }
+                    Ok(CalendarCommand::UpdateCalendar { .. }) => {
+                        let _ = events.send(CalendarSessionEvent::Error("not connected - the list was not renamed".to_string())).await;
+                    }
+                    Ok(CalendarCommand::DeleteCalendar { .. }) => {
+                        let _ = events.send(CalendarSessionEvent::Error("not connected - the list was not deleted".to_string())).await;
+                    }
                     Ok(_) => {}
                     Err(_) => {}
                 }
@@ -151,7 +160,12 @@ async fn connect_and_run(
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone())?;
 
     let discovery = client.discover_calendar(&credential).await?;
-    let calendars = client.list_calendars(&discovery.home_set_href, &config.account_id, &credential).await?;
+    // The calendar-home href is kept for the list-lifecycle commands
+    // (item 4.8 / T-01): a new collection is created under it, and the home is
+    // re-listed after any create/rename/delete so the app's sidebar reflects
+    // the server's own view.
+    let home_set_href = discovery.home_set_href.clone();
+    let mut calendars = client.list_calendars(&home_set_href, &config.account_id, &credential).await?;
     let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
     let _ = events
         .send(CalendarSessionEvent::SchedulingUpdated(SchedulingInfo {
@@ -255,6 +269,36 @@ async fn connect_and_run(
                         let _ = events.send(CalendarSessionEvent::Error(format!("failed to delete task: {e}"))).await;
                     }
                 },
+                // List lifecycle (item 4.8 / T-01): create/rename/delete a
+                // collection, then re-list so the sidebar reflects it.
+                CalendarCommand::CreateCalendar { display_name } => match client.create_calendar(&home_set_href, &display_name, &credential).await {
+                    Ok(_) => calendars = relist_calendars(&client, &home_set_href, config, &credential, events).await?,
+                    Err(e) => {
+                        let _ = events.send(CalendarSessionEvent::Error(format!("couldn't create the list: {e}"))).await;
+                    }
+                },
+                CalendarCommand::UpdateCalendar { calendar_id, display_name } => match calendar_href_for(&calendars, &calendar_id) {
+                    Some(href) => match client.rename_calendar(&href, &display_name, &credential).await {
+                        Ok(()) => calendars = relist_calendars(&client, &home_set_href, config, &credential, events).await?,
+                        Err(e) => {
+                            let _ = events.send(CalendarSessionEvent::Error(format!("couldn't rename the list: {e}"))).await;
+                        }
+                    },
+                    None => {
+                        let _ = events.send(CalendarSessionEvent::Error("couldn't rename the list: it no longer exists".to_string())).await;
+                    }
+                },
+                CalendarCommand::DeleteCalendar { calendar_id } => match calendar_href_for(&calendars, &calendar_id) {
+                    Some(href) => match client.delete_calendar(&href, &credential).await {
+                        Ok(()) => calendars = relist_calendars(&client, &home_set_href, config, &credential, events).await?,
+                        Err(e) => {
+                            let _ = events.send(CalendarSessionEvent::Error(format!("couldn't delete the list: {e}"))).await;
+                        }
+                    },
+                    None => {
+                        let _ = events.send(CalendarSessionEvent::Error("couldn't delete the list: it no longer exists".to_string())).await;
+                    }
+                },
                 // Already connected - nothing to reconnect. Only useful
                 // while backed off between connection attempts, see
                 // `run_calendar_session`.
@@ -262,6 +306,28 @@ async fn connect_and_run(
             }
         }
     }
+}
+
+/// Re-lists the calendar-home after a list create/rename/delete (item 4.8 /
+/// T-01) and pushes the fresh set to the app, returning it so the session's
+/// own `calendars` cache stays in step.
+async fn relist_calendars(
+    client: &DavClient,
+    home_set_href: &str,
+    config: &CalendarAccountConfig,
+    credential: &Credential,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+) -> Result<Vec<CalendarInfo>> {
+    let calendars = client.list_calendars(home_set_href, &config.account_id, credential).await?;
+    let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
+    Ok(calendars)
+}
+
+/// The collection href of the calendar `calendar_id` names, if present - the
+/// lookup the rename/delete commands need (the id is an opaque hash, the href
+/// is the write target).
+fn calendar_href_for(calendars: &[CalendarInfo], calendar_id: &lookout_core::CalendarId) -> Option<String> {
+    calendars.iter().find(|c| c.id == *calendar_id).map(|c| c.href.clone())
 }
 
 /// POSTs a free/busy query to the account's schedule-outbox and emits the

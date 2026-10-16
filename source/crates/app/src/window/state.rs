@@ -1931,6 +1931,20 @@ pub(crate) struct CalendarUiState {
     /// Best-effort handle on the UI-state database for local-task writes;
     /// `None` when it couldn't open (local tasks then live in memory only).
     pub(crate) local_tasks_db: Option<Rc<RefCell<UiStateDb>>>,
+    /// The local on-device task lists (item 4.8 / T-01), mirrored from
+    /// `AppConfig::local_task_lists` so the Tasks navigation pane and the task
+    /// editor (which only see this state) can offer and route them. The
+    /// built-in default is always present.
+    pub(crate) local_task_lists: Vec<crate::app_config::LocalTaskList>,
+    /// Which Tasks navigation row is selected (item 4.8 / T-01). Ephemeral UI
+    /// state - not persisted, defaulting to the "Tasks" (all) row.
+    pub(crate) tasks_filter: crate::tasks_view::TasksFilter,
+    /// The current day's My Day pin set (item 4.9 / T-02), mirrored from the
+    /// UI-state database so the Tasks view can label its rows Add/Remove and
+    /// resolve the pinned tasks without a database read per repaint. Today's
+    /// `day` is kept alongside so a date rollover reloads.
+    pub(crate) my_day_day: chrono::NaiveDate,
+    pub(crate) my_day_pins: Vec<crate::my_day::MyDayKey>,
     /// The Lookout dashboard's repaint hook, registered by the window once
     /// `calendar_state` exists. `refresh_tasks_view` and the calendar event
     /// loops call it so the dashboard stays live; `None` until then (a

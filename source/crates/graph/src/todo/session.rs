@@ -43,6 +43,19 @@ pub enum TodoCommand {
         task_id: String,
         etag: Option<String>,
     },
+    /// Create a new To Do list named `display_name` (item 4.8 / T-01).
+    CreateList {
+        display_name: String,
+    },
+    /// Rename an existing list.
+    UpdateList {
+        list_id: String,
+        display_name: String,
+    },
+    /// Delete an existing list (and every task in it). Destructive.
+    DeleteList {
+        list_id: String,
+    },
 }
 
 /// Whole-snapshot events the session pushes to the app.
@@ -172,6 +185,29 @@ async fn handle_command(account_id: &AccountId, client: &TodoClient, command: To
             if let Err(e) = client.delete_task(&list_id, &task_id, etag.as_deref()).await {
                 tracing::warn!("graph to-do delete failed for {account_id}: {e}");
                 let _ = events.send(TodoEvent::Error(format!("couldn't delete the task: {e}"))).await;
+                return Ok(());
+            }
+        }
+        // List lifecycle (item 4.8 / T-01) - each resyncs below so the app's
+        // sidebar reflects the server.
+        TodoCommand::CreateList { display_name } => {
+            if let Err(e) = client.create_list(&display_name).await {
+                tracing::warn!("graph to-do create list failed for {account_id}: {e}");
+                let _ = events.send(TodoEvent::Error(format!("couldn't create the list: {e}"))).await;
+                return Ok(());
+            }
+        }
+        TodoCommand::UpdateList { list_id, display_name } => {
+            if let Err(e) = client.update_list(&list_id, &display_name).await {
+                tracing::warn!("graph to-do rename list failed for {account_id}: {e}");
+                let _ = events.send(TodoEvent::Error(format!("couldn't rename the list: {e}"))).await;
+                return Ok(());
+            }
+        }
+        TodoCommand::DeleteList { list_id } => {
+            if let Err(e) = client.delete_list(&list_id).await {
+                tracing::warn!("graph to-do delete list failed for {account_id}: {e}");
+                let _ = events.send(TodoEvent::Error(format!("couldn't delete the list: {e}"))).await;
                 return Ok(());
             }
         }

@@ -144,6 +144,26 @@ pub struct SharedCalendar {
     pub display_name: String,
 }
 
+/// One local, on-device task list (OUTLOOK_PARITY.md item 4.8 / T-01). The
+/// fallback task store when no connected server carries `VTODO`s is a single
+/// `CalendarId("local")`; this gives it user-created sibling lists as well, so
+/// the Tasks navigation pane behaves the same whether a list is server-backed
+/// or local. Structured config, so it lives in `settings.json` beside the rules
+/// and Quick Steps (cross-cutting rule §10). A task's list is its synthetic
+/// calendar id (`local` for the built-in default, `local:<id>` otherwise).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalTaskList {
+    /// Stable id. The built-in default list is always `"local"` (its synthetic
+    /// calendar id is the bare `CalendarId("local")`); a user list is a UUID.
+    pub id: String,
+    pub name: String,
+}
+
+/// The synthetic calendar id of the built-in default local task list - the
+/// same `CalendarId` the pre-multi-list fallback store used, kept so existing
+/// `local_tasks` rows keep resolving.
+pub const LOCAL_DEFAULT_LIST_ID: &str = "local";
+
 /// One account's default-signature selections - which signature its new
 /// messages (and its replies & forwards) start with, by id. `None` (or an id
 /// that's no longer in `signatures`, which `remove_signature` clears and the
@@ -234,6 +254,11 @@ pub struct AppConfig {
     /// `quick_steps_seeded`, so deleting them all stays deleted).
     #[serde(default)]
     pub search_folders_seeded: bool,
+    /// The user's local on-device task lists (item 4.8 / T-01), beyond the
+    /// built-in default. The built-in default (`"local"`) is synthesized when
+    /// absent, so an empty list is a valid, fully-working state.
+    #[serde(default)]
+    pub local_task_lists: Vec<LocalTaskList>,
 }
 
 impl AppConfig {
@@ -391,6 +416,43 @@ impl AppConfig {
             }
         }
     }
+
+    /// Every local task list, with the built-in default always present first.
+    /// A rename of the default is persisted as an explicit `"local"` entry;
+    /// the button also never removes it (see [`Self::remove_local_task_list`]),
+    /// so a renamed default keeps its name.
+    pub fn local_task_lists(&self) -> Vec<LocalTaskList> {
+        let mut lists = self.local_task_lists.clone();
+        if !lists.iter().any(|l| l.id == LOCAL_DEFAULT_LIST_ID) {
+            lists.insert(
+                0,
+                LocalTaskList {
+                    id: LOCAL_DEFAULT_LIST_ID.to_string(),
+                    name: "Tasks".to_string(),
+                },
+            );
+        }
+        lists
+    }
+
+    /// Inserts `list`, replacing any existing entry with the same id (the edit
+    /// path) or appending it (the add path).
+    pub fn upsert_local_task_list(&mut self, list: LocalTaskList) {
+        if let Some(existing) = self.local_task_lists.iter_mut().find(|l| l.id == list.id) {
+            *existing = list;
+        } else {
+            self.local_task_lists.push(list);
+        }
+    }
+
+    /// Removes the local task list with `id`, if any. The built-in default is
+    /// never removed (its entry, if any, records only a rename).
+    pub fn remove_local_task_list(&mut self, id: &str) {
+        if id == LOCAL_DEFAULT_LIST_ID {
+            return;
+        }
+        self.local_task_lists.retain(|l| l.id != id);
+    }
 }
 
 pub(crate) fn config_dir() -> PathBuf {
@@ -542,6 +604,10 @@ mod tests {
             quick_steps_seeded: false,
             search_folders: Vec::new(),
             search_folders_seeded: false,
+            local_task_lists: vec![LocalTaskList {
+                id: "work".into(),
+                name: "Work".into(),
+            }],
         };
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
@@ -579,6 +645,7 @@ mod tests {
             quick_steps_seeded: false,
             search_folders: Vec::new(),
             search_folders_seeded: false,
+            local_task_lists: Vec::new(),
         };
 
         let identities = config.identities_for_account(&account, "My Name", "me@example.com");
@@ -916,6 +983,58 @@ mod tests {
         assert_eq!(loaded.quick_steps.len(), 1);
         loaded.remove_quick_step("nope");
         assert_eq!(loaded.quick_steps.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_task_lists_synthesize_the_default_round_trip_and_protect_it() {
+        let dir = std::env::temp_dir().join(format!("lookout-local-task-lists-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `local_task_lists` loads as an empty list, and the
+        // built-in default is still synthesized.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        let loaded = load_at(&path);
+        assert!(loaded.local_task_lists.is_empty());
+        assert_eq!(loaded.local_task_lists().len(), 1);
+        assert_eq!(loaded.local_task_lists()[0].id, LOCAL_DEFAULT_LIST_ID);
+        assert_eq!(loaded.local_task_lists()[0].name, "Tasks");
+
+        // A user list is added, upserted in place, and round-trips.
+        let mut config = AppConfig::default();
+        config.upsert_local_task_list(LocalTaskList {
+            id: "work".into(),
+            name: "Work".into(),
+        });
+        config.upsert_local_task_list(LocalTaskList {
+            id: "work".into(),
+            name: "Work (renamed)".into(),
+        });
+        assert_eq!(config.local_task_lists.len(), 1);
+        let find = |config: &AppConfig, id: &str| config.local_task_lists().into_iter().find(|l| l.id == id);
+        assert_eq!(find(&config, "work").unwrap().name, "Work (renamed)");
+        // The default is present alongside the user list.
+        assert_eq!(config.local_task_lists().len(), 2);
+
+        // Renaming the default persists an explicit entry, and the default is
+        // protected: a removal request is a no-op, so the name stays.
+        config.upsert_local_task_list(LocalTaskList {
+            id: LOCAL_DEFAULT_LIST_ID.into(),
+            name: "Personal".into(),
+        });
+        assert_eq!(find(&config, LOCAL_DEFAULT_LIST_ID).unwrap().name, "Personal");
+        config.remove_local_task_list(LOCAL_DEFAULT_LIST_ID);
+        assert_eq!(find(&config, LOCAL_DEFAULT_LIST_ID).unwrap().name, "Personal", "the default list can't be deleted");
+
+        // A user list can be removed; a missing one is a no-op.
+        config.remove_local_task_list("work");
+        assert!(find(&config, "work").is_none());
+        config.remove_local_task_list("nope");
+
+        save_at(&path, &config);
+        assert_eq!(load_at(&path).local_task_lists, config.local_task_lists);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

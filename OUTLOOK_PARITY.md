@@ -46,11 +46,11 @@ Counts are tallied from the §5 tables.
 | Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 25 | 6 | 3 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. |
 | People (5.4) | 10 | 1 | 1 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). CSV import/export matches Outlook's format (4.5). The Graph GAL reaches `/me/people` and `/users` (5.2); only LDAP and the autocomplete wiring remain (4.7). No merge UI. |
-| Tasks (5.5) | 6 | 1 | 4 | 1 | VTODO, Google Tasks and now Microsoft To Do (Graph) CRUD, sharing the category master list (2.1). No reminders, recurrence, subtasks or My Day. |
+| Tasks (5.5) | 8 | 0 | 3 | 1 | VTODO, Google Tasks and Microsoft To Do (Graph) CRUD, sharing the category master list (2.1), with a navigation pane of smart lists and per-source lists (**My Day**, **Flagged email**, **Tasks**), list create/rename/delete across every backend, and My Day's per-day pin set with due-today/overdue suggestions (4.8, 4.9). No reminders, recurrence or subtasks. |
 | Accounts / Microsoft 365 (5.6) | 6 | 0 | 2 | 0 | Microsoft 365 is mail over IMAP/SMTP, and its **calendar** (5.1), **contacts** (5.2) and **To Do** (5.3) are now native via Graph. Focused Inbox, per-message categories, importance and follow-up flags now sync with Outlook (5.4). |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **107** | **22** | **23** | **5** | ~68% at parity, ~14% partial |
+| **Total** | **109** | **21** | **22** | **5** | ~69% at parity, ~13% partial |
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
@@ -369,8 +369,8 @@ New Outlook offers keyboard **presets** (*Settings → General → Accessibility
 
 | ID | Outlook feature | Lookout today | Status | Gap |
 |---|---|---|---|---|
-| T-01 | Task lists sidebar | Lists merged (`merged_tasks`); chosen only in editor | 🟡 | List navigation pane, create/rename lists |
-| T-02 | My Day | — | ❌ | Per-day pin set (local; Graph To Do has no My Day API; **verify**) |
+| T-01 | Task lists sidebar | `tasks_view.rs` navigation pane: smart lists **My Day**, **Flagged email** and **Tasks** (all), then one row per source (CalDAV calendar, Google Tasks list, To Do list, local list) with its colour, the row filtering the list. Create/rename/delete lists from **+ New list** and each row's ⋯ menu: CalDAV MKCALENDAR (VTODO-only) / PROPPATCH / DELETE, Google Tasks `tasklists` insert/patch/delete, Graph `/me/todo/lists` CRUD (well-known lists guarded), and local lists in `settings.json` — each backend degrades to a toast where it can't (4.8) | ✅ | — |
+| T-02 | My Day | A per-day pin set in `ui_state_db` (`my_day_tasks`), the **My Day** smart list showing the pinned tasks plus **Suggestions** (open, due today or overdue), and a task row's right-click **Add to / Remove from My Day**; a date rollover reloads (4.9) | ✅ | Graph To Do has no My Day API, so the pin set stays local (§9) |
 | T-03 | Flagged email as tasks | Tasks view "Flagged email" section listing open M-10 flags across accounts (check = mark complete, click = open), also on the dashboard and Mail overview; "Create task from message…" in More | ✅ | Lists cached messages only; Graph To Do's `linkedResources` list is not read separately, since M-10 already syncs the message flags directly (5.3) |
 | T-04 | Due, importance, % complete, notes | `app/src/task_editor.rs` | ✅ | — |
 | T-05 | Reminders | — | ❌ | `VALARM` in VTODO; Graph `reminderDateTime` |
@@ -539,7 +539,7 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 
 | ID | Element | Outlook | Lookout today | Change | Effort |
 |---|---|---|---|---|---|
-| UX-71 | Navigation | Left: **My Day, Important, Planned, Assigned to me, Flagged email, Tasks**, then user lists (+ New list) | One list, fixed buckets (Overdue / Today / This week / Later / Completed) | Smart lists plus user lists (T-01, T-02). Keep the buckets as the grouping inside "Planned" | M |
+| UX-71 | Navigation | Left: **My Day, Important, Planned, Assigned to me, Flagged email, Tasks**, then user lists (+ New list) | A navigation pane with **My Day, Flagged email, Tasks** then one row per source list + **New list** (4.8); the due buckets (Overdue / Today / This week / Later / Completed) group the Tasks list (T-09) | Add the remaining smart lists (Important, Planned, Assigned to me) as their data lands; keep the buckets as the grouping inside "Planned" | M |
 | UX-72 | Quick add | "**Add a task**" entry at the top of the list, with inline icons for due date, reminder and repeat; Enter adds | "New Task" button opens the editor dialog | Quick-add row; dialog only for details | S |
 | UX-73 | Task details | **Right-hand details pane**: title + ☐, Steps ("+ Add step"), Add to My Day, Remind me, Add due date, Repeat, Pick a category, Add file, Add note; created/edited footer | Modal editor (`task_editor.rs`) | Details pane (T-05…T-08). ☆ Important toggle on rows (maps to priority High) | M |
 | UX-74 | Tasks View ribbon | Sort by (Importance, Due date, Added to My Day, Alphabetically, Creation date) · Group · Show completed | View tab disabled | Add (T-09) | S |
@@ -680,8 +680,8 @@ Each item lists the IDs it covers, the approach, what it touches, effort and dep
 | 4.5 | ✅ ~~Outlook CSV import/export~~ | P-08 | Column map per §4.6; tolerant header matching | M |
 | 4.6 | Merge duplicates | P-09 | Match by email/phone/name; merge UI with field-level choice | M |
 | 4.7 | Directory lookup | P-11 | Graph `/users` (Microsoft 365) and LDAP (`ldap3`, server configured per account) as an extra provider in `merge_contact_suggestions` | M |
-| 4.8 | Task lists sidebar | T-01 | Navigation list in `tasks_view.rs`: My Day, Flagged email, per-list; create/rename/delete lists (CalDAV MKCALENDAR VTODO / Google / local) | M |
-| 4.9 | My Day | T-02 | Local pin set per date in `ui_state_db`; suggestions (due today/overdue) | S |
+| 4.8 | ✅ ~~Task lists sidebar~~ | T-01 | Navigation pane in `tasks_view.rs`: smart lists (My Day, Flagged email, Tasks) then one row per source, with the row filtering the list. Create/rename/delete lists route to the owning backend — CalDAV MKCALENDAR (VTODO-only) / PROPPATCH / DELETE (`dav`), Google Tasks `tasklists` CRUD, Graph `/me/todo/lists` CRUD (well-known lists guarded), local lists in `settings.json` (`app_config`, `task_lists.rs`) — degrading to a toast where unsupported | M |
+| 4.9 | ✅ ~~My Day~~ | T-02 | Local per-day pin set (`ui_state_db`'s `my_day_tasks`); the **My Day** smart list shows the pins plus due-today/overdue **Suggestions**; a task row's right-click toggles membership (`my_day.rs`, pure selection logic) | S |
 | 4.10 | Task reminders and recurrence | T-05, T-06 | `VALARM`/`RRULE` in `build_vtodo`; roll forward on complete; reminders via 3.9 | M |
 | 4.11 | Steps / subtasks | T-07 | `RELATED-TO;RELTYPE=PARENT` children (CalDAV); Google Tasks `parent`; Graph `checklistItems` | M |
 | 4.12 | ✅ ~~Task sort/group and categories~~ | T-08, T-09 | "Sort and group" toolbar menu (due/importance/title/created; group by due/list/category/none; show completed) persisted in GSettings; `CalendarTask.created` (RFC 5545 `CREATED`); category chips from the 2.1 master list | S |

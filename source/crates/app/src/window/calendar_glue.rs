@@ -779,6 +779,11 @@ pub(crate) fn pickable_task_calendars(calendar_state: &Rc<RefCell<CalendarUiStat
             out.push((format!("{} · {}", handle.display_name, list.display_name), lookout_graph::graph_todo_calendar_id(&list.id)));
         }
     }
+    // The on-device lists are always available, so "New task" always has a
+    // target wherever the user is (item 4.8 / T-01).
+    for list in &st.local_task_lists {
+        out.push((format!("Local · {}", list.name), local_task_list_calendar_id(&list.id)));
+    }
     out
 }
 
@@ -1679,11 +1684,39 @@ pub(crate) fn task_handle_for_id(calendar_state: &Rc<RefCell<CalendarUiState>>, 
         .map(|handle| handle.cmd_tx.clone())
 }
 
-/// The synthetic calendar id of the on-device-only task store (plan C: the
-/// fallback when no connected source supports tasks). Tasks with this id
-/// live in the UI-state database and never sync anywhere.
+/// The synthetic calendar id of the on-device-only task store's built-in
+/// default list (the fallback when no connected source supports tasks). Tasks
+/// with this id live in the UI-state database and never sync anywhere.
 pub(crate) fn local_tasks_calendar_id() -> CalendarId {
-    CalendarId("local".to_string())
+    CalendarId(crate::app_config::LOCAL_DEFAULT_LIST_ID.to_string())
+}
+
+/// The synthetic calendar id for a local task list with `id` (item 4.8 /
+/// T-01): the bare `local` for the built-in default (matching the pre-multi-
+/// list store), `local:<id>` for a user-created list - the same convention the
+/// server-backed sources use.
+pub(crate) fn local_task_list_calendar_id(id: &str) -> CalendarId {
+    if id == crate::app_config::LOCAL_DEFAULT_LIST_ID {
+        CalendarId(crate::app_config::LOCAL_DEFAULT_LIST_ID.to_string())
+    } else {
+        CalendarId(format!("{}:{id}", crate::app_config::LOCAL_DEFAULT_LIST_ID))
+    }
+}
+
+/// The local task list id a synthetic calendar id names, if it names one.
+pub(crate) fn local_task_list_id(calendar_id: &CalendarId) -> Option<&str> {
+    let raw = calendar_id.0.as_str();
+    if raw == crate::app_config::LOCAL_DEFAULT_LIST_ID {
+        Some(crate::app_config::LOCAL_DEFAULT_LIST_ID)
+    } else {
+        raw.strip_prefix(&format!("{}:", crate::app_config::LOCAL_DEFAULT_LIST_ID))
+    }
+}
+
+/// Whether `calendar_id` names any local (on-device) task list - the write
+/// routing test, replacing the old single-list equality check.
+pub(crate) fn is_local_task_calendar(calendar_id: &CalendarId) -> bool {
+    local_task_list_id(calendar_id).is_some()
 }
 
 /// The Google Tasks session owning a `googletasks:<list id>` calendar, if
@@ -1718,32 +1751,19 @@ pub(crate) fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec
 /// empty-state message to match what task sources exist (B: "you have no
 /// tasks" vs "you have nowhere to put tasks").
 pub(crate) fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>) {
+    reload_my_day_if_needed(calendar_state);
     let colors = calendar_state.borrow().calendar_colors.clone();
     let tasks = merged_tasks(calendar_state);
-    // List display names for the "group by list" mode (T-09): every account's
-    // calendar id → its display name. Unlisted sources (a Google list, the
-    // local store) fall back to the id in `arrange_tasks`.
-    let list_names: HashMap<CalendarId, String> = {
-        let st = calendar_state.borrow();
-        let mut names: HashMap<CalendarId, String> = st
-            .accounts
-            .values()
-            .flat_map(|handle| handle.calendars.iter())
-            .map(|cal| (cal.id.clone(), cal.display_name.clone()))
-            .collect();
-        // To Do lists get their proper names for the "group by list" mode;
-        // Google lists keep falling back to their id, as before.
-        for handle in st.graph_todo.values() {
-            for list in &handle.task_lists {
-                names.insert(lookout_graph::graph_todo_calendar_id(&list.id), list.display_name.clone());
-            }
-        }
-        names
-    };
+    let list_names = task_list_names(calendar_state);
+    let filter = calendar_state.borrow().tasks_filter.clone();
+    let rows = task_nav_rows(calendar_state);
+    let pins = calendar_state.borrow().my_day_pins.clone();
+
     let st = calendar_state.borrow();
     let has_caldav_tasks = st.accounts.values().flat_map(|h| h.calendars.iter()).any(|c| c.supports_tasks);
     let has_google_tasks = !st.google_tasks.is_empty();
     let has_graph_todo = !st.graph_todo.is_empty();
+    let flagged = st.flagged_mail.clone();
     drop(st);
     let message = if has_caldav_tasks || has_google_tasks || has_graph_todo {
         "No tasks yet - use New task to create one.".to_string()
@@ -1751,13 +1771,159 @@ pub(crate) fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, 
         "No connected calendar supports tasks, so new tasks are saved on this device only. To sync tasks, use Connect Google Tasks or connect a calendar that supports them (Nextcloud, iCloud).".to_string()
     };
     crate::tasks_view::set_empty_message(tasks_view, &message);
+    // The navigation pane's rows and the selected row (item 4.8 / T-01).
+    crate::tasks_view::set_nav(tasks_view, &rows, &filter);
+    // My Day's pin set (the Add/Remove handler was installed once by the
+    // window); a no-op on any other row.
+    crate::tasks_view::set_my_day_pins(tasks_view, &pins);
+    // The main list renders `All`/`List` and clears itself for My Day/Flagged;
+    // each dedicated setter then fills its own view.
     crate::tasks_view::set_tasks(tasks_view, &tasks, &colors, &list_names);
+    let today = crate::calendar_tz::display_zone().today();
+    let pinned = crate::my_day::pinned_tasks(&tasks, &pins);
+    let suggestions = crate::my_day::suggestions(&tasks, &pins, today);
+    crate::tasks_view::set_my_day(tasks_view, &pinned, &suggestions, &colors);
+    crate::tasks_view::set_flagged_mail(tasks_view, &flagged);
     // Every task change funnels through here (CalDAV and Google Tasks
     // `TasksUpdated` events, local saves, checkbox flips), so this is the
     // single point that keeps the Lookout dashboard's task section and the
     // Mail-screen overview pane's task list live.
     refresh_dashboard_hook(calendar_state);
     refresh_mail_overview_hook(calendar_state);
+}
+
+/// Reloads today's My Day pin set when the display-zone date has rolled over
+/// since the mirror was last filled (item 4.9 / T-02) - a no-op on the same
+/// day, so a repaint doesn't hit the database.
+fn reload_my_day_if_needed(calendar_state: &Rc<RefCell<CalendarUiState>>) {
+    let today = crate::calendar_tz::display_zone().today();
+    if calendar_state.borrow().my_day_day == today {
+        return;
+    }
+    let day = today.format("%Y-%m-%d").to_string();
+    let pins = calendar_state
+        .borrow()
+        .local_tasks_db
+        .clone()
+        .and_then(|db| {
+            let db = db.borrow();
+            let _ = db.prune_my_day(&day);
+            db.load_my_day(&day).ok()
+        })
+        .unwrap_or_default();
+    let mut st = calendar_state.borrow_mut();
+    st.my_day_day = today;
+    st.my_day_pins = pins;
+}
+
+/// Every task list's id → display name, for the "group by list" mode (T-09)
+/// and the navigation pane (item 4.8 / T-01): CalDAV calendars, Google Tasks
+/// lists, To Do lists and the local lists.
+pub(crate) fn task_list_names(calendar_state: &Rc<RefCell<CalendarUiState>>) -> HashMap<CalendarId, String> {
+    let st = calendar_state.borrow();
+    let mut names: HashMap<CalendarId, String> = st
+        .accounts
+        .values()
+        .flat_map(|handle| handle.calendars.iter())
+        .map(|cal| (cal.id.clone(), cal.display_name.clone()))
+        .collect();
+    for handle in st.google_tasks.values() {
+        for list in &handle.task_lists {
+            names.insert(google_tasks::google_task_calendar_id(&list.id), list.title.clone());
+        }
+    }
+    for handle in st.graph_todo.values() {
+        for list in &handle.task_lists {
+            names.insert(lookout_graph::graph_todo_calendar_id(&list.id), list.display_name.clone());
+        }
+    }
+    for list in &st.local_task_lists {
+        names.insert(local_task_list_calendar_id(&list.id), list.name.clone());
+    }
+    names
+}
+
+/// The Tasks navigation pane's rows (item 4.8 / T-01), in Outlook's order:
+/// the smart lists (My Day, Flagged email, Tasks), then every source list -
+/// CalDAV task calendars, Google Tasks lists, To Do lists and local lists -
+/// each with its assigned colour. The trailing "+ New list" row is added by
+/// the view.
+pub(crate) fn task_nav_rows(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<crate::tasks_view::TasksNavRow> {
+    use crate::tasks_view::{TasksFilter, TasksNavRow};
+    let st = calendar_state.borrow();
+    let colors = &st.calendar_colors;
+    let dot = |id: &CalendarId| colors.get(id).cloned();
+    let mut rows = vec![
+        TasksNavRow {
+            label: "My Day".to_string(),
+            filter: TasksFilter::MyDay,
+            color: None,
+            list_id: None,
+        },
+        TasksNavRow {
+            label: "Flagged email".to_string(),
+            filter: TasksFilter::Flagged,
+            color: None,
+            list_id: None,
+        },
+        TasksNavRow {
+            label: "Tasks".to_string(),
+            filter: TasksFilter::All,
+            color: None,
+            list_id: None,
+        },
+    ];
+    let mut handles: Vec<&CalendarAccountHandle> = st.accounts.values().collect();
+    handles.sort_by_key(|h| h.display_name.to_lowercase());
+    for handle in handles {
+        for calendar in handle.calendars.iter().filter(|c| c.supports_tasks) {
+            rows.push(TasksNavRow {
+                label: calendar.display_name.clone(),
+                filter: TasksFilter::List(calendar.id.clone()),
+                color: dot(&calendar.id),
+                list_id: Some(calendar.id.clone()),
+            });
+        }
+    }
+    for handle in st.google_tasks.values() {
+        for list in &handle.task_lists {
+            let id = google_tasks::google_task_calendar_id(&list.id);
+            rows.push(TasksNavRow {
+                label: list.title.clone(),
+                filter: TasksFilter::List(id.clone()),
+                color: dot(&id),
+                list_id: Some(id),
+            });
+        }
+    }
+    let mut graph: Vec<&GraphTodoHandle> = st.graph_todo.values().collect();
+    graph.sort_by_key(|h| h.display_name.to_lowercase());
+    for handle in graph {
+        for list in &handle.task_lists {
+            // The well-known flagged-email list is Outlook's own view of
+            // flagged mail (already the "Flagged email" smart list); skip it.
+            if list.well_known.as_deref() == Some("flaggedEmails") || list.id == lookout_graph::WELL_KNOWN_FLAGGED_EMAIL {
+                continue;
+            }
+            let id = lookout_graph::graph_todo_calendar_id(&list.id);
+            rows.push(TasksNavRow {
+                label: list.display_name.clone(),
+                filter: TasksFilter::List(id.clone()),
+                color: dot(&id),
+                list_id: Some(id),
+            });
+        }
+    }
+    for list in &st.local_task_lists {
+        let id = local_task_list_calendar_id(&list.id);
+        rows.push(TasksNavRow {
+            label: format!("{} (Local)", list.name),
+            filter: TasksFilter::List(id.clone()),
+            color: dot(&id),
+            list_id: Some(id),
+        });
+    }
+    rows
 }
 
 /// Runs the Lookout dashboard's repaint hook if the window has registered
@@ -1957,7 +2123,7 @@ pub(crate) fn show_new_task_editor(
 ) {
     let mut calendars = pickable_task_calendars(calendar_state);
     if calendars.is_empty() {
-        calendars.push(("Local (this device)".to_string(), local_tasks_calendar_id()));
+        calendars.push(("Local · Tasks".to_string(), local_tasks_calendar_id()));
     }
     let default_calendar = default_pickable_task_calendar(calendar_state).unwrap_or_else(local_tasks_calendar_id);
     let categories = state.borrow().app_config.borrow().categories.clone();

@@ -210,6 +210,12 @@ impl UiStateDb {
                 position INTEGER PRIMARY KEY,
                 query TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS my_day_tasks (
+                day TEXT NOT NULL,
+                calendar_id TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                PRIMARY KEY (day, calendar_id, uid)
+            );
             ",
         )?;
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
@@ -552,6 +558,38 @@ impl UiStateDb {
     /// Removes one local task by its uid. A missing row is not an error.
     pub fn delete_local_task(&self, uid: &str) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM local_tasks WHERE uid = ?1", [uid])?;
+        Ok(())
+    }
+
+    /// One day's My Day pin set (item 4.9 / T-02): the `(calendar_id, uid)`
+    /// pairs the user pinned for that date, in pin order. `day` is an ISO
+    /// `YYYY-MM-DD` string in the display zone.
+    pub fn load_my_day(&self, day: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT calendar_id, uid FROM my_day_tasks WHERE day = ?1 ORDER BY rowid")?;
+        let rows = stmt.query_map([day], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
+    /// Replaces one day's My Day pin set wholesale with `keys` - the in-memory
+    /// toggle state is the source of truth, so a replace keeps the table equal
+    /// to it with no diffing.
+    pub fn set_my_day(&self, day: &str, keys: &[(String, String)]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM my_day_tasks WHERE day = ?1", [day])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO my_day_tasks (day, calendar_id, uid) VALUES (?1, ?2, ?3)")?;
+            for (calendar_id, uid) in keys {
+                stmt.execute(rusqlite::params![day, calendar_id, uid])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Drops every My Day pin set older than `day` (an ISO date). Called on
+    /// open so the table can't grow without bound as days pass; a missing row
+    /// is not an error.
+    pub fn prune_my_day(&self, day: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM my_day_tasks WHERE day < ?1", [day])?;
         Ok(())
     }
 }
@@ -1030,6 +1068,42 @@ mod tests {
         let (loaded_expanded, loaded_collapsed) = upgraded.load_folder_expansion().unwrap();
         assert_eq!(loaded_expanded, fewer_expanded);
         assert!(loaded_collapsed.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn my_day_round_trip_replace_prune_and_wipe_survival() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("my-day");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        assert!(db.load_my_day("2026-10-16").unwrap().is_empty());
+
+        db.set_my_day("2026-10-16", &[("local".into(), "t1".into()), ("todo:l1".into(), "t2".into())]).unwrap();
+        db.set_my_day("2026-10-15", &[("local".into(), "old".into())]).unwrap();
+        let today = db.load_my_day("2026-10-16").unwrap();
+        assert_eq!(today, vec![("local".into(), "t1".into()), ("todo:l1".into(), "t2".into())], "pin order is kept");
+
+        // Replace semantics: a smaller set drops the missing pins.
+        db.set_my_day("2026-10-16", &[("local".into(), "t1".into())]).unwrap();
+        assert_eq!(db.load_my_day("2026-10-16").unwrap(), vec![("local".into(), "t1".into())]);
+
+        // Pruning drops older days but leaves today and later.
+        db.set_my_day("2026-10-20", &[("local".into(), "future".into())]).unwrap();
+        db.prune_my_day("2026-10-16").unwrap();
+        assert!(db.load_my_day("2026-10-15").unwrap().is_empty(), "yesterday is pruned");
+        assert_eq!(db.load_my_day("2026-10-16").unwrap().len(), 1);
+        assert_eq!(db.load_my_day("2026-10-20").unwrap().len(), 1);
+
+        // A preference-like table: the version wipe must not touch it.
+        let reopened = UiStateDb::open().unwrap();
+        reopened.conn.pragma_update(None, "user_version", 1).expect("test can write its own version");
+        drop(reopened);
+        let upgraded = UiStateDb::open().unwrap();
+        assert_eq!(upgraded.load_my_day("2026-10-16").unwrap(), vec![("local".into(), "t1".into())]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

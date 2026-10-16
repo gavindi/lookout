@@ -12,6 +12,7 @@
 /// Software released under the GPL3 license
 use lookout_core::text::percent_encode;
 use lookout_core::CalendarTask;
+use serde_json::json;
 
 use crate::client::GraphClient;
 use crate::error::Result;
@@ -78,6 +79,32 @@ impl TodoClient {
         let path = format!("me/todo/lists/{}/tasks/{}", encode_segment(list_id), encode_segment(task_id));
         let headers: Vec<(&str, &str)> = etag.map(|etag| vec![("If-Match", etag)]).unwrap_or_default();
         self.graph.delete_with_headers(&path, &headers).await?;
+        Ok(())
+    }
+
+    /// Creates a new To Do list (`POST /me/todo/lists`) named `display_name`
+    /// (item 4.8 / T-01). The session re-syncs afterwards, so it doesn't need
+    /// Graph's own copy of the new list back.
+    pub async fn create_list(&self, display_name: &str) -> Result<()> {
+        self.graph.post("me/todo/lists", &json!({ "displayName": display_name })).await?;
+        Ok(())
+    }
+
+    /// Renames a list (`PATCH /me/todo/lists/{id}`). The well-known default
+    /// and flagged-email lists are rejected by Graph; the app never offers to
+    /// rename those.
+    pub async fn update_list(&self, list_id: &str, display_name: &str) -> Result<()> {
+        let path = format!("me/todo/lists/{}", encode_segment(list_id));
+        self.graph.patch(&path, &json!({ "displayName": display_name })).await?;
+        Ok(())
+    }
+
+    /// Deletes a list (`DELETE /me/todo/lists/{id}`) and every task in it.
+    /// Destructive and not undoable - the app confirms first (§6.1), and never
+    /// offers a well-known list.
+    pub async fn delete_list(&self, list_id: &str) -> Result<()> {
+        let path = format!("me/todo/lists/{}", encode_segment(list_id));
+        self.graph.delete(&path).await?;
         Ok(())
     }
 
@@ -270,5 +297,37 @@ mod tests {
     fn encode_segment_escapes_path_specials() {
         assert_eq!(encode_segment("l1"), "l1");
         assert_eq!(encode_segment("a+b/c="), "a%2Bb%2Fc%3D");
+    }
+
+    #[tokio::test]
+    async fn create_list_posts_the_display_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/todo/lists"))
+            .and(body_partial_json(json!({ "displayName": "Groceries" })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "l9", "displayName": "Groceries" })))
+            .mount(&server)
+            .await;
+
+        client(&server).create_list("Groceries").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_list_target_the_list_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/v1.0/me/todo/lists/l1"))
+            .and(body_partial_json(json!({ "displayName": "Renamed" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "l1", "displayName": "Renamed" })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/me/todo/lists/l1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        client(&server).update_list("l1", "Renamed").await.unwrap();
+        client(&server).delete_list("l1").await.unwrap();
     }
 }

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.228" date="2026-10-16">
+      <description>
+        <p>The Tasks module gains Outlook's navigation pane: <em>My Day</em> (a per-day pin set with due-today and overdue suggestions), <em>Flagged email</em>, and one row per task list, with lists you can create, rename and delete on CalDAV, Google Tasks, Microsoft To Do or this device.</p>
+      </description>
+    </release>
     <release version="0.9.227" date="2026-10-16">
       <description>
         <p>Outlook's mail-organising layer lands: <em>Sweep</em> (bulk delete or move everything from a sender, keeping the latest or older-than-N-days, with an optional rule), <em>Search Folders</em> (saved searches shown as virtual folders), and <em>Ignore</em> / <em>Clean up conversation</em>.</p>

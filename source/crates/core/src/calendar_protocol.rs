@@ -130,6 +130,26 @@ pub enum CalendarCommand {
         href: String,
         etag: Option<String>,
     },
+    /// Create a new task-list collection under the account's calendar-home
+    /// (RFC 4791 MKCALENDAR), advertising `VTODO` as the only supported
+    /// component so it behaves as a To Do list rather than an events calendar.
+    /// The Tasks navigation pane's "New list" sends this (item 4.8 / T-01);
+    /// the actor re-lists on success. A server that doesn't support MKCALENDAR
+    /// answers with an error the UI toasts (degrade softly, §10).
+    CreateCalendar {
+        display_name: String,
+    },
+    /// Rename an existing collection (`PROPPATCH` `displayname`), then
+    /// re-list. `calendar_id` identifies the collection to rename.
+    UpdateCalendar {
+        calendar_id: CalendarId,
+        display_name: String,
+    },
+    /// Delete an existing collection (`DELETE`), then re-list. Destructive
+    /// and not undoable - the UI confirms before sending (§6.1).
+    DeleteCalendar {
+        calendar_id: CalendarId,
+    },
     /// Replaces the set of *other users'* mailboxes whose calendars this Graph
     /// account also shows (item 5.6 / CAL-25) - the shared/delegated calendars
     /// configured in `settings.json`, each an owner id or address. The Graph

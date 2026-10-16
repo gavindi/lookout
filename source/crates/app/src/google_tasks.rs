@@ -456,6 +456,32 @@ impl GoogleTasksClient {
         resp.bytes().await.map_err(|e| ApiError::Other(e.to_string()))?;
         Ok(())
     }
+
+    /// Creates a new task list (item 4.8 / T-01). The session re-syncs
+    /// afterwards, so the API's returned list is discarded.
+    pub async fn create_task_list(&self, token: &str, title: &str) -> Result<(), ApiError> {
+        let payload = serde_json::json!({ "title": title });
+        let resp = self.send(reqwest::Method::POST, format!("{API_BASE}/users/@me/lists"), token, Some(payload)).await?;
+        resp.bytes().await.map_err(|e| ApiError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Renames a task list.
+    pub async fn rename_task_list(&self, token: &str, list_id: &str, title: &str) -> Result<(), ApiError> {
+        let payload = serde_json::json!({ "title": title });
+        let url = format!("{API_BASE}/users/@me/lists/{}", percent_encode(list_id));
+        let resp = self.send(reqwest::Method::PATCH, url, token, Some(payload)).await?;
+        resp.bytes().await.map_err(|e| ApiError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Deletes a task list (and every task in it). Destructive.
+    pub async fn delete_task_list(&self, token: &str, list_id: &str) -> Result<(), ApiError> {
+        let url = format!("{API_BASE}/users/@me/lists/{}", percent_encode(list_id));
+        let resp = self.send(reqwest::Method::DELETE, url, token, None).await?;
+        resp.bytes().await.map_err(|e| ApiError::Other(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -583,6 +609,19 @@ pub enum GoogleTasksCommand {
         list_id: String,
         task_id: String,
     },
+    /// Create a new task list named `title` (item 4.8 / T-01).
+    CreateList {
+        title: String,
+    },
+    /// Rename an existing task list.
+    RenameList {
+        list_id: String,
+        title: String,
+    },
+    /// Delete an existing task list (and every task in it). Destructive.
+    DeleteList {
+        list_id: String,
+    },
 }
 
 pub enum GoogleTasksEvent {
@@ -689,6 +728,22 @@ pub async fn run_google_tasks_session(email: String, commands: async_channel::Re
                     GoogleTasksCommand::DeleteTask { list_id, task_id } => {
                         if let Err(e) = client.delete_task(&current, &list_id, &task_id).await {
                             let _ = events.send(GoogleTasksEvent::Error(format!("couldn't delete task: {}", api_error_string(e)))).await;
+                        }
+                    }
+                    // List lifecycle (item 4.8 / T-01); each resyncs below.
+                    GoogleTasksCommand::CreateList { title } => {
+                        if let Err(e) = client.create_task_list(&current, &title).await {
+                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't create the list: {}", api_error_string(e)))).await;
+                        }
+                    }
+                    GoogleTasksCommand::RenameList { list_id, title } => {
+                        if let Err(e) = client.rename_task_list(&current, &list_id, &title).await {
+                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't rename the list: {}", api_error_string(e)))).await;
+                        }
+                    }
+                    GoogleTasksCommand::DeleteList { list_id } => {
+                        if let Err(e) = client.delete_task_list(&current, &list_id).await {
+                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't delete the list: {}", api_error_string(e)))).await;
                         }
                     }
                 }

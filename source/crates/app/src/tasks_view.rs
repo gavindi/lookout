@@ -252,14 +252,62 @@ pub fn group_tasks(tasks: &[CalendarTask], now: NaiveDateTime) -> Vec<(TaskBucke
     buckets
 }
 
-/// The Tasks view's widget state. `root` is the scrolled list; callers read
-/// nothing back from it - `set_tasks` repaints from scratch on every push.
-/// The toggle/activate callbacks are stored on the view (via
-/// [`TasksView::set_handlers`]) so `set_tasks` callers don't need to know
-/// about the window or the session routing - the widget owns the handlers,
-/// the caller owns the data.
+/// Which smart list / source the Tasks navigation pane has selected (item 4.8
+/// / T-01). `All` is Outlook's "Tasks" smart list; `MyDay` the per-day pin set
+/// (item 4.9 / T-02); `Flagged` the follow-up-flagged mail section (item 1.16);
+/// `List` one source (a CalDAV calendar, Google list, To Do list or local
+/// list).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TasksFilter {
+    /// Every task from every source - Outlook's "Tasks".
+    #[default]
+    All,
+    /// The My Day pin set plus its due-today/overdue suggestions.
+    MyDay,
+    /// Open follow-up-flagged mail.
+    Flagged,
+    /// One task list / calendar.
+    List(CalendarId),
+}
+
+/// One row in the Tasks navigation pane. Colour dots are for source lists;
+/// smart lists have none. `list_id` is `Some` for a user list (which offers
+/// Rename/Delete), `None` for a smart list.
+pub struct TasksNavRow {
+    pub label: String,
+    pub filter: TasksFilter,
+    pub color: Option<String>,
+    pub list_id: Option<CalendarId>,
+}
+
+/// What a Tasks navigation row asked for.
+pub enum TasksNavAction {
+    Select(TasksFilter),
+    /// The trailing "+ New list" row.
+    NewList,
+    RenameList(CalendarId),
+    DeleteList(CalendarId),
+}
+
+/// A Tasks navigation action callback. Stored on the view (like the toggle
+/// handler) so the caller owns the routing.
+pub type TasksNavHandler = Rc<dyn Fn(TasksNavAction) + 'static>;
+
+/// The Add/Remove-from-My-Day action (item 4.9 / T-02): the caller flips the
+/// pin set, persists it, and repaints.
+pub type MyDayToggleHandler = Rc<dyn Fn(crate::my_day::MyDayKey) + 'static>;
+
+/// The Tasks view's widget state. `root` is the paned navigation-pane + task
+/// list; callers read nothing back from it - `set_tasks` repaints from scratch
+/// on every push. The toggle/activate callbacks are stored on the view (via
+/// [`set_handlers`]) so `set_tasks` callers don't need to know about the
+/// window or the session routing - the widget owns the handlers, the caller
+/// owns the data.
 pub struct TasksView {
-    pub root: gtk::ScrolledWindow,
+    pub root: gtk::Paned,
+    /// The navigation pane's row list (item 4.8 / T-01), rebuilt by
+    /// [`set_nav`] from the caller's rows.
+    sidebar: gtk::ListBox,
     list: gtk::Box,
     /// The "Flagged email" section above the task buckets (item 1.16),
     /// repainted on its own by [`set_flagged_mail`].
@@ -278,6 +326,25 @@ pub struct TasksView {
     group: RefCell<TaskGroupBy>,
     /// Whether completed tasks are shown.
     show_completed: RefCell<bool>,
+    /// Which navigation row is selected (item 4.8 / T-01); drives which tasks
+    /// `set_tasks` renders and whether the flagged-mail section is shown.
+    filter: RefCell<TasksFilter>,
+    /// The navigation-pane action callback (item 4.8 / T-01), set once by the
+    /// caller via [`set_nav`]. Shared with the sidebar's `row-selected`
+    /// connection, which is wired once at build time.
+    nav_action: Rc<RefCell<Option<TasksNavHandler>>>,
+    /// The filter each navigation row maps to, parallel to the sidebar's rows -
+    /// the lookup `row-selected` uses to name the selection.
+    nav_filters: Rc<RefCell<Vec<TasksFilter>>>,
+    /// Mutes `row-selected` while `set_nav` marks the selected row
+    /// programmatically, so re-selecting can't recurse through the handler.
+    nav_suppress: Rc<std::cell::Cell<bool>>,
+    /// The current My Day pin set (item 4.9 / T-02), mirrored from the caller so
+    /// a task row's context action can label itself Add or Remove.
+    my_day_pins: Rc<RefCell<Vec<crate::my_day::MyDayKey>>>,
+    /// The Add/Remove-from-My-Day action (item 4.9 / T-02), set once by the
+    /// caller via [`set_my_day_handler`].
+    my_day_toggle: Rc<RefCell<Option<MyDayToggleHandler>>>,
     /// The live shared category master list (2.1), read to colour the task
     /// rows' category chips. Held as the same `Rc` the rest of the app
     /// mutates, so a category colour change needs no repaint bookkeeping.
@@ -295,9 +362,10 @@ pub(crate) type FlagCompleteHandler = Rc<dyn Fn(EmailSummary) + 'static>;
 /// A clicked flagged-email row: the caller opens the message.
 pub(crate) type FlagOpenHandler = Rc<dyn Fn(EmailSummary) + 'static>;
 
-/// Builds a fresh Tasks view: a scrolled list inside a card, with an empty
-/// placeholder for the no-tasks state. `categories` is the shared category
-/// master list (2.1), kept live for the rows' category chips.
+/// Builds a fresh Tasks view: a navigation pane (item 4.8 / T-01) beside a
+/// scrolled task list, with an empty placeholder for the no-tasks state.
+/// `categories` is the shared category master list (2.1), kept live for the
+/// rows' category chips.
 pub fn build_tasks_view(categories: Rc<RefCell<CategorySet>>) -> TasksView {
     install_tasks_css();
     let list = gtk::Box::builder()
@@ -319,13 +387,79 @@ pub fn build_tasks_view(categories: Rc<RefCell<CategorySet>>) -> TasksView {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&flagged);
     content.append(&list);
-    let root = gtk::ScrolledWindow::builder()
+    let list_scroller = gtk::ScrolledWindow::builder()
         .child(&content)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .build();
+
+    // The navigation pane: smart lists and per-source rows, rebuilt by
+    // `set_nav` as sources change.
+    let sidebar = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["navigation-sidebar"])
+        .build();
+    let sidebar_scroller = gtk::ScrolledWindow::builder()
+        .child(&sidebar)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    // The outer Tasks card provides the frame, so the sidebar is a plain
+    // fixed-width column (no nested card styling).
+    let sidebar_card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_card.set_width_request(220);
+    sidebar_card.append(&sidebar_scroller);
+
+    let root = gtk::Paned::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .start_child(&sidebar_card)
+        .end_child(&list_scroller)
+        .resize_start_child(false)
+        .resize_end_child(true)
+        .shrink_start_child(false)
+        .shrink_end_child(false)
+        .position(220)
+        .build();
+    root.add_css_class("seamless-paned");
+
+    let nav_action: Rc<RefCell<Option<TasksNavHandler>>> = Rc::new(RefCell::new(None));
+    let nav_filters: Rc<RefCell<Vec<TasksFilter>>> = Rc::new(RefCell::new(Vec::new()));
+    let nav_suppress: Rc<std::cell::Cell<bool>> = Rc::new(std::cell::Cell::new(false));
+    let my_day_pins: Rc<RefCell<Vec<crate::my_day::MyDayKey>>> = Rc::new(RefCell::new(Vec::new()));
+    let my_day_toggle: Rc<RefCell<Option<MyDayToggleHandler>>> = Rc::new(RefCell::new(None));
+    // Selection is reported through the stored handler; the sidebar itself
+    // holds no state, so rebuilding its rows never stacks handlers. The last
+    // row is the "+ New list" entry, which maps to `NewList` rather than a
+    // filter. `nav_suppress` mutes the programmatic selection `set_nav`
+    // performs, so re-selecting the current row can't recurse.
+    {
+        let nav_action = nav_action.clone();
+        let nav_filters = nav_filters.clone();
+        let nav_suppress = nav_suppress.clone();
+        sidebar.connect_row_selected(move |_list, row| {
+            if nav_suppress.get() {
+                return;
+            }
+            let Some(row) = row else { return };
+            let index = row.index();
+            if index < 0 {
+                return;
+            }
+            let Some(handler) = nav_action.borrow().clone() else { return };
+            let filters = nav_filters.borrow();
+            let action = if (index as usize) < filters.len() {
+                TasksNavAction::Select(filters[index as usize].clone())
+            } else {
+                TasksNavAction::NewList
+            };
+            drop(filters);
+            handler(action);
+        });
+    }
+
     TasksView {
         root,
+        sidebar,
         list,
         flagged,
         toggle: RefCell::new(None),
@@ -336,6 +470,12 @@ pub fn build_tasks_view(categories: Rc<RefCell<CategorySet>>) -> TasksView {
         sort: RefCell::new(TaskSortKey::default()),
         group: RefCell::new(TaskGroupBy::default()),
         show_completed: RefCell::new(true),
+        filter: RefCell::new(TasksFilter::default()),
+        nav_action,
+        nav_filters,
+        nav_suppress,
+        my_day_pins,
+        my_day_toggle,
         categories,
     }
 }
@@ -354,6 +494,131 @@ pub fn set_view_options(view: &TasksView, sort: TaskSortKey, group: TaskGroupBy,
 pub fn set_handlers(view: &TasksView, toggle: ToggleHandler, activate: ActivateHandler) {
     *view.toggle.borrow_mut() = Some(toggle);
     *view.activate.borrow_mut() = Some(activate);
+}
+
+/// Stores the navigation-pane action callback (item 4.8 / T-01). Called once
+/// at startup, like [`set_handlers`].
+pub fn set_nav_handler(view: &TasksView, handler: TasksNavHandler) {
+    *view.nav_action.borrow_mut() = Some(handler);
+}
+
+/// Stores the Add/Remove-from-My-Day action (item 4.9 / T-02). Called once by
+/// the caller.
+pub fn set_my_day_handler(view: &TasksView, handler: MyDayToggleHandler) {
+    *view.my_day_toggle.borrow_mut() = Some(handler);
+}
+
+/// Stores the current My Day pin set (item 4.9 / T-02) so a task row's context
+/// action can label itself Add or Remove. Called before every repaint from the
+/// caller's in-memory mirror of the database.
+pub fn set_my_day_pins(view: &TasksView, pins: &[crate::my_day::MyDayKey]) {
+    *view.my_day_pins.borrow_mut() = pins.to_vec();
+}
+
+/// Rebuilds the navigation pane from `rows`, marks `selected` (without
+/// emitting a selection action), and stores the row→filter map `row-selected`
+/// reads. Source rows get a colour dot; user lists get a trailing ⋯ menu with
+/// Rename/Delete. A trailing "+ New list" row is always appended.
+pub fn set_nav(view: &TasksView, rows: &[TasksNavRow], selected: &TasksFilter) {
+    *view.filter.borrow_mut() = selected.clone();
+    while let Some(child) = view.sidebar.first_child() {
+        view.sidebar.remove(&child);
+    }
+    let mut filters: Vec<TasksFilter> = Vec::with_capacity(rows.len() + 1);
+    let handler = view.nav_action.borrow().clone().unwrap_or_else(|| Rc::new(|_| {}));
+    let mut selected_index: i32 = -1;
+    for (index, row) in rows.iter().enumerate() {
+        let row_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .margin_start(6)
+            .margin_end(6)
+            .margin_top(4)
+            .margin_bottom(4)
+            .build();
+        if let Some(color) = &row.color {
+            let color = color.clone();
+            let dot = gtk::DrawingArea::builder().width_request(10).height_request(10).valign(gtk::Align::Center).build();
+            dot.set_draw_func(move |_, cr, width, height| {
+                let (r, g, b) = parse_css_color(&color);
+                let radius = width.min(height) as f64 / 2.0 - 1.0;
+                cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius.max(1.0), 0.0, 2.0 * std::f64::consts::PI);
+                cr.set_source_rgba(r, g, b, 1.0);
+                let _ = cr.fill();
+            });
+            row_box.append(&dot);
+        }
+        let label = gtk::Label::builder()
+            .label(&row.label)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+        row_box.append(&label);
+        if let Some(list_id) = &row.list_id {
+            let menu = gtk::MenuButton::builder()
+                .icon_name("view-more-symbolic")
+                .css_classes(["flat"])
+                .tooltip_text("More options")
+                .build();
+            let popover = gtk::Popover::new();
+            let menu_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+            let rename = gtk::Button::builder().label("Rename list").css_classes(["flat"]).halign(gtk::Align::Start).build();
+            let delete = gtk::Button::builder().label("Delete list").css_classes(["flat"]).halign(gtk::Align::Start).build();
+            menu_box.append(&rename);
+            menu_box.append(&delete);
+            popover.set_child(Some(&menu_box));
+            menu.set_popover(Some(&popover));
+            {
+                let handler = handler.clone();
+                let list_id = list_id.clone();
+                let popover = popover.clone();
+                rename.connect_clicked(move |_| {
+                    popover.popdown();
+                    handler(TasksNavAction::RenameList(list_id.clone()));
+                });
+            }
+            {
+                let handler = handler.clone();
+                let list_id = list_id.clone();
+                let popover = popover.clone();
+                delete.connect_clicked(move |_| {
+                    popover.popdown();
+                    handler(TasksNavAction::DeleteList(list_id.clone()));
+                });
+            }
+            row_box.append(&menu);
+        }
+        let list_row = gtk::ListBoxRow::builder().child(&row_box).activatable(true).build();
+        view.sidebar.append(&list_row);
+        if *selected == row.filter {
+            selected_index = index as i32;
+        }
+        filters.push(row.filter.clone());
+    }
+    // "+ New list" is a plain row (no colour dot, no menu).
+    {
+        let new_row = gtk::ListBoxRow::builder().activatable(true).build();
+        let label = gtk::Label::builder()
+            .label("+ New list")
+            .xalign(0.0)
+            .margin_start(6)
+            .margin_top(4)
+            .margin_bottom(4)
+            .css_classes(["dim-label"])
+            .build();
+        new_row.set_child(Some(&label));
+        view.sidebar.append(&new_row);
+    }
+    *view.nav_filters.borrow_mut() = filters;
+    // Mark the selected row without re-emitting a selection action.
+    if selected_index >= 0 {
+        if let Some(row) = view.sidebar.row_at_index(selected_index) {
+            view.nav_suppress.set(true);
+            view.sidebar.select_row(Some(&row));
+            view.nav_suppress.set(false);
+        }
+    }
 }
 
 /// Stores the flagged-email row callbacks (item 1.16). Called once at
@@ -380,10 +645,15 @@ pub fn flagged_mail_rows(messages: &[EmailSummary], today: NaiveDate, week_start
 }
 
 /// Repaints the "Flagged email" section from `messages` (every account's
-/// flagged mail). Hidden when nothing is flagged.
+/// flagged mail). Shown only while the Flagged email navigation row is
+/// selected (item 4.8 / T-01); hidden and emptied otherwise.
 pub fn set_flagged_mail(view: &TasksView, messages: &[EmailSummary]) {
     while let Some(child) = view.flagged.first_child() {
         view.flagged.remove(&child);
+    }
+    if *view.filter.borrow() != TasksFilter::Flagged {
+        view.flagged.set_visible(false);
+        return;
     }
     let zone = crate::calendar_tz::display_zone();
     let today = zone.today();
@@ -519,16 +789,27 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
     let sort = *view.sort.borrow();
     let group = *view.group.borrow();
     let show_completed = *view.show_completed.borrow();
+    let selected = view.filter.borrow().clone();
     let categories: Vec<CategoryDef> = view.categories.borrow().categories.clone();
 
     while let Some(child) = view.list.first_child() {
         view.list.remove(&child);
     }
 
+    // My Day and Flagged email are rendered by their own setters; the main
+    // task list renders `All` and a single `List`.
+    match selected {
+        TasksFilter::MyDay | TasksFilter::Flagged => return,
+        TasksFilter::All | TasksFilter::List(_) => {}
+    }
+    let scoped: Vec<CalendarTask> = match &selected {
+        TasksFilter::List(calendar_id) => tasks.iter().filter(|task| task.calendar_id == *calendar_id).cloned().collect(),
+        _ => tasks.to_vec(),
+    };
     let visible: Vec<CalendarTask> = if show_completed {
-        tasks.to_vec()
+        scoped
     } else {
-        tasks.iter().filter(|task| !task_completed(task)).cloned().collect()
+        scoped.into_iter().filter(|task| !task_completed(task)).collect()
     };
 
     if visible.is_empty() {
@@ -559,9 +840,120 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
             view.list.append(&header);
         }
         for task in group_tasks {
-            view.list.append(&task_row(&task, colors, toggle.clone(), activate.clone(), &[], true, &categories));
+            let row = task_row(&task, colors, toggle.clone(), activate.clone(), &[], true, &categories);
+            attach_my_day_menu(&row, &task, &view.my_day_pins, &view.my_day_toggle);
+            view.list.append(&row);
         }
     }
+}
+
+/// Repaints the My Day smart list (item 4.9 / T-02): the pinned tasks, then
+/// the caller-computed due-today/overdue suggestions. Renders only while the
+/// My Day row is selected - the other filters' setters own their own lists.
+pub fn set_my_day(view: &TasksView, pinned: &[CalendarTask], suggestions: &[CalendarTask], colors: &CalendarColorMap) {
+    if *view.filter.borrow() != TasksFilter::MyDay {
+        return;
+    }
+    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _c| {}));
+    let activate = view.activate.borrow().clone().unwrap_or_else(|| Rc::new(|_t| {}));
+    let show_completed = *view.show_completed.borrow();
+    let categories: Vec<CategoryDef> = view.categories.borrow().categories.clone();
+
+    while let Some(child) = view.list.first_child() {
+        view.list.remove(&child);
+    }
+
+    let pinned: Vec<CalendarTask> = if show_completed {
+        pinned.to_vec()
+    } else {
+        pinned.iter().filter(|task| !task_completed(task)).cloned().collect()
+    };
+
+    if pinned.is_empty() && suggestions.is_empty() {
+        view.list.append(
+            &gtk::Label::builder()
+                .label("Nothing for today - pin a task from any list, or add one due today.")
+                .css_classes(["dim-label", "caption"])
+                .xalign(0.0)
+                .wrap(true)
+                .margin_top(16)
+                .build(),
+        );
+        return;
+    }
+
+    if !pinned.is_empty() {
+        view.list.append(&section_header("My Day"));
+        for task in &pinned {
+            let row = task_row(task, colors, toggle.clone(), activate.clone(), &[], true, &categories);
+            attach_my_day_menu(&row, task, &view.my_day_pins, &view.my_day_toggle);
+            view.list.append(&row);
+        }
+    }
+    if !suggestions.is_empty() {
+        view.list.append(&section_header("Suggestions"));
+        for task in suggestions {
+            let row = task_row(task, colors, toggle.clone(), activate.clone(), &[], true, &categories);
+            attach_my_day_menu(&row, task, &view.my_day_pins, &view.my_day_toggle);
+            view.list.append(&row);
+        }
+    }
+}
+
+/// A caption heading for a My Day section.
+fn section_header(label: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(label)
+        .css_classes(["dim-label", "caption-heading"])
+        .xalign(0.0)
+        .hexpand(true)
+        .margin_top(8)
+        .margin_bottom(2)
+        .build()
+}
+
+/// Attaches the right-click "Add to My Day" / "Remove from My Day" action to a
+/// task row (item 4.9 / T-02). A no-op until the caller installs a toggle
+/// handler via [`set_my_day_state`] - so the dashboard's and Mail overview's
+/// shared rows, which never do, are unaffected.
+fn attach_my_day_menu(row: &gtk::Button, task: &CalendarTask, pins: &Rc<RefCell<Vec<crate::my_day::MyDayKey>>>, toggle: &Rc<RefCell<Option<MyDayToggleHandler>>>) {
+    if toggle.borrow().is_none() {
+        return;
+    }
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    let row_for_gesture = row.clone();
+    let task = task.clone();
+    let pins = pins.clone();
+    let toggle = toggle.clone();
+    gesture.connect_pressed(move |_gesture, _n_press, x, y| {
+        let Some(handler) = toggle.borrow().clone() else { return };
+        let key = crate::my_day::key_for(&task);
+        let pinned = crate::my_day::is_pinned(&pins.borrow(), &key);
+        let popover = gtk::Popover::new();
+        popover.set_parent(&row_for_gesture);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.set_has_arrow(false);
+        let menu = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+        let item = gtk::Button::with_label(if pinned { "Remove from My Day" } else { "Add to My Day" });
+        item.add_css_class("flat");
+        item.set_halign(gtk::Align::Start);
+        {
+            let popover = popover.clone();
+            let key = key.clone();
+            item.connect_clicked(move |_| {
+                popover.popdown();
+                handler(key.clone());
+            });
+        }
+        menu.append(&item);
+        popover.set_child(Some(&menu));
+        // Unparent on close so repeatedly opening the menu doesn't parent a
+        // fresh popover to the row forever.
+        popover.connect_closed(|popover| popover.unparent());
+        popover.popup();
+    });
+    row.add_controller(gesture);
 }
 
 /// One task row: a completion checkbox, a calendar colour dot, the summary,

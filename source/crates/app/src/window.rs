@@ -5355,6 +5355,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         google_account_emails: Vec::new(),
         local_tasks,
         local_tasks_db,
+        local_task_lists: state.borrow().app_config.borrow().local_task_lists(),
+        tasks_filter: crate::tasks_view::TasksFilter::default(),
+        my_day_day: crate::calendar_tz::display_zone().today(),
+        my_day_pins: Vec::new(),
         dashboard_refresh: None,
         flagged_mail: Vec::new(),
         dashboard_generation: 0,
@@ -5370,6 +5374,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
     // applied without every render path carrying a calendar reference.
     state.borrow_mut().calendar_state = Some(calendar_state.clone());
+
+    // My Day (item 4.9 / T-02): prune stale days and load today's pin set into
+    // the in-memory mirror before the first Tasks repaint.
+    {
+        let day = calendar_state.borrow().my_day_day.format("%Y-%m-%d").to_string();
+        if let Some(db) = calendar_state.borrow().local_tasks_db.clone() {
+            let db = db.borrow();
+            let _ = db.prune_my_day(&day);
+            if let Ok(pins) = db.load_my_day(&day) {
+                calendar_state.borrow_mut().my_day_pins = pins;
+            }
+        }
+    }
 
     // --- Lookout dashboard refresh hook: the window registers one closure
     // that repaints the whole dashboard, and hands it to the mail sessions
@@ -9629,6 +9646,60 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             &tasks_view,
             Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view_for_toggle, task, completed)),
             Rc::new(move |task| open_task_editor_for(&window, &state, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
+        );
+    }
+    // Tasks navigation pane (item 4.8 / T-01): selecting a row switches the
+    // filter, and the list rows' create/rename/delete actions route to the
+    // owning backend via `task_lists`.
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let tasks_view_for_nav = tasks_view.clone();
+        let toast_overlay = toast_overlay.clone();
+        crate::tasks_view::set_nav_handler(
+            &tasks_view,
+            Rc::new(move |action| {
+                use crate::tasks_view::TasksNavAction;
+                match action {
+                    TasksNavAction::Select(filter) => {
+                        if calendar_state.borrow().tasks_filter != filter {
+                            calendar_state.borrow_mut().tasks_filter = filter;
+                            refresh_tasks_view(&calendar_state, &tasks_view_for_nav);
+                        }
+                    }
+                    TasksNavAction::NewList => {
+                        crate::task_lists::create_task_list_dialog(&window, &state, &calendar_state, &tasks_view_for_nav, &toast_overlay);
+                    }
+                    TasksNavAction::RenameList(id) => {
+                        crate::task_lists::rename_task_list_dialog(&window, &state, &calendar_state, &tasks_view_for_nav, &toast_overlay, id);
+                    }
+                    TasksNavAction::DeleteList(id) => {
+                        crate::task_lists::delete_task_list_confirm(&window, &state, &calendar_state, &tasks_view_for_nav, &toast_overlay, id);
+                    }
+                }
+            }),
+        );
+    }
+    // My Day (item 4.9 / T-02): the Add/Remove action flips the pin set,
+    // persists it to the UI-state database and repaints.
+    {
+        let calendar_state = calendar_state.clone();
+        let tasks_view_for_my_day = tasks_view.clone();
+        crate::tasks_view::set_my_day_handler(
+            &tasks_view,
+            Rc::new(move |key| {
+                let day = calendar_state.borrow().my_day_day.format("%Y-%m-%d").to_string();
+                let pins = {
+                    let mut st = calendar_state.borrow_mut();
+                    crate::my_day::toggle(&mut st.my_day_pins, key);
+                    st.my_day_pins.clone()
+                };
+                if let Some(db) = calendar_state.borrow().local_tasks_db.clone() {
+                    let _ = db.borrow().set_my_day(&day, &pins);
+                }
+                refresh_tasks_view(&calendar_state, &tasks_view_for_my_day);
+            }),
         );
     }
     // Tasks view arrangement (T-09): seed the view's options from the

@@ -457,6 +457,43 @@ pub fn build_addressbook_multiget_body(hrefs: &[String], props: &[&str]) -> Stri
     body
 }
 
+/// Builds an RFC 4791 MKCALENDAR body (a `CALDAV:mkcalendar` request) for a
+/// `VTODO`-only task-list collection named `display_name` (item 4.8 / T-01).
+/// The component set is deliberately `VTODO` alone, matching Outlook's To Do
+/// lists rather than an events calendar.
+pub fn build_mkcalendar_body(display_name: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
+         <C:mkcalendar xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n\
+         \x20 <D:set>\n\
+         \x20   <D:prop>\n\
+         \x20     <D:displayname>{}</D:displayname>\n\
+         \x20     <C:supported-calendar-component-set>\n\
+         \x20       <C:comp name=\"VTODO\"/>\n\
+         \x20     </C:supported-calendar-component-set>\n\
+         \x20   </D:prop>\n\
+         \x20 </D:set>\n\
+         </C:mkcalendar>",
+        escape_text(display_name),
+    )
+}
+
+/// Builds an RFC 4918 PROPPATCH body (a `D:propertyupdate`) setting a
+/// collection's `displayname` - renames a task list (item 4.8 / T-01).
+pub fn build_proppatch_displayname_body(display_name: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n\
+         <D:propertyupdate xmlns:D=\"DAV:\">\n\
+         \x20 <D:set>\n\
+         \x20   <D:prop>\n\
+         \x20     <D:displayname>{}</D:displayname>\n\
+         \x20   </D:prop>\n\
+         \x20 </D:set>\n\
+         </D:propertyupdate>",
+        escape_text(display_name),
+    )
+}
+
 /// Minimal XML text-content escaping for values interpolated into a request
 /// body (hrefs, sync tokens) - CardDAV hrefs are normally already
 /// percent-encoded and safe, but this is cheap insurance against a server
@@ -869,5 +906,22 @@ END:VCARD
             responses.iter().all(|r| r.status.is_none()),
             "propstat-level 404s must not leak into the response-level status"
         );
+    }
+
+    #[test]
+    fn mkcalendar_body_declares_a_vtodo_only_collection() {
+        let body = build_mkcalendar_body("Groceries & Errands");
+        assert!(body.contains("<C:mkcalendar"));
+        assert!(body.contains("<C:comp name=\"VTODO\"/>"));
+        assert!(!body.contains("VEVENT"), "a task list is VTODO-only");
+        // The display name is XML-escaped.
+        assert!(body.contains("<D:displayname>Groceries &amp; Errands</D:displayname>"));
+    }
+
+    #[test]
+    fn proppatch_body_sets_the_displayname() {
+        let body = build_proppatch_displayname_body("Renamed <list>");
+        assert!(body.contains("<D:propertyupdate"));
+        assert!(body.contains("<D:displayname>Renamed &lt;list&gt;</D:displayname>"));
     }
 }

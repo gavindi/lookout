@@ -248,6 +248,14 @@ async fn connect_and_run(
                         ))
                         .await;
                 }
+                // Task lists on Microsoft 365 live in To Do, which has its own
+                // actor (`lookout_graph::todo`); the Graph calendar actor never
+                // creates task lists (item 4.8 / T-01).
+                CalendarCommand::CreateCalendar { .. } | CalendarCommand::UpdateCalendar { .. } | CalendarCommand::DeleteCalendar { .. } => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("task lists live in Microsoft To Do, not a Graph calendar".to_string()))
+                        .await;
+                }
                 CalendarCommand::FetchFreeBusy {
                     attendees,
                     start,

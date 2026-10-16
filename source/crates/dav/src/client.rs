@@ -496,6 +496,53 @@ impl DavClient {
         self.delete_object(href, credential, etag).await
     }
 
+    /// Creates a new task-list collection under `home_set_href` via
+    /// `MKCALENDAR` (RFC 4791 §5.3.1): a `VTODO`-only collection named
+    /// `display_name` (item 4.8 / T-01). The caller - not the server - names
+    /// the new resource, so the href is `<home>/<uuid>/`; the calendar-home is
+    /// re-listed afterwards to pick up the server's own view of it. Returns
+    /// the new collection's href (relative, as [`Self::list_calendars`]
+    /// reports them). Servers without MKCALENDAR answer non-2xx, which
+    /// surfaces as an error the caller toasts (degrade softly, §10).
+    pub async fn create_calendar(&self, home_set_href: &str, display_name: &str, credential: &Credential) -> Result<String> {
+        let base = home_set_href.trim_end_matches('/');
+        let slug = uuid::Uuid::new_v4().to_string();
+        let href = format!("{base}/{slug}/");
+        let url = self.resolve(&href)?;
+        let request_url = url.clone();
+        let body = xml::build_mkcalendar_body(display_name);
+        let response = self
+            .send_request("MKCALENDAR", url, credential, Some(body), &[("Content-Type", "application/xml; charset=utf-8".to_string())])
+            .await?;
+        tracing::debug!("DAV MKCALENDAR {request_url} -> {}", response.status());
+        // Drain the (usually empty) body so the connection can be reused.
+        drop(response.text().await?);
+        Ok(href)
+    }
+
+    /// Renames the collection at `href` via `PROPPATCH` (RFC 4918 §9.2), then
+    /// the caller re-lists to confirm. A server that refuses to set the
+    /// protected `displayname` property returns a non-2xx, which surfaces as
+    /// an error.
+    pub async fn rename_calendar(&self, href: &str, display_name: &str, credential: &Credential) -> Result<()> {
+        let url = self.resolve(href)?;
+        let request_url = url.clone();
+        let body = xml::build_proppatch_displayname_body(display_name);
+        let response = self
+            .send_request("PROPPATCH", url, credential, Some(body), &[("Content-Type", "application/xml; charset=utf-8".to_string())])
+            .await?;
+        tracing::debug!("DAV PROPPATCH {request_url} -> {}", response.status());
+        drop(response.text().await?);
+        Ok(())
+    }
+
+    /// Deletes the whole collection at `href` via `DELETE` - the list and
+    /// every task in it (RFC 4791 §5.3.4). Distinct from
+    /// [`Self::delete_calendar_object`], which removes one resource.
+    pub async fn delete_calendar(&self, href: &str, credential: &Credential) -> Result<()> {
+        self.delete_object(href, credential, None).await
+    }
+
     /// POSTs a `VFREEBUSY` request (built by
     /// [`crate::freebusy::build_vfreebusy_request`]) to the schedule-outbox at
     /// `outbox_href` and parses the `CALDAV:schedule-response` into one
@@ -847,6 +894,64 @@ END:VCALENDAR
         assert_eq!(availabilities.len(), 1);
         assert_eq!(availabilities[0].address.address, "wilfredo@example.com");
         assert_eq!(availabilities[0].intervals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_calendar_mkcals_a_vtodo_collection_under_the_home() {
+        use wiremock::matchers::{body_string_contains, path_regex};
+
+        let server = MockServer::start().await;
+        Mock::given(method("MKCALENDAR"))
+            .and(path_regex(r"^/dav/calendars/user/[0-9a-f-]+/$"))
+            .and(body_string_contains("<C:mkcalendar"))
+            .and(body_string_contains("<C:comp name=\"VTODO\"/>"))
+            .and(body_string_contains("<D:displayname>Groceries</D:displayname>"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        let href = client.create_calendar("/dav/calendars/user/", "Groceries", &credential).await.unwrap();
+        assert!(href.starts_with("/dav/calendars/user/"), "the new collection href is returned: {href}");
+        assert!(href.ends_with('/'), "a collection href ends with a slash: {href}");
+    }
+
+    #[tokio::test]
+    async fn rename_calendar_proppatches_the_displayname() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("PROPPATCH"))
+            .and(path("/dav/calendars/user/abc/"))
+            .and(body_string_contains("<D:displayname>Renamed</D:displayname>"))
+            .respond_with(ResponseTemplate::new(207))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        client.rename_calendar("/dav/calendars/user/abc/", "Renamed", &credential).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_calendar_deletes_the_collection() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/dav/calendars/user/abc/"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        client.delete_calendar("/dav/calendars/user/abc/", &credential).await.unwrap();
     }
 
     #[tokio::test]
