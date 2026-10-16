@@ -5379,7 +5379,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the in-memory mirror before the first Tasks repaint.
     {
         let day = calendar_state.borrow().my_day_day.format("%Y-%m-%d").to_string();
-        if let Some(db) = calendar_state.borrow().local_tasks_db.clone() {
+        // Copied out first: an `if let` scrutinee would keep the borrow alive
+        // across the body, panicking on the `borrow_mut` below.
+        let local_tasks_db = calendar_state.borrow().local_tasks_db.clone();
+        if let Some(db) = local_tasks_db {
             let db = db.borrow();
             let _ = db.prune_my_day(&day);
             if let Ok(pins) = db.load_my_day(&day) {
