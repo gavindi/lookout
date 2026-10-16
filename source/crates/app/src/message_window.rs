@@ -374,10 +374,10 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
         (&header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
         (&header.bottom_reply_button, crate::compose::ReplyMode::Reply, "Reply"),
     ] {
-        wire_reply_button(button, mode, title, &entry, state, worker, main_reading_stack, parent);
+        wire_reply_button(button, mode, title, &entry, state, worker, main_reading_stack);
     }
     for button in [&header.forward_button, &header.bottom_forward_button] {
-        wire_forward_button(button, &entry, state, worker, main_reading_stack, parent);
+        wire_forward_button(button, &entry, state, worker, main_reading_stack);
     }
     {
         let entry = entry.clone();
@@ -661,10 +661,12 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
     }
 }
 
-/// Wires one reply-family button to the composer, opening it in the main
-/// window's reading pane prefilled from *this window's* message - the same
-/// destination the reading pane's own Reply buttons use.
-#[allow(clippy::too_many_arguments)]
+/// Wires one reply-family button to the composer, opening it straight into
+/// its own window (popped out) prefilled from *this window's* message - the
+/// message is already in a standalone window, so its reply should be too. The
+/// composer is embedded in the main reading pane for a frame and then popped
+/// out on the next idle, exactly like the invitation "Edit response before
+/// sending" flow, so nothing here needs to be surfaced in the main window.
 fn wire_reply_button(
     button: &gtk::Button,
     mode: crate::compose::ReplyMode,
@@ -673,13 +675,11 @@ fn wire_reply_button(
     state: &Rc<RefCell<UiState>>,
     worker: &Rc<Worker>,
     main_reading_stack: &gtk::Stack,
-    parent: &adw::ApplicationWindow,
 ) {
     let entry = entry.clone();
     let state = state.clone();
     let worker = worker.clone();
     let main_reading_stack = main_reading_stack.clone();
-    let parent = parent.clone();
     button.connect_clicked(move |_| {
         let summary = entry.borrow().summary.clone();
         let Some((own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else {
@@ -689,7 +689,7 @@ fn wire_reply_button(
         let Some(body) = body else { return };
         let prefill = crate::compose::build_reply_prefill(&summary, &body, &own_email, mode);
         let rich_text_default = state.borrow().rich_text_default();
-        crate::window::show_composer_in_reading_pane(
+        crate::window::show_composer_in_reading_pane_full(
             &state,
             &worker,
             &main_reading_stack,
@@ -699,25 +699,19 @@ fn wire_reply_button(
             rich_text_default,
             crate::window::mailbox_account_id(&summary.mailbox),
             Some(crate::config_view::SignatureDefault::Reply),
+            None,
+            true,
         );
-        parent.present();
     });
 }
 
-/// The Forward sibling of `wire_reply_button`.
-fn wire_forward_button(
-    button: &gtk::Button,
-    entry: &Rc<RefCell<MessageWindowState>>,
-    state: &Rc<RefCell<UiState>>,
-    worker: &Rc<Worker>,
-    main_reading_stack: &gtk::Stack,
-    parent: &adw::ApplicationWindow,
-) {
+/// The Forward sibling of `wire_reply_button`: opens the forward composer
+/// straight into its own window too.
+fn wire_forward_button(button: &gtk::Button, entry: &Rc<RefCell<MessageWindowState>>, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, main_reading_stack: &gtk::Stack) {
     let entry = entry.clone();
     let state = state.clone();
     let worker = worker.clone();
     let main_reading_stack = main_reading_stack.clone();
-    let parent = parent.clone();
     button.connect_clicked(move |_| {
         let summary = entry.borrow().summary.clone();
         if crate::window::reply_send_context(&state, &summary).is_none() {
@@ -725,7 +719,6 @@ fn wire_forward_button(
         }
         let body = entry.borrow().last_body.clone().or_else(|| state.borrow_mut().cached_body(&summary.mailbox, summary.uid));
         let Some(body) = body else { return };
-        crate::window::forward_message(&state, &worker, &main_reading_stack, &summary, &body);
-        parent.present();
+        crate::window::forward_message(&state, &worker, &main_reading_stack, &summary, &body, true);
     });
 }

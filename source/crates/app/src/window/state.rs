@@ -733,6 +733,9 @@ pub(crate) struct ForwardBatch {
     pub(crate) title: String,
     pub(crate) account_id: Option<AccountId>,
     pub(crate) signature_kind: Option<crate::config_view::SignatureDefault>,
+    /// Open the composer straight into its own window instead of the reading
+    /// pane (the popped-out message window's Forward).
+    pub(crate) pop_out_on_open: bool,
 }
 
 /// A batched fetch of one message's parts, tracked in

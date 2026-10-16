@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.237" date="2026-10-17">
+      <description>
+        <p>Reply, Reply all and Forward from a message opened in its own window now open the composer in its own window too, instead of in the main window's reading pane.</p>
+      </description>
+    </release>
     <release version="0.9.236" date="2026-10-17">
       <description>
         <p>Privacy blur gains a third level - Off, sensitive information only, or all text including message bodies - cycled from the title bar's toggle, which is now its only control (the Config → Advanced row is gone).</p>

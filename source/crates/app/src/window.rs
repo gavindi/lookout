@@ -8916,7 +8916,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_stack = reading_stack.clone();
         forward_button.connect_clicked(move |_| {
             if let Some((summary, body, _from_email, _cmd_tx)) = selected_message_reply_context(&message_list, &state) {
-                forward_message(&state, &worker, &reading_stack, &summary, &body);
+                forward_message(&state, &worker, &reading_stack, &summary, &body, false);
             }
         });
     }
@@ -8928,7 +8928,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_stack = reading_stack.clone();
         button.connect_clicked(move |_| {
             if let Some((summary, body, _from_email, _cmd_tx)) = selected_message_reply_context(&message_list, &state) {
-                forward_message(&state, &worker, &reading_stack, &summary, &body);
+                forward_message(&state, &worker, &reading_stack, &summary, &body, false);
             }
         });
     }

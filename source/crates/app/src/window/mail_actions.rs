@@ -2493,7 +2493,7 @@ pub(crate) fn reply_to_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>
                 Some(crate::config_view::SignatureDefault::Reply),
             );
         }
-        None => forward_message(&state_for_body, &worker, &reading_stack, &summary, &body),
+        None => forward_message(&state_for_body, &worker, &reading_stack, &summary, &body, false),
     });
 }
 
@@ -2502,7 +2502,7 @@ pub(crate) fn reply_to_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>
 /// inline `cid:` images) are fetched and re-attached. The fetch runs first
 /// (`ForwardBatch`); if the message has nothing to attach, the composer opens
 /// straight away.
-pub(crate) fn forward_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, summary: &EmailSummary, body: &EmailBody) {
+pub(crate) fn forward_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, summary: &EmailSummary, body: &EmailBody, pop_out_on_open: bool) {
     let account_id = mailbox_account_id(&summary.mailbox);
     let cmd_tx = account_id.as_ref().and_then(|id| state.borrow().accounts.get(id).map(|h| h.cmd_tx.clone()));
     let Some(cmd_tx) = cmd_tx else { return };
@@ -2513,7 +2513,7 @@ pub(crate) fn forward_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>,
     let parts: Vec<BodyPart> = body.parts.iter().filter(|p| p.is_attachment || p.cid.is_some()).cloned().collect();
     if parts.is_empty() {
         let rich_text_default = state.borrow().rich_text_default;
-        show_composer_in_reading_pane(
+        show_composer_in_reading_pane_full(
             state,
             worker,
             reading_stack,
@@ -2523,6 +2523,8 @@ pub(crate) fn forward_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>,
             rich_text_default,
             account_id,
             Some(crate::config_view::SignatureDefault::Reply),
+            None,
+            pop_out_on_open,
         );
         return;
     }
@@ -2547,6 +2549,7 @@ pub(crate) fn forward_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>,
             title: "Forward".to_string(),
             account_id,
             signature_kind: Some(crate::config_view::SignatureDefault::Reply),
+            pop_out_on_open,
         })),
     );
 }

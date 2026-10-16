@@ -486,7 +486,7 @@ pub(crate) fn open_forward_composer(state: &Rc<RefCell<UiState>>, worker: &Rc<Wo
         prefill.html_body = Some(lookout_mail::body::rewrite_cid_refs_with(&html, &images));
     }
     let rich_text_default = state.borrow().rich_text_default;
-    show_composer_in_reading_pane(
+    show_composer_in_reading_pane_full(
         state,
         worker,
         reading_stack,
@@ -496,6 +496,8 @@ pub(crate) fn open_forward_composer(state: &Rc<RefCell<UiState>>, worker: &Rc<Wo
         rich_text_default,
         fb.account_id,
         fb.signature_kind,
+        None,
+        fb.pop_out_on_open,
     );
 }
 
