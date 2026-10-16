@@ -23,11 +23,8 @@
 //! keystroke must not surprise-launch a browser, so an account without the
 //! grant simply contributes nothing until the user enables it.
 //!
-//! The backend is unused by the running app until the composer/attendee wiring
-//! lands in 4.7.6, hence the module-level `allow(dead_code)` - the same guard
-//! `directory.rs` carries until then.
-
-#![allow(dead_code)]
+//! Wired into the composer/attendee fields by `directory::directory_source`
+//! (item 4.7.6).
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -91,6 +88,8 @@ impl GraphDirectoryBackend {
     /// (`User.ReadBasic.All`, `People.Read`), which are outside the default
     /// combined consent. Only ever called from a user-initiated action - the
     /// opt-in switch (item 4.7.9) - never from [`DirectoryBackend::search`].
+    /// Unused until that switch lands, hence the targeted allow.
+    #[allow(dead_code)]
     pub(crate) async fn ensure_consent(&self) -> Result<(), String> {
         self.contacts.ensure_directory_consent().await.map_err(|error| error.to_string())
     }

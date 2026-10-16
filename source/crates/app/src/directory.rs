@@ -13,14 +13,15 @@
 //! than an error (§10, "degrade softly"); [`DirectoryBackend::search`] returns
 //! a plain `Vec`, never a `Result`.
 //!
-//! The Graph and LDAP backends landed in 4.7.3/4.7.5 and the composer/attendee
-//! wiring follows in 4.7.6, so every item here is unused by the running app
-//! until then. The `allow(dead_code)` below is removed when 4.7.6 wires it up;
-//! the pure pieces ([`directory_query`], [`merge_directory_hits`],
-//! [`PrefixCache`]) and the debounce gate are unit-tested now so 4.7.6 only
-//! adds plumbing.
-
-#![allow(dead_code)]
+//! [`directory_source`] assembles the running backends for a suggestion
+//! surface: the Graph provider for each connected Microsoft 365 account whose
+//! directory search the user has opted into (and whose Graph consent is in
+//! place), plus one LDAP provider per enabled `AppConfig::ldap_directories`
+//! entry in scope. `Some(id)` scopes the source to that account (the composer's
+//! To/Cc/Bcc fields, sending from `id`); `None` unions every account's
+//! directories (the calendar attendee field, where an invitee isn't tied to the
+//! event's calendar account). A disabled, unconsented or unconfigured source
+//! simply contributes no hits.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -32,8 +33,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use gtk::glib;
+use lookout_core::AccountId;
 use lookout_graph::DirectoryPerson;
 
+use crate::app_config::{AppConfig, LdapDirectory};
+use crate::graph_directory::GraphDirectoryBackend;
+use crate::ldap_directory::LdapDirectoryBackend;
+use crate::other_accounts::SecretServiceKeyring;
+use crate::recipient_entry::Suggestion;
+use crate::window::UiState;
 use crate::worker::Worker;
 
 /// The shortest query sent to a directory backend. Below this the source
@@ -65,6 +73,14 @@ pub trait DirectoryBackend: Send + Sync {
     /// long enough per [`directory_query`]), at most `limit` of them.
     async fn search(&self, query: &str, limit: usize) -> Vec<DirectoryPerson>;
 }
+
+/// A prefix → directory-suggestions lookup (item 4.7.7): a [`DirectorySource`]
+/// wrapped so its hits arrive ready to render as read-only
+/// [`Suggestion::Directory`] rows. The recipient picker drives this directly;
+/// the composer and attendee fields use the raw `search` instead, because they
+/// merge directory hits *after* stored contacts rather than showing them on
+/// their own.
+pub(crate) type DirectoryLookup = Rc<dyn Fn(&str, Rc<dyn Fn(Vec<Suggestion>)>)>;
 
 /// The normalised query for `prefix`, or `None` when it is too short to send.
 /// Trims and lower-cases so the cache key and the backend query agree: a
@@ -207,6 +223,22 @@ impl DirectorySource {
         self.timer.set(Some(id));
     }
 
+    /// Wraps this source as a [`DirectoryLookup`] for the recipient picker
+    /// (item 4.7.7): every hit becomes a [`Suggestion::Directory`] row. The
+    /// closure shares this source, so the picker and the composer autocomplete
+    /// it was built beside reuse one prefix cache.
+    pub(crate) fn suggestion_lookup(&self) -> DirectoryLookup {
+        let this = self.clone();
+        Rc::new(move |prefix, complete| {
+            this.search(
+                prefix,
+                Rc::new(move |people| {
+                    complete(directory_suggestions(people));
+                }),
+            );
+        })
+    }
+
     /// Fires the pending query against every backend concurrently on the
     /// `Worker`, then merges, caches and delivers the result on the GTK thread.
     fn dispatch(&self) {
@@ -240,6 +272,69 @@ impl DirectorySource {
             complete(hits);
         });
     }
+}
+
+/// Builds the directory source for one suggestion surface (item 4.7.6).
+///
+/// `account` scopes the source: `Some(id)` serves only that account's
+/// directories (the composer's To/Cc/Bcc fields, sending from `id`), while
+/// `None` unions every account's (the calendar attendee field, where an
+/// invitee isn't tied to the event's calendar account). A Microsoft 365
+/// account contributes its Graph GAL only when the user has opted it in and
+/// its directory consent is in place ([`GraphDirectoryBackend::enabled`]); an
+/// LDAP directory contributes only when it is enabled and in scope. A source
+/// with no qualifying backend is valid and simply answers empty.
+pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<AccountId>, worker: Rc<Worker>) -> DirectorySource {
+    // Read the config and the Graph-capable account ids out under one short
+    // borrow. An account carries the Graph clients only when it is a
+    // Microsoft 365 account with its own token (a shared mailbox borrows its
+    // parent's and is skipped here - the parent is the one with the GAL).
+    let (config, graph_accounts) = {
+        let st = state.borrow();
+        let config = st.app_config.borrow().clone();
+        let ids: Vec<AccountId> = st.accounts.iter().filter(|(_, handle)| handle.graph_pin.is_some()).map(|(id, _)| id.clone()).collect();
+        (config, ids)
+    };
+    let mut backends: Vec<Arc<dyn DirectoryBackend>> = Vec::new();
+    for id in graph_accounts {
+        if account.as_ref().is_some_and(|scope| scope != &id) {
+            continue;
+        }
+        let backend = GraphDirectoryBackend::new(id);
+        if backend.enabled(&config) {
+            backends.push(Arc::new(backend));
+        }
+    }
+    // One keyring handle shared by every LDAP backend; each search opens its
+    // own D-Bus connection from it, so a rotated secret is picked up without a
+    // rebuild.
+    let keyring = SecretServiceKeyring::new();
+    for directory in ldap_directories_in_scope(&config, account.as_ref()) {
+        let backend = LdapDirectoryBackend::new(directory, keyring.clone());
+        if backend.enabled() {
+            backends.push(Arc::new(backend));
+        }
+    }
+    DirectorySource::new(backends, worker)
+}
+
+/// The configured LDAP directories a suggestion surface in `account` scope
+/// searches: `Some(id)` limits to directories serving that account, `None`
+/// takes every one, both filtered to the enabled entries only. Pure, so the
+/// scope rules are unit-tested without a live server or keyring.
+fn ldap_directories_in_scope<'a>(config: &'a AppConfig, account: Option<&AccountId>) -> Vec<&'a LdapDirectory> {
+    config
+        .ldap_directories
+        .iter()
+        .filter(|directory| directory.enabled)
+        .filter(|directory| account.is_none_or(|scope| &directory.account_id == scope))
+        .collect()
+}
+
+/// Maps a source's hits to the read-only picker suggestions of item 4.7.7.
+/// Pure, so the mapping is tested without a live directory.
+fn directory_suggestions(people: Vec<DirectoryPerson>) -> Vec<Suggestion> {
+    people.into_iter().map(Suggestion::Directory).collect()
 }
 
 #[cfg(test)]
@@ -344,5 +439,46 @@ mod tests {
         let got_for_cb = got.clone();
         source.search("grace", Rc::new(move |hits| *got_for_cb.borrow_mut() = Some(hits)));
         assert_eq!(got.borrow().as_deref(), Some(&[][..]));
+    }
+
+    fn ldap(id: &str, account: &str, enabled: bool) -> LdapDirectory {
+        LdapDirectory {
+            id: id.to_string(),
+            account_id: AccountId(account.to_string()),
+            display_name: id.to_string(),
+            host: "ldap.example.com".to_string(),
+            port: 389,
+            tls: false,
+            bind_dn: String::new(),
+            base_dn: "dc=example,dc=com".to_string(),
+            filter: String::new(),
+            mail_attr: String::new(),
+            name_attr: String::new(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn ldap_directories_in_scope_filters_by_enabled_and_account() {
+        let config = AppConfig {
+            ldap_directories: vec![ldap("ldap:a", "account_1", true), ldap("ldap:b", "account_2", true), ldap("ldap:c", "account_1", false)],
+            ..AppConfig::default()
+        };
+
+        // Account-scoped (the composer): only that account's enabled entries.
+        let scoped = ldap_directories_in_scope(&config, Some(&AccountId("account_1".into())));
+        assert_eq!(scoped.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["ldap:a"]);
+
+        // Unscoped (the attendee field): every enabled entry, disabled dropped.
+        let unioned = ldap_directories_in_scope(&config, None);
+        assert_eq!(unioned.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["ldap:a", "ldap:b"]);
+    }
+
+    #[test]
+    fn directory_suggestions_wrap_hits_as_read_only_directory_rows() {
+        let suggestions = directory_suggestions(vec![person("Grace", "grace@y.com")]);
+        assert_eq!(suggestions, vec![Suggestion::Directory(person("Grace", "grace@y.com"))]);
+        // An empty hit list is a valid answer that clears the picker's section.
+        assert!(directory_suggestions(Vec::new()).is_empty());
     }
 }

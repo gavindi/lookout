@@ -38,9 +38,8 @@ const PROTOCOL_SMTP: &str = "smtp";
 /// P-11). Unlike the mail slots, its item is keyed by the `LdapDirectory.id`
 /// (e.g. `ldap:<uuid>`) through the same `KeyringStore` API - the "account"
 /// attribute is just the id string - and `delete_account` drops it when the
-/// directory is removed. Unused until the LDAP backend (4.7.5) and its
-/// Settings UI (4.7.9) consume it.
-#[allow(dead_code)]
+/// directory is removed. Read by the LDAP backend; the Settings UI that writes
+/// it is item 4.7.9.
 pub(crate) const PROTOCOL_LDAP: &str = "ldap";
 
 /// The keyring item attribute identifying Lookout's own items, so the

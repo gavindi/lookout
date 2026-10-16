@@ -16,11 +16,8 @@
 //! against a fake with no live server, while the filter builder (RFC 4515
 //! escaping) and entry mapping are pure functions tested directly.
 //!
-//! The backend is unused by the running app until the composer/attendee wiring
-//! lands in 4.7.6, hence the module-level `allow(dead_code)` - the same guard
-//! `directory.rs` and `graph_directory.rs` carry until then.
-
-#![allow(dead_code)]
+//! Wired into the composer/attendee fields by `directory::directory_source`
+//! (item 4.7.6).
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license

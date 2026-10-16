@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.233" date="2026-10-17">
+      <description>
+        <p>Directory lookup goes live: the composer's recipient fields, the calendar attendee field and the address-book picker now search the company directory (Microsoft 365 GAL or LDAP) alongside your stored contacts, with directory hits shown as their own read-only rows.</p>
+      </description>
+    </release>
     <release version="0.9.232" date="2026-10-16">
       <description>
         <p>Directory lookup gains its LDAP half: Lookout can now search a configured LDAP server - implicit TLS or StartTLS, bind password in the keyring, configurable search base, filter and attributes - ready to feed recipient suggestions.</p>

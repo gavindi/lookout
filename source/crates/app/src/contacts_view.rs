@@ -1181,22 +1181,44 @@ impl ContactsProvider for SnapshotContactsProvider {
 pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>) -> crate::recipient_entry::SuggestionSource {
     let state = state.clone();
     let worker = worker.clone();
+    // The directory half (item 4.7.6) is unioned across every connected
+    // account's configured directories, like the stored-contact half below -
+    // an invitee isn't tied to the event's calendar account.
+    let directory = crate::directory::directory_source(&state, None, worker.clone());
     let carddav_provider = SnapshotContactsProvider {
         state: state.clone(),
         account: None,
     };
-    Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<crate::recipient_entry::Suggestion>)>| {
-        let prefix = prefix.trim();
-        let carddav = carddav_provider.search_contacts(prefix, 8);
+    Rc::new(move |prefix: &str, complete: Rc<dyn Fn(Vec<crate::recipient_entry::Suggestion>)>| {
+        let prefix = prefix.trim().to_string();
+        let carddav = carddav_provider.search_contacts(&prefix, 8);
         let caches: Vec<Arc<lookout_mail::Cache>> = state.borrow().accounts.values().filter_map(|h| h.address_cache.clone()).collect();
         let receivers: Vec<async_channel::Receiver<Vec<EmailAddress>>> = caches
             .into_iter()
             .map(|cache| {
-                let prefix = prefix.to_string();
+                let prefix = prefix.clone();
                 crate::window::spawn_cache_read(&worker, cache, move |cache| cache.search_contacts(&prefix, 8))
             })
             .collect();
-        let prefix = prefix.to_string();
+        // Deliver the merged stored-plus-directory list when the directory
+        // answers, replacing the stored-contact-only delivery that goes first.
+        let deliver_directory = {
+            let directory = directory.clone();
+            let complete = complete.clone();
+            let carddav = carddav.clone();
+            let prefix = prefix.clone();
+            move |mail_history: Vec<EmailAddress>| {
+                directory.search(
+                    &prefix,
+                    Rc::new({
+                        let complete = complete.clone();
+                        let carddav = carddav.clone();
+                        let prefix = prefix.clone();
+                        move |hits| complete(merge_contact_suggestions(mail_history.clone(), &carddav, &hits, &[], &prefix, 8))
+                    }),
+                );
+            }
+        };
         glib::spawn_future_local(async move {
             let mut mail_history = Vec::new();
             for rx in receivers {
@@ -1204,7 +1226,8 @@ pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<W
                     mail_history.extend(hits);
                 }
             }
-            complete(merge_contact_suggestions(mail_history, &carddav, &[], &[], &prefix, 8));
+            complete(merge_contact_suggestions(mail_history.clone(), &carddav, &[], &[], &prefix, 8));
+            deliver_directory(mail_history);
         });
     })
 }

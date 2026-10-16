@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
-use lookout_core::{AccountId, CalendarEvent, ContactsProvider, EmailSummary};
+use lookout_core::{AccountId, CalendarEvent, ContactsProvider, EmailAddress, EmailSummary};
 use lookout_mail::session::AccountCommand;
 
 use crate::contacts_view::{merge_contact_suggestions, SnapshotContactsProvider};
@@ -541,7 +541,12 @@ pub(crate) fn show_composer_in_reading_pane_full(
     let worker_for_suggestions = worker.clone();
     let state_for_suggestions = state.clone();
     let account_for_suggestions = account_id.clone();
-    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Box<dyn FnOnce(Vec<crate::recipient_entry::Suggestion>)>| {
+    // The directory source this composer's To/Cc/Bcc fields (and its recipient
+    // picker, via `directory_lookup` below) search (item 4.7.6): scoped to the
+    // account being sent from, so only that account's directories answer.
+    let directory = crate::directory::directory_source(state, account_id.clone(), worker.clone());
+    let directory_lookup = directory.suggestion_lookup();
+    let suggestions: crate::recipient_entry::SuggestionSource = Rc::new(move |prefix: &str, complete: Rc<dyn Fn(Vec<crate::recipient_entry::Suggestion>)>| {
         let carddav = carddav_provider.search_contacts(prefix, 8);
         // Contact lists (P-05) live on the same account snapshots the picker
         // reads; collect the ones whose name matches the typed prefix.
@@ -552,18 +557,45 @@ pub(crate) fn show_composer_in_reading_pane_full(
                 None => st.contacts_by_account.values().flat_map(|snapshot| snapshot.contact_lists.clone()).collect(),
             }
         };
+        // The directory half is a network round trip. Kick it off beside the
+        // (fast) mail-history read and deliver the merged result when it lands,
+        // replacing the stored-contact-only delivery that went out first. A
+        // cached prefix answers before this returns, so the two deliveries can
+        // land in either order - the source's own keystroke generation guard
+        // plus `RecipientEntry`'s ensure a later prefix always wins.
+        let prefix = prefix.trim().to_string();
+        let deliver_directory = {
+            let directory = directory.clone();
+            let complete = complete.clone();
+            let carddav = carddav.clone();
+            let carddav_lists = carddav_lists.clone();
+            let prefix = prefix.clone();
+            move |mail_history: Vec<EmailAddress>| {
+                directory.search(
+                    &prefix,
+                    Rc::new({
+                        let complete = complete.clone();
+                        let carddav = carddav.clone();
+                        let carddav_lists = carddav_lists.clone();
+                        let prefix = prefix.clone();
+                        move |hits| complete(merge_contact_suggestions(mail_history.clone(), &carddav, &hits, &carddav_lists, &prefix, 8))
+                    }),
+                );
+            }
+        };
         let Some(cache) = address_cache.clone() else {
-            complete(merge_contact_suggestions(Vec::new(), &carddav, &[], &carddav_lists, prefix.trim(), 8));
+            complete(merge_contact_suggestions(Vec::new(), &carddav, &[], &carddav_lists, &prefix, 8));
+            deliver_directory(Vec::new());
             return;
         };
         let reply_rx = spawn_cache_read(&worker_for_suggestions, cache, {
-            let prefix = prefix.to_string();
+            let prefix = prefix.clone();
             move |cache| cache.search_contacts(&prefix, 8)
         });
-        let prefix = prefix.trim().to_string();
         glib::spawn_future_local(async move {
             let mail_history = reply_rx.recv().await.unwrap_or_default();
-            complete(merge_contact_suggestions(mail_history, &carddav, &[], &carddav_lists, &prefix, 8));
+            complete(merge_contact_suggestions(mail_history.clone(), &carddav, &[], &carddav_lists, &prefix, 8));
+            deliver_directory(mail_history);
         });
     });
     // Shows the "Sending: <subject>" toast the instant Send is clicked - with
@@ -594,7 +626,11 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // hands back whatever the user checked.
     let open_contact_picker: crate::contact_picker::ContactPickerOpener = {
         let state = state.clone();
-        Rc::new(move |anchor, on_add| crate::contact_picker::show_contact_picker(&anchor, state.clone(), on_add))
+        // Hand the picker the same account-scoped directory source the To/Cc/
+        // Bcc autocomplete uses (item 4.7.7), so its Directory section shares
+        // this composer's prefix cache and scope.
+        let directory_lookup = directory_lookup.clone();
+        Rc::new(move |anchor, on_add| crate::contact_picker::show_contact_picker(&anchor, state.clone(), Some(directory_lookup.clone()), on_add))
     };
     let (composer, editor_toolbar, draft_tx, identities_refresh) = crate::compose::build_compose_view(
         title,

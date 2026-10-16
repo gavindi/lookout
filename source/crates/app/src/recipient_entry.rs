@@ -165,7 +165,14 @@ pub fn is_plausible_address(token: &str) -> bool {
 /// so results don't arrive on the same call stack. Supplied by the window,
 /// which owns the per-account cache handle the addresses come from - this
 /// module never touches storage itself.
-pub type SuggestionSource = Rc<dyn Fn(&str, Box<dyn FnOnce(Vec<Suggestion>)>)>;
+///
+/// Deliberately multi-shot: the callback may be handed results more than once
+/// for one prefix. The directory half of the lookup (item 4.7.6) is a network
+/// round trip, so stored contacts are delivered at once and the merged
+/// stored-plus-directory result follows when the directory answers; later
+/// deliveries replace earlier ones, and the keystroke generation guard in
+/// `refresh_suggestions` drops anything from a prefix the user has typed past.
+pub type SuggestionSource = Rc<dyn Fn(&str, Rc<dyn Fn(Vec<Suggestion>)>)>;
 
 /// A recipient field. Cheap to clone; clones share the same chips and entry.
 #[derive(Clone)]
@@ -842,7 +849,10 @@ impl RecipientEntry {
             return;
         }
         let this = self.clone();
-        source(&prefix, Box::new(move |matches| this.apply_suggestions(generation, matches)));
+        // Multi-shot: a `source` may deliver the stored-contact half at once
+        // and the merged stored-plus-directory result afterwards. Both carry
+        // the same generation, so the later delivery simply rebuilds the list.
+        source(&prefix, Rc::new(move |matches| this.apply_suggestions(generation, matches)));
     }
 
     /// The "apply results to the popover" half of a suggestion lookup,
