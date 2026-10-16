@@ -13,11 +13,12 @@
 //! than an error (§10, "degrade softly"); [`DirectoryBackend::search`] returns
 //! a plain `Vec`, never a `Result`.
 //!
-//! The Graph and LDAP backends land in 4.7.3/4.7.5 and the composer/attendee
-//! wiring in 4.7.6, so every item here is unused by the running app until
-//! then. The `allow(dead_code)` below is removed when 4.7.6 wires it up; the
-//! pure pieces ([`directory_query`], [`merge_directory_hits`], [`PrefixCache`])
-//! and the debounce gate are unit-tested now so 4.7.6 only adds plumbing.
+//! The Graph and LDAP backends landed in 4.7.3/4.7.5 and the composer/attendee
+//! wiring follows in 4.7.6, so every item here is unused by the running app
+//! until then. The `allow(dead_code)` below is removed when 4.7.6 wires it up;
+//! the pure pieces ([`directory_query`], [`merge_directory_hits`],
+//! [`PrefixCache`]) and the debounce gate are unit-tested now so 4.7.6 only
+//! adds plumbing.
 
 #![allow(dead_code)]
 

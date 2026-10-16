@@ -54,6 +54,10 @@ secret-service = { version = "5.1", default-features = false, features = ["rt-to
 # SNI + dbusmenu D-Bus interfaces, watcher registration, and name ownership
 # on the same zbus 5 stack the rest of the app's D-Bus code uses.
 ksni = "0.3"
+# LDAP directory lookup (item 4.7.5 / P-11): the async client only (no `sync`,
+# no native-tls/ring), with its rustls provider pinned to aws-lc-rs so it
+# shares the reqwest/rustls stack the rest of the app already builds.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
 
 [dev-dependencies]
 # HTTP-level tests for the Graph directory provider (item 4.7.3), the same
