@@ -26,17 +26,36 @@ use std::rc::Rc;
 use gtk::glib;
 use gtk::prelude::*;
 use lookout_core::{ContactList, EmailAddress};
+use lookout_graph::DirectoryPerson;
 
 /// How many completions the popover offers at once. Enough to be useful,
 /// short enough that the list never covers the body editor below it.
 const MAX_SUGGESTIONS: usize = 8;
 
 /// One entry the autocomplete/address-book picker can offer: a single address,
-/// or a contact list (P-05) that expands to its members when inserted.
+/// a contact list (P-05) that expands to its members when inserted, or a
+/// directory/GAL person (item 4.7) that isn't a stored contact - kept as its
+/// own variant so the picker and People search can render it as a read-only
+/// row (4.7.7/4.7.8), while accepting one still commits it as a normal chip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Suggestion {
     Address(EmailAddress),
     List(ContactList),
+    Directory(DirectoryPerson),
+}
+
+/// The address a directory person contributes when committed, or `None` when
+/// the directory entry carries no usable (non-blank) address. The display name
+/// rides along so the chip reads `Name <address>`, the same as a contact.
+pub(crate) fn directory_person_address(person: &DirectoryPerson) -> Option<EmailAddress> {
+    let address = person.address.trim();
+    if address.is_empty() {
+        return None;
+    }
+    Some(EmailAddress {
+        name: person.name.clone().filter(|name| !name.trim().is_empty()),
+        address: address.to_string(),
+    })
 }
 
 /// A committed recipient. A [`Chip::List`] carries the list's name and its
@@ -435,6 +454,7 @@ impl RecipientEntry {
             .iter()
             .filter_map(|suggestion| match suggestion {
                 Suggestion::Address(address) => Some(address.clone()),
+                Suggestion::Directory(person) => directory_person_address(person),
                 Suggestion::List(_) => None,
             })
             .collect();
@@ -444,7 +464,7 @@ impl RecipientEntry {
             .iter()
             .filter_map(|suggestion| match suggestion {
                 Suggestion::List(list) => Some(list),
-                Suggestion::Address(_) => None,
+                Suggestion::Address(_) | Suggestion::Directory(_) => None,
             })
             .collect();
         if lists.is_empty() {
@@ -845,6 +865,7 @@ impl RecipientEntry {
             .into_iter()
             .filter(|m| match m {
                 Suggestion::Address(address) => !existing.contains(&address.address.to_lowercase()),
+                Suggestion::Directory(person) => directory_person_address(person).is_some_and(|address| !existing.contains(&address.address.to_lowercase())),
                 Suggestion::List(_) => true,
             })
             .take(MAX_SUGGESTIONS)
@@ -906,13 +927,10 @@ impl RecipientEntry {
             return false;
         };
         match candidate {
-            Suggestion::Address(address) => {
-                if self.plain {
-                    self.replace_current_segment(&token_for(&address));
-                } else {
-                    self.tokens.borrow_mut().push(Chip::Address(token_for(&address)));
-                    self.entry.set_text("");
-                    self.rebuild_chips();
+            Suggestion::Address(address) => self.commit_address(&address),
+            Suggestion::Directory(person) => {
+                if let Some(address) = directory_person_address(&person) {
+                    self.commit_address(&address);
                 }
             }
             Suggestion::List(list) => {
@@ -932,6 +950,19 @@ impl RecipientEntry {
         }
         self.popover.popdown();
         true
+    }
+
+    /// Commits one address as a chip (or, in plain mode, as the current
+    /// segment). Shared by the `Address` and `Directory` suggestions, which
+    /// both resolve to a single address once accepted.
+    fn commit_address(&self, address: &EmailAddress) {
+        if self.plain {
+            self.replace_current_segment(&token_for(address));
+        } else {
+            self.tokens.borrow_mut().push(Chip::Address(token_for(address)));
+            self.entry.set_text("");
+            self.rebuild_chips();
+        }
     }
 
     /// Plain mode only: swaps the segment currently being typed (the text
@@ -973,10 +1004,10 @@ fn chip_label(token: &str) -> &str {
 
 fn suggestion_label(candidate: &Suggestion) -> String {
     match candidate {
-        Suggestion::Address(address) => match &address.name {
-            Some(name) if !name.trim().is_empty() => format!("{name} <{}>", address.address),
-            _ => address.address.clone(),
-        },
+        Suggestion::Address(address) => token_for(address),
+        Suggestion::Directory(person) => directory_person_address(person)
+            .map(|address| token_for(&address))
+            .unwrap_or_else(|| person.name.clone().unwrap_or_default()),
         Suggestion::List(list) => format!("{} ({})", list.name, list.members.len()),
     }
 }
@@ -1127,6 +1158,47 @@ mod tests {
         let field = RecipientEntry::new("To");
         field.append_suggestions(&[Suggestion::Address(EmailAddress::new("ada@x.com")), Suggestion::List(sample_list())]);
         assert_eq!(field.addresses(), vec!["ada@x.com", "kirk@x.com", "spock@x.com"]);
+    }
+
+    fn sample_directory_person() -> DirectoryPerson {
+        DirectoryPerson {
+            id: Some("graph-id".to_string()),
+            name: Some("Grace Hopper".to_string()),
+            address: "grace@y.com".to_string(),
+            title: None,
+            company: None,
+        }
+    }
+
+    #[test]
+    fn directory_person_address_skips_blank_addresses_and_trims() {
+        assert!(directory_person_address(&sample_directory_person()).is_some());
+        let blank = DirectoryPerson {
+            id: None,
+            name: Some("No Address".to_string()),
+            address: "   ".to_string(),
+            title: None,
+            company: None,
+        };
+        assert!(directory_person_address(&blank).is_none());
+
+        let padded = DirectoryPerson {
+            address: " grace@y.com ".to_string(),
+            ..sample_directory_person()
+        };
+        let address = directory_person_address(&padded).unwrap();
+        assert_eq!(address.address, "grace@y.com");
+        assert_eq!(address.name.as_deref(), Some("Grace Hopper"));
+    }
+
+    #[test]
+    fn a_directory_suggestion_commits_as_a_plain_address() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let field = RecipientEntry::new("To");
+        field.append_suggestions(&[Suggestion::Directory(sample_directory_person())]);
+        assert_eq!(field.addresses(), vec!["Grace Hopper <grace@y.com>"]);
     }
 
     #[test]

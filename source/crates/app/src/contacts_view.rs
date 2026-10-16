@@ -21,7 +21,7 @@ use gtk::{gio, glib};
 use lookout_core::{AccountId, ContactList, ContactListMember, ContactsProvider, EmailAddress, EmailField, Photo, VCard};
 use lookout_dav::{CardDavAccountConfig, ContactRecord, ContactsCache, Credential, DavClient};
 use lookout_goa::{ContactsAuthMethod, GoaClient, GoaContactsAccount, GoaMailAccount};
-use lookout_graph::{ContactsClient, GraphClient, GraphContact};
+use lookout_graph::{ContactsClient, DirectoryPerson, GraphClient, GraphContact};
 
 use crate::microsoft_oauth::MicrosoftOAuth;
 use crate::window::{DiscoveredGoaAccount, UiState};
@@ -1090,9 +1090,20 @@ pub(crate) fn dedupe_addresses(addresses: Vec<EmailAddress>, limit: usize) -> Ve
     out
 }
 
+/// A directory/GAL person matches a completion prefix on their display name or
+/// address, the same rule `contacts_match_prefix` applies to a stored contact.
+fn directory_matches_prefix(person: &DirectoryPerson, prefix: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    let needle = prefix.to_lowercase();
+    person.address.to_lowercase().starts_with(&needle) || person.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
+}
+
 pub fn merge_contact_suggestions(
     mail_history: Vec<EmailAddress>,
     carddav: &[EmailAddress],
+    directory: &[DirectoryPerson],
     lists: &[ContactList],
     prefix: &str,
     limit: usize,
@@ -1101,6 +1112,29 @@ pub fn merge_contact_suggestions(
     addresses.extend(mail_history);
     addresses.extend(carddav.iter().filter(|c| contacts_match_prefix(c, prefix)).cloned());
     let mut merged: Vec<crate::recipient_entry::Suggestion> = dedupe_addresses(addresses, limit).into_iter().map(crate::recipient_entry::Suggestion::Address).collect();
+    // Directory/GAL hits (item 4.7.1) come after stored contacts: a person the
+    // user already has as a contact wins, and the directory only fills what's
+    // left of `limit`. They keep their own variant so the picker and People
+    // search can render them as read-only rows (4.7.7/4.7.8).
+    let mut seen: HashSet<String> = merged
+        .iter()
+        .filter_map(|suggestion| match suggestion {
+            crate::recipient_entry::Suggestion::Address(address) => Some(address.address.trim().to_lowercase()),
+            _ => None,
+        })
+        .collect();
+    for person in directory.iter().filter(|person| directory_matches_prefix(person, prefix)) {
+        if merged.len() >= limit {
+            break;
+        }
+        let Some(address) = crate::recipient_entry::directory_person_address(person) else {
+            continue;
+        };
+        if !seen.insert(address.address.trim().to_lowercase()) {
+            continue;
+        }
+        merged.push(crate::recipient_entry::Suggestion::Directory(person.clone()));
+    }
     for list in lists.iter().filter(|list| contact_list_matches_prefix(list, prefix)) {
         if merged.len() >= limit {
             break;
@@ -1170,7 +1204,7 @@ pub fn calendar_attendee_suggestions(state: &Rc<RefCell<UiState>>, worker: &Rc<W
                     mail_history.extend(hits);
                 }
             }
-            complete(merge_contact_suggestions(mail_history, &carddav, &[], &prefix, 8));
+            complete(merge_contact_suggestions(mail_history, &carddav, &[], &[], &prefix, 8));
         });
     })
 }
@@ -2667,6 +2701,116 @@ mod tests {
         assert!(contact_list_matches_prefix(&list, "brid"));
         assert!(contact_list_matches_prefix(&list, "Bridge"));
         assert!(!contact_list_matches_prefix(&list, "crew"));
+    }
+
+    fn directory_person(name: &str, address: &str) -> DirectoryPerson {
+        DirectoryPerson {
+            id: Some(format!("id-{address}")),
+            name: Some(name.to_string()),
+            address: address.to_string(),
+            title: None,
+            company: None,
+        }
+    }
+
+    /// Flattens a merged suggestion list to the addresses it would insert, in
+    /// order - the shape the ordering/dedupe assertions actually care about.
+    fn merged_addresses(merged: &[crate::recipient_entry::Suggestion]) -> Vec<String> {
+        merged
+            .iter()
+            .filter_map(|suggestion| match suggestion {
+                crate::recipient_entry::Suggestion::Address(address) => Some(address.address.clone()),
+                crate::recipient_entry::Suggestion::Directory(person) => Some(person.address.clone()),
+                crate::recipient_entry::Suggestion::List(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn directory_hits_merge_after_stored_contacts() {
+        let merged = merge_contact_suggestions(
+            Vec::new(),
+            &[EmailAddress::new("ada@x.com")],
+            &[directory_person("Grace Hopper", "grace@y.com")],
+            &[],
+            "",
+            8,
+        );
+        assert_eq!(merged_addresses(&merged), ["ada@x.com", "grace@y.com"]);
+        // The directory hit keeps its own variant (for the read-only rows of
+        // 4.7.7/4.7.8), and its display name rides along.
+        assert!(matches!(
+            &merged[1],
+            crate::recipient_entry::Suggestion::Directory(person) if person.name.as_deref() == Some("Grace Hopper")
+        ));
+    }
+
+    #[test]
+    fn directory_dedupes_against_mail_history_and_carddav() {
+        let merged = merge_contact_suggestions(
+            vec![EmailAddress::new("ada@x.com")],
+            &[EmailAddress::new("bob@x.com")],
+            &[
+                directory_person("Ada", "ADA@x.com"),
+                directory_person("Bob", "bob@x.com"),
+                directory_person("Grace", "grace@y.com"),
+            ],
+            &[],
+            "",
+            8,
+        );
+        // A directory entry for an address already offered by mail history or
+        // CardDAV is dropped (case-insensitively); only Grace is new.
+        assert_eq!(merged_addresses(&merged), ["ada@x.com", "bob@x.com", "grace@y.com"]);
+    }
+
+    #[test]
+    fn the_limit_bounds_stored_contacts_then_directory_then_lists() {
+        let carddav: Vec<EmailAddress> = (0..8).map(|i| EmailAddress::new(format!("a{i}@x.com"))).collect();
+        let merged = merge_contact_suggestions(
+            Vec::new(),
+            &carddav,
+            &[directory_person("Grace", "grace@y.com")],
+            &[ContactList {
+                name: "Bridge Crew".to_string(),
+                members: Vec::new(),
+            }],
+            "",
+            8,
+        );
+        // Stored contacts already fill the limit, so neither the directory hit
+        // nor the list can appear.
+        assert_eq!(merged.len(), 8);
+        assert!(merged.iter().all(|s| matches!(s, crate::recipient_entry::Suggestion::Address(_))));
+    }
+
+    #[test]
+    fn directory_entries_without_an_address_are_skipped() {
+        let merged = merge_contact_suggestions(Vec::new(), &[], &[directory_person("No Address", "  ")], &[], "", 8);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn directory_matches_the_prefix_on_name_or_address() {
+        let people = vec![directory_person("Grace Hopper", "grace@y.com"), directory_person("Ada Lovelace", "ada@x.com")];
+        let by_name = merge_contact_suggestions(Vec::new(), &[], &people, &[], "gra", 8);
+        assert_eq!(merged_addresses(&by_name), ["grace@y.com"]);
+        let by_address = merge_contact_suggestions(Vec::new(), &[], &people, &[], "ada@", 8);
+        assert_eq!(merged_addresses(&by_address), ["ada@x.com"]);
+        assert!(merge_contact_suggestions(Vec::new(), &[], &people, &[], "zzz", 8).is_empty());
+    }
+
+    #[test]
+    fn an_empty_directory_leaves_the_old_merge_result_unchanged() {
+        let carddav = [EmailAddress::new("ada@x.com")];
+        let lists = [ContactList {
+            name: "Bridge Crew".to_string(),
+            members: Vec::new(),
+        }];
+        let merged = merge_contact_suggestions(vec![EmailAddress::new("kirk@x.com")], &carddav, &[], &lists, "", 8);
+        assert!(matches!(merged[0], crate::recipient_entry::Suggestion::Address(_)));
+        assert!(matches!(merged[1], crate::recipient_entry::Suggestion::Address(_)));
+        assert!(matches!(merged[2], crate::recipient_entry::Suggestion::List(_)));
     }
 
     #[test]

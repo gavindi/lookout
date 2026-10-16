@@ -553,7 +553,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             }
         };
         let Some(cache) = address_cache.clone() else {
-            complete(merge_contact_suggestions(Vec::new(), &carddav, &carddav_lists, prefix.trim(), 8));
+            complete(merge_contact_suggestions(Vec::new(), &carddav, &[], &carddav_lists, prefix.trim(), 8));
             return;
         };
         let reply_rx = spawn_cache_read(&worker_for_suggestions, cache, {
@@ -563,7 +563,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
         let prefix = prefix.trim().to_string();
         glib::spawn_future_local(async move {
             let mail_history = reply_rx.recv().await.unwrap_or_default();
-            complete(merge_contact_suggestions(mail_history, &carddav, &carddav_lists, &prefix, 8));
+            complete(merge_contact_suggestions(mail_history, &carddav, &[], &carddav_lists, &prefix, 8));
         });
     });
     // Shows the "Sending: <subject>" toast the instant Send is clicked - with
