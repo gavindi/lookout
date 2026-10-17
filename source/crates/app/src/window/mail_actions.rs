@@ -1250,12 +1250,15 @@ pub(crate) fn build_tag_menu(
             .margin_top(2)
             .margin_bottom(2)
             .build();
+        crate::privacy::mark_ui(&empty);
         boxed.append(&empty);
     } else {
         for tag in &set.categories {
             let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
             let dot = preset_dot_area(tag.color(), 10);
             let toggle = gtk::CheckButton::builder().label(&tag.name).build();
+            // A category name is content: blurred by privacy mode.
+            crate::privacy::mark_content(&toggle);
             let keyword = tag.keyword();
             let (active, inconsistent) = tag_check_state(&targets, &keyword);
             toggle.set_active(active);
@@ -1392,6 +1395,7 @@ pub(crate) fn show_manage_categories_dialog(anchor: &gtk::Widget, state: Rc<RefC
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 list.append(&empty);
             }
             for tag in &set.categories {
@@ -1525,6 +1529,7 @@ pub(crate) fn show_manage_categories_dialog(anchor: &gtk::Widget, state: Rc<RefC
         .margin_start(10)
         .margin_end(10)
         .build();
+    crate::privacy::mark_ui(&error_label);
     {
         let tags = tags.clone();
         let state = state.clone();
@@ -2824,6 +2829,8 @@ pub(crate) fn show_sweep_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>
     };
 
     let all = gtk::CheckButton::with_label(&format!("All messages from {sender_label}"));
+    // The sender's name/address is content: blurred by privacy mode.
+    crate::privacy::mark(&all);
     all.set_active(true);
     let keep_latest = gtk::CheckButton::with_label("All except the latest");
     keep_latest.set_group(Some(&all));
@@ -2834,7 +2841,9 @@ pub(crate) fn show_sweep_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>
     let older_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     older_row.append(&older);
     older_row.append(&older_spin);
-    older_row.append(&gtk::Label::new(Some("days")));
+    let days_label = gtk::Label::new(Some("days"));
+    crate::privacy::mark_ui(&days_label);
+    older_row.append(&days_label);
 
     let target_dropdown = gtk::DropDown::builder().build();
     target_dropdown.set_model(Some(&gtk::StringList::new(&["Deleted Items", "Archive"])));

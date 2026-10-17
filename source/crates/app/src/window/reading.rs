@@ -411,7 +411,9 @@ pub(crate) fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: 
     }
     details_content.append(&fields);
     details_content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    details_content.append(&gtk::Label::builder().label("Internet headers").xalign(0.0).css_classes(["heading"]).build());
+    let internet_headers_heading = gtk::Label::builder().label("Internet headers").xalign(0.0).css_classes(["heading"]).build();
+    crate::privacy::mark_ui(&internet_headers_heading);
+    details_content.append(&internet_headers_heading);
     let headers_view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -470,8 +472,11 @@ pub(crate) fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: 
     let spinner = gtk::Spinner::new();
     spinner.start();
     loading.append(&spinner);
-    loading.append(&gtk::Label::builder().label("Loading message source…").css_classes(["dim-label"]).build());
+    let loading_label = gtk::Label::builder().label("Loading message source…").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&loading_label);
+    loading.append(&loading_label);
     let error_label = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&error_label);
     let retry_button = gtk::Button::with_label("Retry");
     retry_button.add_css_class("suggested-action");
     let error_page = gtk::Box::builder()
@@ -648,6 +653,8 @@ pub(crate) fn message_detail_row(caption: &str, value: &str) -> gtk::Box {
         .css_classes(["dim-label"])
         .valign(gtk::Align::Start)
         .build();
+    // Field captions are chrome; the values are message content.
+    crate::privacy::mark_ui(&caption_label);
     let value_label = gtk::Label::builder().label(value).xalign(0.0).wrap(true).selectable(true).hexpand(true).build();
     // The From/To/Cc values are addresses: blurred by privacy mode. Subject,
     // date and Message ID are left readable.

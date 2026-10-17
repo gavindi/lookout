@@ -717,7 +717,9 @@ pub(crate) fn show_propose_new_time_dialog(parent: &gtk::Widget, toast_overlay: 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.append(&crate::datetime_picker::time_cluster("New time", &calendar, &start_hour, &start_minute));
     let end_cluster = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
-    end_cluster.append(&gtk::Label::builder().label("Ends").css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    let ends_label = gtk::Label::builder().label("Ends").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+    crate::privacy::mark_ui(&ends_label);
+    end_cluster.append(&ends_label);
     let end_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
     end_row.append(&end_hour);
     end_row.append(&gtk::Label::builder().label(":").css_classes(["dim-label"]).build());
@@ -1190,6 +1192,7 @@ pub(crate) fn invite_detail_row(row_name: &str, value_name: &str, caption: &str)
     let caption_label = gtk::Label::new(Some(caption));
     caption_label.add_css_class("dim-label");
     caption_label.add_css_class("caption");
+    crate::privacy::mark_ui(&caption_label);
     caption_label.set_xalign(0.0);
     let value = gtk::Label::new(None);
     value.set_widget_name(value_name);

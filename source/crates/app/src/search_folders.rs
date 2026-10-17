@@ -34,6 +34,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&hint);
 
     // `rebuild` re-renders the list; each Remove calls it again through the
     // `Rc<RefCell<Box<dyn Fn()>>>` cycle bounded to the dialog.
@@ -51,15 +52,15 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
             }
             let folders = app_config.borrow().search_folders.clone();
             if folders.is_empty() {
-                list_group.add(
-                    &gtk::Label::builder()
-                        .label("No saved searches")
-                        .xalign(0.0)
-                        .css_classes(["dim-label", "caption"])
-                        .margin_top(8)
-                        .margin_bottom(8)
-                        .build(),
-                );
+                let empty = gtk::Label::builder()
+                    .label("No saved searches")
+                    .xalign(0.0)
+                    .css_classes(["dim-label", "caption"])
+                    .margin_top(8)
+                    .margin_bottom(8)
+                    .build();
+                crate::privacy::mark_ui(&empty);
+                list_group.add(&empty);
                 return;
             }
             for folder in folders {
@@ -67,6 +68,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                     .title(glib::markup_escape_text(&folder.name))
                     .subtitle(glib::markup_escape_text(&folder.query))
                     .build();
+                crate::privacy::mark_content(&row);
                 let remove = gtk::Button::from_icon_name("user-trash-symbolic");
                 remove.set_tooltip_text(Some("Remove this saved search"));
                 remove.add_css_class("flat");

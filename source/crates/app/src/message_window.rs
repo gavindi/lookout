@@ -250,9 +250,12 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     let spinner = gtk::Spinner::new();
     spinner.start();
     loading_page.append(&spinner);
-    loading_page.append(&gtk::Label::builder().label("Loading message…").css_classes(["dim-label"]).build());
+    let loading_label = gtk::Label::builder().label("Loading message…").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&loading_label);
+    loading_page.append(&loading_label);
 
     let error_label = gtk::Label::builder().wrap(true).justify(gtk::Justification::Center).css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&error_label);
     let retry_button = gtk::Button::with_label("Retry");
     retry_button.add_css_class("suggested-action");
     let error_page = gtk::Box::builder()

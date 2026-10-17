@@ -223,16 +223,16 @@ pub(crate) fn build_flag_popover(state: &Rc<RefCell<UiState>>, on_pick: Rc<dyn F
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
-            list.append(
-                &gtk::Label::builder()
-                    .label("Flag")
-                    .css_classes(["heading"])
-                    .xalign(0.0)
-                    .margin_start(8)
-                    .margin_top(4)
-                    .margin_bottom(4)
-                    .build(),
-            );
+            let heading = gtk::Label::builder()
+                .label("Flag")
+                .css_classes(["heading"])
+                .xalign(0.0)
+                .margin_start(8)
+                .margin_top(4)
+                .margin_bottom(4)
+                .build();
+            crate::privacy::mark_ui(&heading);
+            list.append(&heading);
             let item = |label: &str, detail: Option<String>, flag: lookout_core::FollowUpFlag| {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
                 row.append(&gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build());

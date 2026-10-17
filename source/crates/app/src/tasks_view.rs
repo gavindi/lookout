@@ -554,6 +554,10 @@ pub fn set_nav(view: &TasksView, rows: &[TasksNavRow], selected: &TasksFilter) {
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        if row.list_id.is_none() {
+            // My Day / Flagged email / Tasks are app chrome; list names are content.
+            crate::privacy::mark_ui(&label);
+        }
         row_box.append(&label);
         if let Some(list_id) = &row.list_id {
             let menu = gtk::MenuButton::builder()
@@ -607,6 +611,7 @@ pub fn set_nav(view: &TasksView, rows: &[TasksNavRow], selected: &TasksFilter) {
             .margin_bottom(4)
             .css_classes(["dim-label"])
             .build();
+        crate::privacy::mark_ui(&label);
         new_row.set_child(Some(&label));
         view.sidebar.append(&new_row);
     }
@@ -662,14 +667,14 @@ pub fn set_flagged_mail(view: &TasksView, messages: &[EmailSummary]) {
     if rows.is_empty() {
         return;
     }
-    view.flagged.append(
-        &gtk::Label::builder()
-            .label("Flagged email")
-            .css_classes(["dim-label", "caption-heading"])
-            .xalign(0.0)
-            .margin_bottom(2)
-            .build(),
-    );
+    let flagged_heading = gtk::Label::builder()
+        .label("Flagged email")
+        .css_classes(["dim-label", "caption-heading"])
+        .xalign(0.0)
+        .margin_bottom(2)
+        .build();
+    crate::privacy::mark_ui(&flagged_heading);
+    view.flagged.append(&flagged_heading);
     let complete = view.flag_complete.borrow().clone().unwrap_or_else(|| Rc::new(|_| {}));
     let open = view.flag_open.borrow().clone().unwrap_or_else(|| Rc::new(|_| {}));
     for message in rows {
@@ -738,6 +743,8 @@ pub(crate) fn flagged_mail_row(message: &EmailSummary, today: NaiveDate, complet
     row_box.append(&text);
     row_box.append(&due);
     let button = gtk::Button::builder().child(&row_box).css_classes(["flat"]).hexpand(true).build();
+    // Subject/sender/due are content: blurred by privacy mode.
+    crate::privacy::mark_content(&button);
     if let (Some(check), Some(complete)) = (&check, complete) {
         let message = message.clone();
         check.connect_toggled(move |check| {
@@ -823,6 +830,7 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
             .wrap(true)
             .margin_top(16)
             .build();
+        crate::privacy::mark_ui(&placeholder);
         view.list.append(&placeholder);
         return;
     }
@@ -872,15 +880,15 @@ pub fn set_my_day(view: &TasksView, pinned: &[CalendarTask], suggestions: &[Cale
     };
 
     if pinned.is_empty() && suggestions.is_empty() {
-        view.list.append(
-            &gtk::Label::builder()
-                .label("Nothing for today - pin a task from any list, or add one due today.")
-                .css_classes(["dim-label", "caption"])
-                .xalign(0.0)
-                .wrap(true)
-                .margin_top(16)
-                .build(),
-        );
+        let empty = gtk::Label::builder()
+            .label("Nothing for today - pin a task from any list, or add one due today.")
+            .css_classes(["dim-label", "caption"])
+            .xalign(0.0)
+            .wrap(true)
+            .margin_top(16)
+            .build();
+        crate::privacy::mark_ui(&empty);
+        view.list.append(&empty);
         return;
     }
 
@@ -904,14 +912,16 @@ pub fn set_my_day(view: &TasksView, pinned: &[CalendarTask], suggestions: &[Cale
 
 /// A caption heading for a My Day section.
 fn section_header(label: &str) -> gtk::Label {
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(label)
         .css_classes(["dim-label", "caption-heading"])
         .xalign(0.0)
         .hexpand(true)
         .margin_top(8)
         .margin_bottom(2)
-        .build()
+        .build();
+    crate::privacy::mark_ui(&label);
+    label
 }
 
 /// Attaches the right-click "Add to My Day" / "Remove from My Day" action to a
@@ -1053,6 +1063,8 @@ pub(crate) fn task_row(
     }
 
     let button = gtk::Button::builder().child(&row_box).css_classes(["flat"]).hexpand(true).build();
+    // Task text is content: blurred by privacy mode.
+    crate::privacy::mark_content(&button);
     if let Some(check) = &check {
         let task = task.clone();
         check.connect_toggled(move |_| {

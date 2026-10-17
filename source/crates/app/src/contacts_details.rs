@@ -90,14 +90,14 @@ impl ContactsDetailsPane {
             .margin_end(18)
             .build();
         empty.append(&gtk::Image::from_icon_name("avatar-default-symbolic").upcast::<gtk::Widget>());
-        empty.append(
-            &gtk::Label::builder()
-                .label("Select a contact to see details")
-                .wrap(true)
-                .justify(gtk::Justification::Center)
-                .css_classes(["dim-label"])
-                .build(),
-        );
+        let empty_note = gtk::Label::builder()
+            .label("Select a contact to see details")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label"])
+            .build();
+        crate::privacy::mark_ui(&empty_note);
+        empty.append(&empty_note);
         root.add_named(&empty, Some("empty"));
 
         let details = gtk::Box::builder()
@@ -591,6 +591,8 @@ fn mail_row(actions: &ContactsDetailsActions, message: &EmailSummary) -> gtk::Wi
             .build(),
     );
     let button = gtk::Button::builder().child(&row).css_classes(["flat", "profile-card-row"]).build();
+    // Subject/date are content: blurred by privacy mode.
+    crate::privacy::mark_content(&button);
     let actions = actions.clone();
     let message = message.clone();
     button.connect_clicked(move |_| (actions.open_message)(&message));
@@ -700,6 +702,8 @@ fn file_row(actions: &ContactsDetailsActions, file: &PersonFile) -> gtk::Widget 
     row.append(&text);
 
     let button = gtk::Button::builder().child(&row).css_classes(["flat", "profile-card-row"]).build();
+    // The file name/size/date are content: blurred by privacy mode.
+    crate::privacy::mark_content(&button);
     button.set_tooltip_text(Some("Open the message with this file"));
     let actions = actions.clone();
     let message = file.message.clone();
@@ -766,15 +770,16 @@ fn info_value(text: &str) -> gtk::Widget {
 }
 
 fn empty_label(text: &str) -> gtk::Widget {
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(text)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["caption", "dim-label"])
         .margin_top(2)
         .margin_bottom(2)
-        .build()
-        .upcast()
+        .build();
+    crate::privacy::mark_ui(&label);
+    label.upcast()
 }
 
 /// The line form of a vCard address, omitting empty components.

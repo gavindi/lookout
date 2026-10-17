@@ -398,11 +398,15 @@ pub(crate) fn build_refine_popover(state: &Rc<RefCell<UiState>>) -> gtk::Popover
         ("Size", size.upcast_ref()),
     ];
     for (row, (label, widget)) in fields.iter().enumerate() {
-        grid.attach(&gtk::Label::builder().label(*label).xalign(1.0).build(), 0, row as i32, 1, 1);
+        let field_label = gtk::Label::builder().label(*label).xalign(1.0).build();
+        crate::privacy::mark_ui(&field_label);
+        grid.attach(&field_label, 0, row as i32, 1, 1);
         grid.attach(*widget, 1, row as i32, 1, 1);
     }
     let row = fields.len() as i32;
-    grid.attach(&gtk::Label::builder().label("Received").xalign(1.0).build(), 0, row, 1, 1);
+    let received_label = gtk::Label::builder().label("Received").xalign(1.0).build();
+    crate::privacy::mark_ui(&received_label);
+    grid.attach(&received_label, 0, row, 1, 1);
     grid.attach(&received, 1, row, 1, 1);
     grid.attach(&has_files, 0, row + 1, 1, 1);
     grid.attach(&unread, 1, row + 1, 1, 1);

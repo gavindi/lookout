@@ -885,6 +885,8 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
 
     let choose_button = gtk::Button::with_label("Choose file…");
     let file_label = gtk::Label::builder().label("No file chosen").xalign(0.0).css_classes(["dim-label"]).build();
+    // It becomes the chosen file's name, so keep it content, not chrome.
+    crate::privacy::mark_content(&file_label);
     let chosen_file: Rc<RefCell<Option<(ContactFileFormat, String)>>> = Rc::new(RefCell::new(None));
 
     let file_group = gtk::Box::builder()
@@ -901,6 +903,8 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
     let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
     let string_list = gtk::StringList::new(&label_refs);
     let book_dropdown = gtk::DropDown::builder().model(&string_list).build();
+    // Address-book names are content: blurred by privacy mode.
+    crate::privacy::mark_content(&book_dropdown);
     let target_group = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(10)
@@ -909,6 +913,7 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
         .margin_end(12)
         .build();
     let target_label = gtk::Label::builder().label("Import into").xalign(0.0).build();
+    crate::privacy::mark_ui(&target_label);
     target_group.append(&target_label);
     target_group.append(&book_dropdown);
 
@@ -1318,7 +1323,7 @@ fn append_contacts_header_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxR
 
 /// Appends a selectable bucket/category row, indented under its section
 /// header, to the People screen's left pane.
-fn append_contacts_choice_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxRow {
+fn append_contacts_choice_row(list: &gtk::ListBox, label: &str, chrome: bool) -> gtk::ListBoxRow {
     let row_label = gtk::Label::builder().label(label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
     row_label.set_margin_start(20);
     row_label.set_margin_end(8);
@@ -1326,6 +1331,9 @@ fn append_contacts_choice_row(list: &gtk::ListBox, label: &str) -> gtk::ListBoxR
     row_label.set_margin_bottom(6);
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&row_label));
+    if chrome {
+        crate::privacy::mark_ui(&row);
+    }
     list.append(&row);
     row
 }
@@ -1431,7 +1439,7 @@ pub fn refresh_contacts_category_ui(
             };
             let label = contacts_bucket_label(&kind);
             rows.push(ContactsCategoryChoice { kind, contacts: members });
-            row_widgets.push((append_contacts_choice_row(category_list, &label), Some(rows.len() - 1)));
+            row_widgets.push((append_contacts_choice_row(category_list, &label, true), Some(rows.len() - 1)));
         }
 
         for &(account_id, account) in &accounts {
@@ -1476,7 +1484,7 @@ pub fn refresh_contacts_category_ui(
                     contacts: account_contacts.clone(),
                 });
                 let label = contacts_bucket_label(&kind);
-                row_widgets.push((append_contacts_choice_row(category_list, &label), Some(rows.len() - 1)));
+                row_widgets.push((append_contacts_choice_row(category_list, &label, true), Some(rows.len() - 1)));
             }
 
             rows.push(ContactsCategoryChoice {
@@ -1484,7 +1492,7 @@ pub fn refresh_contacts_category_ui(
                 contacts: lists,
             });
             row_widgets.push((
-                append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::ContactLists)),
+                append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::ContactLists), true),
                 Some(rows.len() - 1),
             ));
 
@@ -1493,13 +1501,15 @@ pub fn refresh_contacts_category_ui(
                 contacts: deleted,
             });
             row_widgets.push((
-                append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted)),
+                append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted), true),
                 Some(rows.len() - 1),
             ));
         }
 
         if !category_members.is_empty() {
-            row_widgets.push((append_contacts_header_row(category_list, "Categories"), None));
+            let categories_header = append_contacts_header_row(category_list, "Categories");
+            crate::privacy::mark_ui(&categories_header);
+            row_widgets.push((categories_header, None));
             let mut names: Vec<String> = category_members.keys().cloned().collect();
             names.sort_by_key(|name| name.to_lowercase());
             for name in names {
@@ -1508,7 +1518,7 @@ pub fn refresh_contacts_category_ui(
                     kind: ContactsBucketKind::Category(name.clone()),
                     contacts: members,
                 });
-                row_widgets.push((append_contacts_choice_row(category_list, &name), Some(rows.len() - 1)));
+                row_widgets.push((append_contacts_choice_row(category_list, &name, false), Some(rows.len() - 1)));
             }
         }
     }
@@ -1529,6 +1539,7 @@ pub fn refresh_contacts_category_ui(
         refresh_actions();
         details_refresh();
         let label = gtk::Label::builder().label("No contacts available yet").xalign(0.0).css_classes(["dim-label"]).build();
+        crate::privacy::mark_ui(&label);
         label.set_margin_start(10);
         label.set_margin_end(10);
         label.set_margin_top(10);
@@ -1649,6 +1660,7 @@ pub fn rebuild_contacts_list_ui(
                 .halign(gtk::Align::Center)
                 .css_classes(["dim-label"])
                 .build();
+            crate::privacy::mark_ui(&label);
             let empty_box = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
                 .spacing(12)
@@ -1674,6 +1686,7 @@ pub fn rebuild_contacts_list_ui(
                 .halign(gtk::Align::Center)
                 .css_classes(["dim-label"])
                 .build();
+            crate::privacy::mark_ui(&label);
             let empty_box = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
                 .spacing(12)
@@ -1688,6 +1701,7 @@ pub fn rebuild_contacts_list_ui(
             }
         } else {
             let label = gtk::Label::builder().label("No contacts in this category").xalign(0.0).css_classes(["dim-label"]).build();
+            crate::privacy::mark_ui(&label);
             label.set_margin_start(10);
             label.set_margin_end(10);
             label.set_margin_top(10);
@@ -2703,6 +2717,7 @@ pub fn show_manage_groups_dialog(window: &adw::ApplicationWindow, state: &Rc<Ref
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&hint);
                 list.append(&hint);
                 return;
             }

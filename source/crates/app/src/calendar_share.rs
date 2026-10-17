@@ -89,13 +89,13 @@ pub(crate) fn show_share_calendar_dialog(window: &adw::ApplicationWindow, calend
                 };
                 clear_box(&people_box);
                 if permissions.is_empty() {
-                    people_box.append(
-                        &gtk::Label::builder()
-                            .label("This calendar isn't shared with anyone yet")
-                            .xalign(0.0)
-                            .css_classes(["dim-label", "caption"])
-                            .build(),
-                    );
+                    let empty = gtk::Label::builder()
+                        .label("This calendar isn't shared with anyone yet")
+                        .xalign(0.0)
+                        .css_classes(["dim-label", "caption"])
+                        .build();
+                    crate::privacy::mark_ui(&empty);
+                    people_box.append(&empty);
                 }
                 for permission in permissions {
                     people_box.append(&permission_row(&permission, &calendar, &client, &toast_overlay, reload.clone()));

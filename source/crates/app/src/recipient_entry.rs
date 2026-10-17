@@ -254,6 +254,7 @@ impl RecipientEntry {
                 entry.set_placeholder_text(Some("Recipients"));
             } else {
                 let caption = gtk::Label::builder().label(title).css_classes(["caption", "dim-label"]).valign(gtk::Align::Center).build();
+                crate::privacy::mark_ui(&caption);
                 root.append(&caption);
             }
             root.append(&entry);
@@ -265,6 +266,7 @@ impl RecipientEntry {
             // the To button placed in this header with `add_header_suffix`.
             if !title.is_empty() {
                 let title_label = gtk::Label::builder().label(title).xalign(0.0).hexpand(true).css_classes(["caption", "dim-label"]).build();
+                crate::privacy::mark_ui(&title_label);
                 header.append(&title_label);
             }
 

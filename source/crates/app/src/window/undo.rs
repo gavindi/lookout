@@ -493,6 +493,8 @@ pub(crate) fn fill_outbox_dialog(state: &Rc<RefCell<UiState>>, list: &gtk::Box) 
     let now = chrono::Local::now();
     for (account_id, items) in listed {
         let group = adw::PreferencesGroup::builder().title(glib::markup_escape_text(&emails[&account_id]).as_str()).build();
+        // The group heading is an account address: content, not chrome.
+        crate::privacy::mark_content_heading(&group);
         for item in items {
             let status = if item.failed {
                 "Couldn't send".to_string()
@@ -515,6 +517,7 @@ pub(crate) fn fill_outbox_dialog(state: &Rc<RefCell<UiState>>, list: &gtk::Box) 
                 .subtitle(glib::markup_escape_text(&format!("{to}{status}")).as_str())
                 .subtitle_lines(2)
                 .build();
+            crate::privacy::mark_content(&row);
             let send_now = gtk::Button::builder()
                 .label(if item.failed { "Retry" } else { "Send now" })
                 .valign(gtk::Align::Center)

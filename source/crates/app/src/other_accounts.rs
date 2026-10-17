@@ -300,11 +300,13 @@ pub fn show_add_account_dialog(
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&tls_note);
     form.attach(&tls_note, 1, row, 3, 1);
     row += 1;
 
     let same_server_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).hexpand(true).build();
     let same_server_label = gtk::Label::builder().label("Use the same server for SMTP").hexpand(true).halign(gtk::Align::Start).build();
+    crate::privacy::mark_ui(&same_server_label);
     same_server_row.append(&same_server_label);
     same_server_row.append(&same_server_switch);
     form.attach(&same_server_row, 1, row, 3, 1);
@@ -316,6 +318,7 @@ pub fn show_add_account_dialog(
     smtp_host_row.append(&smtp_port_spin);
     let smtp_username_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
     let smtp_username_label = gtk::Label::builder().label("SMTP username").width_request(120).halign(gtk::Align::End).build();
+    crate::privacy::mark_ui(&smtp_username_label);
     smtp_username_row.append(&smtp_username_label);
     smtp_username_row.append(&smtp_username_entry);
     smtp_fields_box.append(&smtp_host_row);
@@ -330,6 +333,7 @@ pub fn show_add_account_dialog(
         .hexpand(true)
         .halign(gtk::Align::Start)
         .build();
+    crate::privacy::mark_ui(&same_password_label);
     same_password_row.append(&same_password_label);
     same_password_row.append(&same_password_switch);
     form.attach(&same_password_row, 1, row, 3, 1);
@@ -564,12 +568,16 @@ pub fn show_add_account_dialog(
 
 /// A right-aligned field label for the two-column form grid.
 fn field_label(text: &str) -> gtk::Label {
-    gtk::Label::builder().label(text).halign(gtk::Align::End).build()
+    let label = gtk::Label::builder().label(text).halign(gtk::Align::End).build();
+    crate::privacy::mark_ui(&label);
+    label
 }
 
 /// A small "Port" caption for the grid's port columns.
 fn port_label(text: &str) -> gtk::Label {
-    gtk::Label::builder().label(text).css_classes(["dim-label"]).build()
+    let label = gtk::Label::builder().label(text).css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&label);
+    label
 }
 
 #[cfg(test)]

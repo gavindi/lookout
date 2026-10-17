@@ -104,6 +104,7 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
             .halign(gtk::Align::Start)
             .css_classes(["dim-label"])
             .build();
+        crate::privacy::mark_ui(&note);
         root.append(&note);
         let done = gtk::Button::builder().label("Done").css_classes(["suggested-action"]).halign(gtk::Align::End).build();
         {
@@ -122,14 +123,18 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&hint);
     root.append(&hint);
 
     // --- Account picker. ---
     let labels: Vec<&str> = accounts.iter().map(|(_, label, _)| label.as_str()).collect();
     let account_dropdown = gtk::DropDown::from_strings(&labels);
+    // Account names/addresses are content: blurred by privacy mode.
+    crate::privacy::mark_content(&account_dropdown);
     root.append(&labeled_row("Account", &account_dropdown));
 
     let backend_label = gtk::Label::builder().halign(gtk::Align::Start).css_classes(["dim-label", "caption"]).build();
+    crate::privacy::mark_ui(&backend_label);
     root.append(&backend_label);
 
     // --- The editable form, in one container so a not-yet-consented account
@@ -155,6 +160,7 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
     form.append(&section("Automatic replies", &replies_section));
 
     let message_caption = gtk::Label::builder().halign(gtk::Align::Start).css_classes(["dim-label", "caption"]).build();
+    crate::privacy::mark_ui(&message_caption);
     let message_section = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     message_section.append(&message_caption);
     message_section.append(&gtk::ScrolledWindow::builder().height_request(110).child(&internal_view).build());
@@ -167,6 +173,7 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
         .halign(gtk::Align::Start)
         .css_classes(["dim-label", "caption"])
         .build();
+    crate::privacy::mark_ui(&external_caption);
     external_section.append(&external_caption);
     external_section.append(&gtk::ScrolledWindow::builder().height_request(110).child(&external_view).build());
     form.append(&section("Outside your organization", &external_section));
@@ -174,6 +181,7 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
     root.append(&form);
 
     let support_note = gtk::Label::builder().wrap(true).halign(gtk::Align::Start).css_classes(["dim-label", "caption"]).build();
+    crate::privacy::mark_ui(&support_note);
     root.append(&support_note);
 
     // The Graph-not-consented state: a note and the consent button (the same
@@ -185,12 +193,14 @@ pub(crate) fn show_automatic_replies_dialog(anchor: &gtk::Widget, state: Rc<RefC
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&enable_note);
     let enable_button = gtk::Button::with_label("Enable Outlook sync");
     enable_box.append(&enable_note);
     enable_box.append(&enable_button);
     root.append(&enable_box);
 
     let error_label = gtk::Label::builder().wrap(true).halign(gtk::Align::Start).css_classes(["error"]).visible(false).build();
+    crate::privacy::mark_ui(&error_label);
     root.append(&error_label);
 
     let buttons = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).halign(gtk::Align::End).build();
@@ -621,6 +631,7 @@ fn set_label_if_needed(label: &gtk::Label, text: &str) {
 fn switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
     let text = gtk::Label::builder().label(label).halign(gtk::Align::Start).hexpand(true).build();
+    crate::privacy::mark_ui(&text);
     row.append(&text);
     row.append(switch);
     row
@@ -630,6 +641,7 @@ fn switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
 fn section(title: &str, content: &gtk::Box) -> gtk::Box {
     let outer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     let label = gtk::Label::builder().label(title).halign(gtk::Align::Start).css_classes(["heading"]).build();
+    crate::privacy::mark_ui(&label);
     outer.append(&label);
     outer.append(content);
     outer

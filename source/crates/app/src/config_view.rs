@@ -912,6 +912,7 @@ pub fn build() -> ConfigView {
     for d in crate::shortcuts::DEFAULT_SHORTCUTS {
         let label = gtk::Label::builder().css_classes(["dim-label"]).halign(gtk::Align::End).build();
         label.set_label(&crate::shortcuts::format_accel(d.modifiers, d.keyval));
+        crate::privacy::mark_ui(&label);
         let row = adw::ActionRow::builder().title(d.title).activatable(true).build();
         row.add_suffix(&label);
         row.set_activatable_widget(Some(&row));
@@ -1006,6 +1007,25 @@ pub fn build() -> ConfigView {
         .model(&gtk::StringList::new(&crate::settings::CONVERSATION_ORDER_LABELS))
         .build();
     appearance_group.add(&conversation_order_row);
+    // These pickers show app-defined choices (not account data), so their
+    // selected values are chrome too.
+    for row in [
+        &theme_row,
+        &spell_languages_row,
+        &mark_as_read_row,
+        &undo_send_row,
+        &calendar_week_start_row,
+        &calendar_work_days_row,
+        &calendar_default_reminder_row,
+        &contacts_file_as_row,
+        &spacing_row,
+        &reading_pane_row,
+        &ribbon_style_row,
+        &preview_lines_row,
+        &conversation_order_row,
+    ] {
+        crate::privacy::mark_ui(row);
+    }
     let conversation_include_sent_row = adw::SwitchRow::builder()
         .title("Include messages from Sent Items")
         .subtitle("Show your own replies among a conversation's messages")
@@ -1066,6 +1086,10 @@ pub fn build() -> ConfigView {
 
     let contacts_cache_group = adw::PreferencesGroup::builder().title("Contacts cache").build();
     advanced_group.add(&contacts_cache_group);
+    // Their headings gain the cache path during refresh, so they are content.
+    crate::privacy::mark_content_heading(&mail_cache_group);
+    crate::privacy::mark_content_heading(&calendar_cache_group);
+    crate::privacy::mark_content_heading(&contacts_cache_group);
 
     let clear_cache_row = adw::ActionRow::builder()
         .title("Clear all caches")
@@ -1107,6 +1131,7 @@ pub fn build() -> ConfigView {
         .build();
     for (label, _) in &sections {
         let row_label = gtk::Label::builder().label(*label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        crate::privacy::mark_ui(&row_label);
         row_label.set_margin_start(12);
         row_label.set_margin_end(8);
         row_label.set_margin_top(8);
@@ -1495,10 +1520,14 @@ pub fn refresh(
 }
 
 fn account_row(title: &str, subtitle: &str) -> adw::ActionRow {
-    adw::ActionRow::builder()
+    let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(title))
         .subtitle(glib::markup_escape_text(subtitle))
-        .build()
+        .build();
+    // Account/signature/template names and details are content, not chrome.
+    // Sensitive rows are additionally tagged at their call sites.
+    crate::privacy::mark_content(&row);
+    row
 }
 
 fn empty_row(title: &str) -> adw::ActionRow {
@@ -1517,6 +1546,8 @@ fn cache_file_row(name: &str, size: &str) -> adw::ActionRow {
         .title(glib::markup_escape_text(name))
         .subtitle(glib::markup_escape_text(size))
         .build();
+    // Cached file names/sizes are content, not chrome.
+    crate::privacy::mark_content(&row);
     row.set_sensitive(false);
     row
 }
@@ -1739,6 +1770,8 @@ fn time_zone_row(title: &str, secondary: bool) -> adw::ComboRow {
         .subtitle(time_zone_subtitle(0, secondary))
         .build();
     row.connect_selected_notify(move |row| row.set_subtitle(&time_zone_subtitle(row.selected(), secondary)));
+    // Zone names are app chrome, not account content.
+    crate::privacy::mark_ui(&row);
     row
 }
 

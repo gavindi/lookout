@@ -102,6 +102,7 @@ pub(crate) fn create_task_list_dialog(
     group.add(&target_row);
 
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).css_classes(["error"]).visible(false).build();
+    crate::privacy::mark_ui(&error_label);
 
     let cancel = gtk::Button::with_label("Cancel");
     let create = gtk::Button::with_label("Create");

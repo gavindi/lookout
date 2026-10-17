@@ -58,7 +58,9 @@ pub(crate) fn time_cluster(label: &str, calendar: &gtk::Calendar, hour: &gtk::Sp
     let date_button = gtk::MenuButton::builder().popover(&popover).child(&date_label).build();
 
     let cluster = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
-    cluster.append(&gtk::Label::builder().label(label).css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    let field_label = gtk::Label::builder().label(label).css_classes(["dim-label", "caption"]).xalign(0.0).build();
+    crate::privacy::mark_ui(&field_label);
+    cluster.append(&field_label);
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
     row.append(&date_button);
     row.append(&time_box);
@@ -106,16 +108,16 @@ pub(crate) fn build_time_preset_popover(
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
-            list.append(
-                &gtk::Label::builder()
-                    .label(heading)
-                    .css_classes(["heading"])
-                    .xalign(0.0)
-                    .margin_start(8)
-                    .margin_top(4)
-                    .margin_bottom(4)
-                    .build(),
-            );
+            let heading = gtk::Label::builder()
+                .label(heading)
+                .css_classes(["heading"])
+                .xalign(0.0)
+                .margin_start(8)
+                .margin_top(4)
+                .margin_bottom(4)
+                .build();
+            crate::privacy::mark_ui(&heading);
+            list.append(&heading);
             let now = Local::now();
             for choice in presets(now) {
                 let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -172,7 +174,9 @@ pub(crate) fn present_time_dialog(parent: Option<&gtk::Widget>, spec: &TimeDialo
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.append(&time_cluster(spec.field_label, &calendar, &hour, &minute));
     if let Some(note) = spec.note {
-        content.append(&gtk::Label::builder().label(note).css_classes(["dim-label", "caption"]).wrap(true).xalign(0.0).build());
+        let note = gtk::Label::builder().label(note).css_classes(["dim-label", "caption"]).wrap(true).xalign(0.0).build();
+        crate::privacy::mark_ui(&note);
+        content.append(&note);
     }
     let dialog = adw::AlertDialog::builder()
         .heading(spec.heading)
@@ -226,7 +230,9 @@ pub(crate) fn present_date_dialog(parent: Option<&gtk::Widget>, heading: &str, f
     set_calendar_date(&calendar, &date, initial);
     wire_calendar(&calendar, &date);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    content.append(&gtk::Label::builder().label(field_label).css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    let field_label_widget = gtk::Label::builder().label(field_label).css_classes(["dim-label", "caption"]).xalign(0.0).build();
+    crate::privacy::mark_ui(&field_label_widget);
+    content.append(&field_label_widget);
     content.append(&calendar);
     let dialog = adw::AlertDialog::builder().heading(heading).default_response("accept").close_response("cancel").build();
     dialog.add_response("cancel", "Cancel");

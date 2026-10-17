@@ -2946,6 +2946,7 @@ pub fn set_agenda(
 
     if upcoming.is_empty() {
         let placeholder = gtk::Label::builder().label("No events").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        crate::privacy::mark_ui(&placeholder);
         a.events_box.append(&placeholder);
         return;
     }
@@ -3017,6 +3018,8 @@ pub fn set_agenda(
             // agenda can open an event too. A plain box otherwise.
             if let Some(callback) = a.on_activate.borrow().as_ref() {
                 let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
+                // Event text is content: blurred by privacy mode.
+                crate::privacy::mark_content(&button);
                 let occ = occ.clone();
                 let callback = callback.clone();
                 button.connect_clicked(move |_| callback(occ.clone()));
@@ -4350,6 +4353,7 @@ pub fn rebuild_calendar_checklist(
             .css_classes(["dim-label", "caption"])
             .xalign(0.0)
             .build();
+        crate::privacy::mark_ui(&placeholder);
         container.append(&placeholder);
     }
     for section in sections {
@@ -4453,6 +4457,8 @@ fn calendar_toggle_row(name: &str, color: &str, active: bool, on_toggle: impl Fn
         indicator.set_draw_func(move |_, cr, width, height| draw_calendar_indicator(cr, width, height, &color, checked.get()));
     }
     let label = gtk::Label::builder().label(name).xalign(0.0).hexpand(true).css_classes(["calendar-toggle-label"]).build();
+    // A calendar name is content: blurred by privacy mode.
+    crate::privacy::mark_content(&label);
     let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     content.append(&indicator);
     content.append(&label);
@@ -4672,6 +4678,7 @@ pub fn build_sidebar(week_start: chrono::Weekday) -> CalendarSidebar {
     let add_calendar_button = gtk::Button::builder().label("Add calendar").css_classes(["flat"]).halign(gtk::Align::Start).build();
 
     let my_calendars_label = gtk::Label::builder().label("My calendars").css_classes(["heading"]).xalign(0.0).margin_top(12).build();
+    crate::privacy::mark_ui(&my_calendars_label);
     let calendar_list_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
     let calendar_list_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)

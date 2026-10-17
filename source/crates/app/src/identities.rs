@@ -69,6 +69,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 list.append(&empty);
             }
             for identity in &identities {
@@ -172,6 +173,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
     add_row.append(&add_button);
 
     let error_label = gtk::Label::builder().halign(gtk::Align::Start).css_classes(["error"]).visible(false).build();
+    crate::privacy::mark_ui(&error_label);
 
     add_box.append(&add_row);
     add_box.append(&error_label);

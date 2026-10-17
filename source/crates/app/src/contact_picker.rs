@@ -213,6 +213,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
                     .margin_start(10)
                     .margin_end(10)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 list.append(&empty);
                 return;
             }
@@ -387,6 +388,7 @@ fn append_section_header(list: &gtk::ListBox, label: &str) {
         .margin_start(10)
         .margin_end(10)
         .build();
+    crate::privacy::mark_ui(&header);
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&header));
     row.set_selectable(false);

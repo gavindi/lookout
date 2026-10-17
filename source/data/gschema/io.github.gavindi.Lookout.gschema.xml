@@ -444,7 +444,7 @@
     <key name="privacy-blur-mode" type="s">
       <default>'off'</default>
       <summary>Privacy blur mode</summary>
-      <description>How much text the privacy blur hides for screenshots: 'off' blurs nothing, 'sensitive' blurs email addresses, account names and people's names, 'all' blurs every piece of text including message bodies. Intended for taking screenshots for demos and marketing, so personal details are not readable.</description>
+      <description>How much text the privacy blur hides for screenshots: 'off' blurs nothing, 'sensitive' blurs email addresses, account names and people's names, 'all' blurs content text including message bodies while leaving app chrome such as buttons, menus and headings readable. Intended for taking screenshots for demos and marketing, so personal details are not readable.</description>
     </key>
 
     <!-- Session memory -->

@@ -45,6 +45,7 @@ pub(crate) fn show_manage_quick_steps_dialog(anchor: &gtk::Widget, state: Rc<Ref
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&hint);
 
     let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
     let groups: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::new(RefCell::new(Vec::new()));
@@ -70,6 +71,7 @@ pub(crate) fn show_manage_quick_steps_dialog(anchor: &gtk::Widget, state: Rc<Ref
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 group.add(&empty);
             }
             for (index, step) in steps.iter().enumerate() {
@@ -77,6 +79,7 @@ pub(crate) fn show_manage_quick_steps_dialog(anchor: &gtk::Widget, state: Rc<Ref
                     .title(glib::markup_escape_text(&step.name))
                     .subtitle(glib::markup_escape_text(&step.summary()))
                     .build();
+                crate::privacy::mark_content(&row);
                 row.set_activatable(false);
                 let suffix = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).valign(gtk::Align::Center).build();
 
@@ -300,6 +303,7 @@ pub(crate) fn show_quick_step_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiS
 fn section(title: &str, content: &gtk::Box) -> gtk::Box {
     let outer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     let label = gtk::Label::builder().label(title).halign(gtk::Align::Start).css_classes(["heading"]).build();
+    crate::privacy::mark_ui(&label);
     outer.append(&label);
     outer.append(content);
     outer
@@ -339,6 +343,7 @@ pub(crate) fn build_quick_steps_menu(state: &Rc<RefCell<UiState>>, message_list:
             .margin_top(2)
             .margin_bottom(2)
             .build();
+        crate::privacy::mark_ui(&empty);
         boxed.append(&empty);
     } else {
         for (slot, step) in steps.iter().enumerate() {
@@ -353,6 +358,7 @@ pub(crate) fn build_quick_steps_menu(state: &Rc<RefCell<UiState>>, message_list:
                 .halign(gtk::Align::Start)
                 .tooltip_text(step.summary())
                 .build();
+            crate::privacy::mark_content(&button);
             button.set_sensitive(has_selection && step.runnable());
             button.connect_clicked({
                 let state = state.clone();

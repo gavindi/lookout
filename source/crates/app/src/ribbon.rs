@@ -191,6 +191,7 @@ impl RibbonBand {
         row.add_css_class("ribbon-group-row");
         let caption_label = gtk::Label::builder().label(caption).build();
         caption_label.add_css_class("ribbon-group-caption");
+        crate::privacy::mark_ui(&caption_label);
         group_box.append(&row);
         group_box.append(&caption_label);
         let divider = gtk::Separator::new(gtk::Orientation::Vertical);

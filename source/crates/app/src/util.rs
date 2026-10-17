@@ -54,6 +54,7 @@ pub fn action_button(icon: &str, label: &str) -> gtk::Button {
 pub fn labeled_row(label: &str, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
     let label = gtk::Label::builder().label(label).width_chars(9).halign(gtk::Align::Start).build();
+    crate::privacy::mark_ui(&label);
     widget.set_hexpand(true);
     row.append(&label);
     row.append(widget);

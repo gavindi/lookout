@@ -285,11 +285,14 @@ pub fn build_series_control(initial_raw: Option<&str>, week_start: Weekday) -> S
     content.append(&freq_dropdown);
 
     let interval_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    interval_row.append(&gtk::Label::new(Some("Every")));
+    let every_label = gtk::Label::new(Some("Every"));
+    crate::privacy::mark_ui(&every_label);
+    interval_row.append(&every_label);
     let interval_spin = gtk::SpinButton::with_range(1.0, 999.0, 1.0);
     interval_spin.set_value(f64::from(initial.as_ref().map(|r| r.interval).unwrap_or(1)));
     interval_row.append(&interval_spin);
     let interval_unit_label = gtk::Label::new(Some("time(s)"));
+    crate::privacy::mark_ui(&interval_unit_label);
     interval_row.append(&interval_unit_label);
     content.append(&interval_row);
 

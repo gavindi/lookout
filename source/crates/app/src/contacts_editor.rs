@@ -220,6 +220,10 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
     } else {
         None
     };
+    if let Some(dropdown) = &book_dropdown {
+        // Address-book names are content: blurred by privacy mode.
+        crate::privacy::mark_content(dropdown);
+    }
 
     // --- Single-valued fields.
     let name_row = adw::EntryRow::new();
@@ -815,6 +819,7 @@ fn parse_date_entry(text: &str) -> Option<Option<lookout_core::Birthday>> {
 
 fn section_header(label: &str) -> gtk::Label {
     let header = gtk::Label::builder().label(label).xalign(0.0).css_classes(["heading"]).build();
+    crate::privacy::mark_ui(&header);
     header.set_margin_top(4);
     header
 }

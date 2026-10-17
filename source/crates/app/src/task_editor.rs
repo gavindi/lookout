@@ -76,6 +76,8 @@ pub fn show_task_editor(
         .sensitive(!calendar_ids.is_empty() && !has_existing)
         .valign(gtk::Align::Center)
         .build();
+    // Calendar names are content: blurred by privacy mode.
+    crate::privacy::mark_content(&calendar_dropdown);
     let calendar_row = adw::ActionRow::builder().title("Calendar").build();
     calendar_row.add_suffix(&calendar_dropdown);
 
@@ -94,6 +96,7 @@ pub fn show_task_editor(
         .xalign(0.0)
         .halign(gtk::Align::Start)
         .build();
+    crate::privacy::mark_ui(&notes_label);
     let notes_scroller = gtk::ScrolledWindow::builder()
         .child(&notes_view)
         .vexpand(true)
@@ -204,6 +207,7 @@ pub fn show_task_editor(
     fields_group.add(&categorize_row);
 
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).halign(gtk::Align::Start).css_classes(["error"]).build();
+    crate::privacy::mark_ui(&error_label);
     error_label.set_visible(false);
 
     let form_box = gtk::Box::builder()

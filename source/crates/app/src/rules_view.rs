@@ -199,6 +199,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&hint);
 
     let rebuild: Rc<RefCell<Box<dyn Fn()>>> = Rc::new(RefCell::new(Box::new(|| {})));
     let groups: Rc<RefCell<Vec<adw::PreferencesGroup>>> = Rc::new(RefCell::new(Vec::new()));
@@ -224,6 +225,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 group.add(&empty);
             }
             for (index, rule) in rules.iter().enumerate() {
@@ -231,6 +233,7 @@ pub(crate) fn show_manage_rules_dialog(anchor: &gtk::Widget, state: Rc<RefCell<U
                     .title(glib::markup_escape_text(&rule.name))
                     .subtitle(glib::markup_escape_text(&format!("{} · {}", backend_label(rule.backend), rule_summary(rule))))
                     .build();
+                crate::privacy::mark_content(&row);
                 row.set_activatable(false);
                 let suffix = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).valign(gtk::Align::Center).build();
 
@@ -421,6 +424,8 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
     } else {
         let labels: Vec<&str> = accounts.iter().map(|(_, label)| label.as_str()).collect();
         let account = gtk::DropDown::from_strings(&labels);
+        // Account label/address: blurred by privacy mode.
+        crate::privacy::mark_content(&account);
         if let Some(index) = accounts.iter().position(|(id, _)| rule.borrow().account.as_ref() == Some(id)) {
             account.set_selected(index as u32);
         }
@@ -573,6 +578,7 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
 fn section(title: &str, content: &gtk::Box) -> gtk::Box {
     let outer = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     let label = gtk::Label::builder().label(title).halign(gtk::Align::Start).css_classes(["heading"]).build();
+    crate::privacy::mark_ui(&label);
     outer.append(&label);
     outer.append(content);
     outer
@@ -763,7 +769,9 @@ fn append_condition_value(row: &gtk::Box, set: ConditionSetter, condition: RuleC
             }
             row.append(&dropdown);
             row.append(&entry);
-            row.append(&gtk::Label::builder().label("MB").build());
+            let unit = gtk::Label::builder().label("MB").build();
+            crate::privacy::mark_ui(&unit);
+            row.append(&unit);
         }
         RuleCondition::SentOnlyToMe => {}
     }

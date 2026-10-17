@@ -160,6 +160,7 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
     }));
 
     let header_label = gtk::Label::builder().label(format_date(date)).css_classes(["heading"]).build();
+    crate::privacy::mark_ui(&header_label);
     let prev = gtk::Button::from_icon_name("go-previous-symbolic");
     let next = gtk::Button::from_icon_name("go-next-symbolic");
     let today = gtk::Button::with_label("Today");
@@ -192,6 +193,7 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
         .margin_end(8)
         .wrap(true)
         .build();
+    crate::privacy::mark_ui(&status_label);
     status_label.set_visible(false);
 
     let canvas = gtk::DrawingArea::new();

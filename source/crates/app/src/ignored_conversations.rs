@@ -36,6 +36,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&hint);
 
     // `rebuild` re-renders the per-account sections; each Remove calls it again
     // through the `Rc<RefCell<Box<dyn Fn()>>>` cycle bounded to the dialog.
@@ -73,6 +74,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 group.add(&empty);
                 page.add(&group);
                 groups.borrow_mut().push(group);
@@ -88,6 +90,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                     .title(glib::markup_escape_text(&label))
                     .subtitle(glib::markup_escape_text(&account_label))
                     .build();
+                crate::privacy::mark_content(&row);
                 let remove = gtk::Button::from_icon_name("user-trash-symbolic");
                 remove.set_tooltip_text(Some("Stop ignoring this conversation"));
                 remove.add_css_class("flat");

@@ -429,6 +429,8 @@ fn message_row(actions: &ProfileCardActions, message: &EmailSummary) -> gtk::Wid
     row.append(&date);
 
     let button = gtk::Button::builder().child(&row).css_classes(["flat", "profile-card-row"]).build();
+    // Subject/date are content: blurred by privacy mode.
+    crate::privacy::mark_content(&button);
     let actions = actions.clone();
     let message = message.clone();
     button.connect_clicked(move |_| (actions.open_message)(&message));
@@ -456,6 +458,8 @@ fn event_row(ctx: &ProfileCardContext, occ: &EventOccurrence) -> gtk::Widget {
     text.append(&gtk::Label::builder().label(&time).xalign(0.0).css_classes(["caption", "dim-label"]).build());
 
     let button = gtk::Button::builder().child(&text).css_classes(["flat", "profile-card-row"]).build();
+    // Event title/time are content: blurred by privacy mode.
+    crate::privacy::mark_content(&button);
     let actions = ctx.actions.clone();
     let occ = occ.clone();
     button.connect_clicked(move |_| (actions.open_event)(&occ));
@@ -475,14 +479,15 @@ fn section_heading(text: &str) -> gtk::Widget {
 
 /// A dim empty-state note.
 fn empty_label(text: &str) -> gtk::Widget {
-    gtk::Label::builder()
+    let label = gtk::Label::builder()
         .label(text)
         .xalign(0.0)
         .css_classes(["caption", "dim-label"])
         .margin_top(2)
         .margin_bottom(2)
-        .build()
-        .upcast()
+        .build();
+    crate::privacy::mark_ui(&label);
+    label.upcast()
 }
 
 /// A flat icon + label button, matching the reading pane's action cluster.

@@ -65,6 +65,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
         .build();
+    crate::privacy::mark_ui(&hint);
 
     // `rebuild` re-renders the per-account sections; its per-row handlers
     // call it again after an add/remove, and reach it through the
@@ -113,6 +114,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                     .margin_top(12)
                     .margin_bottom(12)
                     .build();
+                crate::privacy::mark_ui(&empty);
                 group.add(&empty);
                 page.add(&group);
                 groups.borrow_mut().push(group);
@@ -120,6 +122,8 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
             }
             for (account, label) in accounts {
                 let group = adw::PreferencesGroup::builder().title(glib::markup_escape_text(&label)).build();
+                // The group heading is an account name/address: content, not chrome.
+                crate::privacy::mark_content_heading(&group);
                 groups.borrow_mut().push(group.clone());
                 let mut account_entries: Vec<(String, TrustLevel)> = entries.iter().filter(|(a, _, _)| *a == account).map(|(_, entry, level)| (entry.clone(), *level)).collect();
                 account_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -169,6 +173,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                     .build();
                 let entry_field = gtk::Entry::builder().placeholder_text("name@example.com or @example.com").hexpand(true).build();
                 let error_label = gtk::Label::builder().label("").css_classes(["error"]).halign(gtk::Align::Start).build();
+                crate::privacy::mark_ui(&error_label);
                 error_label.set_visible(false);
                 let add_button = gtk::Button::builder().label("Add").build();
                 let add_dropdown = level_dropdown(TrustLevel::Images, |_| {});

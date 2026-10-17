@@ -266,6 +266,8 @@ pub fn show_event_editor(
         .sensitive(!calendar_ids.is_empty() && !has_existing)
         .valign(gtk::Align::Center)
         .build();
+    // Calendar names are content: blurred by privacy mode.
+    crate::privacy::mark_content(&calendar_dropdown);
     let calendar_row = adw::ActionRow::builder().title("Calendar").build();
     calendar_row.add_suffix(&calendar_dropdown);
 
@@ -399,7 +401,9 @@ pub fn show_event_editor(
         .margin_bottom(6)
         .build();
     datetime_row.append(&time_cluster("Starts", &start_calendar, &start_hour, &start_minute));
-    datetime_row.append(&gtk::Label::builder().label("to").css_classes(["dim-label"]).build());
+    let to_label = gtk::Label::builder().label("to").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&to_label);
+    datetime_row.append(&to_label);
     datetime_row.append(&time_cluster("Ends", &end_calendar, &end_hour, &end_minute));
     let all_day_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -408,11 +412,15 @@ pub fn show_event_editor(
         .hexpand(true)
         .valign(gtk::Align::Start)
         .build();
-    all_day_box.append(&gtk::Label::new(Some("All day")));
+    let all_day_label = gtk::Label::new(Some("All day"));
+    crate::privacy::mark_ui(&all_day_label);
+    all_day_box.append(&all_day_label);
     all_day_box.append(&all_day_switch);
     datetime_row.append(&all_day_box);
     let zone_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).valign(gtk::Align::Start).build();
-    zone_box.append(&gtk::Label::builder().label("Time zone").css_classes(["dim-label", "caption"]).xalign(0.0).build());
+    let time_zone_label = gtk::Label::builder().label("Time zone").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+    crate::privacy::mark_ui(&time_zone_label);
+    zone_box.append(&time_zone_label);
     zone_box.append(&zone_dropdown);
     datetime_row.append(&zone_box);
 
@@ -463,6 +471,7 @@ pub fn show_event_editor(
         .halign(gtk::Align::Start)
         .build();
     recurring_note.set_visible(existing.as_ref().is_some_and(|occ| occ.rrule.is_some()));
+    crate::privacy::mark_ui(&recurring_note);
     let read_only_note = gtk::Label::builder()
         .label(prefill.read_only_note)
         .css_classes(["dim-label", "caption"])
@@ -471,7 +480,9 @@ pub fn show_event_editor(
         .halign(gtk::Align::Start)
         .build();
     read_only_note.set_visible(read_only);
+    crate::privacy::mark_ui(&read_only_note);
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).halign(gtk::Align::Start).css_classes(["error"]).build();
+    crate::privacy::mark_ui(&error_label);
     error_label.set_visible(false);
 
     let notes_label = gtk::Label::builder()
@@ -480,6 +491,7 @@ pub fn show_event_editor(
         .xalign(0.0)
         .halign(gtk::Align::Start)
         .build();
+    crate::privacy::mark_ui(&notes_label);
     let notes_scroller = gtk::ScrolledWindow::builder()
         .child(&description_view)
         .vexpand(true)
@@ -833,14 +845,14 @@ pub fn show_event_editor(
         let page_content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
         page_content.append(&grid.root);
         page_content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        page_content.append(
-            &gtk::Label::builder()
-                .label("Suggested times")
-                .xalign(0.0)
-                .css_classes(["dim-label", "caption"])
-                .margin_start(12)
-                .build(),
-        );
+        let suggested_heading = gtk::Label::builder()
+            .label("Suggested times")
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .margin_start(12)
+            .build();
+        crate::privacy::mark_ui(&suggested_heading);
+        page_content.append(&suggested_heading);
         page_content.append(&suggestions_box);
         let page = gtk::ScrolledWindow::builder()
             .child(&page_content)
@@ -940,10 +952,14 @@ pub fn show_event_editor(
                     suggestions_box.remove(&child);
                 }
                 if !addresses.is_empty() && !loading.get() && suggestions.is_empty() {
-                    suggestions_box.append(&gtk::Label::builder().label("No free time found on this day").xalign(0.0).css_classes(["dim-label"]).build());
+                    let no_free_time = gtk::Label::builder().label("No free time found on this day").xalign(0.0).css_classes(["dim-label"]).build();
+                    crate::privacy::mark_ui(&no_free_time);
+                    suggestions_box.append(&no_free_time);
                 }
                 for slot in suggestions {
                     let button = gtk::Button::with_label(&slot.format("%H:%M").to_string());
+                    // A suggested time is calendar content: blurred by privacy mode.
+                    crate::privacy::mark_content(&button);
                     button.set_tooltip_text(Some("Set the meeting to this time"));
                     let apply = apply_time.clone();
                     button.connect_clicked(move |_| apply(slot, slot + chrono::Duration::minutes(duration)));
@@ -1444,15 +1460,16 @@ fn build_tracking_page(occurrence: &EventOccurrence, owner_email: Option<&str>) 
         .build();
 
     let heading = gtk::Label::builder().label("Tracking").xalign(0.0).css_classes(["title-4"]).build();
+    crate::privacy::mark_ui(&heading);
     content.append(&heading);
     let counts = attendee_responses(&occurrence.attendees);
-    content.append(
-        &gtk::Label::builder()
-            .label(attendee_responses_summary(&counts))
-            .xalign(0.0)
-            .css_classes(["dim-label"])
-            .build(),
-    );
+    let counts_label = gtk::Label::builder()
+        .label(attendee_responses_summary(&counts))
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    crate::privacy::mark_ui(&counts_label);
+    content.append(&counts_label);
 
     let group = adw::PreferencesGroup::new();
     if let Some(organizer) = occurrence.organizer.as_ref() {
@@ -1463,7 +1480,9 @@ fn build_tracking_page(occurrence: &EventOccurrence, owner_email: Option<&str>) 
             .build();
         // Organizer name/address: blurred by privacy mode.
         crate::privacy::mark_row(&row);
-        row.add_suffix(&gtk::Label::builder().label("Organizer").css_classes(["dim-label"]).build());
+        let organizer_label = gtk::Label::builder().label("Organizer").css_classes(["dim-label"]).build();
+        crate::privacy::mark_ui(&organizer_label);
+        row.add_suffix(&organizer_label);
         group.add(&row);
     }
     for attendee in &occurrence.attendees {
@@ -1507,7 +1526,9 @@ fn tracking_status_widget(status: AttendeeStatus) -> gtk::Widget {
     let (icon_name, fallbacks) = attendee_status_icon(status);
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).valign(gtk::Align::Center).build();
     row.append(&gtk::Image::from_icon_name(themed_icon(icon_name, fallbacks)));
-    row.append(&gtk::Label::builder().label(attendee_status_label(status)).css_classes(["dim-label"]).build());
+    let status_label = gtk::Label::builder().label(attendee_status_label(status)).css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&status_label);
+    row.append(&status_label);
     row.upcast()
 }
 
@@ -1743,13 +1764,13 @@ pub(crate) fn build_category_picker(master: &[crate::categories::CategoryDef], s
     }
 
     if names.is_empty() {
-        list.append(
-            &gtk::Label::builder()
-                .label("No categories defined yet")
-                .halign(gtk::Align::Start)
-                .css_classes(["dim-label"])
-                .build(),
-        );
+        let empty = gtk::Label::builder()
+            .label("No categories defined yet")
+            .halign(gtk::Align::Start)
+            .css_classes(["dim-label"])
+            .build();
+        crate::privacy::mark_ui(&empty);
+        list.append(&empty);
     }
     for name in names {
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
@@ -1757,6 +1778,8 @@ pub(crate) fn build_category_picker(master: &[crate::categories::CategoryDef], s
             row.append(&crate::window::preset_dot_area(cat.color(), 12));
         }
         let check = gtk::CheckButton::builder().label(&name).sensitive(!read_only).build();
+        // A category name is content: blurred by privacy mode.
+        crate::privacy::mark_content(&check);
         check.set_active(chosen.borrow().iter().any(|n| n.eq_ignore_ascii_case(&name)));
         let chosen_for = chosen.clone();
         let name_for = name.clone();

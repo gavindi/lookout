@@ -1299,9 +1299,13 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
     let table_cols = gtk::SpinButton::with_range(1.0, 10.0, 1.0);
     table_cols.set_value(2.0);
     let table_grid = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-    table_grid.append(&gtk::Label::new(Some("Rows")));
+    let rows_label = gtk::Label::new(Some("Rows"));
+    crate::privacy::mark_ui(&rows_label);
+    table_grid.append(&rows_label);
     table_grid.append(&table_rows);
-    table_grid.append(&gtk::Label::new(Some("Columns")));
+    let columns_label = gtk::Label::new(Some("Columns"));
+    crate::privacy::mark_ui(&columns_label);
+    table_grid.append(&columns_label);
     table_grid.append(&table_cols);
     let table_dialog = adw::AlertDialog::builder()
         .heading("Insert table")
@@ -1666,6 +1670,8 @@ pub fn build_compose_view(
     // list immediately.
     let identities = Rc::new(RefCell::new(identities_source()));
     let from_dropdown = gtk::DropDown::builder().selected(0).build();
+    // Identity names/addresses are content: blurred by privacy mode.
+    crate::privacy::mark_content(&from_dropdown);
     // `identities_for_account` always inserts the account's own default
     // identity at index 0, so anything else selected is an alternate one.
     // Providers (Gmail in particular) silently substitute the account's own
@@ -1994,6 +2000,7 @@ pub fn build_compose_view(
         .margin_top(3)
         .margin_bottom(3)
         .build();
+    crate::privacy::mark_ui(&manage_label);
     let manage_button = gtk::Button::builder().css_classes(["flat"]).build();
     manage_button.set_child(Some(&manage_label));
     {
@@ -2134,6 +2141,7 @@ pub fn build_compose_view(
         .margin_top(3)
         .margin_bottom(3)
         .build();
+    crate::privacy::mark_ui(&manage_templates_label);
     let manage_templates_button = gtk::Button::builder().css_classes(["flat"]).build();
     manage_templates_button.set_child(Some(&manage_templates_label));
     {
@@ -2279,6 +2287,7 @@ pub fn build_compose_view(
     // autosave timer can't fire against a torn-down page.
     let closed = Rc::new(Cell::new(false));
     let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&status_label);
     // A reopened draft keeps the saved message's own Message-ID (bare, no
     // `<>` - `build_raw_message` re-adds the brackets), so resaves replace
     // the stored copy; a fresh composer mints a new stable id.

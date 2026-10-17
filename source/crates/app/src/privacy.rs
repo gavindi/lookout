@@ -8,8 +8,9 @@
 //!   names are blurred, everywhere the app has tagged them (message list,
 //!   reading pane, folder tree, contacts, calendar, Settings account rows,
 //!   ...);
-//! - [`BlurMode::All`] - every piece of text is blurred, including message
-//!   bodies, so nothing in a screenshot is readable.
+//! - [`BlurMode::All`] - every piece of *content* text is blurred, including
+//!   message bodies, while app chrome (controls, menus, headings, status and
+//!   help text) stays readable.
 //!
 //! The mechanism is a single display-level `gtk::CssProvider` at APPLICATION
 //! priority whose contents depend on the mode. Sensitive mode needs the app to
@@ -17,7 +18,13 @@
 //! [`mark`] / [`mark_row`]); All mode is broad - it blurs every GTK text node
 //! (`label`, `entry`, `textview`, `spinbutton`) plus the content views tagged
 //! with [`BLUR_ALL_CLASS`] (see [`mark_blur_all`]), which is how WebKit message
-//! bodies get covered. Switching modes reloads the provider, which restyles
+//! bodies get covered. It then exempts the chrome: standard control internals
+//! (button, menu, dropdown, tab and row titles), libadwaita group headings and
+//! anything tagged with [`UI_CLASS`] (see [`mark_ui`]). Because content must
+//! stay private even where it sits inside a control, dynamic buttons,
+//! checkboxes, dropdowns and rows that show user data are tagged with
+//! [`CONTENT_CLASS`] (see [`mark_content`]) or the sensitive classes, and
+//! those rules win over the chrome exemptions. Switching modes reloads the provider, which restyles
 //! every widget live. Because the rules are class/element based rather than
 //! ancestry-based, they reach the main window, dialogs, popovers and pop-out
 //! windows alike.
@@ -44,6 +51,19 @@ pub const SENSITIVE_CLASS: &str = "lookout-sensitive";
 /// CSS class applied to a libadwaita row whose title/subtitle are sensitive;
 /// only those two labels blur, not the row's switch/button suffix.
 pub const SENSITIVE_ROW_CLASS: &str = "lookout-sensitive-row";
+/// CSS class applied to a chrome widget (a static heading, help text, tag or a
+/// container holding only chrome) whose text stays sharp in "All text" mode.
+/// Never tag a widget that displays content or sensitive data.
+pub const UI_CLASS: &str = "lookout-ui";
+/// CSS class applied to a control or row that shows content (a calendar name,
+/// task title, category, saved search, ...) so its text stays blurred in "All
+/// text" mode even though the control's chrome is exempt. Unlike
+/// [`SENSITIVE_CLASS`], it does not blur anything in "Sensitive" mode.
+pub const CONTENT_CLASS: &str = "lookout-content";
+/// CSS class applied to a libadwaita group whose *heading* is data rather than
+/// chrome (an account address, a cache path, ...), so its title stays blurred
+/// in "All text" mode while chrome group headings stay sharp.
+pub const CONTENT_HEADING_CLASS: &str = "lookout-content-heading";
 /// CSS class applied to a content view (a WebKit message body, ...) that
 /// cannot be reached by the `label`/`entry`/`textview` selectors, so the "All
 /// text" mode has to blur the whole widget.
@@ -106,6 +126,30 @@ pub fn mark_row<W: IsA<gtk::Widget>>(row: &W) {
     row.add_css_class(SENSITIVE_ROW_CLASS);
 }
 
+/// Tags a chrome widget (a static heading, hint, toolbar caption, or a
+/// container that holds only chrome) whose text stays sharp in
+/// [`BlurMode::All`]. Do not tag content or sensitive data with this: the
+/// exemption is applied to the widget and all `label` descendants.
+pub fn mark_ui<W: IsA<gtk::Widget>>(widget: &W) {
+    widget.add_css_class(UI_CLASS);
+}
+
+/// Tags a control, label or row that shows content (not chrome) so its text
+/// stays blurred in [`BlurMode::All`] even where the control itself is
+/// exempted (a button label, a dropdown value, an `adw` row title). This does
+/// not affect [`BlurMode::Sensitive`]; use [`mark`] / [`mark_row`] for
+/// personal data that must blur there too.
+pub fn mark_content<W: IsA<gtk::Widget>>(widget: &W) {
+    widget.add_css_class(CONTENT_CLASS);
+}
+
+/// Tags a container (typically a libadwaita `PreferencesGroup`) whose heading
+/// is content rather than chrome, so its `.heading` label stays blurred in
+/// [`BlurMode::All`] while the other chrome headings stay readable.
+pub fn mark_content_heading<W: IsA<gtk::Widget>>(widget: &W) {
+    widget.add_css_class(CONTENT_HEADING_CLASS);
+}
+
 /// Tags a content view (a WebKit message body or editor, ...) whose whole
 /// rendering is blurred by [`BlurMode::All`] - the GTK text selectors can't
 /// reach inside a `WebView`.
@@ -150,11 +194,49 @@ fn blur_css(mode: BlurMode) -> String {
              .{SENSITIVE_ROW_CLASS} .subtitle {{ filter: blur({BLUR_RADIUS_PX}px); }}\n"
         ),
         BlurMode::All => format!(
-            "/* Privacy blur: all text (Config → Advanced) */\n\
+            "/* Privacy blur: content text; app chrome stays readable */\n\
              label,\n\
              entry,\n\
              textview,\n\
              spinbutton {{ filter: blur({BLUR_RADIUS_PX}px); }}\n\
+             /* Chrome exemptions: standard control internals and tagged UI text. */\n\
+             button label,\n\
+             buttoncontent label,\n\
+             modelbutton,\n\
+             modelbutton label,\n\
+             checkbutton label,\n\
+             dropdown label,\n\
+             viewswitcher label,\n\
+             tabbar label,\n\
+             columnview header label,\n\
+             statuspage label,\n\
+             row .title,\n\
+             row .subtitle,\n\
+             preferencesgroup label.heading,\n\
+             preferencesgroup label.description,\n\
+             preferencespage label.description,\n\
+             .ribbon-group-caption,\n\
+             .{UI_CLASS},\n\
+             .{UI_CLASS} label {{ filter: none; }}\n\
+             /* Content keeps winning over chrome, even inside tagged controls. */\n\
+             .{SENSITIVE_CLASS},\n\
+             .{SENSITIVE_CLASS} label,\n\
+             .{SENSITIVE_ROW_CLASS} .title,\n\
+             .{SENSITIVE_ROW_CLASS} .subtitle,\n\
+             .{UI_CLASS} .{SENSITIVE_CLASS},\n\
+             .{UI_CLASS} label.{SENSITIVE_CLASS},\n\
+             .{UI_CLASS} .{SENSITIVE_ROW_CLASS} .title,\n\
+             .{UI_CLASS} .{SENSITIVE_ROW_CLASS} .subtitle,\n\
+             .{CONTENT_CLASS},\n\
+             .{CONTENT_CLASS} label,\n\
+             .{CONTENT_CLASS} .title,\n\
+             .{CONTENT_CLASS} .subtitle,\n\
+             .{UI_CLASS} .{CONTENT_CLASS},\n\
+             .{UI_CLASS} label.{CONTENT_CLASS},\n\
+             .{UI_CLASS} .{CONTENT_CLASS} label,\n\
+             .{UI_CLASS} .{CONTENT_CLASS} .title,\n\
+             .{UI_CLASS} .{CONTENT_CLASS} .subtitle,\n\
+             .{CONTENT_HEADING_CLASS} label.heading {{ filter: blur({BLUR_RADIUS_PX}px); }}\n\
              .{BLUR_ALL_CLASS} {{ filter: blur({BLUR_RADIUS_PX}px); }}\n"
         ),
     }
@@ -207,6 +289,37 @@ mod tests {
     }
 
     #[test]
+    fn all_text_mode_exempts_chrome_but_reblurs_content() {
+        let all = blur_css(BlurMode::All);
+        for selector in [
+            "button label",
+            "buttoncontent label",
+            "modelbutton",
+            "checkbutton label",
+            "dropdown label",
+            "viewswitcher label",
+            "tabbar label",
+            "columnview header label",
+            "statuspage label",
+            "row .title",
+            "row .subtitle",
+            "preferencesgroup label.heading",
+            ".ribbon-group-caption",
+        ] {
+            assert!(all.contains(selector), "all-text CSS should exempt {selector}");
+        }
+        assert!(all.contains(UI_CLASS), "all-text CSS should exempt tagged UI text");
+        assert!(all.contains("filter: none"), "the chrome rules should clear the blur");
+        assert!(all.contains(CONTENT_CLASS), "tagged content controls must stay blurred");
+        assert!(all.contains(CONTENT_HEADING_CLASS), "data group headings must stay blurred");
+        assert!(all.contains(&format!(".{SENSITIVE_CLASS} label")), "content inside controls must stay blurred");
+        assert!(
+            all.find(&format!(".{UI_CLASS} label")).unwrap() < all.find(&format!(".{SENSITIVE_CLASS} label")).unwrap(),
+            "content re-blur rules must come after the UI exemptions"
+        );
+    }
+
+    #[test]
     fn mark_adds_the_expected_classes() {
         if !gtk_ok() {
             return;
@@ -220,6 +333,15 @@ mod tests {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         mark_blur_all(&body);
         assert!(body.has_css_class(BLUR_ALL_CLASS));
+        let heading = gtk::Label::new(Some("Inbox"));
+        mark_ui(&heading);
+        assert!(heading.has_css_class(UI_CLASS));
+        let button = gtk::Button::with_label("Project");
+        mark_content(&button);
+        assert!(button.has_css_class(CONTENT_CLASS));
+        let group = adw::PreferencesGroup::new();
+        mark_content_heading(&group);
+        assert!(group.has_css_class(CONTENT_HEADING_CLASS));
     }
 
     #[test]

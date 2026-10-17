@@ -190,6 +190,7 @@ pub fn build_lookout_view() -> LookoutView {
     });
     histogram_box.append(&histogram_area);
     let histogram_caption = gtk::Label::builder().css_classes(["dim-label", "caption"]).xalign(0.0).build();
+    crate::privacy::mark_ui(&histogram_caption);
     histogram_box.append(&histogram_caption);
 
     let (contacts_card, contacts_list) = section_card("People most contacted");
@@ -242,6 +243,7 @@ fn section_card(title: &str) -> (gtk::Box, gtk::Box) {
         .margin_start(12)
         .margin_end(12)
         .build();
+    crate::privacy::mark_ui(&heading);
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -484,6 +486,7 @@ fn append_empty(box_: &gtk::Box, text: &str) {
         .wrap(true)
         .margin_top(8)
         .build();
+    crate::privacy::mark_ui(&placeholder);
     box_.append(&placeholder);
 }
 

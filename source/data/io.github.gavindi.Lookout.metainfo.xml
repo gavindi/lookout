@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.242" date="2026-10-17">
+      <description>
+        <p>The full privacy blur now hides content only: message, contact, calendar and task data stays blurred, while buttons, menus, tabs, column headers, settings rows and help text remain readable. Sensitive-information mode is unchanged.</p>
+      </description>
+    </release>
     <release version="0.9.241" date="2026-10-17">
       <description>
         <p>Calendar event chips take on Outlook's look: a soft calendar-colour tint with a colour stripe down the left edge whose style shows the event's "Show as" state, a bold title with a dim time, and small marks for recurring, private, meeting, online and reminder. VEVENT STATUS (confirmed / tentative / cancelled) is now read and written, so a cancelled event fades and strikes through, and Microsoft 365's isCancelled is honoured.</p>

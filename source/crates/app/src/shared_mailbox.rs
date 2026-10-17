@@ -44,6 +44,8 @@ pub fn show_manage_shared_mailboxes(anchor: &gtk::Widget, app_config: Rc<RefCell
     // exactly one Microsoft 365 account).
     let address_entry = adw::EntryRow::builder().title("Shared mailbox address").build();
     let parent_dropdown = gtk::DropDown::builder().build();
+    // Account names/addresses are content: blurred by privacy mode.
+    crate::privacy::mark_content(&parent_dropdown);
     let parent_labels: Vec<&str> = parents.iter().map(|p| p.label.as_str()).collect();
     parent_dropdown.set_model(Some(&gtk::StringList::new(&parent_labels)));
     parent_dropdown.set_selected(0);
@@ -80,13 +82,13 @@ pub fn show_manage_shared_mailboxes(anchor: &gtk::Widget, app_config: Rc<RefCell
             }
             let mailboxes = app_config.borrow().shared_mailboxes.clone();
             if mailboxes.is_empty() {
-                list_box.append(
-                    &gtk::Label::builder()
-                        .label("No shared mailboxes yet")
-                        .xalign(0.0)
-                        .css_classes(["dim-label", "caption"])
-                        .build(),
-                );
+                let empty = gtk::Label::builder()
+                    .label("No shared mailboxes yet")
+                    .xalign(0.0)
+                    .css_classes(["dim-label", "caption"])
+                    .build();
+                crate::privacy::mark_ui(&empty);
+                list_box.append(&empty);
                 return;
             }
             for mailbox in mailboxes {

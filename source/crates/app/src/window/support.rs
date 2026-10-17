@@ -926,22 +926,26 @@ pub(crate) fn show_about_dialog() {
         include_bytes!("../../../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg"),
         128,
     ));
-    content.append(&gtk::Label::builder().label("Lookout").css_classes(["title-1"]).build());
-    content.append(
-        &gtk::Label::builder()
-            .label(format!("Version {}", env!("CARGO_PKG_VERSION")))
-            .css_classes(["dim-label"])
-            .build(),
-    );
-    content.append(&gtk::Label::builder().label("Gavin Graham").css_classes(["dim-label"]).build());
-    content.append(
-        &gtk::Label::builder()
-            .label("A native GNOME mail client for GNOME Online Accounts.")
-            .wrap(true)
-            .justify(gtk::Justification::Center)
-            .margin_top(12)
-            .build(),
-    );
+    let about_title = gtk::Label::builder().label("Lookout").css_classes(["title-1"]).build();
+    crate::privacy::mark_ui(&about_title);
+    content.append(&about_title);
+    let version = gtk::Label::builder()
+        .label(format!("Version {}", env!("CARGO_PKG_VERSION")))
+        .css_classes(["dim-label"])
+        .build();
+    crate::privacy::mark_ui(&version);
+    content.append(&version);
+    let author = gtk::Label::builder().label("Gavin Graham").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&author);
+    content.append(&author);
+    let description = gtk::Label::builder()
+        .label("A native GNOME mail client for GNOME Online Accounts.")
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .margin_top(12)
+        .build();
+    crate::privacy::mark_ui(&description);
+    content.append(&description);
 
     let links = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -955,20 +959,20 @@ pub(crate) fn show_about_dialog() {
 
     // The former "Legal" subpage, inlined. Markup is on for the licence link,
     // so the copyright line's ampersand has to be escaped.
-    content.append(
-        &gtk::Label::builder()
-            .label(
-                "© 2026 Gavin Graham &amp; Contributors\n\
-                 Licensed under the <a href=\"https://www.gnu.org/licenses/gpl-3.0.html\">GNU General Public \
-                 License, version 3 or later</a>. This application comes with absolutely no warranty.",
-            )
-            .use_markup(true)
-            .wrap(true)
-            .justify(gtk::Justification::Center)
-            .css_classes(["caption", "dim-label"])
-            .margin_top(12)
-            .build(),
-    );
+    let license = gtk::Label::builder()
+        .label(
+            "© 2026 Gavin Graham &amp; Contributors\n\
+             Licensed under the <a href=\"https://www.gnu.org/licenses/gpl-3.0.html\">GNU General Public \
+             License, version 3 or later</a>. This application comes with absolutely no warranty.",
+        )
+        .use_markup(true)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["caption", "dim-label"])
+        .margin_top(12)
+        .build();
+    crate::privacy::mark_ui(&license);
+    content.append(&license);
 
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1006,6 +1010,7 @@ pub(crate) fn show_google_tasks_client_id_dialog(window: &adw::ApplicationWindow
         .wrap(true)
         .xalign(0.0)
         .build();
+    crate::privacy::mark_ui(&help);
     let entry = gtk::Entry::builder().placeholder_text("e.g. 1234567890-abc.apps.googleusercontent.com").build();
     entry.set_text(&google_tasks::configured_client_id());
 

@@ -1088,10 +1088,12 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
         .css_classes(["caption-heading"])
         .xalign(0.0)
         .build();
+    crate::privacy::mark_ui(&header);
     day_list_box.append(&header);
 
     if occurrences.is_empty() {
         let placeholder = gtk::Label::builder().label("No events").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        crate::privacy::mark_ui(&placeholder);
         day_list_box.append(&placeholder);
     } else {
         // A grid rather than one label per row: it auto-sizes the prefix
@@ -1115,10 +1117,12 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
         .xalign(0.0)
         .margin_top(8)
         .build();
+    crate::privacy::mark_ui(&upcoming_header);
     day_list_box.append(&upcoming_header);
 
     if upcoming.is_empty() {
         let placeholder = gtk::Label::builder().label("No upcoming events").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+        crate::privacy::mark_ui(&placeholder);
         day_list_box.append(&placeholder);
     } else {
         let grid = gtk::Grid::builder().row_spacing(10).column_spacing(6).build();
@@ -1144,6 +1148,7 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
         .xalign(0.0)
         .margin_top(8)
         .build();
+    crate::privacy::mark_ui(&tasks_header);
     day_list_box.append(&tasks_header);
 
     let outstanding = crate::lookout_view::outstanding_tasks(&tasks, chrono::Local::now().naive_local(), usize::MAX);
@@ -1153,6 +1158,7 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
             .css_classes(["dim-label", "caption"])
             .xalign(0.0)
             .build();
+        crate::privacy::mark_ui(&placeholder);
         day_list_box.append(&placeholder);
     } else {
         for task in outstanding {
@@ -1171,14 +1177,14 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
     let today = crate::calendar_tz::display_zone().today();
     let flagged = crate::tasks_view::flagged_mail_rows(&calendar_state.borrow().flagged_mail, today, crate::message_list::current_week_start());
     if !flagged.is_empty() {
-        day_list_box.append(
-            &gtk::Label::builder()
-                .label("Flagged email")
-                .css_classes(["caption-heading"])
-                .xalign(0.0)
-                .margin_top(8)
-                .build(),
-        );
+        let flagged_header = gtk::Label::builder()
+            .label("Flagged email")
+            .css_classes(["caption-heading"])
+            .xalign(0.0)
+            .margin_top(8)
+            .build();
+        crate::privacy::mark_ui(&flagged_header);
+        day_list_box.append(&flagged_header);
         let open = crate::tasks_view::open_message_through_app();
         for message in &flagged {
             day_list_box.append(&crate::tasks_view::flagged_mail_row(message, today, None, open.clone(), &["caption"]));
@@ -1661,19 +1667,21 @@ pub(crate) fn build_event_category_menu(
         .margin_end(6)
         .build();
     if master.is_empty() {
-        boxed.append(
-            &gtk::Label::builder()
-                .label("No categories defined yet")
-                .halign(gtk::Align::Start)
-                .css_classes(["dim-label"])
-                .build(),
-        );
+        let empty = gtk::Label::builder()
+            .label("No categories defined yet")
+            .halign(gtk::Align::Start)
+            .css_classes(["dim-label"])
+            .build();
+        crate::privacy::mark_ui(&empty);
+        boxed.append(&empty);
         return boxed;
     }
     for category in &master {
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         row.append(&preset_dot_area(category.color(), 10));
         let check = gtk::CheckButton::builder().label(&category.name).build();
+        // A category name is content: blurred by privacy mode.
+        crate::privacy::mark_content(&check);
         check.set_active(occ.categories.iter().any(|name| name.eq_ignore_ascii_case(&category.name)));
         {
             let window = window.clone();
@@ -2689,11 +2697,15 @@ pub(crate) fn show_calendar_dialog(
         .wrap(true)
         .hexpand(true)
         .build();
+    // It becomes the chosen file's name, so keep it content, not chrome.
+    crate::privacy::mark_content(&import_file_label);
     let chosen_ics: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let pickable = pickable_calendars(calendar_state);
     let import_calendar_labels: Vec<String> = pickable.iter().map(|(label, _)| label.clone()).collect();
     let import_calendar_ids: Vec<CalendarId> = pickable.iter().map(|(_, id)| id.clone()).collect();
     let import_target_dropdown = gtk::DropDown::builder().build();
+    // Calendar names are content: blurred by privacy mode.
+    crate::privacy::mark_content(&import_target_dropdown);
     if import_calendar_ids.is_empty() {
         import_target_dropdown.set_sensitive(false);
     } else {
@@ -2812,6 +2824,7 @@ pub(crate) fn show_calendar_dialog(
                     .css_classes(["dim-label", "caption"])
                     .xalign(0.0)
                     .build();
+                crate::privacy::mark_ui(&label);
                 manage_box.append(&label);
             }
             for sub in subs {
@@ -3042,7 +3055,10 @@ pub(crate) fn show_calendar_dialog(
         .css_classes(["dim-label", "caption"])
         .wrap(true)
         .build();
+    crate::privacy::mark_ui(&shared_status);
     let shared_calendar_dropdown = gtk::DropDown::builder().build();
+    // Shared calendar names are content: blurred by privacy mode.
+    crate::privacy::mark_content(&shared_calendar_dropdown);
     shared_calendar_dropdown.set_sensitive(false);
     let shared_add_button = gtk::Button::with_label("Add");
     shared_add_button.add_css_class("suggested-action");
@@ -3217,13 +3233,13 @@ pub(crate) fn show_calendar_dialog(
         shared_manage_box.append(&row);
     }
     if shared_manage_box.first_child().is_none() {
-        shared_manage_box.append(
-            &gtk::Label::builder()
-                .label("No shared calendars yet")
-                .xalign(0.0)
-                .css_classes(["dim-label", "caption"])
-                .build(),
-        );
+        let empty = gtk::Label::builder()
+            .label("No shared calendars yet")
+            .xalign(0.0)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        crate::privacy::mark_ui(&empty);
+        shared_manage_box.append(&empty);
     }
 
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();

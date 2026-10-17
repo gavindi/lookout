@@ -376,6 +376,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     icon.set_icon_name(Some("mail-inbox-symbolic"));
                     label.set_label("All Inboxes");
                     label.set_css_classes(&["heading", "folder-row-label"]);
+                    crate::privacy::mark_ui(&label);
                     set_count(*unread);
                 }
                 TreeItem::Favorites => {
@@ -383,6 +384,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     icon.set_icon_name(Some(themed_icon_name(&["starred-symbolic", "mail-mark-important-symbolic"])));
                     label.set_label("Favorites");
                     label.set_css_classes(&["heading", "folder-row-label"]);
+                    crate::privacy::mark_ui(&label);
                     // A pure grouping row: every folder under it shows its own.
                     set_count(0);
                 }
@@ -400,6 +402,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     icon.set_icon_name(Some(themed_icon_name(&["edit-find-symbolic", "system-search-symbolic"])));
                     label.set_label("Search Folders");
                     label.set_css_classes(&["heading", "folder-row-label"]);
+                    crate::privacy::mark_ui(&label);
                     set_count(0);
                 }
                 TreeItem::SearchFolder(folder) => {
@@ -1784,6 +1787,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // for however long the live IMAP fetch takes.
     let message_loading_spinner = gtk::Spinner::builder().spinning(true).width_request(32).height_request(32).build();
     let message_loading_label = gtk::Label::builder().label("Fetching message list.").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&message_loading_label);
     let message_loading_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -1805,6 +1809,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_empty_icon.add_css_class("empty-state-icon");
     let message_empty_title = gtk::Label::builder().label("Folder is empty").css_classes(["heading"]).build();
     let message_empty_subtitle = gtk::Label::builder().label("The stars were bright, Fernando.").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&message_empty_title);
+    crate::privacy::mark_ui(&message_empty_subtitle);
     let message_empty_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -2024,6 +2030,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .margin_end(10)
         .css_classes(["message-column-header"])
         .build();
+    // Column names are chrome, not message content.
+    crate::privacy::mark_ui(&column_header_row);
     // The sender column starts 51px in (3px accent + 8px margin + 32px avatar
     // + 8px margin); the box's own 8px spacing covers the last of that, so the
     // gutter is 43 wide.
@@ -2716,6 +2724,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .build();
+    crate::privacy::mark_ui(&reading_multi_label);
     let reading_multi = gtk::Box::builder().orientation(gtk::Orientation::Vertical).valign(gtk::Align::Center).vexpand(true).build();
     reading_multi.append(&reading_multi_label);
     reading_stack.add_named(&reading_multi, Some("multi"));
@@ -2734,6 +2743,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let reading_loading_spinner = gtk::Spinner::new();
     reading_loading_spinner.set_widget_name("body-loading-spinner");
     let reading_loading_label = gtk::Label::builder().label("Loading message…").css_classes(["dim-label"]).build();
+    crate::privacy::mark_ui(&reading_loading_label);
     reading_loading.append(&reading_loading_spinner);
     reading_loading.append(&reading_loading_label);
     reading_stack.add_named(&reading_loading, Some("loading"));
@@ -4357,7 +4367,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
             let win = adw::Window::builder().default_width(960).default_height(680).build();
             let header = adw::HeaderBar::new();
-            header.set_title_widget(Some(&adw::WindowTitle::new("People", "")));
+            let people_title = adw::WindowTitle::new("People", "");
+            crate::privacy::mark_ui(&people_title);
+            header.set_title_widget(Some(&people_title));
             let back_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popin1", "go-previous-symbolic", "go-back-symbolic"]));
             back_button.set_tooltip_text(Some("Return the People screen to the main window"));
             header.pack_start(&back_button);
@@ -4576,11 +4588,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 let recent = state.borrow().recent_searches.clone();
                 if recent.is_empty() {
-                    history_box.append(&gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build());
+                    let empty = gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build();
+                    crate::privacy::mark_ui(&empty);
+                    history_box.append(&empty);
                     return;
                 }
                 for query in recent {
                     let button = gtk::Button::with_label(&query);
+                    // A previous search is content: blurred by privacy mode.
+                    crate::privacy::mark_content(&button);
                     button.add_css_class("flat");
                     button.set_halign(gtk::Align::Start);
                     {
@@ -6467,7 +6483,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .width_request(240)
                 .build();
 
-            content.append(&gtk::Label::builder().label("Sort by").xalign(0.0).css_classes(["heading"]).build());
+            let sort_heading = gtk::Label::builder().label("Sort by").xalign(0.0).css_classes(["heading"]).build();
+            crate::privacy::mark_ui(&sort_heading);
+            content.append(&sort_heading);
             let sort_dropdown = gtk::DropDown::from_strings(&crate::settings::CONTACT_FILE_AS_LABELS);
             sort_dropdown.set_selected(crate::settings::contact_file_as_index(
                 &state.borrow().settings.get_string(crate::settings::CONTACTS_FILE_AS),
@@ -6485,7 +6503,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             content.append(&sort_dropdown);
             content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-            content.append(&gtk::Label::builder().label("Filter").xalign(0.0).css_classes(["heading"]).build());
+            let filter_heading = gtk::Label::builder().label("Filter").xalign(0.0).css_classes(["heading"]).build();
+            crate::privacy::mark_ui(&filter_heading);
+            content.append(&filter_heading);
             let mut categories: Vec<String> = state
                 .borrow()
                 .contacts_by_account
@@ -6499,6 +6519,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             labels.extend(categories.iter().cloned());
             let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
             let category_dropdown = gtk::DropDown::from_strings(&label_refs);
+            // Category names are content: blurred by privacy mode.
+            crate::privacy::mark_content(&category_dropdown);
             let selected_category = state.borrow().contacts_filter_options.category.clone();
             let selected_index = selected_category
                 .as_ref()
@@ -8845,7 +8867,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .default_height(720)
                     .build();
                 let header = adw::HeaderBar::new();
-                header.set_title_widget(Some(&adw::WindowTitle::new("Settings", "")));
+                let settings_title = adw::WindowTitle::new("Settings", "");
+                crate::privacy::mark_ui(&settings_title);
+                header.set_title_widget(Some(&settings_title));
                 let close_button = gtk::Button::from_icon_name("window-close-symbolic");
                 close_button.set_css_classes(&["flat"]);
                 close_button.set_tooltip_text(Some("Close"));
@@ -10736,6 +10760,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 fn contacts_filter_switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
     let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).build();
     let text = gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build();
+    crate::privacy::mark_ui(&text);
     row.append(&text);
     row.append(switch);
     row

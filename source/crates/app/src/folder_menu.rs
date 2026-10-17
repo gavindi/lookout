@@ -355,6 +355,7 @@ impl RowMenu {
 pub fn present_name_dialog(parent: &gtk::Widget, heading: &str, confirm_label: &str, initial: &str, delimiter: char, siblings: Vec<String>, on_confirm: impl Fn(String) + 'static) {
     let entry = gtk::Entry::builder().text(initial).activates_default(true).build();
     let problem_label = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["caption", "error"]).visible(false).build();
+    crate::privacy::mark_ui(&problem_label);
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     content.append(&entry);
     content.append(&problem_label);
