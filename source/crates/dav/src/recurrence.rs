@@ -148,6 +148,7 @@ fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>,
                 categories: event.categories.clone(),
                 sensitivity: event.sensitivity,
                 show_as: event.show_as,
+                status: event.status,
                 reminder_minutes_before: event.reminder_minutes_before,
                 conference_url: event.conference_url.clone(),
             }
@@ -210,6 +211,7 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             categories: event.categories.clone(),
             sensitivity: event.sensitivity,
             show_as: event.show_as,
+            status: event.status,
             reminder_minutes_before: event.reminder_minutes_before,
             conference_url: event.conference_url.clone(),
         }]
@@ -248,6 +250,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: lookout_core::EventSensitivity::default(),
             show_as: lookout_core::BusyStatus::default(),
+            status: lookout_core::EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
             is_online_meeting: false,

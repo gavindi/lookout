@@ -586,6 +586,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: lookout_core::EventSensitivity::default(),
             show_as: lookout_core::BusyStatus::default(),
+            status: lookout_core::EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

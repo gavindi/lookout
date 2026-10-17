@@ -8,7 +8,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike, U
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::prelude::*;
 use lookout_core::calendar_protocol::ConnectionState as CalendarConnectionState;
-use lookout_core::{BusyStatus, CalendarId, CalendarInfo, EventOccurrence};
+use lookout_core::{BusyStatus, CalendarId, CalendarInfo, EventOccurrence, EventSensitivity, EventStatus};
 
 use crate::calendar_colors;
 use crate::context_menu::{ActionSpec, ContextMenu, Dispatch, MenuDescription};
@@ -316,9 +316,10 @@ fn install_calendar_css() {
         .calendar-color-swatch:hover {
             border-color: @accent_bg_color;
         }
-        /* Month-grid event chips are `Gtk.Button`s so they can open an editor;
-           strip the button chrome so they render as the plain colored chips the
-           `.calendar-event-<hex>` rule draws. */
+        /* Month-grid and Split-view event chips are plain boxes (so the grid's
+           own gesture keeps seeing clicks - see `clickable_event_label`); this
+           strips any default box chrome so the `.calendar-event-<hex>` rule
+           alone paints the tint, stripe and radius. */
         .calendar-event-chip-button {
             padding: 0;
             min-width: 0;
@@ -874,33 +875,23 @@ fn attach_month_drag(
     grid.add_controller(gesture);
 }
 
-/// Wraps a month-grid event chip's label in a plain clickable box and
-/// registers it (with its occurrence) in `chip_events` - the lookup the
-/// month-grid gesture uses to find what the pointer hit. The grid gesture
-/// (see `attach_month_drag`) owns press/click handling: a drag-free single
-/// click peeks, a double-click opens the editor, and a drag reschedules.
+/// Marks a month-grid event chip clickable and registers it (with its
+/// occurrence) in `chip_events` - the lookup the month-grid gesture uses to
+/// find what the pointer hit. The grid gesture (see `attach_month_drag`) owns
+/// press/click handling: a drag-free single click peeks, a double-click opens
+/// the editor, and a drag reschedules.
 ///
-/// A `gtk::Box` rather than a `gtk::Button` on purpose: a button's own click
-/// gesture claims the pointer sequence, which starves the ancestor grid's
-/// gesture of the press/release events it needs (so nothing happened at all).
-/// A box has no competing gesture, so the grid gesture sees every click. The
-/// label itself paints the coloured chip; `.calendar-event-chip-button` keeps
-/// the old chrome-strip rule harmless.
-fn clickable_event_label(label: gtk::Label, occ: &EventOccurrence, mg: &MonthGrid) -> gtk::Widget {
-    let chip = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .css_classes(["calendar-event-chip-button", "calendar-event-chip"])
-        .halign(gtk::Align::Fill)
-        .build();
+/// The chip itself is a plain `gtk::Box` (built by [`event_label`]) rather than
+/// a `gtk::Button` on purpose: a button's own click gesture claims the pointer
+/// sequence, which starves the ancestor grid's gesture of the press/release
+/// events it needs (so nothing happened at all). A box has no competing
+/// gesture, so the grid gesture sees every click; `.calendar-event-chip-button`
+/// keeps the old chrome-strip rule harmless.
+fn clickable_event_label(chip: gtk::Widget, occ: &EventOccurrence, mg: &MonthGrid) -> gtk::Widget {
+    chip.add_css_class("calendar-event-chip-button");
     chip.set_cursor_from_name(Some("pointer"));
-    // The label's own background is the coloured chip, so it must fill the
-    // cell-wide chip box (a `gtk::Button` did this implicitly; a plain
-    // child of the horizontal box would otherwise stop at its text width).
-    label.set_hexpand(true);
-    label.set_halign(gtk::Align::Fill);
-    chip.append(&label);
-    mg.chip_events.borrow_mut().insert(chip.clone().upcast(), occ.clone());
-    chip.upcast()
+    mg.chip_events.borrow_mut().insert(chip.clone(), occ.clone());
+    chip
 }
 
 /// The one-line "when" text for the event peek: "All day · Mon 12 Aug" for an
@@ -1047,6 +1038,11 @@ struct TimeChip {
     /// Minutes since local midnight of the chip's *last* column, exclusive
     /// (`1440` means "runs to the next midnight").
     end_minutes: i64,
+    /// Whether this chip is the first (respectively last) piece of its event,
+    /// so a multi-day bar can round the outer corners and leave the inner
+    /// ones square where the bar continues into the next column.
+    starts: bool,
+    ends: bool,
     /// Index into the caller's `EventOccurrence` slice.
     occurrence: usize,
 }
@@ -1787,6 +1783,8 @@ fn drag_ghost_chip(drag: &TimeGridDrag, occurrence: usize) -> TimeChip {
         all_day: drag.all_day,
         start_minutes: drag.live_start % 1440,
         end_minutes,
+        starts: true,
+        ends: true,
         occurrence,
     }
 }
@@ -1921,13 +1919,13 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
     }
     let first = dates[0];
 
-    // (start_col, end_col inclusive, occurrence index) for all-day chips.
-    let mut all_day: Vec<(i64, i64, usize)> = Vec::new();
+    // (start_col, end_col inclusive, starts, ends, occurrence index) for all-day chips.
+    let mut all_day: Vec<(i64, i64, bool, bool, usize)> = Vec::new();
     // (column, start_minutes, end_minutes, occurrence index) for single-day timed events.
     let mut timed: Vec<(i64, i64, i64, usize)> = Vec::new();
-    // (start_col, span_columns, start_minutes, end_minutes, occurrence index)
-    // for timed events that cross midnight / span days.
-    let mut multi: Vec<(i64, i64, i64, i64, usize)> = Vec::new();
+    // (start_col, span_columns, start_minutes, end_minutes, starts, ends,
+    // occurrence index) for timed events that cross midnight / span days.
+    let mut multi: Vec<(i64, i64, i64, i64, bool, bool, usize)> = Vec::new();
 
     for (index, occ) in occurrences.iter().enumerate() {
         let (start_local, end_local) = local_span(occ);
@@ -1954,7 +1952,7 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
             let col_start = start_col.max(0);
             let col_end = end_col.min(n - 1);
             if col_start <= col_end {
-                all_day.push((col_start, col_end, index));
+                all_day.push((col_start, col_end, start_col >= 0, end_col < n, index));
             }
             continue;
         }
@@ -1969,7 +1967,7 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
         let eff_start_minutes = if start_col < 0 { 0 } else { start_minutes };
         let eff_end_minutes = if end_col > n - 1 { 1440 } else { end_minutes };
         if col_end - col_start >= 1 {
-            multi.push((col_start, col_end - col_start + 1, eff_start_minutes, eff_end_minutes, index));
+            multi.push((col_start, col_end - col_start + 1, eff_start_minutes, eff_end_minutes, start_col >= 0, end_col < n, index));
         } else {
             timed.push((col_start, eff_start_minutes, eff_end_minutes, index));
         }
@@ -1981,11 +1979,11 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
     // area). One global greedy lane pass over the whole band keeps a
     // multi-day chip's lane/width consistent across the columns it covers.
     if !all_day.is_empty() {
-        all_day.sort_by_key(|(c0, c1, _)| (*c0, *c1));
-        let ranges: Vec<(i64, i64)> = all_day.iter().map(|(c0, c1, _)| (*c0, *c1 + 1)).collect();
+        all_day.sort_by_key(|(c0, c1, _, _, _)| (*c0, *c1));
+        let ranges: Vec<(i64, i64)> = all_day.iter().map(|(c0, c1, _, _, _)| (*c0, *c1 + 1)).collect();
         let lanes = assign_lanes(&ranges);
         let total = lanes.iter().copied().max().map(|l| l + 1).unwrap_or(1);
-        for (i, (c0, c1, occ_index)) in all_day.iter().enumerate() {
+        for (i, (c0, c1, starts, ends, occ_index)) in all_day.iter().enumerate() {
             chips.push(TimeChip {
                 column: *c0 as usize,
                 span: (*c1 - *c0 + 1) as usize,
@@ -1994,6 +1992,8 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
                 all_day: true,
                 start_minutes: 0,
                 end_minutes: 1440,
+                starts: *starts,
+                ends: *ends,
                 occurrence: *occ_index,
             });
         }
@@ -2001,7 +2001,7 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
 
     // Multi-day timed chips next, as full-width blocks under the lane-shared
     // single-day chips.
-    for (col, span, start_min, end_min, occ_index) in multi {
+    for (col, span, start_min, end_min, starts, ends, occ_index) in multi {
         chips.push(TimeChip {
             column: col as usize,
             span: span as usize,
@@ -2010,6 +2010,8 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
             all_day: false,
             start_minutes: start_min,
             end_minutes: end_min,
+            starts,
+            ends,
             occurrence: occ_index,
         });
     }
@@ -2035,6 +2037,8 @@ fn compute_time_grid_chips(dates: &[NaiveDate], occurrences: &[EventOccurrence])
                     all_day: false,
                     start_minutes: *start_min,
                     end_minutes: *end_min,
+                    starts: true,
+                    ends: true,
                     occurrence: *occ_index,
                 });
             }
@@ -2086,21 +2090,6 @@ fn chip_geometry(gutter: f64, chip: &TimeChip, col_width: f64) -> (f64, f64, f64
         let y = chip.start_minutes as f64 * TIME_SLOT_HEIGHT / 60.0 + 1.0;
         let y_end = chip.end_minutes as f64 * TIME_SLOT_HEIGHT / 60.0 - 1.0;
         (x, y, w, (y_end - y).max(6.0))
-    }
-}
-
-/// The event chip's label text: "9:30am Summary" when the chip is tall enough
-/// to fit a time prefix, otherwise just the summary (all-day chips always
-/// show just the summary).
-fn chip_text(occ: &EventOccurrence, chip: &TimeChip, chip_height: f64) -> String {
-    let summary = occ.summary.as_deref().unwrap_or("(untitled)");
-    if chip.all_day {
-        summary.to_string()
-    } else if chip_height >= 20.0 {
-        let time = format_event_time(&local_span(occ).0);
-        format!("{time} {summary}")
-    } else {
-        summary.to_string()
     }
 }
 
@@ -2372,46 +2361,413 @@ fn oof_fill(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
     (0.45 * r + 0.55 * OOF_PURPLE.0, 0.45 * g + 0.55 * OOF_PURPLE.1, 0.45 * b + 0.55 * OOF_PURPLE.2)
 }
 
-fn fill_rect(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: (f64, f64, f64), alpha: f64) {
-    let (x, y, w, h) = rect;
-    cr.rectangle(x, y, w, h);
-    cr.set_source_rgba(color.0, color.1, color.2, alpha);
-    let _ = cr.fill();
+/// The width of the colour stripe down the left edge of an entry (UX-57).
+const ENTRY_EDGE_WIDTH: f64 = 5.0;
+
+/// The corner radius of an entry.
+const ENTRY_RADIUS: f64 = 3.0;
+
+/// The base alpha of an entry's soft fill over the calendar pane, before the
+/// per-show-as strength scales it. Kept low so the pane's (possibly
+/// image-backed) background shows through - the fill is a tint, not a slab -
+/// while still reading as a distinct block in both light and dark themes.
+const ENTRY_FILL_ALPHA: f64 = 0.30;
+
+/// How much a hover brightens an entry's fill.
+const ENTRY_HOVER_BOOST: f64 = 0.08;
+
+/// Text size of an entry's title, and of its dimmer meta line.
+const ENTRY_TITLE_SIZE: f64 = 10.5;
+const ENTRY_META_SIZE: f64 = 9.5;
+
+/// How the left stripe of an entry is drawn - the state "Show as" carries
+/// (CAL-05, UX-57): solid for busy/away, dotted for working elsewhere,
+/// hatched for tentative and hollow (an outline) for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeKind {
+    Solid,
+    Hollow,
+    Hatched,
+    Dotted,
 }
 
-fn stroke_rect(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: (f64, f64, f64), alpha: f64, width: f64) {
-    let (x, y, w, h) = rect;
-    cr.rectangle(x, y, w, h);
-    cr.set_source_rgba(color.0, color.1, color.2, alpha);
-    cr.set_line_width(width);
-    let _ = cr.stroke();
+/// Everything [`paint_entry`] needs about one entry's colours and state,
+/// derived from its calendar colour, "Show as" and `STATUS`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EntryLook {
+    /// The soft fill colour (the calendar colour, or the OOF purple).
+    fill: (f64, f64, f64),
+    /// Alpha of the fill over the pane.
+    fill_alpha: f64,
+    /// The stripe's colour.
+    edge: (f64, f64, f64),
+    edge_kind: EdgeKind,
+    /// Whether the whole entry is outlined (Free).
+    outline: bool,
+    /// Alpha of the title text (the theme foreground).
+    ink_alpha: f64,
+    /// Alpha of the dim meta text.
+    dim_alpha: f64,
+    /// Whether the title is struck through (a cancelled event).
+    strike: bool,
 }
 
-/// Diagonal hatching across the chip: the tentative fill, clipped to the
-/// chip's rectangle so no line escapes it.
-fn hatch_rect(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: (f64, f64, f64), alpha: f64) {
-    let (x, y, w, h) = rect;
+/// Derives an entry's look. `alpha` scales the fill (the drag ghost paints at
+/// a lower alpha so the grid stays readable under it), and a cancelled event's
+/// fill and text fade.
+fn entry_look(rgb: (f64, f64, f64), show_as: BusyStatus, status: EventStatus, hovered: bool, alpha: f64) -> EntryLook {
+    let style = chip_style(show_as);
+    let (strength, edge_kind) = match style {
+        ChipStyle::Solid => (1.0, EdgeKind::Solid),
+        ChipStyle::Oof => (1.0, EdgeKind::Solid),
+        ChipStyle::Dotted => (0.8, EdgeKind::Dotted),
+        ChipStyle::Hatched => (0.6, EdgeKind::Hatched),
+        ChipStyle::Hollow => (0.2, EdgeKind::Hollow),
+    };
+    // Away keeps the calendar's colour in its fill (tinted toward purple) but
+    // draws its stripe in Outlook's own OOF purple.
+    let (fill, edge) = match style {
+        ChipStyle::Oof => (oof_fill(rgb.0, rgb.1, rgb.2), OOF_PURPLE),
+        _ => (rgb, rgb),
+    };
+    let base = if hovered { ENTRY_FILL_ALPHA + ENTRY_HOVER_BOOST } else { ENTRY_FILL_ALPHA };
+    let cancelled = status == EventStatus::Cancelled;
+    let mut fill_alpha = base * strength * alpha;
+    if cancelled {
+        fill_alpha *= 0.5;
+    }
+    EntryLook {
+        fill,
+        fill_alpha,
+        edge,
+        edge_kind,
+        outline: style == ChipStyle::Hollow,
+        ink_alpha: if cancelled { 0.5 } else { 0.95 },
+        dim_alpha: if cancelled { 0.38 } else { 0.62 },
+        strike: cancelled,
+    }
+}
+
+/// A small status mark drawn at the right of an entry (UX-57).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Recurrence,
+    Private,
+    Meeting,
+    OnlineMeeting,
+    Reminder,
+}
+
+/// The marks an occurrence earns, in draw order (left to right).
+fn entry_marks(occ: &EventOccurrence) -> Vec<Mark> {
+    let mut marks = Vec::new();
+    if occ.rrule.is_some() {
+        marks.push(Mark::Recurrence);
+    }
+    if occ.sensitivity != EventSensitivity::Public {
+        marks.push(Mark::Private);
+    }
+    if !occ.attendees.is_empty() {
+        marks.push(Mark::Meeting);
+    }
+    if occ.conference_url.is_some() {
+        marks.push(Mark::OnlineMeeting);
+    }
+    if occ.reminder_minutes_before.is_some() {
+        marks.push(Mark::Reminder);
+    }
+    marks
+}
+
+/// Builds a rounded-rectangle sub-path with a per-corner radius
+/// (`[top-left, top-right, bottom-right, bottom-left]`), clamping each to the
+/// half-extent so a small chip still draws cleanly.
+fn rounded_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, radii: [f64; 4]) {
+    let cap = (w / 2.0).min(h / 2.0);
+    let [tl, tr, br, bl] = radii.map(|r| r.clamp(0.0, cap));
+    cr.new_sub_path();
+    cr.arc(x + w - tr, y + tr, tr, -std::f64::consts::FRAC_PI_2, 0.0);
+    cr.arc(x + w - br, y + h - br, br, 0.0, std::f64::consts::FRAC_PI_2);
+    cr.arc(x + bl, y + h - bl, bl, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+    cr.arc(x + tl, y + tl, tl, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+    cr.close_path();
+}
+
+/// Paints the colour stripe down the left edge of an entry. `corners` are the
+/// entry's own outer radii (`[tl, tr, br, bl]`); only the stripe's left
+/// corners inherit them, the right side stays square against the body.
+fn paint_edge(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, look: &EntryLook, corners: [f64; 4]) {
+    let radii = [corners[0], 0.0, 0.0, corners[3]];
+    let (r, g, b) = look.edge;
+    match look.edge_kind {
+        EdgeKind::Solid => {
+            rounded_rect(cr, x, y, w, h, radii);
+            cr.set_source_rgba(r, g, b, 1.0);
+            let _ = cr.fill();
+        }
+        EdgeKind::Hollow => {
+            rounded_rect(cr, x + 0.5, y, (w - 1.0).max(0.0), h, radii);
+            cr.set_source_rgba(r, g, b, 0.9);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+        }
+        EdgeKind::Dotted => {
+            let _ = cr.save();
+            rounded_rect(cr, x + 0.6, y + 0.6, (w - 1.2).max(0.0), (h - 1.2).max(0.0), radii);
+            cr.set_dash(&[2.0, 2.0], 0.0);
+            cr.set_source_rgba(r, g, b, 1.0);
+            cr.set_line_width(1.2);
+            let _ = cr.stroke();
+            cr.set_dash(&[], 0.0);
+            let _ = cr.restore();
+        }
+        EdgeKind::Hatched => {
+            let _ = cr.save();
+            rounded_rect(cr, x, y, w, h, radii);
+            cr.clip();
+            cr.set_source_rgba(r, g, b, 0.3);
+            let _ = cr.paint();
+            cr.set_source_rgba(r, g, b, 1.0);
+            cr.set_line_width(1.0);
+            let mut offset = -h;
+            while offset < w + h {
+                cr.move_to(x + offset, y + h);
+                cr.line_to(x + offset + h, y);
+                offset += 4.0;
+            }
+            let _ = cr.stroke();
+            let _ = cr.restore();
+        }
+    }
+}
+
+/// Draws one line of entry text at `baseline`, ellipsized to `max_width`, in
+/// the theme foreground at `alpha`; strikes it through when `strike`.
+/// Returns the drawn width.
+#[allow(clippy::too_many_arguments)]
+fn paint_entry_text(
+    cr: &gtk::cairo::Context,
+    left: f64,
+    baseline: f64,
+    max_width: f64,
+    text: &str,
+    size: f64,
+    weight: FontWeight,
+    fg: (f64, f64, f64),
+    alpha: f64,
+    strike: bool,
+) -> f64 {
+    if max_width <= 2.0 || text.is_empty() {
+        return 0.0;
+    }
+    cr.select_font_face("Sans", FontSlant::Normal, weight);
+    cr.set_font_size(size);
+    let drawn = ellipsize_text(cr, text, max_width);
+    if drawn.is_empty() {
+        return 0.0;
+    }
+    cr.set_source_rgba(fg.0, fg.1, fg.2, alpha);
+    cr.move_to(left, baseline);
+    let _ = cr.show_text(&drawn);
+    let width = cr.text_extents(&drawn).map(|e| e.x_advance()).unwrap_or(0.0);
+    if strike {
+        let mid = baseline - size * 0.34;
+        cr.set_line_width(1.0);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, alpha);
+        cr.move_to(left, mid);
+        cr.line_to(left + width, mid);
+        let _ = cr.stroke();
+    }
+    width
+}
+
+/// Paints one small vector status mark, top-left at `(x, y)` in a `size` box.
+fn paint_mark(cr: &gtk::cairo::Context, mark: Mark, x: f64, y: f64, size: f64, fg: (f64, f64, f64), alpha: f64) {
+    let cx = x + size / 2.0;
+    let cy = y + size / 2.0;
+    let s = size;
+    cr.set_source_rgba(fg.0, fg.1, fg.2, alpha);
+    cr.set_line_width(1.1);
+    match mark {
+        // A circular arrow with a small head.
+        Mark::Recurrence => {
+            let r = s * 0.30;
+            cr.arc(cx, cy, r, -std::f64::consts::FRAC_PI_2, 1.15 * std::f64::consts::PI);
+            let _ = cr.stroke();
+            let (ax, ay) = (cx, cy - r);
+            cr.move_to(ax - 2.0, ay + 0.5);
+            cr.line_to(ax + 2.0, ay + 0.5);
+            cr.line_to(ax, ay - 2.5);
+            cr.close_path();
+            let _ = cr.fill();
+        }
+        // A padlock: a shackle over a body.
+        Mark::Private => {
+            cr.rectangle(x + s * 0.26, y + s * 0.46, s * 0.48, s * 0.40);
+            let _ = cr.fill();
+            cr.arc(cx, y + s * 0.46, s * 0.17, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+            let _ = cr.stroke();
+        }
+        // Two people: a head and a shoulder each.
+        Mark::Meeting => {
+            cr.arc(x + s * 0.34, y + s * 0.36, s * 0.13, 0.0, 2.0 * std::f64::consts::PI);
+            let _ = cr.fill();
+            cr.arc(x + s * 0.34, y + s * 0.86, s * 0.22, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+            let _ = cr.fill();
+            cr.arc(x + s * 0.72, y + s * 0.42, s * 0.10, 0.0, 2.0 * std::f64::consts::PI);
+            let _ = cr.fill();
+            cr.arc(x + s * 0.72, y + s * 0.86, s * 0.16, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+            let _ = cr.fill();
+        }
+        // A camera: a body with a lens-triangle to its right.
+        Mark::OnlineMeeting => {
+            cr.rectangle(x + s * 0.10, y + s * 0.34, s * 0.48, s * 0.32);
+            let _ = cr.fill();
+            cr.move_to(x + s * 0.62, y + s * 0.42);
+            cr.line_to(x + s * 0.90, y + s * 0.30);
+            cr.line_to(x + s * 0.90, y + s * 0.70);
+            cr.line_to(x + s * 0.62, y + s * 0.58);
+            cr.close_path();
+            let _ = cr.fill();
+        }
+        // A bell with a clapper.
+        Mark::Reminder => {
+            cr.move_to(x + s * 0.18, y + s * 0.74);
+            cr.arc(cx, y + s * 0.46, s * 0.30, std::f64::consts::PI, 2.0 * std::f64::consts::PI);
+            cr.line_to(x + s * 0.82, y + s * 0.74);
+            cr.close_path();
+            let _ = cr.fill();
+            cr.arc(cx, y + s * 0.86, s * 0.08, 0.0, 2.0 * std::f64::consts::PI);
+            let _ = cr.fill();
+        }
+    }
+}
+
+/// Paints `marks` right-to-left from `right_x`, centred on `center_y`, and
+/// returns the x the entry's text must stop before (never left of `min_x`).
+fn paint_marks(cr: &gtk::cairo::Context, marks: &[Mark], right_x: f64, center_y: f64, fg: (f64, f64, f64), alpha: f64, min_x: f64) -> f64 {
+    let size = 10.0;
+    let gap = 3.0;
+    let mut stop = right_x;
+    let mut x = right_x - size;
+    for mark in marks {
+        if x < min_x {
+            break;
+        }
+        paint_mark(cr, *mark, x, center_y - size / 2.0, size, fg, alpha);
+        stop = x - gap;
+        x -= size + gap;
+    }
+    stop
+}
+
+/// The content of one entry: what to draw inside the block.
+struct EntryContent<'a> {
+    title: &'a str,
+    /// A dim second run, drawn after the title on one line or under it on a
+    /// tall block (the event's time, then its location).
+    meta: Option<String>,
+    marks: Vec<Mark>,
+    strike: bool,
+}
+
+/// Paints one event entry the UX-57 way: a soft calendar-colour tint, a colour
+/// stripe down the left edge whose style carries the "Show as" state, the
+/// title (and dim meta) in the theme foreground, and the status marks at the
+/// right. `corners` gives the entry's outer radii so a multi-day bar can stay
+/// square on the side that continues into the next column; `stacked` puts the
+/// meta on its own line on a block tall enough to hold it.
+#[allow(clippy::too_many_arguments)]
+fn paint_entry(cr: &gtk::cairo::Context, (x, y, w, h): (f64, f64, f64, f64), corners: [f64; 4], look: &EntryLook, content: &EntryContent, fg: (f64, f64, f64), stacked: bool) {
+    if w < 2.0 || h < 2.0 {
+        return;
+    }
     let _ = cr.save();
     cr.rectangle(x, y, w, h);
     cr.clip();
-    cr.set_source_rgba(color.0, color.1, color.2, alpha);
-    cr.set_line_width(1.0);
-    let step = 6.0;
-    let mut offset = -h;
-    while offset < w + h {
-        cr.move_to(x + offset, y + h);
-        cr.line_to(x + offset + h, y);
-        offset += step;
+
+    rounded_rect(cr, x, y, w, h, corners);
+    cr.set_source_rgba(look.fill.0, look.fill.1, look.fill.2, look.fill_alpha);
+    let _ = cr.fill();
+
+    if look.outline {
+        rounded_rect(cr, x + 0.5, y + 0.5, (w - 1.0).max(0.0), (h - 1.0).max(0.0), corners);
+        cr.set_source_rgba(look.edge.0, look.edge.1, look.edge.2, 0.8);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
     }
-    let _ = cr.stroke();
+
+    let edge_w = ENTRY_EDGE_WIDTH.min(w);
+    paint_edge(cr, x, y, edge_w, h, look, corners);
+    if w < 20.0 {
+        let _ = cr.restore();
+        return;
+    }
+
+    let left = x + edge_w + 4.0;
+    let right = x + w - 4.0;
+    let stop = paint_marks(cr, &content.marks, right, y + h / 2.0, fg, look.dim_alpha, left + 18.0);
+
+    if stacked && h >= 30.0 {
+        let title_baseline = y + 12.0 + ENTRY_TITLE_SIZE * CHIP_TEXT_BASELINE_OFFSET;
+        paint_entry_text(
+            cr,
+            left,
+            title_baseline,
+            stop - left,
+            content.title,
+            ENTRY_TITLE_SIZE,
+            FontWeight::Bold,
+            fg,
+            look.ink_alpha,
+            content.strike,
+        );
+        if let Some(meta) = content.meta.as_deref() {
+            let meta_baseline = y + 24.0 + ENTRY_META_SIZE * CHIP_TEXT_BASELINE_OFFSET;
+            if meta_baseline < y + h - 1.0 {
+                paint_entry_text(cr, left, meta_baseline, right - left, meta, ENTRY_META_SIZE, FontWeight::Normal, fg, look.dim_alpha, false);
+            }
+        }
+    } else {
+        let baseline = y + h / 2.0 + ENTRY_TITLE_SIZE * CHIP_TEXT_BASELINE_OFFSET;
+        let used = paint_entry_text(
+            cr,
+            left,
+            baseline,
+            stop - left,
+            content.title,
+            ENTRY_TITLE_SIZE,
+            FontWeight::Bold,
+            fg,
+            look.ink_alpha,
+            content.strike,
+        );
+        if let Some(meta) = content.meta.as_deref() {
+            let gap = 6.0;
+            if stop - left - used > gap + 14.0 {
+                paint_entry_text(
+                    cr,
+                    left + used + gap,
+                    baseline,
+                    stop - left - used - gap,
+                    meta,
+                    ENTRY_META_SIZE,
+                    FontWeight::Normal,
+                    fg,
+                    look.dim_alpha,
+                    false,
+                );
+            }
+        }
+    }
     let _ = cr.restore();
 }
 
-/// Paints one event chip (fill, outline, hover ring, and its label). `alpha`
-/// scales the fill opacity - the drag ghost paints at a lower alpha so the
-/// grid stays readable under it. `fg` is the canvas's theme foreground, used
-/// as the text colour on the light-filled styles where a white/dark-on-colour
-/// choice doesn't apply.
+/// Paints one event chip in the Day/Week time grid or the all-day band: its
+/// calendar colour, "Show as" state, title/meta and marks, with rounded ends
+/// for a multi-day bar. `alpha` scales the fill (the drag ghost paints at a
+/// lower alpha so the grid stays readable under it); `fg` is the canvas's
+/// theme foreground, the text colour on every entry.
 #[allow(clippy::too_many_arguments)]
 fn paint_chip(
     cr: &gtk::cairo::Context,
@@ -2426,90 +2782,56 @@ fn paint_chip(
 ) {
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
     let (cx, cy, cw, ch) = chip_geometry(gutter, chip, col_width);
-    paint_event_block(cr, (cx, cy, cw, ch), color, occ.show_as, &chip_text(occ, chip, ch), hovered, alpha, fg);
+    let look = entry_look(css_color_rgb(color), occ.show_as, occ.status, hovered, alpha);
+    let corners = entry_corners(chip.starts, chip.ends, chip.all_day || chip.span > 1);
+    let content = entry_content(occ, ch);
+    paint_entry(cr, (cx, cy, cw, ch), corners, &look, &content, fg, ch >= 30.0);
 }
 
-/// Paints an event block into `rect`: the calendar-colour fill/outline, the
-/// hover ring and the label, styled per show-as state (CAL-05, UX-57). Shared
-/// by the Day/Week time-grid chips ([`paint_chip`]) and the Schedule view's
-/// lanes, so both read identically. `alpha` scales the fill opacity; `fg` is
-/// the canvas's theme foreground, the text colour on the light-filled styles.
-#[allow(clippy::too_many_arguments)]
-fn paint_event_block(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: &str, show_as: BusyStatus, label: &str, hovered: bool, alpha: f64, fg: (f64, f64, f64)) {
-    let (cx, cy, cw, ch) = rect;
-    if cw < 2.0 || ch < 2.0 {
-        return;
+/// The outer radii of an entry: all four corners for a single-day chip, but
+/// only the sides a multi-day bar actually begins/ends on are rounded so the
+/// bar reads as continuous where it runs into the next column.
+fn entry_corners(starts: bool, ends: bool, bar: bool) -> [f64; 4] {
+    if !bar {
+        return [ENTRY_RADIUS; 4];
     }
-    let (r, g, b) = css_color_rgb(color);
-    let style = chip_style(show_as);
-    let chip_color = (r, g, b);
-    let inset = (cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
-    match style {
-        // Busy: the original solid fill with its dark hairline border.
-        ChipStyle::Solid => {
-            fill_rect(cr, rect, chip_color, 0.92 * alpha);
-            stroke_rect(cr, inset, (0.0, 0.0, 0.0), 0.35, 1.0);
-        }
-        // Away: solid, purple-tinted.
-        ChipStyle::Oof => {
-            fill_rect(cr, rect, oof_fill(r, g, b), 0.92 * alpha);
-            stroke_rect(cr, inset, (0.0, 0.0, 0.0), 0.35, 1.0);
-        }
-        // Tentative: a light wash under diagonal hatching.
-        ChipStyle::Hatched => {
-            fill_rect(cr, rect, chip_color, 0.30 * alpha);
-            hatch_rect(cr, rect, chip_color, 0.85 * alpha);
-            stroke_rect(cr, inset, (0.0, 0.0, 0.0), 0.35, 1.0);
-        }
-        // Free: outline only, in the calendar's own colour.
-        ChipStyle::Hollow => {
-            stroke_rect(cr, (cx + 0.75, cy + 0.75, cw - 1.5, ch - 1.5), chip_color, 0.9 * alpha, 1.5);
-        }
-        // Working elsewhere: a translucent fill with a dotted outline.
-        ChipStyle::Dotted => {
-            fill_rect(cr, rect, chip_color, 0.55 * alpha);
-            let _ = cr.save();
-            cr.set_dash(&[3.0, 3.0], 0.0);
-            stroke_rect(cr, (cx + 0.75, cy + 0.75, cw - 1.5, ch - 1.5), chip_color, 0.95 * alpha, 1.2);
-            cr.set_dash(&[], 0.0);
-            let _ = cr.restore();
-        }
-    }
-    if hovered {
-        cr.rectangle(cx + 0.5, cy + 0.5, cw - 1.0, ch - 1.0);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
-        let _ = cr.stroke();
-    }
-    // On the solid styles the text contrast is decided by the fill colour; on
-    // the light-filled/hollow styles it follows the theme's foreground.
-    let text_color = match style {
-        ChipStyle::Solid => readable_chip_color(color),
-        ChipStyle::Oof => readable_chip_color(&css_color_to_hex(oof_fill(r, g, b))),
-        ChipStyle::Dotted => readable_chip_color(color),
-        ChipStyle::Hatched | ChipStyle::Hollow => (fg.0, fg.1, fg.2, 0.95),
-    };
-    let text = ellipsize_text(cr, label, (cw - 8.0).max(4.0));
-    if !text.is_empty() {
-        cr.set_source_rgba(text_color.0, text_color.1, text_color.2, text_color.3);
-        cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Normal);
-        cr.set_font_size(10.0);
-        cr.move_to(cx + 4.0, cy + ch / 2.0 + 10.0 * CHIP_TEXT_BASELINE_OFFSET);
-        let _ = cr.show_text(&text);
-    }
+    let left = if starts { ENTRY_RADIUS } else { 0.0 };
+    let right = if ends { ENTRY_RADIUS } else { 0.0 };
+    // [top-left, top-right, bottom-right, bottom-left]
+    [left, right, right, left]
 }
 
-/// White or near-black text for a chip fill, by luminance (the old inline
-/// choice, now shared by the tinted Away fill).
-fn readable_chip_color(hex: &str) -> (f64, f64, f64, f64) {
-    if calendar_colors::readable_foreground(hex) == "white" {
-        (1.0, 1.0, 1.0, 0.95)
+/// The title and dim meta line for an occurrence rendered in a `height`-tall
+/// entry. A timed event shows its time; a tall block shows the range, and the
+/// title is struck through when the event is cancelled.
+fn entry_content(occ: &EventOccurrence, height: f64) -> EntryContent<'_> {
+    let (start, end) = local_span(occ);
+    let meta = if occ.all_day {
+        None
+    } else if height >= 30.0 {
+        Some(format!("{} – {}", format_event_time(&start), format_event_time(&end)))
     } else {
-        (0.0, 0.0, 0.0, 0.85)
+        Some(format_event_time(&start))
+    };
+    EntryContent {
+        title: occ.summary.as_deref().unwrap_or("(untitled)"),
+        meta,
+        marks: entry_marks(occ),
+        strike: occ.status == EventStatus::Cancelled,
     }
 }
 
-fn css_color_to_hex((r, g, b): (f64, f64, f64)) -> String {
-    format!("#{:02x}{:02x}{:02x}", (r * 255.0).round() as u8, (g * 255.0).round() as u8, (b * 255.0).round() as u8)
+/// Paints one event block in the Schedule view's lanes with the shared UX-57
+/// entry look, so a schedule block reads like the Day/Week chips.
+fn paint_schedule_block(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: &str, occ: &EventOccurrence, hovered: bool, fg: (f64, f64, f64)) {
+    let look = entry_look(css_color_rgb(color), occ.show_as, occ.status, hovered, 0.95);
+    let content = EntryContent {
+        title: occ.summary.as_deref().unwrap_or("(untitled)"),
+        meta: None,
+        marks: entry_marks(occ),
+        strike: occ.status == EventStatus::Cancelled,
+    };
+    paint_entry(cr, rect, [ENTRY_RADIUS; 4], &look, &content, fg, false);
 }
 
 /// Draws `text` right-aligned so its right edge lands on `right_x`, with `y`
@@ -2671,7 +2993,7 @@ pub fn set_agenda(
                 .css_classes(["caption"])
                 .hexpand(true)
                 .build();
-            apply_event_color(&summary_label, &occ.calendar_id, colors);
+            apply_event_classes(summary_label.upcast_ref(), occ, colors);
 
             row.append(&time_label);
             row.append(&summary_label);
@@ -3085,8 +3407,7 @@ fn paint_schedule(cr: &gtk::cairo::Context, width: f64, height: f64, state: &Sch
         // The lane's event blocks.
         for (block_index, block) in lane.blocks.iter().enumerate() {
             let rect = schedule_block_rect(lane_index, block, width);
-            let label = block.occ.summary.as_deref().unwrap_or("(untitled)");
-            paint_event_block(cr, rect, &lane.color, block.occ.show_as, label, hover == Some((lane_index, block_index)), 0.95, fg);
+            paint_schedule_block(cr, rect, &lane.color, &block.occ, hover == Some((lane_index, block_index)), fg);
         }
 
         // Row separator.
@@ -3540,32 +3861,94 @@ fn week_start(anchor: NaiveDate, first: chrono::Weekday) -> NaiveDate {
     anchor - chrono::Duration::days(offset)
 }
 
-/// A single event's compact label: "5:00pm Summary", or just "Summary" for an
-/// all-day event. The label carries the `.calendar-event-<hex>` class matching
-/// its calendar's colour so it renders as a coloured chip.
-fn event_label(occ: &EventOccurrence, colors: &HashMap<CalendarId, String>) -> gtk::Label {
-    let text = if occ.all_day {
-        occ.summary.clone().unwrap_or_else(|| "(untitled)".to_string())
-    } else {
-        let time = format_event_time(&local_span(occ).0);
-        format!("{time} {}", occ.summary.as_deref().unwrap_or("(untitled)"))
-    };
-    let label = gtk::Label::builder()
-        .label(&text)
+/// Builds one month/Split-grid event chip (UX-57): a soft calendar-colour tint
+/// with a stripe down its left edge (from the `.calendar-event-<hex>` class
+/// [`apply_event_classes`] applies), a dim time, the title, and the event's
+/// status marks. A plain box, not a button, so the ancestor month grid's
+/// gesture still sees every click (see [`clickable_event_label`]).
+fn event_label(occ: &EventOccurrence, colors: &HashMap<CalendarId, String>) -> gtk::Widget {
+    let chip = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .hexpand(true)
+        .halign(gtk::Align::Fill)
+        .css_classes(["calendar-event-chip"])
+        .build();
+    apply_event_classes(chip.upcast_ref(), occ, colors);
+
+    if !occ.all_day {
+        let time = gtk::Label::builder()
+            .label(format_event_time(&local_span(occ).0))
+            .css_classes(["dim-label", "caption"])
+            .xalign(0.0)
+            .build();
+        chip.append(&time);
+    }
+    let title = gtk::Label::builder()
+        .label(occ.summary.as_deref().unwrap_or("(untitled)"))
+        .css_classes(["caption"])
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
-        .css_classes(["caption"])
+        .hexpand(true)
         .build();
-    apply_event_color(&label, &occ.calendar_id, colors);
-    label
+    chip.append(&title);
+
+    if let Some(marks) = entry_marks_box(occ) {
+        chip.append(&marks);
+    }
+    chip.upcast()
 }
 
-/// Adds the `.calendar-event-<hex>` class to `label` for `calendar_id`'s
-/// colour, or does nothing if the colour is unknown. The class's CSS rule is
-/// generated alongside the checkbox rules in [`rebuild_calendar_checklist`].
-fn apply_event_color(label: &gtk::Label, calendar_id: &CalendarId, colors: &HashMap<CalendarId, String>) {
-    if let Some(color) = colors.get(calendar_id) {
-        label.add_css_class(&format!("calendar-event-{}", color.trim_start_matches('#')));
+/// A small row of status marks (recurring, private, meeting, online, reminder;
+/// UX-57) for a widget chip, or `None` when the event has none. The cairo views
+/// draw the same marks as vectors - see [`paint_mark`].
+fn entry_marks_box(occ: &EventOccurrence) -> Option<gtk::Widget> {
+    let marks = entry_marks(occ);
+    if marks.is_empty() {
+        return None;
+    }
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).valign(gtk::Align::Center).build();
+    for mark in marks {
+        let image = gtk::Image::builder().icon_name(mark_icon_name(mark)).pixel_size(12).css_classes(["dim-label"]).build();
+        row.append(&image);
+    }
+    Some(row.upcast())
+}
+
+/// The themed symbolic icon for a status mark (widget chips only).
+fn mark_icon_name(mark: Mark) -> &'static str {
+    match mark {
+        Mark::Recurrence => "view-refresh-symbolic",
+        Mark::Private => "changes-prevent-symbolic",
+        Mark::Meeting => "system-users-symbolic",
+        Mark::OnlineMeeting => "camera-web-symbolic",
+        Mark::Reminder => "alarm-symbolic",
+    }
+}
+
+/// The CSS class naming one "Show as" state, whose tint/stripe variant rule is
+/// generated alongside the colour class in [`rebuild_calendar_checklist`].
+fn show_as_css_class(show_as: BusyStatus) -> &'static str {
+    match show_as {
+        BusyStatus::Busy => "calendar-show-busy",
+        BusyStatus::Free => "calendar-show-free",
+        BusyStatus::Tentative => "calendar-show-tentative",
+        BusyStatus::Oof => "calendar-show-oof",
+        BusyStatus::WorkingElsewhere => "calendar-show-working-elsewhere",
+    }
+}
+
+/// Applies the `.calendar-event-<hex>` colour class (or nothing when the
+/// calendar has no colour), the per-"Show as" state class, and the cancelled
+/// fade to an event chip. The colour rule is generated alongside the checkbox
+/// rules in [`rebuild_calendar_checklist`].
+fn apply_event_classes(widget: &gtk::Widget, occ: &EventOccurrence, colors: &HashMap<CalendarId, String>) {
+    if let Some(color) = colors.get(&occ.calendar_id) {
+        widget.add_css_class(&format!("calendar-event-{}", color.trim_start_matches('#')));
+    }
+    widget.add_css_class(show_as_css_class(occ.show_as));
+    if occ.status == EventStatus::Cancelled {
+        widget.add_css_class("calendar-event-cancelled");
     }
 }
 
@@ -4248,14 +4631,21 @@ fn draw_calendar_indicator(cr: &gtk::cairo::Context, width: i32, height: i32, co
 }
 
 /// The CSS rule for one calendar's colour: the `.calendar-event-<hex>` chip
-/// rule that [`event_label`] applies to occurrences of each calendar. The
-/// checklist's own indicator is hand-drawn (see [`calendar_toggle_row`]) and
-/// needs no CSS.
+/// rule that [`event_label`] applies to occurrences of each calendar, plus the
+/// per-"Show as" variants (UX-57). The chip is a soft tint of the calendar
+/// colour over the pane's translucent background, with the state carried by a
+/// stripe down its left edge: solid (busy/away), dashed (tentative), dotted
+/// (working elsewhere) or a hollow outline (free). The checklist's own
+/// indicator is hand-drawn (see [`calendar_toggle_row`]) and needs no CSS.
 fn calendar_color_css(color: &str) -> String {
-    let fg = calendar_colors::readable_foreground(color);
+    let hex = color.trim_start_matches('#');
     format!(
-        ".calendar-event-{} {{ background-color: {color}; color: {fg}; border-radius: 4px; padding: 1px 4px; }}\n",
-        color.trim_start_matches('#')
+        ".calendar-event-{hex} {{ background-color: alpha({color}, 0.30); border-left: 5px solid {color}; border-radius: 3px; padding: 1px 4px; }}\n\
+         .calendar-event-{hex}.calendar-show-tentative {{ background-color: alpha({color}, 0.16); border-left: 5px dashed {color}; }}\n\
+         .calendar-event-{hex}.calendar-show-working-elsewhere {{ background-color: alpha({color}, 0.22); border-left: 5px dotted {color}; }}\n\
+         .calendar-event-{hex}.calendar-show-free {{ background-color: transparent; border: 1px solid alpha({color}, 0.7); border-left: 5px solid {color}; }}\n\
+         .calendar-event-{hex}.calendar-show-oof {{ background-color: alpha(#7b2cbf, 0.30); border-left: 5px solid #7b2cbf; }}\n\
+         .calendar-event-{hex}.calendar-event-cancelled {{ opacity: 0.6; }}\n"
     )
 }
 
@@ -4387,6 +4777,73 @@ mod tests {
         assert_eq!(chip_style(BusyStatus::Tentative), ChipStyle::Hatched);
         assert_eq!(chip_style(BusyStatus::Oof), ChipStyle::Oof);
         assert_eq!(chip_style(BusyStatus::WorkingElsewhere), ChipStyle::Dotted);
+    }
+
+    /// UX-57: "Show as" sets the stripe style and the fill strength (busy
+    /// strongest, free faintest), and Away draws a purple stripe whatever the
+    /// calendar's colour.
+    #[test]
+    fn entry_look_carries_the_show_as_state_on_the_edge() {
+        let blue = (0.2, 0.5, 0.9);
+        let busy = entry_look(blue, BusyStatus::Busy, EventStatus::Confirmed, false, 1.0);
+        assert_eq!(busy.edge_kind, EdgeKind::Solid);
+        assert!(!busy.outline);
+        assert_eq!(busy.edge, blue);
+
+        assert_eq!(entry_look(blue, BusyStatus::Tentative, EventStatus::Confirmed, false, 1.0).edge_kind, EdgeKind::Hatched);
+        assert_eq!(
+            entry_look(blue, BusyStatus::WorkingElsewhere, EventStatus::Confirmed, false, 1.0).edge_kind,
+            EdgeKind::Dotted
+        );
+
+        let free = entry_look(blue, BusyStatus::Free, EventStatus::Confirmed, false, 1.0);
+        assert_eq!(free.edge_kind, EdgeKind::Hollow);
+        assert!(free.outline, "free entries are outlined");
+        assert!(free.fill_alpha < busy.fill_alpha, "free fills fainter than busy");
+
+        let away = entry_look(blue, BusyStatus::Oof, EventStatus::Confirmed, false, 1.0);
+        assert_eq!(away.edge, OOF_PURPLE, "away uses the OOF purple stripe");
+        assert_ne!(away.fill, blue);
+
+        let hovered = entry_look(blue, BusyStatus::Busy, EventStatus::Confirmed, true, 1.0);
+        assert!(hovered.fill_alpha > busy.fill_alpha, "hover brightens");
+    }
+
+    /// UX-57: a cancelled event fades and its title is struck through.
+    #[test]
+    fn entry_look_fades_cancelled_events() {
+        let ok = entry_look((0.2, 0.5, 0.9), BusyStatus::Busy, EventStatus::Confirmed, false, 1.0);
+        let cancelled = entry_look((0.2, 0.5, 0.9), BusyStatus::Busy, EventStatus::Cancelled, false, 1.0);
+        assert!(cancelled.strike);
+        assert!(cancelled.fill_alpha < ok.fill_alpha);
+        assert!(cancelled.ink_alpha < ok.ink_alpha);
+    }
+
+    /// A single-day chip rounds every corner; a multi-day bar stays square on
+    /// the side that continues into the next column.
+    #[test]
+    fn entry_corners_round_only_the_bar_ends() {
+        assert_eq!(entry_corners(true, true, false), [ENTRY_RADIUS; 4]);
+        // Continues to the right: the right corners are square.
+        assert_eq!(entry_corners(true, false, true), [ENTRY_RADIUS, 0.0, 0.0, ENTRY_RADIUS]);
+        // Continues to the left: the left corners are square.
+        assert_eq!(entry_corners(false, true, true), [0.0, ENTRY_RADIUS, ENTRY_RADIUS, 0.0]);
+    }
+
+    /// The marks an occurrence earns, left to right (UX-57).
+    #[test]
+    fn entry_marks_reflect_the_event_flags() {
+        let mut occ = occ(
+            "Sync",
+            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap().and_hms_opt(9, 0, 0).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 12).unwrap().and_hms_opt(10, 0, 0).unwrap(),
+            false,
+        );
+        assert!(entry_marks(&occ).is_empty());
+        occ.rrule = Some("FREQ=WEEKLY".to_string());
+        occ.sensitivity = EventSensitivity::Private;
+        occ.reminder_minutes_before = Some(10);
+        assert_eq!(entry_marks(&occ), vec![Mark::Recurrence, Mark::Private, Mark::Reminder]);
     }
 
     /// An Away chip is 55% Outlook's OOF purple over the calendar's colour:
@@ -4554,6 +5011,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: lookout_core::EventSensitivity::default(),
             show_as: lookout_core::BusyStatus::default(),
+            status: lookout_core::EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }
@@ -4907,6 +5365,12 @@ mod tests {
         let round_tripped = provider.to_str();
         assert!(!round_tripped.is_empty(), "calendar colour CSS did not parse");
         assert!(round_tripped.contains("calendar-event-3584e4"));
+        // The show-as variants survive parsing too (the stripe style carries
+        // the state, UX-57).
+        assert!(round_tripped.contains("calendar-show-tentative"), "tentative variant written");
+        assert!(round_tripped.contains("calendar-show-free"), "free variant written");
+        assert!(round_tripped.contains("calendar-show-working-elsewhere"), "working-elsewhere variant written");
+        assert!(round_tripped.contains("calendar-show-oof"), "away variant written");
 
         let multi = format!("{}{}", calendar_color_css("#e5a50a"), calendar_color_css("#56b9c4"));
         provider.load_from_string(&multi);

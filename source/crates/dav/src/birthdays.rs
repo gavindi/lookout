@@ -90,6 +90,7 @@ pub fn birthday_occurrences(account_id: &AccountId, calendar_id: &CalendarId, co
                 categories: Vec::new(),
                 sensitivity: lookout_core::EventSensitivity::Public,
                 show_as: lookout_core::BusyStatus::Free,
+                status: lookout_core::EventStatus::Confirmed,
                 // "At time of event": the alert fires as the birthday day
                 // begins (the reminder engine computes `start - minutes` in
                 // local time, so 0 = local midnight).

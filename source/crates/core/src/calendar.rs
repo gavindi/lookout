@@ -72,6 +72,21 @@ pub enum EventSensitivity {
     Confidential,
 }
 
+/// RFC 5545 §3.8.1.11 `STATUS` on a VEVENT: the event's own lifecycle state.
+/// `Confirmed` is the RFC default and the value a plain event carries;
+/// `Tentative` marks a provisional booking (Outlook also expresses this
+/// through "Show as", but a non-Outlook source writes it here); `Cancelled`
+/// means the organizer withdrew the event, so the views fade and strike it
+/// through. This is independent of [`BusyStatus`] (`TRANSP`/"Show as"), which
+/// only says whether the time is blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EventStatus {
+    #[default]
+    Confirmed,
+    Tentative,
+    Cancelled,
+}
+
 /// RFC 5545 `RANGE` parameter on a `RECURRENCE-ID` (§3.2.13): how far a
 /// per-occurrence override reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -246,6 +261,12 @@ pub struct CalendarEvent {
     /// 3.3 readable.
     #[serde(default, rename = "show_as", alias = "transparency")]
     pub show_as: BusyStatus,
+    /// RFC 5545 §3.8.1.11 `STATUS`: the event's own lifecycle state (see
+    /// [`EventStatus`]). Distinct from `show_as`, which only describes
+    /// time-blocking - a `Cancelled` event is struck through and faded in the
+    /// calendar views whatever its "Show as" says.
+    #[serde(default)]
+    pub status: EventStatus,
     /// Minutes before `start` a `VALARM` (DISPLAY) should fire. `None` means
     /// no reminder. Only a single alarm is modeled - multiple/repeating
     /// `VALARM`s are out of scope for this pass.
@@ -352,6 +373,9 @@ pub struct EventOccurrence {
     /// The occurrence's "Show as" state (see [`CalendarEvent::show_as`]).
     #[serde(default, rename = "show_as", alias = "transparency")]
     pub show_as: BusyStatus,
+    /// The occurrence's lifecycle state (see [`CalendarEvent::status`]).
+    #[serde(default)]
+    pub status: EventStatus,
     #[serde(default)]
     pub reminder_minutes_before: Option<i64>,
     #[serde(default)]

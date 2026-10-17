@@ -97,35 +97,6 @@ fn is_hex_color(c: &str) -> bool {
     matches!(body, Some(b) if (b.len() == 3 || b.len() == 6 || b.len() == 8) && b.chars().all(|ch| ch.is_ascii_hexdigit()))
 }
 
-/// Parses a `#rgb`/`#rrggbb`/`#rrggbbaa` colour to `(r, g, b)` (alpha ignored).
-fn parse_hex_rgb(c: &str) -> Option<(u8, u8, u8)> {
-    let body = c.strip_prefix('#')?;
-    let body = match body.len() {
-        3 => return parse_expanded_hex(body),
-        6 => body,
-        8 => &body[..6],
-        _ => return None,
-    };
-    if body.chars().any(|ch| !ch.is_ascii_hexdigit()) {
-        return None;
-    }
-    Some((
-        u8::from_str_radix(&body[0..2], 16).ok()?,
-        u8::from_str_radix(&body[2..4], 16).ok()?,
-        u8::from_str_radix(&body[4..6], 16).ok()?,
-    ))
-}
-
-/// `#abc` expands to `#aabbcc`.
-fn parse_expanded_hex(body: &str) -> Option<(u8, u8, u8)> {
-    if body.chars().any(|ch| !ch.is_ascii_hexdigit()) {
-        return None;
-    }
-    let byte = |ch: char| u8::from_str_radix(&ch.to_string().repeat(2), 16).ok();
-    let mut chars = body.chars();
-    Some((byte(chars.next()?)?, byte(chars.next()?)?, byte(chars.next()?)?))
-}
-
 /// Formats a picked colour's 0.0-1.0 RGB components (as a `gtk::gdk::RGBA`
 /// carries them, `f32`) as the `#rrggbb` string the map stores. Components are
 /// clamped, so a slightly out-of-range value from a colour dialog can't
@@ -142,28 +113,6 @@ pub fn rgba_to_hex(r: f32, g: f32, b: f32) -> String {
 /// window's action handler and its tests agree on the result.
 pub fn automatic_color(server_color: Option<&str>, index: usize) -> String {
     resolve_color(server_color, CALENDAR_PALETTE[index % CALENDAR_PALETTE.len()])
-}
-
-/// A foreground colour that stays readable against `background` as an event
-/// chip: `"white"` for dark backgrounds, `"black"` for light ones. Uses the
-/// standard sRGB-relative luminance, so bright calendar colours (yellows,
-/// light greens) still get legible text.
-pub fn readable_foreground(background: &str) -> &'static str {
-    let Some((r, g, b)) = parse_hex_rgb(background) else { return "white" };
-    let lin = |c: u8| {
-        let c = c as f64 / 255.0;
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let luminance = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
-    if luminance > 0.4 {
-        "black"
-    } else {
-        "white"
-    }
 }
 
 /// Assigns a colour to every calendar in `calendars` that doesn't have one in
@@ -252,24 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn readable_foreground_contrasts_with_background() {
-        assert_eq!(readable_foreground("#ffffff"), "black");
-        assert_eq!(readable_foreground("#000000"), "white");
-        assert_eq!(readable_foreground("#3584e4"), "white");
-        assert_eq!(readable_foreground("#e5a50a"), "black");
-        assert_eq!(readable_foreground("#abc"), "black");
-        assert_eq!(readable_foreground("not-a-color"), "white");
-    }
-
-    #[test]
-    fn rgba_to_hex_round_trips_through_parse_hex_rgb() {
+    fn rgba_to_hex_formats_and_clamps() {
         // The colour dialog hands components back as 0.0-1.0 floats; the map
-        // stores hex, so the conversion must agree with the parser the rest of
-        // this module (and the CSS class names) work from.
+        // stores hex, so the conversion must produce the `#rrggbb` string the
+        // CSS class names are built from.
         assert_eq!(rgba_to_hex(1.0, 1.0, 1.0), "#ffffff");
         assert_eq!(rgba_to_hex(0.0, 0.0, 0.0), "#000000");
         assert_eq!(rgba_to_hex(0.2, 0.5, 0.25), "#338040");
-        assert_eq!(parse_hex_rgb(&rgba_to_hex(0.2, 0.5, 0.25)), Some((0x33, 0x80, 0x40)));
         // Out-of-range components clamp rather than producing a malformed hex.
         assert_eq!(rgba_to_hex(-0.5, 1.5, 0.0), "#00ff00");
     }

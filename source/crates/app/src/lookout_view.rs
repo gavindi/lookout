@@ -995,6 +995,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: Default::default(),
             show_as: Default::default(),
+            status: Default::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

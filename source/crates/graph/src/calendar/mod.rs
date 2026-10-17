@@ -33,7 +33,7 @@ pub use client::CalendarClient;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use lookout_core::{
-    AccountId, Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarInfo, EmailAddress, EventOccurrence, EventSensitivity, EventUid,
+    AccountId, Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarInfo, EmailAddress, EventOccurrence, EventSensitivity, EventStatus, EventUid,
 };
 use serde_json::{json, Value};
 
@@ -94,6 +94,7 @@ pub fn event_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<Calen
         categories: string_array(value, "categories"),
         sensitivity: sensitivity_from_graph(value.get("sensitivity").and_then(Value::as_str)),
         show_as: show_as_from_graph(value),
+        status: event_status_from_graph(value),
         reminder_minutes_before: reminder_minutes(value),
         conference_url: conference_url(value),
         is_online_meeting: is_online_meeting(value),
@@ -137,6 +138,7 @@ pub fn occurrence_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<
         categories: string_array(value, "categories"),
         sensitivity: sensitivity_from_graph(value.get("sensitivity").and_then(Value::as_str)),
         show_as: show_as_from_graph(value),
+        status: event_status_from_graph(value),
         reminder_minutes_before: reminder_minutes(value),
         conference_url: conference_url(value),
     })
@@ -364,6 +366,18 @@ fn is_online_meeting(value: &Value) -> bool {
 
 fn show_as_from_graph(value: &Value) -> BusyStatus {
     value.get("showAs").and_then(Value::as_str).and_then(BusyStatus::from_graph).unwrap_or_default()
+}
+
+/// The event's lifecycle state from Graph's `isCancelled` boolean. Graph has
+/// no separate `STATUS`, and `tentative` is carried by `showAs` rather than
+/// status, so this reads only `Confirmed`/`Cancelled` (a `true` `isCancelled`
+/// marks an event the organizer withdrew). Absent reads as `Confirmed`.
+fn event_status_from_graph(value: &Value) -> EventStatus {
+    if value.get("isCancelled").and_then(Value::as_bool).unwrap_or(false) {
+        EventStatus::Cancelled
+    } else {
+        EventStatus::Confirmed
+    }
 }
 
 fn sensitivity_from_graph(value: Option<&str>) -> EventSensitivity {
@@ -711,6 +725,17 @@ mod tests {
         assert_eq!(event.attendees[0].status, AttendeeStatus::Accepted);
         assert_eq!(event.attendees[1].role, AttendeeRole::Optional);
         assert_eq!(event.attendees[1].status, AttendeeStatus::Tentative);
+    }
+
+    /// Graph carries a cancelled event as `isCancelled: true` (no separate
+    /// STATUS); everything else reads as Confirmed.
+    #[test]
+    fn event_status_reads_graphs_is_cancelled() {
+        let mut value = sample_event();
+        value["isCancelled"] = json!(true);
+        assert_eq!(event_from_graph(&value, &calendar_id()).unwrap().status, EventStatus::Cancelled);
+        assert_eq!(occurrence_from_graph(&value, &calendar_id()).unwrap().status, EventStatus::Cancelled);
+        assert_eq!(event_from_graph(&sample_event(), &calendar_id()).unwrap().status, EventStatus::Confirmed);
     }
 
     #[test]

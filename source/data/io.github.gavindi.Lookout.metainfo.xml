@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.241" date="2026-10-17">
+      <description>
+        <p>Calendar event chips take on Outlook's look: a soft calendar-colour tint with a colour stripe down the left edge whose style shows the event's "Show as" state, a bold title with a dim time, and small marks for recurring, private, meeting, online and reminder. VEVENT STATUS (confirmed / tentative / cancelled) is now read and written, so a cancelled event fades and strikes through, and Microsoft 365's isCancelled is honoured.</p>
+      </description>
+    </release>
     <release version="0.9.238" date="2026-10-17">
       <description>
         <p>The Calendar sidebar's calendars gain a per-calendar menu - change the colour from a palette or a colour picker (written back to CalDAV servers as calendar-color), rename, share, remove, and move between user-defined groups - plus named groups with their own Rename/Delete and a "Show all" to bring back removed calendars.</p>

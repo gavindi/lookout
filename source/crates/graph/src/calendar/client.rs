@@ -49,7 +49,7 @@ const MAX_PERMISSIONS: usize = 500;
 
 /// The `$select` fields the calendar-view read needs (exactly what the mapper
 /// consumes, so full bodies aren't fetched).
-const EVENT_SELECT: &str = "$select=id,changeKey,iCalUId,subject,body,start,end,isAllDay,location,showAs,sensitivity,categories,isReminderOn,reminderMinutesBeforeStart,organizer,attendees,onlineMeeting,onlineMeetingUrl";
+const EVENT_SELECT: &str = "$select=id,changeKey,iCalUId,subject,body,start,end,isAllDay,location,showAs,sensitivity,categories,isCancelled,isReminderOn,reminderMinutesBeforeStart,organizer,attendees,onlineMeeting,onlineMeetingUrl";
 
 /// The calendar HTTP operations, over a shared [`GraphClient`].
 pub struct CalendarClient {

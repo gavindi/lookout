@@ -2085,6 +2085,7 @@ pub(crate) fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>
             categories: occ.categories.clone(),
             sensitivity: occ.sensitivity,
             show_as: occ.show_as,
+            status: occ.status,
             reminder_minutes_before: occ.reminder_minutes_before,
             conference_url: occ.conference_url.clone(),
             is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),

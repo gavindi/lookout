@@ -27,8 +27,8 @@ pub mod vcard;
 
 pub use automatic_replies::{AutomaticReplies, AutomaticRepliesError, AutomaticReplyStatus, ExternalAudience};
 pub use calendar::{
-    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventTransparency, RecurrenceRange, ScheduleAgent,
-    SchedulingInfo, TaskPriority, TaskStatus, WebcalSubscription,
+    Attendee, AttendeeRole, AttendeeStatus, CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, EventSensitivity, EventStatus, EventTransparency, RecurrenceRange,
+    ScheduleAgent, SchedulingInfo, TaskPriority, TaskStatus, WebcalSubscription,
 };
 pub use email::{
     cid_matches, display_name_address_mismatch, header_value, is_auto_submitted, is_external_sender, is_report_message, parse_disposition_notification_to, parse_imip_method,

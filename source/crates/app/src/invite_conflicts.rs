@@ -76,6 +76,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: Default::default(),
             show_as,
+            status: Default::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }

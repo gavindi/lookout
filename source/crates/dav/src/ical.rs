@@ -2,11 +2,12 @@
 /// Software released under the GPL3 license
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use icalendar::{
-    Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, PartStat, Property, Role, TodoStatus, Trigger,
+    Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, EventStatus as IcalEventStatus, PartStat,
+    Property, Role, TodoStatus, Trigger,
 };
 use lookout_core::interop::{cdo, onlinemeeting};
 use lookout_core::{
-    Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventUid, ImipInvitation, ImipMethod,
+    Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventStatus, EventUid, ImipInvitation, ImipMethod,
     RecurrenceRange, ScheduleAgent, TaskPriority, TaskStatus, TaskUid,
 };
 
@@ -107,6 +108,7 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         categories: parse_categories(event),
         sensitivity: event.get_class().map(from_ical_class).unwrap_or_default(),
         show_as: parse_show_as(event),
+        status: parse_event_status(event),
         conference_url: online_meeting_url(event),
         // A CalDAV/iMIP event carries no Graph Teams-meeting flag; the join
         // URL (parsed above) is the only online-meeting signal.
@@ -286,6 +288,25 @@ fn parse_show_as(event: &icalendar::Event) -> BusyStatus {
             Some("TRANSPARENT") => BusyStatus::Free,
             _ => BusyStatus::Busy,
         })
+}
+
+/// The event's RFC 5545 §3.8.1.11 `STATUS`. Anything absent or unrecognised
+/// (including `NEEDS-ACTION`, which is nonsensical on a VEVENT) reads as the
+/// RFC default `Confirmed`, so a plain event is unchanged.
+fn parse_event_status(event: &icalendar::Event) -> EventStatus {
+    match event.get_status() {
+        Some(IcalEventStatus::Tentative) => EventStatus::Tentative,
+        Some(IcalEventStatus::Cancelled) => EventStatus::Cancelled,
+        _ => EventStatus::Confirmed,
+    }
+}
+
+fn to_ical_status(status: EventStatus) -> IcalEventStatus {
+    match status {
+        EventStatus::Tentative => IcalEventStatus::Tentative,
+        EventStatus::Confirmed => IcalEventStatus::Confirmed,
+        EventStatus::Cancelled => IcalEventStatus::Cancelled,
+    }
 }
 
 fn to_ical_class(sensitivity: EventSensitivity) -> Class {
@@ -824,6 +845,11 @@ fn build_vevent_form(event: &CalendarEvent, form: Option<ImipMethod>) -> icalend
     }
     if form == Some(ImipMethod::Cancel) {
         vevent.append_property(Property::new("STATUS", "CANCELLED"));
+    } else if event.status != EventStatus::Confirmed {
+        // RFC 5545 §3.8.1.11 `STATUS`: written only when it says something a
+        // reader can't already assume, so a confirmed event grows no noise.
+        // An iMIP `CANCEL` is handled above (it always says `CANCELLED`).
+        vevent.status(to_ical_status(event.status));
     }
 
     vevent
@@ -1070,6 +1096,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
+            status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
             is_online_meeting: false,
@@ -1202,6 +1229,35 @@ mod tests {
         let events = parse_vevents(&cal_id(), ics_set);
         assert_eq!(events[0].sensitivity, EventSensitivity::Confidential);
         assert_eq!(events[0].show_as, BusyStatus::Free);
+    }
+
+    /// RFC 5545 §3.8.1.11: a VEVENT's `STATUS` reads into `EventStatus`
+    /// (absent = Confirmed), and the writer round-trips Tentative/Cancelled
+    /// while leaving a Confirmed event's ICS free of the property.
+    #[test]
+    fn parses_and_writes_event_status() {
+        let base = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:st-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\n";
+        let absent = format!("{base}END:VEVENT\r\nEND:VCALENDAR\r\n");
+        assert_eq!(parse_vevents(&cal_id(), &absent)[0].status, EventStatus::Confirmed);
+
+        let cancelled = format!("{base}STATUS:CANCELLED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        assert_eq!(parse_vevents(&cal_id(), &cancelled)[0].status, EventStatus::Cancelled);
+
+        let tentative = format!("{base}STATUS:TENTATIVE\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+        assert_eq!(parse_vevents(&cal_id(), &tentative)[0].status, EventStatus::Tentative);
+
+        // Confirmed (the RFC default) writes nothing...
+        let ics = build_vcalendar(&full_event());
+        assert!(!ics.contains("STATUS:"), "confirmed writes no STATUS: {ics}");
+        // ...while the other states round-trip.
+        let mut event = full_event();
+        event.status = EventStatus::Cancelled;
+        let ics = build_vcalendar(&event);
+        assert!(ics.contains("STATUS:CANCELLED"), "cancelled is written: {ics}");
+        assert_eq!(parse_vevents(&cal_id(), &ics)[0].status, EventStatus::Cancelled);
+        let mut event = full_event();
+        event.status = EventStatus::Tentative;
+        assert_eq!(parse_vevents(&cal_id(), &build_vcalendar(&event))[0].status, EventStatus::Tentative);
     }
 
     /// CAL-05: Outlook's five show-as states come from

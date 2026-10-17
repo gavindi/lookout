@@ -22,7 +22,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
 use lookout_core::{
-    Attendee, AttendeeAvailability, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventUid,
+    Attendee, AttendeeAvailability, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventStatus, EventUid,
     FreeBusyInterval, RecurrenceRange,
 };
 
@@ -1207,6 +1207,7 @@ pub fn show_event_editor(
                     _ => EventSensitivity::Public,
                 },
                 show_as: show_as_from_index(busy_dropdown.selected()),
+                status: existing.as_ref().map(|occ| occ.status).unwrap_or_default(),
                 reminder_minutes_before: reminder_choices.get(reminder_dropdown.selected() as usize).and_then(|(_, m)| *m),
                 video_enabled: video_toggle.is_active(),
                 conference_url_text: video_url_row.text().to_string(),
@@ -1598,6 +1599,7 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
         categories: Vec::new(),
         sensitivity: EventSensitivity::default(),
         show_as: BusyStatus::default(),
+        status: EventStatus::default(),
         reminder_minutes_before: None,
         conference_url: None,
     }
@@ -1914,6 +1916,10 @@ struct FormInput {
     categories: Vec<String>,
     sensitivity: EventSensitivity,
     show_as: BusyStatus,
+    /// The event's lifecycle status (see [`CalendarEvent::status`]), carried
+    /// through an edit so a cancelled event isn't silently revived. The form
+    /// has no status control yet.
+    status: EventStatus,
     reminder_minutes_before: Option<i64>,
     video_enabled: bool,
     conference_url_text: String,
@@ -2036,6 +2042,7 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         categories: occ.categories.clone(),
         sensitivity: occ.sensitivity,
         show_as: occ.show_as,
+        status: occ.status,
         reminder_minutes_before: occ.reminder_minutes_before,
         conference_url: occ.conference_url.clone(),
         is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
@@ -2111,6 +2118,7 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         categories: input.categories,
         sensitivity: input.sensitivity,
         show_as: input.show_as,
+        status: input.status,
         reminder_minutes_before: input.reminder_minutes_before,
         // A typed Teams URL (or a Teams link carried over) means "this is a
         // Teams meeting", so a Graph write preserves/creates the link; the
@@ -2139,6 +2147,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: EventSensitivity::Public,
             show_as: BusyStatus::Busy,
+            status: EventStatus::Confirmed,
             reminder_minutes_before: None,
             video_enabled: false,
             conference_url_text: String::new(),
@@ -2230,6 +2239,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
+            status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         }
@@ -2428,6 +2438,7 @@ mod tests {
             categories: vec!["team".to_string()],
             sensitivity: EventSensitivity::Private,
             show_as: BusyStatus::Free,
+            status: EventStatus::default(),
             reminder_minutes_before: Some(10),
             conference_url: Some("https://meet.example.com/x".to_string()),
         };
@@ -2528,6 +2539,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
+            status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         };
@@ -2572,6 +2584,7 @@ mod tests {
             categories: Vec::new(),
             sensitivity: EventSensitivity::default(),
             show_as: BusyStatus::default(),
+            status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
         };
