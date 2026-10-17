@@ -155,6 +155,47 @@ pub(crate) fn install_paned_css() {
         .ribbon-group-label {
             margin-right: 6px;
         }
+        /* The command ribbon's groups: a run of controls above a caption,
+           parted from its neighbour by a vertical rule. The caption and the
+           classic icon-over-label layout appear only in the Classic mode
+           (`ribbon.rs` toggles `.ribbon-classic` on the band).
+
+           The geometry must land on the *button* node, never the control's
+           host: a `GtkButton`/`GtkToggleButton` is the button itself, but a
+           `GtkMenuButton`/`AdwSplitButton` is a container whose own `button`
+           child is what the eye sees - styling only the host there leaves the
+           inner button at Adwaita's default size. Hence `button.ribbon-control`
+           for the plain cases and the `>` child selectors for the rest. */
+        .ribbon {
+            padding: 1px 2px;
+        }
+        .ribbon-group {
+            margin: 0 2px;
+        }
+        .ribbon-group-caption {
+            font-size: 0.72em;
+            opacity: 0.65;
+            margin-top: 1px;
+        }
+        .ribbon-divider {
+            margin: 3px 2px;
+        }
+        button.ribbon-control,
+        .ribbon-control > button,
+        .ribbon-control > menubutton > button {
+            padding: 2px 6px;
+            min-height: 0;
+            min-width: 0;
+        }
+        .ribbon-classic button.ribbon-control,
+        .ribbon-classic .ribbon-control > button,
+        .ribbon-classic .ribbon-control > menubutton > button {
+            padding: 4px 8px;
+            min-height: 52px;
+        }
+        .ribbon-classic .ribbon-group-caption {
+            margin-top: 2px;
+        }
         button.list-header-action {
             min-width: 24px;
             min-height: 24px;
@@ -691,10 +732,10 @@ pub(crate) fn importance_icon_and_tooltip(importance: lookout_core::Importance) 
 /// message(s) are pinned (`\Flagged`) - active only when every selected
 /// message is pinned (including nothing selected, which reads as inactive).
 /// Mirrors `apply_favorite_visual`'s icon-swap convention.
-pub(crate) fn refresh_pin_button(button: &gtk::Button, message_list: &MessageListModel) {
+pub(crate) fn refresh_pin_button(icon: &crate::ribbon::RibbonIcon, message_list: &MessageListModel) {
     let summaries = message_list.selected_summaries();
     let pinned = !summaries.is_empty() && summaries.iter().all(|s| s.is_pinned());
-    set_pin_button_state(button, pinned);
+    icon.set_icon_name(pin_icon_name(pinned));
 }
 
 /// The Mark Read/Unread icon+tooltip for what clicking would currently do -
@@ -722,12 +763,12 @@ pub(crate) fn mark_read_button_icon(mark_read_action: bool) -> (&'static str, &'
 /// everything unread) - matching the same aggregate direction the click
 /// handler itself computes. Mirrors `apply_favorite_visual`'s icon-swap
 /// convention.
-pub(crate) fn refresh_mark_read_button(button: &gtk::Button, message_list: &MessageListModel) {
+pub(crate) fn refresh_mark_read_button(icon: &crate::ribbon::RibbonIcon, message_list: &MessageListModel) {
     let summaries = message_list.selected_summaries();
     let mark_read = summaries.is_empty() || summaries.iter().any(|s| s.is_unread());
-    let (icon, tooltip) = mark_read_button_icon(mark_read);
-    button.set_icon_name(icon);
-    button.set_tooltip_text(Some(tooltip));
+    let (icon_name, tooltip) = mark_read_button_icon(mark_read);
+    icon.set_icon_name(icon_name);
+    icon.set_tooltip_text(Some(tooltip));
 }
 
 /// The first of `candidates` the current icon theme actually has. Icon names

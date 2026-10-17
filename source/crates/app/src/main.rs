@@ -70,6 +70,7 @@ mod recurrence;
 mod reminders;
 mod reply_with_meeting;
 mod resources;
+mod ribbon;
 mod rules;
 mod rules_view;
 mod schedule_grid;

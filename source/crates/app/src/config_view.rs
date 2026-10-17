@@ -245,6 +245,10 @@ pub struct ConfigView {
     /// boolean and `layout-reading-pane-position` key, and apply a change
     /// through the same path as the View ribbon's dropdown.
     pub reading_pane_row: adw::ComboRow,
+    /// "Ribbon style" dropdown (Config → Appearance): Simplified / Classic.
+    /// Exposed so the caller can seed it from the `ribbon-style` key and
+    /// apply a change through the ribbon's own layout switch.
+    pub ribbon_style_row: adw::ComboRow,
     /// "Message preview" dropdown (Config → Appearance): Off / 1 / 2 / 3
     /// lines of body preview per message-list row.
     pub preview_lines_row: adw::ComboRow,
@@ -964,6 +968,15 @@ pub fn build() -> ConfigView {
         .model(&reading_pane_model)
         .build();
     appearance_group.add(&reading_pane_row);
+    // The command ribbon's layout: Simplified (one row, the label beside the
+    // icon) or Classic (the icon over the label, captioned groups). Mirrors
+    // the ribbon's own "Ribbon layout" menu.
+    let ribbon_style_row = adw::ComboRow::builder()
+        .title("Ribbon style")
+        .subtitle("How the command ribbon lays its actions out")
+        .model(&gtk::StringList::new(&["Simplified", "Classic"]))
+        .build();
+    appearance_group.add(&ribbon_style_row);
     // How many body-preview lines each message-list row shows.
     let preview_lines_model = gtk::StringList::new(&["Off", "1 line", "2 lines", "3 lines"]);
     let preview_lines_row = adw::ComboRow::builder()
@@ -1160,6 +1173,7 @@ pub fn build() -> ConfigView {
         message_theme_dark_row,
         spacing_row,
         reading_pane_row,
+        ribbon_style_row,
         preview_lines_row,
         show_sender_images_row,
         conversations_row,

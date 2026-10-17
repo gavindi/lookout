@@ -632,6 +632,14 @@ pub(crate) fn show_composer_in_reading_pane_full(
         let directory_lookup = directory_lookup.clone();
         Rc::new(move |anchor, on_add| crate::contact_picker::show_contact_picker(&anchor, state.clone(), Some(directory_lookup.clone()), on_add))
     };
+    // The composer's ribbon shares the window's layout state, so a layout
+    // switch reaches it too. `unwrap_or_else` only guards a build order where
+    // `build_window` hasn't stored it yet.
+    let ribbon_style = state
+        .borrow()
+        .ribbon_style
+        .clone()
+        .unwrap_or_else(|| crate::ribbon::RibbonStyle::new(crate::ribbon::RibbonMode::default()));
     let (composer, editor_toolbar, draft_tx, identities_refresh) = crate::compose::build_compose_view(
         title,
         // The composer's From dropdown re-reads from here whenever the
@@ -720,6 +728,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             }))
         },
         pop_out_on_open,
+        ribbon_style,
     );
     // Replacing any previous composer's relay (dropped sender = its consumer
     // exits), and hooking the Config manage-identities dialog into the new

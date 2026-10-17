@@ -849,6 +849,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         search_entry: None,
         search_ribbon: None,
         search_ribbon_prev: None,
+        ribbon_style: None,
     }))
 }
 

@@ -45,6 +45,11 @@ pub const WINDOW_BACKGROUND_PATH: &str = "window-background-path";
 pub const BACKGROUND_BRIGHTNESS: &str = "background-brightness";
 pub const THEME_ID: &str = "theme-id";
 pub const ACCENT_COLOR: &str = "accent-color";
+/// How the command ribbon lays its actions out: one of the two
+/// `ribbon::RibbonMode` codes ("simplified" default, "classic").
+pub const RIBBON_STYLE: &str = "ribbon-style";
+/// Whether the command ribbon is collapsed to its tab strip (Ctrl+F1).
+pub const RIBBON_COLLAPSED: &str = "ribbon-collapsed";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 /// Where the reading pane sits: one of [`READING_PANE_POSITIONS`] ("right"
@@ -357,6 +362,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PREFETCH_BATCH_SIZE, Value::Int(1));
     map.insert(PREFETCH_REFRESH_INTERVAL_MINUTES, Value::Int(60));
     map.insert(PRIVACY_BLUR_MODE, Value::String("off".into()));
+    map.insert(RIBBON_STYLE, Value::String("simplified".into()));
+    map.insert(RIBBON_COLLAPSED, Value::Bool(false));
     map
 }
 

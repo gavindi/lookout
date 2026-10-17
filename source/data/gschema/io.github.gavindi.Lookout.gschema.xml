@@ -85,6 +85,16 @@
       <summary>Accent colour</summary>
       <description>A CSS colour string (as written by gdk::RGBA::to_str) used app-wide instead of the system accent; empty means follow the system accent.</description>
     </key>
+    <key name="ribbon-style" type="s">
+      <default>'simplified'</default>
+      <summary>Ribbon style</summary>
+      <description>How the command ribbon lays its actions out: 'simplified' is one row with the label beside each icon, 'classic' stacks the icon over the label and captions each group.</description>
+    </key>
+    <key name="ribbon-collapsed" type="b">
+      <default>false</default>
+      <summary>Ribbon collapsed</summary>
+      <description>Whether the command ribbon is collapsed to just its tab strip (Ctrl+F1 toggles it), as in Outlook's classic ribbon.</description>
+    </key>
 
     <!-- View → Layout -->
     <key name="layout-folder-pane" type="b">

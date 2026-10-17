@@ -1662,6 +1662,11 @@ pub(crate) struct UiState {
     /// The ribbon stack's visible child before the search row was shown, kept
     /// so `exit_search` restores exactly what the user was looking at.
     pub(crate) search_ribbon_prev: Option<String>,
+    /// The shared ribbon layout state (`ribbon.rs`): the mode in force and
+    /// every live band, so one Simplified/Classic switch reaches the main
+    /// window's ribbon and any open composer's toolbar alike. `None` only
+    /// until `build_window` creates it.
+    pub(crate) ribbon_style: Option<crate::ribbon::RibbonStyle>,
 }
 
 impl UiState {

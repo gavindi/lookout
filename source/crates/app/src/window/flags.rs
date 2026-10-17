@@ -37,10 +37,10 @@ pub(crate) fn follow_up_icon_name(flagged: bool) -> &'static str {
 /// The toolbar Flag button's icon and tooltip for the selection: filled
 /// "Clear flag" when any selected message has an open follow-up flag (what a
 /// click then does), outline "Flag" otherwise.
-pub(crate) fn refresh_flag_button(button: &adw::SplitButton, message_list: &MessageListModel) {
+pub(crate) fn refresh_flag_button(icon: &crate::ribbon::RibbonIcon, message_list: &MessageListModel) {
     let flagged = message_list.selected_summaries().iter().any(EmailSummary::is_flagged_for_follow_up);
-    button.set_icon_name(follow_up_icon_name(flagged));
-    button.set_tooltip_text(Some(if flagged { "Clear flag" } else { "Flag" }));
+    icon.set_icon_name(follow_up_icon_name(flagged));
+    icon.set_tooltip_text(Some(if flagged { "Clear flag" } else { "Flag" }));
 }
 
 /// The row's hover Flag button for `flag`, mirroring `refresh_flag_button`.

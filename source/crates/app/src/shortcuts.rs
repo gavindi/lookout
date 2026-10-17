@@ -81,6 +81,9 @@ pub const ACTION_CONTACTS: &str = "contacts";
 pub const ACTION_TASKS: &str = "tasks";
 pub const ACTION_LOOKOUT: &str = "lookout";
 pub const ACTION_CONFIG: &str = "config";
+/// Collapses or expands the command ribbon to just its tab strip - Outlook's
+/// Ctrl+F1 (`ribbon-collapsed` in GSettings).
+pub const ACTION_TOGGLE_RIBBON: &str = "toggle-ribbon";
 
 /// The nine Quick Step slots (item 2.6 / M-15): each runs the quick step in
 /// that gallery position on the selected messages, matching Outlook's
@@ -241,6 +244,12 @@ pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
         action: ACTION_CONFIG,
         title: "Go to Settings",
         keyval: gdk::Key::_6,
+        modifiers: CONTROL,
+    },
+    DefaultShortcut {
+        action: ACTION_TOGGLE_RIBBON,
+        title: "Collapse / expand the ribbon",
+        keyval: gdk::Key::F1,
         modifiers: CONTROL,
     },
     DefaultShortcut {
@@ -589,7 +598,7 @@ mod tests {
             let key = d.keyval.to_lower();
             assert!(chords.insert((d.modifiers & MODIFIER_MASK, key)), "duplicate chord for {}", d.action);
         }
-        assert_eq!(actions.len(), 31);
+        assert_eq!(actions.len(), 32);
     }
 
     #[test]

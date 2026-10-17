@@ -49,8 +49,8 @@ pub(crate) fn spawn_account_discovery(
     current_lookout_page: Rc<Cell<&'static str>>,
     lookout_view_button: gtk::ToggleButton,
     dashboard_refresh: Rc<dyn Fn()>,
-    mark_read_button: gtk::Button,
-    pin_button: gtk::Button,
+    mark_read_button: crate::ribbon::RibbonIcon,
+    pin_button: crate::ribbon::RibbonIcon,
 ) {
     let (goa_tx, goa_rx) = async_channel::bounded(1);
     worker.spawn(async move {
@@ -220,8 +220,8 @@ pub(crate) fn connect_account(
     list_header: ListHeader,
     account: lookout_goa::GoaMailAccount,
     dashboard_refresh: Rc<dyn Fn()>,
-    mark_read_button: gtk::Button,
-    pin_button: gtk::Button,
+    mark_read_button: crate::ribbon::RibbonIcon,
+    pin_button: crate::ribbon::RibbonIcon,
 ) {
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
@@ -494,8 +494,8 @@ pub(crate) fn spawn_account_event_loop(
     app: adw::Application,
     list_header: ListHeader,
     dashboard_refresh: Rc<dyn Fn()>,
-    mark_read_button: gtk::Button,
-    pin_button: gtk::Button,
+    mark_read_button: crate::ribbon::RibbonIcon,
+    pin_button: crate::ribbon::RibbonIcon,
     worker: Rc<Worker>,
 ) {
     glib::spawn_future_local(async move {
@@ -1466,8 +1466,8 @@ pub(crate) fn connect_other_account(
     account: crate::app_config::OtherAccount,
     keyring: std::sync::Arc<dyn crate::other_accounts::KeyringStore>,
     dashboard_refresh: Rc<dyn Fn()>,
-    mark_read_button: gtk::Button,
-    pin_button: gtk::Button,
+    mark_read_button: crate::ribbon::RibbonIcon,
+    pin_button: crate::ribbon::RibbonIcon,
 ) {
     let account_id = AccountId(account.id.clone());
     let display_name = account.display_name.clone();
@@ -1689,8 +1689,8 @@ pub(crate) fn connect_goa_account(
     app: adw::Application,
     list_header: ListHeader,
     dashboard_refresh: Rc<dyn Fn()>,
-    mark_read_button: gtk::Button,
-    pin_button: gtk::Button,
+    mark_read_button: crate::ribbon::RibbonIcon,
+    pin_button: crate::ribbon::RibbonIcon,
     calendar_main: Rc<CalendarMain>,
     calendar_list_box: gtk::Box,
     mini_calendar: calendar_view::MiniCalendar,
@@ -2249,8 +2249,8 @@ pub(crate) fn connect_shared_mailboxes(
     goa_client: GoaClient,
     list_header: ListHeader,
     dashboard_refresh: Rc<dyn Fn()>,
-    mark_read_button: gtk::Button,
-    pin_button: gtk::Button,
+    mark_read_button: crate::ribbon::RibbonIcon,
+    pin_button: crate::ribbon::RibbonIcon,
     parent_id: &AccountId,
     parent: &lookout_goa::GoaMailAccount,
 ) {

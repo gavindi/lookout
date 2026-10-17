@@ -695,7 +695,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         search_entry: None,
         search_ribbon: None,
         search_ribbon_prev: None,
+        ribbon_style: None,
     }));
+    // The ribbon's shared layout state: the Simplified/Classic mode and every
+    // live band, so one switch reaches the main window's ribbon and any open
+    // composer's toolbar. Read from GSettings at startup, written back by the
+    // layout menu and the Config → Appearance row (`ribbon.rs`).
+    let ribbon_style = crate::ribbon::RibbonStyle::new(crate::ribbon::RibbonMode::from_code(&settings.get_string(crate::settings::RIBBON_STYLE)));
+    state.borrow_mut().ribbon_style = Some(ribbon_style.clone());
+    // The layout switch: a stateful `win.ribbon-style` action carrying the
+    // mode's code, driven by the ribbon's own "Ribbon layout" menu and by
+    // Config → Appearance's "Ribbon style" row. Its activation handler is
+    // wired below, once the Config row exists.
+    let ribbon_style_action = gio::SimpleAction::new_stateful("ribbon-style", Some(glib::VariantTy::STRING), &ribbon_style.mode().code().to_variant());
     // The folder rows' drop targets reach `state` through this slot (they
     // were built before it existed).
     *state_slot.borrow_mut() = Some(state.clone());
@@ -3466,7 +3478,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     let pin_button = gtk::Button::from_icon_name(pin_icon_name(false));
     pin_button.set_tooltip_text(Some("Pin/Unpin"));
-    refresh_pin_button(&pin_button, &message_list);
     // Flag ▾ (item 1.16 / M-10): the main part flags the selection (no due
     // date) or clears its flag; the arrow opens Outlook's due-date menu.
     // A follow-up flag, never Pin's `\Flagged` (UX-02). Its icon tracks the
@@ -3479,7 +3490,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the selection means the action marks everything read; only when every
     // selected message is already read does it become "mark all unread."
     let mark_read_button = gtk::Button::from_icon_name(themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]));
-    refresh_mark_read_button(&mark_read_button, &message_list);
     // Categorize: a menu of the defined color tags, toggle-checked against
     // the selected messages. Its popover is rebuilt on every `show` so the
     // check states track whichever messages are selected when it opens.
@@ -3539,22 +3549,52 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    let command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    command_toolbar.append(&compose_button);
-    command_toolbar.append(&reply_button);
-    command_toolbar.append(&reply_all_button);
-    command_toolbar.append(&forward_button);
-    command_toolbar.append(&delete_button);
-    command_toolbar.append(&archive_button);
-    command_toolbar.append(&report_button);
-    command_toolbar.append(&sweep_button);
-    command_toolbar.append(&pin_button);
-    command_toolbar.append(&flag_button);
-    command_toolbar.append(&mark_read_button);
-    command_toolbar.append(&categorize_button);
-    command_toolbar.append(&snooze_button);
-    command_toolbar.append(&quick_steps_button);
-    command_toolbar.append(&more_button);
+    // --- Command ribbon (Mail Home). Every control above was created and
+    // wired already; the ribbon only dresses it with an icon and a label,
+    // arranged in Outlook's groups (see `ribbon.rs`). The Simplified/Classic
+    // layout is shared app-wide via `ribbon_style`.
+    let command_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    command_band.group("New", |group| {
+        group.button(&compose_button, "mail-message-new-symbolic", "New Message");
+    });
+    command_band.group("Delete", |group| {
+        group.button(&delete_button, "user-trash-symbolic", "Delete");
+        group.button(&archive_button, "mail-archive-symbolic", "Archive");
+        group.split(&report_button, "mail-mark-junk-symbolic", "Report");
+        group.button(&sweep_button, "edit-clear-all-symbolic", "Sweep");
+    });
+    command_band.group("Respond", |group| {
+        group.button(&reply_button, "mail-reply-sender-symbolic", "Reply");
+        group.button(&reply_all_button, "mail-reply-all-symbolic", "Reply all");
+        group.split(&forward_button, "mail-forward-symbolic", "Forward");
+    });
+    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Tags", |group| {
+        let pin = group.button(&pin_button, pin_icon_name(false), "Pin");
+        let flag = group.split(&flag_button, follow_up_icon_name(false), "Flag");
+        let read = group.button(
+            &mark_read_button,
+            themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
+            "Read",
+        );
+        group.menu(&categorize_button, themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]), "Categorize");
+        group.button(&snooze_button, "appointment-soon-symbolic", "Snooze");
+        (pin, flag, read)
+    });
+    command_band.group("Quick Steps", |group| {
+        group.menu(
+            &quick_steps_button,
+            themed_icon_name(&["system-run-symbolic", "media-playback-start-symbolic", "go-next-symbolic"]),
+            "Quick Steps",
+        );
+    });
+    // "More" is the overflow menu; it sits outside a group at the band's end.
+    command_band.standalone().menu(&more_button, "view-more-symbolic", "More");
+    // The dynamic glyphs now that every control is dressed.
+    refresh_pin_button(&pin_icon, &message_list);
+    refresh_flag_button(&flag_icon, &message_list);
+    refresh_mark_read_button(&mark_read_icon, &message_list);
+
+    let command_toolbar = command_band.root().clone();
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
@@ -3581,14 +3621,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     week_view_button.set_group(Some(&month_view_button));
     work_week_view_button.set_group(Some(&week_view_button));
     day_view_button.set_group(Some(&work_week_view_button));
-    let view_switch_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["linked"]).build();
-    view_switch_box.append(&day_view_button);
-    view_switch_box.append(&work_week_view_button);
-    view_switch_box.append(&week_view_button);
-    view_switch_box.append(&month_view_button);
-    view_switch_box.append(&schedule_view_button);
-    view_switch_box.append(&split_view_button);
-    view_switch_box.append(&list_view_button);
     for (button, view) in [
         (&day_view_button, "day"),
         (&work_week_view_button, "workweek"),
@@ -3613,12 +3645,37 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     share_button.set_tooltip_text(Some("Share"));
     let print_button = gtk::Button::from_icon_name("printer-symbolic");
     print_button.set_tooltip_text(Some("Print"));
-    let calendar_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    calendar_command_toolbar.append(&new_event_button);
-    calendar_command_toolbar.append(&view_switch_box);
-    calendar_command_toolbar.append(&filter_button);
-    calendar_command_toolbar.append(&share_button);
-    calendar_command_toolbar.append(&print_button);
+    let calendar_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    calendar_band.group("New", |group| {
+        group.button(&new_event_button, "appointment-new-symbolic", "New Event");
+    });
+    calendar_band.group("View", |group| {
+        group.toggle(&day_view_button, themed_icon_name(&["view-calendar-day-symbolic", "x-office-calendar-symbolic"]), "Day");
+        group.toggle(
+            &work_week_view_button,
+            themed_icon_name(&["view-calendar-workweek-symbolic", "x-office-calendar-symbolic"]),
+            "Work week",
+        );
+        group.toggle(&week_view_button, themed_icon_name(&["view-calendar-week-symbolic", "x-office-calendar-symbolic"]), "Week");
+        group.toggle(
+            &month_view_button,
+            themed_icon_name(&["view-calendar-month-symbolic", "x-office-calendar-symbolic"]),
+            "Month",
+        );
+        group.toggle(&schedule_view_button, themed_icon_name(&["view-list-symbolic", "x-office-calendar-symbolic"]), "Schedule");
+        group.toggle(&split_view_button, themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic"]), "Split view");
+        group.toggle(&list_view_button, themed_icon_name(&["view-list-symbolic"]), "List");
+    });
+    calendar_band.group("Filter", |group| {
+        group.button(&filter_button, "edit-find-symbolic", "Filter");
+    });
+    calendar_band.group("Share", |group| {
+        group.button(&share_button, "send-to-symbolic", "Share");
+    });
+    calendar_band.group("Print", |group| {
+        group.button(&print_button, "printer-symbolic", "Print");
+    });
+    let calendar_command_toolbar = calendar_band.root().clone();
 
     // --- Tasks' own command toolbar row, swapped in when the Tasks nav-rail
     // button is active. New task opens the task editor (wired later, once
@@ -3629,8 +3686,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let connect_google_tasks_button = gtk::Button::with_label("Connect Google Tasks");
     connect_google_tasks_button.set_tooltip_text(Some("Sign in to Google Tasks (the Tasks API, separate from Google's event-only CalDAV)"));
 
-    let tasks_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    tasks_command_toolbar.append(&new_task_button);
     // Sort/Group/Show-completed (T-09, UX-74): a menu of stateful `win.`
     // actions whose handlers (wired once `calendar_state` exists) persist to
     // GSettings and repaint the list.
@@ -3655,7 +3710,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .valign(gtk::Align::Center)
         .menu_model(&tasks_arrange_menu)
         .build();
-    tasks_command_toolbar.append(&tasks_arrange_button);
     let task_sort_action = gio::SimpleAction::new_stateful(
         "task-sort",
         Some(glib::VariantTy::STRING),
@@ -3667,14 +3721,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         &settings.get_string(crate::settings::TASKS_GROUP_BY).to_variant(),
     );
     let task_show_completed_action = gio::SimpleAction::new_stateful("task-show-completed", None, &settings.get_bool(crate::settings::TASKS_SHOW_COMPLETED).to_variant());
-    tasks_command_toolbar.append(&connect_google_tasks_button);
+    let tasks_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    tasks_band.group("New", |group| {
+        group.button(&new_task_button, themed_icon_name(&["view-task-symbolic", "appointment-soon-symbolic"]), "New Task");
+    });
+    tasks_band.group("View", |group| {
+        group.menu(
+            &tasks_arrange_button,
+            themed_icon_name(&["view-sort-ascending-symbolic", "view-list-symbolic"]),
+            "Sort & group",
+        );
+    });
+    tasks_band.group("Accounts", |group| {
+        group.button(&connect_google_tasks_button, "x-office-calendar-symbolic", "Connect Google Tasks");
+    });
+    let tasks_command_toolbar = tasks_band.root().clone();
 
     // --- View tab's ribbon content (Mail module): a "Layout" group of
-    // pane-visibility toggles - Folder pane / Reading pane / Calendar
-    // overview. All three default on; their click handlers live in a later
-    // block (after every pane widget exists), write through to GSettings
-    // (see `settings`), and are re-applied from there at startup.
-    let layout_label = gtk::Label::builder().label("Layout").css_classes(["ribbon-group-label", "dim-label"]).build();
+    // pane-visibility controls - Folder pane / Reading pane / Calendar
+    // overview - and a "Messages" group. All three layout toggles default on;
+    // their click handlers live in a later block (after every pane widget
+    // exists), write through to GSettings (see `settings`), and are re-applied
+    // from there at startup.
     let folder_pane_toggle = gtk::ToggleButton::builder().icon_name("folder-symbolic").build();
     folder_pane_toggle.set_tooltip_text(Some("Folder pane"));
     folder_pane_toggle.set_active(true);
@@ -3730,12 +3798,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         Some(glib::VariantTy::STRING),
         &crate::settings::conversation_order_at(crate::settings::conversation_order_index(&settings.get_string(crate::settings::MAIL_CONVERSATION_ORDER))).to_variant(),
     );
-    let view_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    view_toolbar.append(&layout_label);
-    view_toolbar.append(&folder_pane_toggle);
-    view_toolbar.append(&reading_pane_button);
-    view_toolbar.append(&overview_pane_toggle);
-    view_toolbar.append(&messages_button);
+    let view_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    view_band.group("Layout", |group| {
+        group.toggle(&folder_pane_toggle, "folder-symbolic", "Folder pane");
+        group.menu(
+            &reading_pane_button,
+            themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic", "view-paged-symbolic"]),
+            "Reading pane",
+        );
+        group.toggle(&overview_pane_toggle, "x-office-calendar-symbolic", "Calendar overview");
+    });
+    view_band.group("Messages", |group| {
+        group.menu(
+            &messages_button,
+            themed_icon_name(&["mail-unread-symbolic", "mail-read-symbolic", "mail-message-new-symbolic"]),
+            "Messages",
+        );
+    });
+    let view_toolbar = view_band.root().clone();
 
     let view_toolbar_stack = gtk::Stack::new();
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
@@ -3746,9 +3826,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // The contextual "Search" ribbon row (UX-11, roadmap 2.3): revealed while a
     // search is active (see `start_search`), it mirrors the title-bar scope
     // dropdown plus the Refine form and a Clear action.
-    let search_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    let search_toolbar_label = gtk::Label::builder().label("Search").xalign(0.0).css_classes(["dim-label"]).build();
-    let ribbon_scope_label = gtk::Label::builder().label("Scope:").xalign(0.0).build();
     let ribbon_scope_dropdown = gtk::DropDown::from_strings(&[
         SearchScope::Folder.label(),
         SearchScope::Subfolders.label(),
@@ -3759,30 +3836,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     ribbon_scope_dropdown.set_tooltip_text(Some("Search scope"));
     let ribbon_refine_button = gtk::MenuButton::builder().label("Refine").css_classes(["flat"]).build();
     let search_clear_button = gtk::Button::with_label("Clear search");
-    search_toolbar.append(&search_toolbar_label);
-    search_toolbar.append(&ribbon_scope_label);
-    search_toolbar.append(&ribbon_scope_dropdown);
-    search_toolbar.append(&ribbon_refine_button);
-    search_toolbar.append(&search_clear_button);
+    let search_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    search_band.group("Search", |group| {
+        group.widget(&ribbon_scope_dropdown);
+        group.menu(&ribbon_refine_button, "edit-find-symbolic", "Refine");
+        group.button(&search_clear_button, "edit-clear-symbolic", "Clear search");
+    });
+    let search_toolbar = search_band.root().clone();
     view_toolbar_stack.add_named(&search_toolbar, Some("search"));
     state.borrow_mut().search_ribbon = Some(view_toolbar_stack.clone());
 
-    let contacts_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    let contacts_toolbar_label = gtk::Label::builder().label("People").xalign(0.0).css_classes(["dim-label"]).build();
-    contacts_command_toolbar.append(&contacts_toolbar_label);
+    // People's command ribbon. The buttons were created above; here they are
+    // dressed with icons and labels and arranged in Outlook's groups.
     let new_contact_button = gtk::Button::with_label("New contact");
-    contacts_command_toolbar.append(&new_contact_button);
     // Edit/Delete for the contacts checked in the list, gated by
     // `refresh_contacts_actions`: Edit enables only when exactly one contact
     // is selected, Delete for any number; both start disabled.
     let contacts_edit_button = gtk::Button::with_label("Edit");
     contacts_edit_button.set_sensitive(false);
-    contacts_command_toolbar.append(&contacts_edit_button);
     let contacts_delete_button = gtk::Button::with_label("Delete");
     contacts_delete_button.set_sensitive(false);
-    contacts_command_toolbar.append(&contacts_delete_button);
     let import_contacts_button = gtk::Button::with_label("Import…");
-    contacts_command_toolbar.append(&import_contacts_button);
     // Export is a split menu button (UX-16's split-button pattern): each
     // entry opens the save dialog in its format - the multi-card vCard, or
     // Outlook's CSV columns (P-08, §4.6).
@@ -3795,21 +3869,42 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .tooltip_text("Export contacts")
         .popover(&export_contacts_popover)
         .build();
-    contacts_command_toolbar.append(&export_contacts_button);
     let manage_groups_button = gtk::Button::with_label("Manage groups…");
-    contacts_command_toolbar.append(&manage_groups_button);
     let open_contacts_window_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
     open_contacts_window_button.set_tooltip_text(Some("Open the People screen in its own window"));
-    contacts_command_toolbar.append(&open_contacts_window_button);
+    let contacts_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    contacts_band.group("New", |group| {
+        group.button(&new_contact_button, "contact-new-symbolic", "New contact");
+    });
+    contacts_band.group("Actions", |group| {
+        group.button(&contacts_edit_button, "document-edit-symbolic", "Edit");
+        group.button(&contacts_delete_button, "user-trash-symbolic", "Delete");
+    });
+    contacts_band.group("Transfer", |group| {
+        group.button(&import_contacts_button, "document-open-symbolic", "Import…");
+        group.menu(&export_contacts_button, "document-save-symbolic", "Export");
+    });
+    contacts_band.group("Groups", |group| {
+        group.button(&manage_groups_button, "view-list-symbolic", "Manage groups…");
+    });
+    contacts_band.standalone().button(
+        &open_contacts_window_button,
+        crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]),
+        "Open in window",
+    );
+    let contacts_command_toolbar = contacts_band.root().clone();
     view_toolbar_stack.add_named(&contacts_command_toolbar, Some("contacts"));
 
     // The Lookout dashboard's command toolbar: a single Refresh button that
     // re-reads the caches and widens the calendar sync horizon so upcoming
     // events reach into next month.
-    let lookout_command_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
     let lookout_refresh_button = gtk::Button::from_icon_name("view-refresh-symbolic");
     lookout_refresh_button.set_tooltip_text(Some("Refresh dashboard"));
-    lookout_command_toolbar.append(&lookout_refresh_button);
+    let lookout_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    lookout_band.group("Dashboard", |group| {
+        group.button(&lookout_refresh_button, "view-refresh-symbolic", "Refresh");
+    });
+    let lookout_command_toolbar = lookout_band.root().clone();
     view_toolbar_stack.add_named(&lookout_command_toolbar, Some("lookout"));
 
     // The action-bar slot switcher, stored in `UiState` (not captured by the
@@ -4524,8 +4619,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // The icon command toolbar (Mail's/Calendar's) gets its own dark grey
     // subgroup, distinct from the menu bar's black background.
+    //
+    // Its right end carries the "Ribbon layout" menu - the Simplified/Classic
+    // switch, Outlook's own layout chevron. It sits outside the module stack
+    // so it is present in every module and on every tab; `win.ribbon-style`
+    // is the stateful action behind it (see the ribbon wiring above).
+    let ribbon_layout_menu = gio::Menu::new();
+    {
+        let section = gio::Menu::new();
+        for mode in crate::ribbon::RibbonMode::ALL {
+            section.append(Some(mode.label()), Some(&format!("win.ribbon-style('{}')", mode.code())));
+        }
+        ribbon_layout_menu.append_section(None, &section);
+    }
+    let ribbon_layout_button = gtk::MenuButton::builder()
+        .tooltip_text("Ribbon layout")
+        .valign(gtk::Align::Center)
+        .menu_model(&ribbon_layout_menu)
+        .build();
+    // Dress it as a ribbon control in a one-button band of its own, so it
+    // carries the same `.ribbon-control`/`.flat` classes and the same
+    // Simplified/Classic geometry as every module's controls instead of
+    // sitting at Adwaita's default size beside them.
+    let ribbon_chrome_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
+    ribbon_chrome_band.standalone().menu(&ribbon_layout_button, "view-grid-symbolic", "Layout");
+    let ribbon_chrome = ribbon_chrome_band.root().clone();
+
     let icon_toolbar_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
+        .orientation(gtk::Orientation::Horizontal)
         .css_classes(["window-icon-toolbar-background"])
         .overflow(gtk::Overflow::Hidden)
         .margin_start(6)
@@ -4533,7 +4654,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .margin_top(6)
         .margin_bottom(6)
         .build();
+    view_toolbar_stack.set_hexpand(true);
     icon_toolbar_box.append(&view_toolbar_stack);
+    icon_toolbar_box.append(&ribbon_chrome);
 
     // Menu bar + icon toolbar grouped onto their own shared black
     // background, rather than each row painting (or not painting) its own.
@@ -4662,6 +4785,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window.add_action(&task_sort_action);
     window.add_action(&task_group_action);
     window.add_action(&task_show_completed_action);
+    window.add_action(&ribbon_style_action);
 
     // --- Close-to-background: the window's close button hides the window
     // instead of exiting (Config → General → "Keep running when the window
@@ -5245,6 +5369,53 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // back through.
         let choice = reading_pane_action_state(&state.borrow().settings);
         apply(&choice, false);
+    }
+    // The ribbon's layout switch: the band's own "Ribbon layout" menu and
+    // Config → Appearance's "Ribbon style" row both drive `win.ribbon-style`,
+    // and this one handler keeps the mode, the setting and the row in step.
+    {
+        let ribbon_style_action = ribbon_style_action.clone();
+        let state = state.clone();
+        let ribbon_style_row = config_view.ribbon_style_row.clone();
+        // Guards the ComboRow's `selected` notify while `apply` writes it.
+        let suppress_row: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let initial_mode = ribbon_style.mode();
+        let apply: Rc<dyn Fn(crate::ribbon::RibbonMode, bool)> = {
+            let ribbon_style = ribbon_style.clone();
+            let ribbon_style_action = ribbon_style_action.clone();
+            let ribbon_style_row = ribbon_style_row.clone();
+            let suppress_row = suppress_row.clone();
+            Rc::new(move |mode, persist| {
+                ribbon_style.set_mode(mode);
+                ribbon_style_action.set_state(&mode.code().to_variant());
+                if persist {
+                    state.borrow().settings.set_string(crate::settings::RIBBON_STYLE, mode.code());
+                }
+                suppress_row.set(true);
+                ribbon_style_row.set_selected(mode.index());
+                suppress_row.set(false);
+            })
+        };
+        {
+            let apply = apply.clone();
+            ribbon_style_action.connect_activate(move |_action, parameter| {
+                let mode = parameter.and_then(|p| p.str()).map(crate::ribbon::RibbonMode::from_code).unwrap_or_default();
+                apply(mode, true);
+            });
+        }
+        {
+            let apply = apply.clone();
+            let suppress_row = suppress_row.clone();
+            ribbon_style_row.connect_selected_notify(move |row| {
+                if suppress_row.get() {
+                    return;
+                }
+                let mode = crate::ribbon::RibbonMode::ALL.get(row.selected() as usize).copied().unwrap_or_default();
+                apply(mode, true);
+            });
+        }
+        // Seed the row from the stored mode without writing anything back.
+        apply(initial_mode, false);
     }
     // GTK4 only updates `default-width` when the window is resized while
     // resizable and not maximized/tiled/fullscreen (see `should_remember_size`
@@ -7555,6 +7726,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list = message_list.clone();
         dispatch.insert(action, Rc::new(move || crate::quick_steps::apply_quick_step_slot(&state, &message_list, slot)));
     }
+    // Collapse / expand the ribbon (Ctrl+F1, UX-16): hides the command band
+    // while the menu bar's File/Home/View/Help tab strip stays put, and
+    // remembers the choice in `ribbon-collapsed`.
+    {
+        let settings = settings.clone();
+        let icon_toolbar_box = icon_toolbar_box.clone();
+        let collapsed = Rc::new(Cell::new(settings.get_bool(crate::settings::RIBBON_COLLAPSED)));
+        icon_toolbar_box.set_visible(!collapsed.get());
+        dispatch.insert(
+            crate::shortcuts::ACTION_TOGGLE_RIBBON,
+            Rc::new(move || {
+                let next = !collapsed.get();
+                collapsed.set(next);
+                settings.set_bool(crate::settings::RIBBON_COLLAPSED, next);
+                icon_toolbar_box.set_visible(!next);
+            }),
+        );
+    }
     // Print: the reading-pane print path (the calendar toolbar's Print
     // button prints the month instead), gated the same way the More menu's
     // Print item is: only while a message is actually rendered.
@@ -7833,8 +8022,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_stack = reading_stack.clone();
         let list_header = list_header.clone();
         let dashboard_refresh = dashboard_refresh.clone();
-        let mark_read_button = mark_read_button.clone();
-        let pin_button = pin_button.clone();
+        let mark_read_icon = mark_read_icon.clone();
+        let pin_icon = pin_icon.clone();
         // Everything the GOA enable/disable toggle needs beyond the mail
         // set above: the calendar/tasks/contacts wiring, and the page-state
         // cells the re-enable path flips back from their empty states.
@@ -8059,8 +8248,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let reading_stack = reading_stack.clone();
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
-                let mark_read_button = mark_read_button.clone();
-                let pin_button = pin_button.clone();
+                let mark_read_icon = mark_read_icon.clone();
+                let pin_icon = pin_icon.clone();
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |anchor, account_id: &str| {
                     let Some(existing) = state.borrow().app_config.borrow().other_account(account_id) else {
@@ -8082,8 +8271,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         let reading_stack = reading_stack.clone();
                         let list_header = list_header.clone();
                         let dashboard_refresh = dashboard_refresh.clone();
-                        let mark_read_button = mark_read_button.clone();
-                        let pin_button = pin_button.clone();
+                        let mark_read_icon = mark_read_icon.clone();
+                        let pin_icon = pin_icon.clone();
                         let refresh_hook = refresh_hook.borrow().clone();
                         Rc::new(move |account_id: &str| {
                             // Editing always fully reconnects: the running
@@ -8114,8 +8303,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 account,
                                 keyring.clone(),
                                 dashboard_refresh.clone(),
-                                mark_read_button.clone(),
-                                pin_button.clone(),
+                                mark_read_icon.clone(),
+                                pin_icon.clone(),
                             );
                             refresh_hook();
                         })
@@ -8287,8 +8476,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let reading_stack = reading_stack.clone();
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
-                let mark_read_button = mark_read_button.clone();
-                let pin_button = pin_button.clone();
+                let mark_read_icon = mark_read_icon.clone();
+                let pin_icon = pin_icon.clone();
                 let root_stack = root_stack.clone();
                 let current_mail_page = current_mail_page.clone();
                 let mail_view_button = mail_view_button.clone();
@@ -8339,8 +8528,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                 app.clone(),
                                 list_header.clone(),
                                 dashboard_refresh.clone(),
-                                mark_read_button.clone(),
-                                pin_button.clone(),
+                                mark_read_icon.clone(),
+                                pin_icon.clone(),
                                 calendar_main.clone(),
                                 calendar_list_box.clone(),
                                 mini_calendar.clone(),
@@ -8433,8 +8622,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_stack = reading_stack.clone();
         let list_header = list_header.clone();
         let dashboard_refresh = dashboard_refresh.clone();
-        let mark_read_button = mark_read_button.clone();
-        let pin_button = pin_button.clone();
+        let mark_read_icon = mark_read_icon.clone();
+        let pin_icon = pin_icon.clone();
         let refresh_hook = refresh_hook.clone();
         add_imap_row.connect_activated(move |row| {
             let app_config = state.borrow().app_config.clone();
@@ -8453,8 +8642,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let reading_stack = reading_stack.clone();
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
-                let mark_read_button = mark_read_button.clone();
-                let pin_button = pin_button.clone();
+                let mark_read_icon = mark_read_icon.clone();
+                let pin_icon = pin_icon.clone();
                 let refresh_hook = refresh_hook.borrow().clone();
                 Rc::new(move |account_id: &str| {
                     let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
@@ -8476,8 +8665,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         account,
                         keyring.clone(),
                         dashboard_refresh.clone(),
-                        mark_read_button.clone(),
-                        pin_button.clone(),
+                        mark_read_icon.clone(),
+                        pin_icon.clone(),
                     );
                     refresh_hook();
                 })
@@ -8503,8 +8692,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_stack = reading_stack.clone();
         let list_header = list_header.clone();
         let dashboard_refresh = dashboard_refresh.clone();
-        let mark_read_button = mark_read_button.clone();
-        let pin_button = pin_button.clone();
+        let mark_read_icon = mark_read_icon.clone();
+        let pin_icon = pin_icon.clone();
         let refresh_hook = refresh_hook.clone();
         add_shared_mailbox_row.connect_activated(move |row| {
             let app_config = state.borrow().app_config.clone();
@@ -8537,8 +8726,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let reading_stack = reading_stack.clone();
                 let list_header = list_header.clone();
                 let dashboard_refresh = dashboard_refresh.clone();
-                let mark_read_button = mark_read_button.clone();
-                let pin_button = pin_button.clone();
+                let mark_read_icon = mark_read_icon.clone();
+                let pin_icon = pin_icon.clone();
                 let refresh_hook = refresh_hook.borrow().clone();
                 Rc::new(move || {
                     let Some(goa_client) = state.borrow().goa_client.clone() else { return };
@@ -8565,8 +8754,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             goa_client.clone(),
                             list_header.clone(),
                             dashboard_refresh.clone(),
-                            mark_read_button.clone(),
-                            pin_button.clone(),
+                            mark_read_icon.clone(),
+                            pin_icon.clone(),
                             &parent_id,
                             &parent,
                         );
@@ -9466,9 +9655,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reading_multi_label = reading_multi_label.clone();
         let message_header = message_header.clone();
         let message_list_for_selection = message_list.clone();
-        let mark_read_button = mark_read_button.clone();
-        let pin_button = pin_button.clone();
-        let flag_button = flag_button.clone();
+        let mark_read_icon = mark_read_icon.clone();
+        let pin_icon = pin_icon.clone();
+        let flag_icon = flag_icon.clone();
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
         let theme_override_sheet = theme_override_sheet.clone();
@@ -9482,9 +9671,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 ReadingTarget::Multiple(_) => "Multiple",
             };
             tracing::debug!(pos, n_items, kind, "selection-changed fired");
-            refresh_mark_read_button(&mark_read_button, &message_list_for_selection);
-            refresh_pin_button(&pin_button, &message_list_for_selection);
-            refresh_flag_button(&flag_button, &message_list_for_selection);
+            refresh_mark_read_button(&mark_read_icon, &message_list_for_selection);
+            refresh_pin_button(&pin_icon, &message_list_for_selection);
+            refresh_flag_button(&flag_icon, &message_list_for_selection);
             let summary = match target {
                 ReadingTarget::Single(summary) => {
                     // A lone message (or any message while conversations are
@@ -9773,7 +9962,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let message_list = message_list.clone();
         let state = state.clone();
-        let pin_button_for_click = pin_button.clone();
+        let pin_icon_for_click = pin_icon.clone();
         pin_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
             let pinning = summaries.iter().any(|s| !s.is_pinned());
@@ -9783,7 +9972,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // selection, so the aggregate state `refresh_pin_button` reads
             // off `selected_summaries()` is genuinely current - no need for
             // a separate manual icon flip first.
-            refresh_pin_button(&pin_button_for_click, &message_list);
+            refresh_pin_button(&pin_icon_for_click, &message_list);
         });
     }
     // --- Flag ▾ (item 1.16): the main part toggles the selection's flag,
@@ -9791,34 +9980,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let message_list = message_list.clone();
         let state = state.clone();
-        let flag_button_for_click = flag_button.clone();
+        let flag_icon_for_click = flag_icon.clone();
         flag_button.connect_clicked(move |_| {
             toggle_follow_up(&state, &message_list, message_list.selected_summaries());
-            refresh_flag_button(&flag_button_for_click, &message_list);
+            refresh_flag_button(&flag_icon_for_click, &message_list);
         });
     }
     {
         let message_list = message_list.clone();
         let state = state.clone();
         let state_for_pick = state.clone();
-        let flag_button_for_pick = flag_button.clone();
+        let flag_icon_for_pick = flag_icon.clone();
         flag_button.set_popover(Some(&build_flag_popover(
             &state,
             Rc::new(move |flag| {
                 set_follow_up(&state_for_pick, &message_list, message_list.selected_summaries(), flag);
-                refresh_flag_button(&flag_button_for_pick, &message_list);
+                refresh_flag_button(&flag_icon_for_pick, &message_list);
             }),
         )));
     }
     {
         let message_list = message_list.clone();
         let state = state.clone();
-        let mark_read_button_for_click = mark_read_button.clone();
+        let mark_read_icon_for_click = mark_read_icon.clone();
         mark_read_button.connect_clicked(move |_| {
             let summaries = message_list.selected_summaries();
             let mark_read = summaries.iter().any(|s| s.is_unread());
             set_messages_read(&state, &message_list, &summaries, mark_read);
-            refresh_mark_read_button(&mark_read_button_for_click, &message_list);
+            refresh_mark_read_button(&mark_read_icon_for_click, &message_list);
         });
     }
     // --- Snooze ▾ (item 1.15): the button opens Outlook's preset menu (Later
@@ -10476,8 +10665,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     account,
                     keyring.clone(),
                     dashboard_refresh.clone(),
-                    mark_read_button.clone(),
-                    pin_button.clone(),
+                    mark_read_icon.clone(),
+                    pin_icon.clone(),
                 );
             }
             refresh_config();
@@ -10504,8 +10693,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         current_lookout_page.clone(),
         lookout_view_button.clone(),
         dashboard_refresh.clone(),
-        mark_read_button.clone(),
-        pin_button.clone(),
+        mark_read_icon.clone(),
+        pin_icon.clone(),
     );
     spawn_contacts_discovery(
         worker.clone(),

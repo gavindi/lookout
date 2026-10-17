@@ -1576,6 +1576,10 @@ pub fn build_compose_view(
     // header button runs, scheduled on the next main-loop turn so the
     // composer is rooted in its reading-pane page first.
     pop_out_on_open: bool,
+    // The shared ribbon layout state (`ribbon.rs`), so the composer's command
+    // toolbar dresses (and re-dresses) its controls exactly like the main
+    // window's ribbon.
+    ribbon_style: crate::ribbon::RibbonStyle,
 ) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
     // Chip-mode fields (UX-42): each recipient is a removable pill, so a
     // contact list picked from the address book can render as a single
@@ -1919,7 +1923,6 @@ pub fn build_compose_view(
         .label("Rich text")
         .tooltip_text("Toggle between plain text and formatted editing")
         .build();
-    let editor_toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
     // Always sensitive - unlike the formatting buttons, plain-text mode can
     // carry real file attachments too.
     let attach_button = gtk::Button::from_icon_name("mail-attachment-symbolic");
@@ -1942,7 +1945,6 @@ pub fn build_compose_view(
             });
         });
     }
-    editor_toolbar.append(&attach_button);
     // --- Signature menu: a "Signature" button that drops down the global
     // signature list (Config → Accounts → Signatures), one row per
     // signature inserting it at the cursor - the HTML form in rich mode,
@@ -2224,18 +2226,33 @@ pub fn build_compose_view(
             }
         });
     }
-    editor_toolbar.append(&rich_toggle);
-    editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
-    editor_toolbar.append(&format_toolbar);
-    // The signature and template menus are the toolbar's last controls.
-    editor_toolbar.append(&signature_button);
-    editor_toolbar.append(&templates_button);
-    // Importance buttons trail the signature, after a separator.
-    editor_toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
-    editor_toolbar.append(&high_importance_toggle);
-    editor_toolbar.append(&low_importance_toggle);
-    // Sensitivity trails importance.
-    editor_toolbar.append(&sensitivity_dropdown);
+    // --- The composer's command ribbon. The controls were built above; the
+    // ribbon dresses each with an icon and a label and groups them like
+    // Outlook's Message tab. The dense inline-formatting row
+    // (`format_toolbar`) keeps its glyphs, as Outlook's does, and rides in
+    // the "Format" group as a unit.
+    let editor_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    editor_band.group("Actions", |group| {
+        group.button(&attach_button, "mail-attachment-symbolic", "Attach files");
+        group.toggle(
+            &rich_toggle,
+            crate::window::themed_icon_name(&["document-edit-symbolic", "accessories-text-editor-symbolic"]),
+            "Rich text",
+        );
+    });
+    editor_band.group("Insert", |group| {
+        group.menu(&signature_button, "signature-1", "Signature");
+        group.menu(&templates_button, "edit-copy-symbolic", "Templates");
+    });
+    editor_band.group("Format", |group| {
+        group.widget(&format_toolbar);
+    });
+    editor_band.group("Options", |group| {
+        group.toggle(&high_importance_toggle, "emblem-important-symbolic", "High");
+        group.toggle(&low_importance_toggle, "go-down-symbolic", "Low");
+        group.widget(&sensitivity_dropdown);
+    });
+    let editor_toolbar = editor_band.root().clone();
 
     {
         let web_view = rich_web_view.clone();
