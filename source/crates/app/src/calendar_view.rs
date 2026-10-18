@@ -3441,6 +3441,16 @@ fn paint_schedule(cr: &gtk::cairo::Context, width: f64, height: f64, state: &Sch
     }
 }
 
+/// One row of the calendar's event-search results (CAL-22 / item 3.14): the
+/// full occurrence so the existing editor can open it, plus the calendar label
+/// and the field excerpt the cache matched.
+#[derive(Clone)]
+pub struct CalendarSearchRow {
+    pub occurrence: EventOccurrence,
+    pub calendar_name: String,
+    pub snippet: Option<String>,
+}
+
 /// The calendar view's main panel: a shared header row (Today + prev/next +
 /// a current-month dropdown whose popover holds a mini month grid) above a
 /// stack of the views - Month, Work week, Week, Day, Split, List and the
@@ -3454,6 +3464,9 @@ pub struct CalendarMain {
     pub prev_button: gtk::Button,
     pub next_button: gtk::Button,
     pub today_button: gtk::Button,
+    /// The "Clear" action beside the search result summary - the caller wires
+    /// it to `exit_calendar_search`.
+    pub search_clear_button: gtk::Button,
     /// The mini month grid living inside the header's current-month dropdown
     /// (a `MenuButton` whose popover holds it). Clicking a day in it re-anchors
     /// the whole panel, so it doubles as the month selector the user asked
@@ -3469,6 +3482,15 @@ pub struct CalendarMain {
     split: SplitView,
     /// The horizontal calendars-as-rows Schedule view (CAL-03).
     schedule: ScheduleView,
+    /// Swaps the normal Today/arrows/month header for the search summary and
+    /// its Clear action (CAL-22).
+    header_stack: gtk::Stack,
+    search_header_label: gtk::Label,
+    /// "Searching older events…" while the bounded backfill is running.
+    search_backfill_label: gtk::Label,
+    /// The event-search results page (the `"search"` stack child). Rows are
+    /// rebuilt by [`set_search_results`].
+    search_box: gtk::Box,
     /// The checked calendars, in sidebar order, as `(id, display_name)` - the
     /// rows the Schedule view draws (CAL-03). Refreshed by window.rs from the
     /// sidebar checklist via [`set_schedule_calendars`].
@@ -3531,6 +3553,38 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
         .css_classes(["calendar-toggle"])
         .build();
 
+    let normal_header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    normal_header.append(&today_button);
+    normal_header.append(&prev_button);
+    normal_header.append(&next_button);
+    normal_header.append(&month_button);
+
+    // Event search (CAL-22): while results are on screen the month navigation
+    // is replaced by the query summary and a Clear action.
+    let search_header_label = gtk::Label::builder().css_classes(["title-2"]).hexpand(true).xalign(0.0).build();
+    crate::privacy::mark_ui(&search_header_label);
+    let search_clear_button = gtk::Button::builder()
+        .icon_name("edit-clear-symbolic")
+        .tooltip_text("Clear search")
+        .css_classes(["flat"])
+        .build();
+    search_clear_button.update_property(&[gtk::accessible::Property::Label("Clear search")]);
+    let search_backfill_label = gtk::Label::builder()
+        .label("Searching older events…")
+        .css_classes(["dim-label", "caption"])
+        .visible(false)
+        .build();
+    crate::privacy::mark_ui(&search_backfill_label);
+    let search_header = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    search_header.append(&search_header_label);
+    search_header.append(&search_backfill_label);
+    search_header.append(&search_clear_button);
+    let header_stack = gtk::Stack::new();
+    header_stack.set_hexpand(true);
+    header_stack.add_named(&normal_header, Some("normal"));
+    header_stack.add_named(&search_header, Some("search"));
+    header_stack.set_visible_child_name("normal");
+
     let header_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -3539,10 +3593,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
         .margin_top(6)
         .margin_bottom(6)
         .build();
-    header_row.append(&today_button);
-    header_row.append(&prev_button);
-    header_row.append(&next_button);
-    header_row.append(&month_button);
+    header_row.append(&header_stack);
 
     // The event context-menu callback (item 3.12) is registered after
     // `build_main` returns, so the shared cell is created up-front and cloned
@@ -3561,6 +3612,40 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     let split = build_split_view(week_start, &on_context);
     let schedule = build_schedule_view(prefs, &on_context);
 
+    // The event-search results page. Rows are plain buttons that open the
+    // existing editor (the same `on_activate` cell every other view uses), so
+    // search results need no separate event-open path.
+    let search_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let search_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .child(&search_box)
+        .build();
+    // Esc leaves the results page even when focus is on a result row rather
+    // than the title-bar entry (which handles its own Esc).
+    {
+        let clear = search_clear_button.clone();
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                clear.emit_clicked();
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        search_scroller.add_controller(keys);
+    }
+
     let stack = gtk::Stack::new();
     stack.add_named(&workweek.root, Some("workweek"));
     stack.add_named(&week.root, Some("week"));
@@ -3569,6 +3654,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
     stack.add_named(&agenda.root, Some("list"));
     stack.add_named(&schedule.root, Some("schedule"));
     stack.add_named(&month.root, Some("month"));
+    stack.add_named(&search_scroller, Some("search"));
     stack.set_visible_child_name("month");
 
     let root_box = gtk::Box::builder()
@@ -3602,6 +3688,11 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
         prev_button,
         next_button,
         today_button,
+        search_clear_button,
+        header_stack,
+        search_header_label,
+        search_backfill_label,
+        search_box,
         month_mini,
         stack,
         month,
@@ -3639,6 +3730,7 @@ pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain 
 /// (wired to the scroller's `map` signal in [`build_time_grid`]).
 pub fn set_view(c: &CalendarMain, view: &'static str) {
     if c.stack.child_by_name(view).is_some() {
+        c.header_stack.set_visible_child_name("normal");
         c.stack.set_visible_child_name(view);
         refresh(c);
     }
@@ -3653,6 +3745,7 @@ pub fn active_view(c: &CalendarMain) -> &'static str {
         Some("split") => "split",
         Some("list") => "list",
         Some("schedule") => "schedule",
+        Some("search") => "search",
         _ => "month",
     }
 }
@@ -3701,6 +3794,132 @@ pub fn anchor(c: &CalendarMain) -> NaiveDate {
 pub fn set_occurrences(c: &CalendarMain, occurrences: &[EventOccurrence]) {
     *c.occurrences.borrow_mut() = occurrences.to_vec();
     refresh(c);
+}
+
+/// Shows the event-search results page (CAL-22 / item 3.14). `pending` keeps
+/// the existing rows visible while a newer query or a cache refresh is still
+/// in flight; an empty pending list shows "Searching…" instead of the empty
+/// state, so a slow cache read never looks like "no matches".
+pub fn set_search_results(c: &CalendarMain, query: &str, rows: &[CalendarSearchRow], pending: bool) {
+    clear_children(&c.search_box);
+    c.header_stack.set_visible_child_name("search");
+    c.stack.set_visible_child_name("search");
+
+    let summary = if pending && rows.is_empty() {
+        "Searching…".to_string()
+    } else if rows.is_empty() {
+        format!("No events found for “{query}”")
+    } else {
+        format!("{} result{} for “{query}”", rows.len(), if rows.len() == 1 { "" } else { "s" })
+    };
+    c.search_header_label.set_label(&summary);
+
+    if rows.is_empty() {
+        let placeholder = gtk::Label::builder()
+            .label(if pending { "Searching…" } else { "No events found" })
+            .css_classes(["dim-label", "caption"])
+            .xalign(0.0)
+            .margin_top(12)
+            .build();
+        crate::privacy::mark_ui(&placeholder);
+        c.search_box.append(&placeholder);
+        return;
+    }
+
+    let colors = c.colors.borrow().clone();
+    let on_activate = c.on_activate.borrow().clone();
+    let on_context = c.on_context.borrow().clone();
+    for row in rows {
+        let occurrence = &row.occurrence;
+        let (start, end) = local_span(occurrence);
+        let date = start.format("%a %d %b %Y").to_string();
+        let when = if occurrence.all_day {
+            "All day".to_string()
+        } else {
+            format!("{} – {}", format_event_time(&start), format_event_time(&end))
+        };
+        let title = occurrence.summary.as_deref().filter(|summary| !summary.trim().is_empty()).unwrap_or("(untitled)");
+        let recurring = if occurrence.rrule.is_some() { " ↻" } else { "" };
+
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(1)
+            .margin_top(4)
+            .margin_bottom(4)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        apply_event_classes(content.upcast_ref(), occurrence, &colors);
+
+        let title_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+        let title_label = gtk::Label::builder()
+            .label(format!("{title}{recurring}"))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .hexpand(true)
+            .css_classes(["caption-heading"])
+            .build();
+        title_row.append(&title_label);
+        content.append(&title_row);
+
+        let location = occurrence
+            .location
+            .as_deref()
+            .filter(|location| !location.trim().is_empty())
+            .map(|location| format!(" · {location}"))
+            .unwrap_or_default();
+        let meta = gtk::Label::builder()
+            .label(format!("{date} · {when}{location} · {}", row.calendar_name))
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        content.append(&meta);
+
+        if let Some(snippet) = row.snippet.as_deref().filter(|snippet| !snippet.trim().is_empty()) {
+            let snippet_label = gtk::Label::builder()
+                .label(snippet)
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["dim-label", "caption"])
+                .build();
+            content.append(&snippet_label);
+        }
+
+        let button = gtk::Button::builder().child(&content).css_classes(["flat", "calendar-search-result"]).build();
+        crate::privacy::mark_content(&button);
+        button.update_property(&[gtk::accessible::Property::Label(&format!("{title}, {date} {when}, {}", row.calendar_name))]);
+        if let Some(callback) = on_activate.clone() {
+            let occurrence = occurrence.clone();
+            button.connect_clicked(move |_| callback(occurrence.clone()));
+        }
+        if let Some(callback) = on_context.clone() {
+            let occurrence = occurrence.clone();
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+            gesture.connect_pressed(move |gesture, _, _, _| {
+                if let Some(anchor) = gesture.widget() {
+                    callback(occurrence.clone(), anchor, None);
+                }
+            });
+            button.add_controller(gesture);
+        }
+        c.search_box.append(&button);
+    }
+}
+
+/// Returns the calendar to its normal header after a search. The caller
+/// restores the view that was on screen before the search.
+pub fn clear_search_results(c: &CalendarMain) {
+    clear_children(&c.search_box);
+    c.search_backfill_label.set_visible(false);
+    c.header_stack.set_visible_child_name("normal");
+}
+
+/// Shows or hides the "Searching older events…" note while the bounded
+/// `FetchMonth` backfill is filling the cache (CAL-22).
+pub fn set_search_backfilling(c: &CalendarMain, backfilling: bool) {
+    c.search_backfill_label.set_visible(backfilling);
 }
 
 /// Updates the `CalendarId` -> colour map used to tint event chips. The
@@ -6021,5 +6240,61 @@ mod tests {
         click("+ New group");
         click("Show all");
         assert_eq!(fired.borrow().as_slice(), &["new-group".to_string(), "show-all".to_string()]);
+    }
+
+    #[test]
+    fn search_results_page_shows_the_summary_and_clears_back_to_the_normal_header() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        use chrono::TimeZone;
+        let main = build_main(&crate::settings::CalendarPreferences::default());
+        let start = Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap();
+        let occurrence = EventOccurrence {
+            uid: lookout_core::EventUid("budget".to_string()),
+            calendar_id: CalendarId("cal-1".to_string()),
+            summary: Some("Budget review".to_string()),
+            description: None,
+            location: Some("Room 3".to_string()),
+            start,
+            end: start + chrono::Duration::hours(1),
+            all_day: false,
+            time_zone: None,
+            rrule: None,
+            recurrence_id: None,
+            exdates: Vec::new(),
+            master_start: None,
+            master_end: None,
+            href: None,
+            etag: None,
+            master_href: None,
+            master_etag: None,
+            sequence: 0,
+            attendees: Vec::new(),
+            organizer: None,
+            schedule_agent: None,
+            categories: Vec::new(),
+            sensitivity: EventSensitivity::default(),
+            show_as: BusyStatus::default(),
+            status: EventStatus::default(),
+            reminder_minutes_before: None,
+            conference_url: None,
+        };
+        set_search_results(
+            &main,
+            "budget",
+            &[CalendarSearchRow {
+                occurrence,
+                calendar_name: "Work".to_string(),
+                snippet: None,
+            }],
+            false,
+        );
+        assert_eq!(main.stack.visible_child_name().as_deref(), Some("search"));
+        assert!(main.search_header_label.text().contains("budget"), "summary names the query");
+        assert!(main.search_header_label.text().contains('1'), "summary counts the result");
+        clear_search_results(&main);
+        assert_eq!(main.header_stack.visible_child_name().as_deref(), Some("normal"));
+        assert_eq!(main.search_box.first_child(), None, "rows are cleared");
     }
 }

@@ -1964,6 +1964,28 @@ pub(crate) struct CalendarUiState {
     /// Which Tasks navigation row is selected (item 4.8 / T-01). Ephemeral UI
     /// state - not persisted, defaulting to the "Tasks" (all) row.
     pub(crate) tasks_filter: crate::tasks_view::TasksFilter,
+    /// Event search (CAL-22 / item 3.14): whether the calendar is showing
+    /// results, the query, the merged/deduped rows, and the view to restore
+    /// when the search is cleared.
+    pub(crate) calendar_search_active: bool,
+    pub(crate) calendar_search_query: String,
+    pub(crate) calendar_search_results: Vec<crate::calendar_view::CalendarSearchRow>,
+    pub(crate) calendar_search_previous_view: &'static str,
+    /// Monotonic token for the async cache queries; replies for an older
+    /// query are discarded.
+    pub(crate) calendar_search_generation: u64,
+    /// Number of per-account cache queries still in flight.
+    pub(crate) calendar_search_pending: usize,
+    /// Search only the calendars currently checked in the sidebar.
+    pub(crate) calendar_search_checked_only: bool,
+    /// Whether the one-shot cache backfill for search coverage has run this
+    /// session (CAL-22). The backfill fetches a bounded month window with
+    /// `FetchMonth` so cold-start search isn't limited to browsed months.
+    pub(crate) calendar_search_backfilled: bool,
+    /// Late-bound repaint hook so the calendar event loop can refresh an active
+    /// search when a month syncs or an event changes (the loop has no
+    /// `Worker`/search-entry references of its own).
+    pub(crate) calendar_search_refresh: Option<Rc<dyn Fn()>>,
     /// The current day's My Day pin set (item 4.9 / T-02), mirrored from the
     /// UI-state database so the Tasks view can label its rows Add/Remove and
     /// resolve the pinned tasks without a database read per repaint. Today's

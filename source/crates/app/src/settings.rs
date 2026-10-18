@@ -111,6 +111,9 @@ pub const MAIL_FILTERS: &str = "mail-filters";
 /// all). Defaults to "all", the pre-scope behaviour of searching every
 /// account's cache.
 pub const MAIL_SEARCH_SCOPE: &str = "mail-search-scope";
+/// Calendar event search scope (CAL-22): `all` searches every connected
+/// calendar, `checked` only the calendars currently ticked in the sidebar.
+pub const CALENDAR_SEARCH_SCOPE: &str = "calendar-search-scope";
 /// Config → Mail → "Internal domains": addresses outside this list are tagged
 /// external in the reading pane (S-06). Empty disables the tag.
 pub const MAIL_INTERNAL_DOMAINS: &str = "mail-internal-domains";
@@ -322,6 +325,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
+    map.insert(CALENDAR_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(MAIL_INTERNAL_DOMAINS, Value::Strv(Vec::new()));
     map.insert(MAIL_REPORT_PHISHING_ADDRESS, Value::String(String::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));

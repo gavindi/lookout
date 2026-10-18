@@ -2423,6 +2423,12 @@ pub(crate) fn connect_calendar_account(
         worker.spawn(lookout_dav::session::run_calendar_session(config, credentials, cmd_rx, evt_tx));
     }
 
+    // Graph's session has no cache of its own, so the app writes each synced
+    // month into the same per-account `CalendarCache` the CalDAV/webcal
+    // sessions use. That is what makes event search (CAL-22) cover Microsoft
+    // 365 too.
+    let graph_account = microsoft_365;
+    let cache_worker = worker.clone();
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
             // Drain the whole queued batch before handling, collapsing
@@ -2462,6 +2468,10 @@ pub(crate) fn connect_calendar_account(
                             handle.calendars = calendars.clone();
                         }
                         refresh_calendar_checklist(&calendar_state, &calendar_list_box, &calendar_main);
+                        let search_refresh = calendar_state.borrow().calendar_search_refresh.clone();
+                        if let Some(refresh) = search_refresh {
+                            refresh();
+                        }
                         if let Some(handle) = calendar_state.borrow().accounts.get(&account_id) {
                             if !handle.calendars.is_empty() {
                                 let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(calendar_state.borrow().displayed_month));
@@ -2487,16 +2497,40 @@ pub(crate) fn connect_calendar_account(
                         // every month it's been shown, since `last_occurrences`
                         // only holds whatever month synced last.
                         reminders_engine.borrow_mut().ingest(&account_id, &occurrences);
+                        // A `FetchMonth` for the search backfill (or the
+                        // dashboard horizon) must not replace the month the
+                        // calendar is actually showing. Only the displayed
+                        // month updates `last_occurrences`; every month still
+                        // lands in `occurrences_by_month` and, for Graph, in
+                        // the search cache.
+                        let displayed_month = calendar_state.borrow().displayed_month;
                         if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
-                            handle.last_occurrences = occurrences;
-                            handle.last_synced_month = Some(month);
-                            insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, handle.last_occurrences.clone());
+                            if month == displayed_month {
+                                handle.last_occurrences = occurrences.clone();
+                                handle.last_synced_month = Some(month);
+                            }
+                            insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, occurrences.clone());
                         }
-                        refresh_displayed_calendar_view(&calendar_state, &calendar_main);
-                        refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                        if graph_account {
+                            spawn_calendar_cache_store(&cache_worker, account_id.clone(), month, occurrences.clone());
+                        }
+                        let search_refresh = calendar_state.borrow().calendar_search_refresh.clone();
+                        if let Some(refresh) = search_refresh {
+                            refresh();
+                        }
+                        // A backfill fetch for a month that isn't on screen
+                        // must not repaint the visible grid (the displayed
+                        // month's own occurrences are unchanged).
+                        if month == displayed_month {
+                            refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+                            refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+                        }
                         // The dashboard's upcoming-events section follows the
-                        // synced occurrences.
-                        refresh_dashboard_hook(&calendar_state);
+                        // synced occurrences. A backfill month outside its
+                        // current-to-+3 horizon can't change it.
+                        if dashboard_month_window().contains(&month) {
+                            refresh_dashboard_hook(&calendar_state);
+                        }
                         // The sidebar mini-calendar's bold event-day numerals track
                         // the currently-displayed month - refresh them when a fetch
                         // for that month lands (navigating to an uncached month

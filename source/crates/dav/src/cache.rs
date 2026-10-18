@@ -3,10 +3,37 @@
 use std::sync::Mutex;
 
 use chrono::{Datelike, NaiveDate};
-use lookout_core::{AccountId, CalendarTask, EventOccurrence, VCard};
+use lookout_core::{AccountId, CalendarTask, EventOccurrence, EventStatus, VCard};
 use rusqlite::Connection;
 
 use crate::{ContactRecord, Result};
+
+/// The on-disk schema version for [`CalendarCache`] (stored in `PRAGMA
+/// user_version`). Version 1 introduced the searchable `event_search` table;
+/// opening an older cache rebuilds it once from the existing `occurrences`
+/// rows. The table is derived data and can always be thrown away.
+const CALENDAR_CACHE_VERSION: i64 = 1;
+
+/// Which event field matched a search term - the results list shows the match
+/// in context (a description snippet rather than the title when the title did
+/// not contain the query).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchField {
+    Summary,
+    Location,
+    Description,
+    Attendees,
+    Organizer,
+}
+
+/// One row returned by [`CalendarCache::search_events`]: the full occurrence
+/// (so the editor can open it directly) plus where and how the query matched.
+#[derive(Debug, Clone)]
+pub struct CachedEventHit {
+    pub occurrence: EventOccurrence,
+    pub matched: SearchField,
+    pub snippet: Option<String>,
+}
 
 /// A per-account local SQLite cache of expanded calendar occurrences, keyed by
 /// month - the CalDAV mirror of `lookout_mail::cache::Cache`. Used for a fast
@@ -129,8 +156,35 @@ impl CalendarCache {
             CREATE TABLE IF NOT EXISTS tasks (
                 data TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS event_search (
+                calendar_id TEXT NOT NULL,
+                uid TEXT NOT NULL,
+                start_utc TEXT NOT NULL,
+                end_utc TEXT NOT NULL,
+                all_day INTEGER NOT NULL,
+                month TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                attendees TEXT NOT NULL DEFAULT '',
+                organizer TEXT NOT NULL DEFAULT '',
+                search_blob TEXT NOT NULL DEFAULT '',
+                cancelled INTEGER NOT NULL DEFAULT 0,
+                data TEXT NOT NULL,
+                PRIMARY KEY (calendar_id, uid, start_utc, month)
+            );
+            CREATE INDEX IF NOT EXISTS event_search_month ON event_search(month);
+            CREATE INDEX IF NOT EXISTS event_search_start ON event_search(start_utc);
             ",
         )?;
+        // A cache written before the search index existed has `occurrences`
+        // rows but no `event_search` rows. Rebuild it once rather than making
+        // event search silently miss every month synced by the old build.
+        let stored: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap_or(0);
+        if stored < CALENDAR_CACHE_VERSION {
+            backfill_search_index(&conn)?;
+            conn.pragma_update(None, "user_version", CALENDAR_CACHE_VERSION)?;
+        }
         Ok(CalendarCache { conn: Mutex::new(conn) })
     }
 
@@ -148,15 +202,82 @@ impl CalendarCache {
     }
 
     /// Stores (replacing any previous entry) the freshly-fetched expanded
-    /// occurrences for `month`.
+    /// occurrences for `month`, and rebuilds that month's search rows in the
+    /// same transaction. A resync therefore cannot leave a deleted or moved
+    /// event findable in the search index.
     pub fn store_month(&self, month: NaiveDate, occurrences: &[EventOccurrence]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let month = month_key(first_of_month(month));
         let data = serde_json::to_string(occurrences)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO occurrences (month, data) VALUES (?1, ?2)",
-            rusqlite::params![month_key(first_of_month(month)), data],
-        )?;
+        let tx = conn.transaction()?;
+        tx.execute("INSERT OR REPLACE INTO occurrences (month, data) VALUES (?1, ?2)", rusqlite::params![&month, data])?;
+        tx.execute("DELETE FROM event_search WHERE month = ?1", [&month])?;
+        insert_search_rows(&tx, &month, occurrences)?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The subset of `months` this cache has never stored. Used by the
+    /// calendar search backfill (CAL-22) to avoid re-fetching months that are
+    /// already indexed; a month is "present" once any `store_month` has
+    /// completed for it, even if it later turns out to have no events.
+    pub fn missing_months(&self, months: &[NaiveDate]) -> Result<Vec<NaiveDate>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT month FROM occurrences")?;
+        let cached: std::collections::HashSet<String> = stmt.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(months.iter().copied().filter(|month| !cached.contains(&month_key(first_of_month(*month)))).collect())
+    }
+
+    /// Searches every cached month's occurrences. Each term must match at
+    /// least one of title, location, notes (description), attendees or
+    /// organizer; terms are ANDed, case-insensitively. Cancelled occurrences
+    /// are omitted, matching what the calendar views show. The caller dedupes
+    /// recurring series across rows.
+    ///
+    /// `limit` is a safety cap on the raw rows scanned - a weekly series
+    /// cached over several years can match hundreds of times, and the caller
+    /// collapses those to one result row. A generous cap keeps one long
+    /// series from starving every other matching event.
+    pub fn search_events(&self, terms: &[String], limit: usize) -> Result<Vec<CachedEventHit>> {
+        let terms: Vec<String> = terms.iter().map(|term| term.trim().to_lowercase()).filter(|term| !term.is_empty()).collect();
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            "SELECT summary, location, description, attendees, organizer, data \
+             FROM event_search WHERE cancelled = 0",
+        );
+        for _ in &terms {
+            sql.push_str(" AND search_blob LIKE ? ESCAPE '\\'");
+        }
+        sql.push_str(" ORDER BY start_utc DESC LIMIT ?");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<rusqlite::types::Value> = terms.iter().map(|term| rusqlite::types::Value::Text(format!("%{}%", escape_like(term)))).collect();
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            let summary: String = row.get(0)?;
+            let location: String = row.get(1)?;
+            let description: String = row.get(2)?;
+            let attendees: String = row.get(3)?;
+            let organizer: String = row.get(4)?;
+            let data: String = row.get(5)?;
+            Ok((summary, location, description, attendees, organizer, data))
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (summary, location, description, attendees, organizer, data) = row?;
+            let occurrence: EventOccurrence = match serde_json::from_str(&data) {
+                Ok(occurrence) => occurrence,
+                Err(e) => {
+                    tracing::warn!("skipping unparseable cached event in the search index: {e}");
+                    continue;
+                }
+            };
+            let (matched, snippet) = match_field(&terms, &summary, &location, &description, &attendees, &organizer);
+            hits.push(CachedEventHit { occurrence, matched, snippet });
+        }
+        Ok(hits)
     }
 
     /// The cached tasks from the last successful sync, or `None` if this
@@ -187,6 +308,181 @@ impl CalendarCache {
 
 fn first_of_month(date: NaiveDate) -> NaiveDate {
     date.with_day(1).unwrap_or(date)
+}
+
+/// Flattens one occurrence's searchable fields into `event_search` rows. The
+/// three original text columns are kept so a hit can say *where* it matched
+/// and show a snippet; `search_blob` is the lowercased union the SQL `LIKE`
+/// scans.
+fn insert_search_rows(conn: &Connection, month: &str, occurrences: &[EventOccurrence]) -> Result<()> {
+    if occurrences.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO event_search \
+         (calendar_id, uid, start_utc, end_utc, all_day, month, summary, location, \
+          description, attendees, organizer, search_blob, cancelled, data) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+    )?;
+    for occurrence in occurrences {
+        let summary = occurrence.summary.clone().unwrap_or_default();
+        let location = occurrence.location.clone().unwrap_or_default();
+        let description = occurrence.description.clone().unwrap_or_default();
+        let attendees = attendee_text(&occurrence.attendees);
+        let organizer = occurrence.organizer.as_ref().map(address_text).unwrap_or_default();
+        let blob = search_blob(&[&summary, &location, &description, &attendees, &organizer]);
+        let data = serde_json::to_string(occurrence)?;
+        stmt.execute(rusqlite::params![
+            &occurrence.calendar_id.0,
+            &occurrence.uid.0,
+            occurrence.start.to_rfc3339(),
+            occurrence.end.to_rfc3339(),
+            if occurrence.all_day { 1 } else { 0 },
+            month,
+            summary,
+            location,
+            description,
+            attendees,
+            organizer,
+            blob,
+            if occurrence.status == EventStatus::Cancelled { 1 } else { 0 },
+            data,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Rebuilds `event_search` from every stored month - the migration path for a
+/// cache written before the search index existed. The table is derived data,
+/// so clearing it and rebuilding is always safe.
+fn backfill_search_index(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare("SELECT month, data FROM occurrences")?;
+        let mapped = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row?);
+        }
+        rows
+    };
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM event_search", [])?;
+    for (month, data) in rows {
+        match serde_json::from_str::<Vec<EventOccurrence>>(&data) {
+            Ok(occurrences) => insert_search_rows(&tx, &month, &occurrences)?,
+            Err(e) => tracing::warn!("skipping unparseable cached month {month} while rebuilding the event search index: {e}"),
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn address_text(address: &lookout_core::EmailAddress) -> String {
+    format!("{} {}", address.display_label(), address.address)
+}
+
+fn attendee_text(attendees: &[lookout_core::Attendee]) -> String {
+    attendees.iter().map(|attendee| address_text(&attendee.address)).collect::<Vec<_>>().join(" ")
+}
+
+fn search_blob(fields: &[&str]) -> String {
+    fields.join(" \n ").to_lowercase()
+}
+
+/// Escapes the SQL `LIKE` metacharacters so a query containing `%` or `_`
+/// searches for those characters instead of matching everything.
+fn escape_like(term: &str) -> String {
+    let mut escaped = String::with_capacity(term.len());
+    for character in term.chars() {
+        match character {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// The first field (in display order) that contains one of the terms, plus a
+/// short excerpt around the match in that field.
+fn match_field(terms: &[String], summary: &str, location: &str, description: &str, attendees: &str, organizer: &str) -> (SearchField, Option<String>) {
+    let fields = [
+        (SearchField::Summary, summary),
+        (SearchField::Location, location),
+        (SearchField::Description, description),
+        (SearchField::Attendees, attendees),
+        (SearchField::Organizer, organizer),
+    ];
+    for (field, text) in fields {
+        let lowered = text.to_lowercase();
+        if let Some(term) = terms.iter().find(|term| lowered.contains(term.as_str())) {
+            // The row already shows the title and location; only the "other"
+            // fields need an explanatory excerpt.
+            let snippet = match field {
+                SearchField::Summary | SearchField::Location => None,
+                SearchField::Description => snippet_for(&strip_html(text), term),
+                SearchField::Attendees | SearchField::Organizer => snippet_for(text, term),
+            };
+            return (field, snippet);
+        }
+    }
+    (SearchField::Summary, None)
+}
+
+/// A one-line excerpt around `term`, trimmed to something the results row can
+/// show. Returns `None` when the term is not actually present in `text`.
+fn snippet_for(text: &str, term: &str) -> Option<String> {
+    if term.is_empty() {
+        return None;
+    }
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lowered = collapsed.to_lowercase();
+    let position = lowered.find(term)?;
+    let start = floor_char_boundary(&collapsed, position.saturating_sub(40));
+    let end = ceil_char_boundary(&collapsed, (position + term.len() + 80).min(collapsed.len()));
+    let mut snippet = collapsed[start..end].trim().to_string();
+    if start > 0 {
+        snippet.insert(0, '…');
+    }
+    if end < collapsed.len() {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Removes HTML tags and collapses whitespace - Graph and some CalDAV clients
+/// store an HTML `DESCRIPTION`, and a search snippet should read as text.
+fn strip_html(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for character in text.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                output.push(' ');
+            }
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +947,151 @@ mod tests {
         let sanitized = sanitize_filename(&id);
         assert!(!sanitized.contains('/'));
         assert_eq!(sanitized, "_org_gnome_OnlineAccounts_Accounts_account_1234");
+    }
+
+    fn sample_event(calendar_id: &CalendarId, uid: &str, summary: &str, day: u32) -> EventOccurrence {
+        let mut occurrence = sample_occurrence(calendar_id, summary, day);
+        occurrence.uid = lookout_core::EventUid(uid.to_string());
+        occurrence
+    }
+
+    #[test]
+    fn missing_months_reports_only_the_months_without_a_cached_snapshot() {
+        let account_id = temp_account_id();
+        let cache = CalendarCache::open(&account_id).unwrap();
+        let calendar = CalendarId("cal-1".to_string());
+        let august = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let july = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        cache.store_month(august, &[sample_occurrence(&calendar, "August", 3)]).unwrap();
+        let missing = cache.missing_months(&[july, august]).unwrap();
+        assert_eq!(missing, vec![july], "an already-stored month is not re-fetched");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn event_search_matches_title_location_notes_attendees_and_organizer() {
+        let account_id = temp_account_id();
+        let cache = CalendarCache::open(&account_id).unwrap();
+        let calendar = CalendarId("cal-1".to_string());
+        let mut budget = sample_event(&calendar, "budget", "Quarterly budget review", 3);
+        budget.location = Some("Room 3".to_string());
+        budget.description = Some("Discuss the <b>budget</b> plans for next year".to_string());
+        budget.attendees = vec![lookout_core::Attendee {
+            address: lookout_core::EmailAddress {
+                name: Some("Ada Lovelace".to_string()),
+                address: "ada@example.com".to_string(),
+            },
+            role: lookout_core::AttendeeRole::Required,
+            status: lookout_core::AttendeeStatus::Accepted,
+        }];
+        budget.organizer = Some(lookout_core::EmailAddress {
+            name: Some("Grace Hopper".to_string()),
+            address: "grace@example.com".to_string(),
+        });
+        let lunch = sample_event(&calendar, "lunch", "Team lunch", 4);
+        cache.store_month(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(), &[budget, lunch]).unwrap();
+
+        let search = |term: &str| cache.search_events(&[term.to_string()], 100).unwrap();
+        assert_eq!(search("budget").len(), 1);
+        assert_eq!(cache.search_events(&["room".to_string(), "missing".to_string()], 10).unwrap().len(), 0, "terms are ANDed");
+        assert_eq!(cache.search_events(&["room".to_string(), "budget".to_string()], 10).unwrap().len(), 1);
+        assert_eq!(search("room").len(), 1);
+        assert_eq!(search("plans").len(), 1);
+        assert_eq!(search("plans")[0].matched, SearchField::Description);
+        assert_eq!(search("ada").len(), 1);
+        assert_eq!(search("ada@example.com").len(), 1);
+        assert_eq!(search("grace").len(), 1);
+        assert_eq!(search("grace")[0].matched, SearchField::Organizer);
+        assert_eq!(search("lunch").len(), 1);
+        assert_eq!(search("QUARTERLY").len(), 1, "matching is case-insensitive");
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn event_search_treats_like_metacharacters_literally() {
+        let account_id = temp_account_id();
+        let cache = CalendarCache::open(&account_id).unwrap();
+        let calendar = CalendarId("cal-1".to_string());
+        let mut percent = sample_event(&calendar, "percent", "100% complete", 3);
+        percent.description = Some("a_b".to_string());
+        let ordinary = sample_event(&calendar, "ordinary", "Plain event", 4);
+        cache.store_month(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(), &[percent, ordinary]).unwrap();
+
+        assert_eq!(cache.search_events(&["100%".to_string()], 10).unwrap().len(), 1);
+        assert_eq!(
+            cache.search_events(&["%".to_string()], 10).unwrap().len(),
+            1,
+            "% must match the literal character, not every row"
+        );
+        assert_eq!(cache.search_events(&["a_b".to_string()], 10).unwrap().len(), 1);
+        assert_eq!(
+            cache.search_events(&["_".to_string()], 10).unwrap().len(),
+            1,
+            "_ must match the literal character, not every row"
+        );
+        assert_eq!(
+            cache.search_events(&["a_b".to_string()], 10).unwrap()[0].occurrence.summary.as_deref(),
+            Some("100% complete")
+        );
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn storing_a_month_replaces_its_search_rows_and_omits_cancelled_events() {
+        let account_id = temp_account_id();
+        let cache = CalendarCache::open(&account_id).unwrap();
+        let calendar = CalendarId("cal-1".to_string());
+        let mut first = sample_event(&calendar, "first", "Budget review", 3);
+        let mut second = sample_event(&calendar, "second", "Budget planning", 10);
+        cache.store_month(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(), &[first.clone(), second.clone()]).unwrap();
+        assert_eq!(cache.search_events(&["budget".to_string()], 10).unwrap().len(), 2);
+
+        first.status = lookout_core::EventStatus::Cancelled;
+        second.summary = Some("Retrospective".to_string());
+        cache.store_month(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(), &[first, second]).unwrap();
+        assert!(
+            cache.search_events(&["budget".to_string()], 10).unwrap().is_empty(),
+            "cancelled rows and replaced titles must disappear"
+        );
+        assert_eq!(cache.search_events(&["retrospective".to_string()], 10).unwrap().len(), 1);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn opening_an_old_cache_backfills_the_search_index() {
+        let account_id = temp_account_id();
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        std::fs::create_dir_all(cache_dir()).unwrap();
+        let occurrence = sample_event(&CalendarId("cal-1".to_string()), "old", "Archived budget meeting", 3);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE occurrences (month TEXT PRIMARY KEY, data TEXT NOT NULL);
+                 CREATE TABLE tasks (data TEXT NOT NULL);
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO occurrences (month, data) VALUES (?1, ?2)",
+                rusqlite::params!["2026-08-01", serde_json::to_string(&vec![occurrence]).unwrap()],
+            )
+            .unwrap();
+        }
+
+        let cache = CalendarCache::open(&account_id).unwrap();
+        let hits = cache.search_events(&["archived".to_string()], 10).unwrap();
+        assert_eq!(hits.len(), 1, "the old occurrence row must be indexed on open");
+        assert_eq!(hits[0].occurrence.uid.0, "old");
+        drop(cache);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::worker::Worker;
 // the submodules can refer to each other's items unqualified.
 mod attachments;
 mod calendar_glue;
+mod calendar_search;
 mod compose_host;
 mod connect;
 mod conversation;
@@ -55,6 +56,7 @@ mod tests;
 
 pub(crate) use attachments::*;
 pub(crate) use calendar_glue::*;
+pub(crate) use calendar_search::*;
 pub(crate) use compose_host::*;
 pub(crate) use connect::*;
 pub(crate) use conversation::*;
@@ -3312,13 +3314,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     ]);
     scope_dropdown.set_selected(search_scope_index(state.borrow().search_scope));
     scope_dropdown.set_tooltip_text(Some("Search scope"));
+    // Calendar's own scope (CAL-22): the title bar follows the active module,
+    // so Calendar shows "All calendars" / "Checked calendars" instead of the
+    // mail folder scopes.
+    let calendar_scope_dropdown = gtk::DropDown::from_strings(&["All calendars", "Checked calendars"]);
+    let calendar_scope_checked = state.borrow().settings.get_string(crate::settings::CALENDAR_SEARCH_SCOPE) == "checked";
+    calendar_scope_dropdown.set_selected(if calendar_scope_checked { 1 } else { 0 });
+    calendar_scope_dropdown.set_tooltip_text(Some("Calendar search scope"));
+    let scope_stack = gtk::Stack::new();
+    scope_stack.add_named(&scope_dropdown, Some("mail"));
+    scope_stack.add_named(&calendar_scope_dropdown, Some("calendar"));
+    scope_stack.set_visible_child_name("mail");
     let search_refine_button = gtk::MenuButton::builder()
         .icon_name(themed_icon_name(&["view-list-symbolic", "view-continuous-symbolic"]))
         .tooltip_text("Refine search")
         .css_classes(["flat"])
         .build();
     let search_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-    search_box.append(&scope_dropdown);
+    search_box.append(&scope_stack);
     search_box.append(&search_entry);
     search_box.append(&search_refine_button);
     window_header.set_title_widget(Some(&search_box));
@@ -3660,16 +3673,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         (&list_view_button, "list"),
     ] {
         let calendar_main = calendar_main.clone();
+        let state = state.clone();
+        let search_entry = search_entry.clone();
         button.connect_toggled(move |btn| {
             if btn.is_active() {
+                // Choosing a view is also a way out of the results page.
+                if let Some(calendar_state) = active_calendar_state(&state) {
+                    if calendar_state.borrow().calendar_search_active {
+                        exit_calendar_search(&calendar_state, &calendar_main, &search_entry);
+                    }
+                }
                 calendar_view::set_view(&calendar_main, view);
             }
         });
     }
 
+    // CAL-22: the Calendar Filter action is live - it focuses the title-bar
+    // calendar search. (Outlook's richer category/show-as/recurring filter
+    // menu is Track U.7.)
     let filter_button = gtk::Button::from_icon_name("edit-find-symbolic");
-    filter_button.set_tooltip_text(Some("Filter"));
-    filter_button.set_sensitive(false);
+    filter_button.set_tooltip_text(Some("Search calendar"));
+    filter_button.set_sensitive(true);
     let share_button = gtk::Button::from_icon_name("send-to-symbolic");
     share_button.set_tooltip_text(Some("Share"));
     let print_button = gtk::Button::from_icon_name("printer-symbolic");
@@ -4246,10 +4270,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_button = view_button.clone();
         let state = state.clone();
         let search_entry = search_entry.clone();
+        let scope_stack = scope_stack.clone();
+        let search_refine_button = search_refine_button.clone();
+        let calendar_main = calendar_main.clone();
         mail_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("mail");
+                exit_calendar_search_if_active(&state, &calendar_main, &search_entry);
+                scope_stack.set_visible_child_name("mail");
+                search_refine_button.set_visible(true);
                 search_entry.set_placeholder_text(Some("Search mail"));
+                search_entry.set_tooltip_text(Some("Search mail (Ctrl+F)"));
                 root_stack.set_visible_child_name(current_mail_page.get());
                 // Keep the contextual Search row on screen when a search is
                 // running (a search started from another module activates this
@@ -4278,10 +4309,29 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let search_entry = search_entry.clone();
+        let scope_stack = scope_stack.clone();
+        let search_refine_button = search_refine_button.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        let list_header = list_header.clone();
         calendar_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("calendar");
-                search_entry.set_placeholder_text(Some("Search mail"));
+                // Search is module-scoped: a mail search showing its results
+                // is left behind before Calendar takes over the title bar.
+                if state.borrow().search_active {
+                    exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, &search_entry);
+                } else if !search_entry.text().is_empty() {
+                    // A mail query still waiting out its debounce must not
+                    // leak into the Calendar placeholder.
+                    search_entry.set_text("");
+                }
+                scope_stack.set_visible_child_name("calendar");
+                search_refine_button.set_visible(false);
+                search_entry.set_placeholder_text(Some("Search calendar"));
+                search_entry.set_tooltip_text(Some("Search calendar (Ctrl+F)"));
                 root_stack.set_visible_child_name(current_calendar_page.get());
                 view_toolbar_stack.set_visible_child_name("calendar");
                 mail_calendar_overview_card.set_visible(false);
@@ -4300,10 +4350,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_button = view_button.clone();
         let contacts_window = contacts_window.clone();
         let search_entry = search_entry.clone();
+        let scope_stack = scope_stack.clone();
+        let search_refine_button = search_refine_button.clone();
+        let state = state.clone();
+        let calendar_main = calendar_main.clone();
         contacts_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("contacts");
+                exit_calendar_search_if_active(&state, &calendar_main, &search_entry);
+                scope_stack.set_visible_child_name("mail");
+                search_refine_button.set_visible(true);
                 search_entry.set_placeholder_text(Some("Search contacts"));
+                search_entry.set_tooltip_text(Some("Search contacts (Ctrl+F)"));
                 root_stack.set_visible_child_name(current_contacts_page.get());
                 view_toolbar_stack.set_visible_child_name("contacts");
                 mail_calendar_overview_card.set_visible(false);
@@ -4326,10 +4384,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let search_entry = search_entry.clone();
+        let scope_stack = scope_stack.clone();
+        let search_refine_button = search_refine_button.clone();
+        let state = state.clone();
+        let calendar_main = calendar_main.clone();
         tasks_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("tasks");
+                exit_calendar_search_if_active(&state, &calendar_main, &search_entry);
+                scope_stack.set_visible_child_name("mail");
+                search_refine_button.set_visible(true);
                 search_entry.set_placeholder_text(Some("Search mail"));
+                search_entry.set_tooltip_text(Some("Search mail (Ctrl+F)"));
                 root_stack.set_visible_child_name(current_tasks_page.get());
                 view_toolbar_stack.set_visible_child_name("tasks");
                 mail_calendar_overview_card.set_visible(false);
@@ -4347,10 +4413,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let home_button = home_button.clone();
         let view_button = view_button.clone();
         let search_entry = search_entry.clone();
+        let scope_stack = scope_stack.clone();
+        let search_refine_button = search_refine_button.clone();
+        let state = state.clone();
+        let calendar_main = calendar_main.clone();
         lookout_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("lookout");
+                exit_calendar_search_if_active(&state, &calendar_main, &search_entry);
+                scope_stack.set_visible_child_name("mail");
+                search_refine_button.set_visible(true);
                 search_entry.set_placeholder_text(Some("Search mail"));
+                search_entry.set_tooltip_text(Some("Search mail (Ctrl+F)"));
                 root_stack.set_visible_child_name(current_lookout_page.get());
                 view_toolbar_stack.set_visible_child_name("lookout");
                 mail_calendar_overview_card.set_visible(false);
@@ -4457,8 +4531,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let search_debounce = search_debounce.clone();
         let mail_view_button = mail_view_button.clone();
         let current_module = current_module.clone();
+        let calendar_main = calendar_main.clone();
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text();
+            // Calendar event search (CAL-22 / UX-12): the title bar follows
+            // the active module, so a query typed here searches cached events
+            // and shows the results page instead of switching to Mail.
+            if current_module.get() == "calendar" {
+                search_debounce.set(search_debounce.get() + 1);
+                if query.trim().is_empty() {
+                    if let Some(calendar_state) = active_calendar_state(&state) {
+                        exit_calendar_search(&calendar_state, &calendar_main, entry);
+                    }
+                    return;
+                }
+                let token = search_debounce.get();
+                let state = state.clone();
+                let calendar_main = calendar_main.clone();
+                let worker = worker.clone();
+                let search_debounce = search_debounce.clone();
+                let current_module = current_module.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64), move || {
+                    if search_debounce.get() != token || current_module.get() != "calendar" {
+                        return;
+                    }
+                    if let Some(calendar_state) = active_calendar_state(&state) {
+                        start_calendar_search(&calendar_state, &worker, &calendar_main, &query);
+                    }
+                });
+                return;
+            }
             // While the People module is active the title-bar search becomes
             // the People search (UX-12, P-06): filter the contacts list in
             // place rather than switching to Mail. An emptied box clears the
@@ -4491,8 +4593,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let list_header = list_header.clone();
             let search_debounce = search_debounce.clone();
             let mail_view_button = mail_view_button.clone();
+            let current_module = current_module.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS as u64), move || {
-                if search_debounce.get() != token {
+                if search_debounce.get() != token || current_module.get() == "calendar" {
                     return;
                 }
                 start_search(&state, &worker, &message_list, &list_header, query.as_str());
@@ -4509,6 +4612,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list_stack = message_list_stack.clone();
         let list_header = list_header.clone();
         let search_debounce = search_debounce.clone();
+        let current_module = current_module.clone();
+        let calendar_main = calendar_main.clone();
         // Esc in the entry: leave search mode entirely rather than just
         // clearing the field (`GtkSearchEntry` emits `stop-search` on Esc).
         search_entry.connect_stop_search(move |entry| {
@@ -4519,7 +4624,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // and re-enter a search for the (already-cleared) query.
                 search_debounce.set(search_debounce.get() + 1);
             }
-            exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, entry);
+            if current_module.get() == "calendar" {
+                if let Some(calendar_state) = active_calendar_state(&state) {
+                    exit_calendar_search(&calendar_state, &calendar_main, entry);
+                }
+            } else {
+                exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, entry);
+            }
+        });
+    }
+
+    // Calendar's ribbon Filter action focuses the title-bar search (CAL-22).
+    {
+        let search_entry = search_entry.clone();
+        filter_button.connect_clicked(move |_| {
+            search_entry.grab_focus();
         });
     }
 
@@ -4572,6 +4691,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let on_scope = on_scope.clone();
             move |dropdown| on_scope(dropdown.selected())
         });
+
+        // Calendar search scope (CAL-22): all connected calendars vs only the
+        // ones ticked in the sidebar. Persisted like the mail scope, and an
+        // active search re-runs immediately.
+        {
+            let state = state.clone();
+            let worker = worker.clone();
+            let calendar_main = calendar_main.clone();
+            calendar_scope_dropdown.connect_selected_notify(move |dropdown| {
+                let checked = dropdown.selected() == 1;
+                let Some(calendar_state) = active_calendar_state(&state) else {
+                    return;
+                };
+                {
+                    let mut st = calendar_state.borrow_mut();
+                    if st.calendar_search_checked_only == checked {
+                        return;
+                    }
+                    st.calendar_search_checked_only = checked;
+                }
+                state
+                    .borrow()
+                    .settings
+                    .set_string(crate::settings::CALENDAR_SEARCH_SCOPE, if checked { "checked" } else { "all" });
+                if calendar_state.borrow().calendar_search_active {
+                    rerun_calendar_search(&calendar_state, &worker, &calendar_main);
+                }
+            });
+        }
+        {
+            let state = state.clone();
+            let clear_calendar_main = calendar_main.clone();
+            let entry = search_entry.clone();
+            calendar_main.search_clear_button.connect_clicked(move |_| {
+                if let Some(calendar_state) = active_calendar_state(&state) {
+                    exit_calendar_search(&calendar_state, &clear_calendar_main, &entry);
+                }
+            });
+        }
 
         let header_refine = build_refine_popover(&state);
         search_refine_button.set_popover(Some(&header_refine));
@@ -5677,6 +5835,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         local_tasks_db,
         local_task_lists: state.borrow().app_config.borrow().local_task_lists(),
         tasks_filter: crate::tasks_view::TasksFilter::default(),
+        calendar_search_active: false,
+        calendar_search_query: String::new(),
+        calendar_search_results: Vec::new(),
+        calendar_search_previous_view: "month",
+        calendar_search_generation: 0,
+        calendar_search_pending: 0,
+        calendar_search_checked_only: state.borrow().settings.get_string(crate::settings::CALENDAR_SEARCH_SCOPE) == "checked",
+        calendar_search_backfilled: false,
+        calendar_search_refresh: None,
         my_day_day: crate::calendar_tz::display_zone().today(),
         my_day_pins: Vec::new(),
         dashboard_refresh: None,
@@ -10532,6 +10699,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
         });
     }
+    // The calendar event loop's way back into an active event search: the
+    // loop has no `Worker`/results-page references, so it calls this hook
+    // after a month sync or an event edit (CAL-22).
+    calendar_state.borrow_mut().calendar_search_refresh = Some({
+        let calendar_state = calendar_state.clone();
+        let worker = worker.clone();
+        let calendar_main = calendar_main.clone();
+        // The backfill and a batch of month syncs can fire dozens of these in
+        // quick succession; coalesce them so the cache isn't queried once per
+        // month.
+        let generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        Rc::new(move || {
+            let token = generation.get().wrapping_add(1);
+            generation.set(token);
+            let calendar_state = calendar_state.clone();
+            let worker = worker.clone();
+            let calendar_main = calendar_main.clone();
+            let generation = generation.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(750), move || {
+                if generation.get() == token {
+                    rerun_calendar_search(&calendar_state, &worker, &calendar_main);
+                }
+            });
+        })
+    });
     // The calendar event loop's window into the event editor: after a
     // context-menu Duplicate / Copy (item 3.12) the loop opens the new
     // occurrence's editor once the server has confirmed it.

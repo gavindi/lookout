@@ -20,7 +20,9 @@ mod vtimezone;
 mod xml;
 
 pub use birthdays::birthday_occurrences;
-pub use cache::{cache_info, clear_all_caches, contacts_cache_info, remove_subscription_cache, CachedAddressBook, CachedContact, ContactsCache};
+pub use cache::{
+    cache_info, clear_all_caches, contacts_cache_info, remove_subscription_cache, CachedAddressBook, CachedContact, CachedEventHit, CalendarCache, ContactsCache, SearchField,
+};
 pub use client::{fetch_webcal_ics, normalize_webcal_url, AddressBookInfo, ContactRecord, DavClient, MAX_FEED_BYTES};
 pub use config::{CalendarAccountConfig, CardDavAccountConfig, Credential};
 pub use error::{Error, Result};

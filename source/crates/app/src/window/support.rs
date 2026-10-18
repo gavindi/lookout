@@ -852,6 +852,94 @@ pub(crate) fn spawn_cache_read<T: Send + 'static>(
 /// (see `AccountHandle::address_cache`'s doc comment: "a failure here only
 /// costs suggestions"). Mirrors `spawn_cache_read`'s shape, except there's no
 /// existing `Cache` to query - this is what produces one in the first place.
+/// Writes one month of a non-CalDAV backend's occurrences into the calendar
+/// cache, so event search (CAL-22) sees Microsoft 365 and any other
+/// app-supplied source. CalDAV and webcal sessions write their own cache in
+/// `sync_month`; this is the app-side path for Graph, whose session has no
+/// cache of its own. Best-effort: a failure only costs search coverage for
+/// that month, never the live view.
+pub(crate) fn spawn_calendar_cache_store(worker: &Worker, account_id: AccountId, month: chrono::NaiveDate, occurrences: Vec<lookout_core::EventOccurrence>) {
+    worker.spawn(async move {
+        let warn_id = account_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let cache = lookout_dav::CalendarCache::open(&account_id)?;
+            cache.store_month(month, &occurrences)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("failed to cache {warn_id}'s calendar month {month} for search: {e}"),
+            Err(e) => tracing::warn!("calendar cache write for {warn_id} panicked: {e}"),
+        }
+    });
+}
+
+/// Opens a calendar cache's index on the `Worker`'s blocking thread pool and
+/// returns the matching occurrences - the calendar counterpart of
+/// [`spawn_cache_read`]. The cache is opened per query: SQLite connections are
+/// cheap, and this avoids the app holding a second long-lived handle to a
+/// file the account session already owns.
+pub(crate) fn spawn_calendar_cache_search(worker: &Worker, account_id: AccountId, terms: Vec<String>) -> async_channel::Receiver<Vec<lookout_dav::CachedEventHit>> {
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    let warn_id = account_id.clone();
+    worker.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let cache = lookout_dav::CalendarCache::open(&account_id)?;
+            cache.search_events(&terms, CALENDAR_SEARCH_ROW_LIMIT)
+        })
+        .await;
+        let hits = match result {
+            Ok(Ok(hits)) => hits,
+            Ok(Err(e)) => {
+                tracing::warn!("calendar search failed for {warn_id}: {e}");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!("calendar search for {warn_id} panicked: {e}");
+                Vec::new()
+            }
+        };
+        let _ = reply_tx.send(hits).await;
+    });
+    reply_rx
+}
+
+/// The months in `months` a calendar cache has never stored - the backfill's
+/// "don't re-fetch what we already indexed" check, run off the GTK thread.
+pub(crate) fn spawn_calendar_cache_missing_months(worker: &Worker, account_id: AccountId, months: Vec<chrono::NaiveDate>) -> async_channel::Receiver<Vec<chrono::NaiveDate>> {
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    let warn_id = account_id.clone();
+    worker.spawn(async move {
+        let fallback = months.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let cache = lookout_dav::CalendarCache::open(&account_id)?;
+            cache.missing_months(&months)
+        })
+        .await;
+        let missing = match result {
+            Ok(Ok(missing)) => missing,
+            Ok(Err(e)) => {
+                tracing::warn!("calendar backfill check failed for {warn_id}: {e}");
+                fallback
+            }
+            Err(e) => {
+                tracing::warn!("calendar backfill check for {warn_id} panicked: {e}");
+                fallback
+            }
+        };
+        let _ = reply_tx.send(missing).await;
+    });
+    reply_rx
+}
+
+/// Raw rows scanned per account before the caller dedupes recurring series.
+/// Generous enough for a long-running weekly series while still bounding a
+/// single account's memory use.
+pub(crate) const CALENDAR_SEARCH_ROW_LIMIT: usize = 2000;
+
+/// Results shown after dedupe (one per series).
+pub(crate) const CALENDAR_SEARCH_RESULT_LIMIT: usize = 200;
+
 pub(crate) fn spawn_cache_open(worker: &Worker, account_id: AccountId) -> async_channel::Receiver<Option<Arc<lookout_mail::Cache>>> {
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     worker.spawn(async move {

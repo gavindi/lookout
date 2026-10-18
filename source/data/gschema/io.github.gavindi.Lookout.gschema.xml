@@ -328,6 +328,11 @@
       <summary>Event alerts</summary>
       <description>Show a notification when an event reminder comes due.</description>
     </key>
+    <key name="calendar-search-scope" type="s">
+      <default>'all'</default>
+      <summary>Calendar search scope</summary>
+      <description>Which calendars event search covers: all connected calendars, or only those checked in the sidebar.</description>
+    </key>
     <key name="calendar-week-start" type="i">
       <range min="0" max="6"/>
       <default>0</default>

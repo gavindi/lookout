@@ -533,6 +533,14 @@ philosophy, with one key exception:
 -- CalendarCache
 CREATE TABLE occurrences (month TEXT PRIMARY KEY, data TEXT NOT NULL);  -- JSON array of EventOccurrence
 CREATE TABLE tasks (data TEXT NOT NULL);                                 -- single-row JSON array of CalendarTask
+-- Derived search index for CAL-22 (rebuilt from `occurrences` on a
+-- `user_version` bump; one row per occurrence, deduped by the UI):
+CREATE TABLE event_search (
+    calendar_id TEXT, uid TEXT, start_utc TEXT, end_utc TEXT, all_day INTEGER,
+    month TEXT, summary TEXT, location TEXT, description TEXT, attendees TEXT,
+    organizer TEXT, search_blob TEXT, cancelled INTEGER, data TEXT,
+    PRIMARY KEY (calendar_id, uid, start_utc, month)
+);
 
 -- ContactsCache
 CREATE TABLE address_books (href TEXT PRIMARY KEY, displayname TEXT NOT NULL, sync_token TEXT);
@@ -542,7 +550,11 @@ CREATE TABLE contacts (href TEXT PRIMARY KEY, book_href TEXT NOT NULL, etag TEXT
 `ContactsCache` is the one DAV cache that **is** authoritative for something: it persists each
 address book's RFC 6578 `sync_token`, so polls can run incremental `sync-collection` REPORTs, and
 it's the baseline the People screen's "Deleted" bucket diffs against across restarts.
-`CalendarCache` is a pure fast-paint hint, always superseded by the next live sync.
+`CalendarCache` is still non-authoritative, but `event_search` is a persisted read index for
+Calendar search (CAL-22): it is derived from `occurrences`, rebuilt from scratch on a
+`user_version` bump, and written by `store_month`, so it never needs its own sync path. Microsoft
+365 months reach it through `spawn_calendar_cache_store` in the app's calendar event loop (the
+Graph actor has no cache of its own).
 
 ### 5.6 Synthesized/derived calendars
 
@@ -647,7 +659,11 @@ per-domain state blobs rather than one giant struct.
 events window), `displayed_month`, `checked_calendar_ids` (sidebar checklist), `calendar_colors`,
 webcal subscription handles, a synthesized `birthdays` handle, Google Tasks handles, a local-tasks
 fallback store (`CalendarId("local")`, used when no connected calendar supports VTODO), and its own
-`pending_calendar_moves` optimistic-rollback map for drag-to-reschedule.
+`pending_calendar_moves` optimistic-rollback map for drag-to-reschedule. Event search (CAL-22) adds
+`calendar_search_active` / `_query` / `_results` / `_previous_view` / `_generation` /
+`_pending` / `_checked_only` / `_backfilled` plus a late-bound `calendar_search_refresh` hook, and
+its orchestration lives in `window/calendar_search.rs` (pure term parsing, cache fan-out, series
+dedupe and the bounded `FetchMonth` backfill).
 
 ### 8.3 Event dispatch — the uniform actor-consumption pattern
 
