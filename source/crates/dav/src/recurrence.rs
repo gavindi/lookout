@@ -1,7 +1,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use chrono::{DateTime, Utc};
-use lookout_core::{CalendarEvent, EventOccurrence, RecurrenceRange};
+use lookout_core::{CalendarEvent, CalendarTask, EventOccurrence, RecurrenceRange};
 use rrule::{RRule, RRuleSet, Unvalidated};
 
 /// Defensive cap on how many occurrences a single event can expand into,
@@ -106,6 +106,35 @@ where
     override_occurrences.sort_by_key(|occ| occ.start);
     occurrences.extend(override_occurrences);
     occurrences
+}
+
+/// Expands a recurring task one occurrence forward (T-06): the series anchor
+/// (unchanged `DTSTART`) and the next due date after the task's current due,
+/// so a `COUNT`/`UNTIL` series is exhausted correctly. `None` when the task
+/// has no `RRULE`/`DUE`, when the rule is malformed, or when the series is
+/// finished - the caller then completes the existing task instead of rolling
+/// it.
+///
+/// Tasks carry no time zone (like the rest of `CalendarTask`), so expansion
+/// runs in UTC; a rule near a DST boundary keeps its UTC instant rather than
+/// its local wall time. Lookout's editor anchors a new recurring task on its
+/// due instant, so the common case is a zero due-minus-start offset; a task
+/// imported with a separate start keeps that original anchor and its per-
+/// occurrence offset is flattened to zero on the first roll.
+pub fn next_task_occurrence(task: &CalendarTask) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let rrule = task.rrule.as_deref()?;
+    let due = task.due?;
+    let anchor = task.start.unwrap_or(due);
+    let tz_anchor = anchor.with_timezone(&rrule::Tz::UTC);
+    let unvalidated: RRule<Unvalidated> = rrule.parse().ok()?;
+    let validated = unvalidated.validate(tz_anchor).ok()?;
+    let set = RRuleSet::new(tz_anchor).rrule(validated);
+    // `after` may be inclusive depending on the set's own iterator settings;
+    // filter the current due out so a completed occurrence can't be
+    // "advanced" to the same date.
+    let result = set.after(tz_anchor).all(2);
+    let next = result.dates.into_iter().map(|date| date.with_timezone(&Utc)).find(|date| *date > due)?;
+    Some((anchor, next))
 }
 
 fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>, window_end: DateTime<Utc>) -> Vec<EventOccurrence> {
@@ -404,5 +433,60 @@ mod tests {
         }
         assert_eq!(occurrences[0].start, "2026-07-01T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
         assert_eq!(occurrences[1].start, "2026-07-08T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    fn base_task(due: &str, rrule: Option<&str>) -> CalendarTask {
+        CalendarTask {
+            uid: lookout_core::TaskUid("task-1@example.com".to_string()),
+            calendar_id: CalendarId("acct:cal".to_string()),
+            summary: Some("Recurring task".to_string()),
+            description: None,
+            due: Some(due.parse().unwrap()),
+            start: None,
+            rrule: rrule.map(str::to_string),
+            created: None,
+            completed: None,
+            status: lookout_core::TaskStatus::NeedsAction,
+            priority: lookout_core::TaskPriority(0),
+            percent_complete: None,
+            reminder_minutes_before: None,
+            categories: Vec::new(),
+            href: None,
+            etag: None,
+        }
+    }
+
+    #[test]
+    fn next_task_occurrence_advances_each_frequency() {
+        let daily = next_task_occurrence(&base_task("2026-07-15T09:00:00Z", Some("FREQ=DAILY"))).unwrap();
+        assert_eq!(daily.0, "2026-07-15T09:00:00Z".parse::<DateTime<Utc>>().unwrap(), "the series anchor stays put");
+        assert_eq!(daily.1, "2026-07-16T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+
+        let weekly = next_task_occurrence(&base_task("2026-07-15T09:00:00Z", Some("FREQ=WEEKLY;BYDAY=WE"))).unwrap();
+        assert_eq!(weekly.1, "2026-07-22T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+
+        let monthly = next_task_occurrence(&base_task("2026-07-15T09:00:00Z", Some("FREQ=MONTHLY;BYMONTHDAY=15"))).unwrap();
+        assert_eq!(monthly.1, "2026-08-15T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    }
+
+    #[test]
+    fn next_task_occurrence_keeps_the_anchor_and_honours_count() {
+        let mut task = base_task("2026-07-15T17:00:00Z", Some("FREQ=DAILY;COUNT=2"));
+        task.start = Some("2026-07-15T09:00:00Z".parse().unwrap());
+        let (start, due) = next_task_occurrence(&task).unwrap();
+        assert_eq!(start, "2026-07-15T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        assert_eq!(due, "2026-07-16T09:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        // COUNT=2: once the second occurrence is due, the series is over.
+        let finished = CalendarTask { due: Some(due), ..task };
+        assert_eq!(next_task_occurrence(&finished), None);
+    }
+
+    #[test]
+    fn next_task_occurrence_returns_none_without_a_rule_or_with_a_bad_rule() {
+        assert!(next_task_occurrence(&base_task("2026-07-15T09:00:00Z", None)).is_none());
+        assert!(next_task_occurrence(&base_task("2026-07-15T09:00:00Z", Some("FREQ=BOGUS"))).is_none());
+        let mut no_due = base_task("2026-07-15T09:00:00Z", Some("FREQ=DAILY"));
+        no_due.due = None;
+        assert!(next_task_occurrence(&no_due).is_none());
     }
 }

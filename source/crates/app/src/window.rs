@@ -9,7 +9,7 @@ use adw::prelude::*;
 use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::calendar_protocol::CalendarCommand;
-use lookout_core::{display_name, AccountId, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
+use lookout_core::{display_name, AccountId, CalendarTask, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_dav::subscription::SubscriptionCommand;
 use lookout_mail::session::AccountCommand;
 use lookout_mail::SearchScope;
@@ -5673,6 +5673,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         graph_todo: HashMap::new(),
         google_account_emails: Vec::new(),
         local_tasks,
+        task_reminders_refresh: None,
         local_tasks_db,
         local_task_lists: state.borrow().app_config.borrow().local_task_lists(),
         tasks_filter: crate::tasks_view::TasksFilter::default(),
@@ -5975,20 +5976,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .inspect_err(|e| tracing::warn!("reminder state won't persist: {e}"))
             .ok(),
     )));
-    crate::reminders::spawn_reminder_loop(app, reminders_engine.clone(), settings.clone(), {
-        let window = window.clone();
-        let state = state.clone();
-        let worker = worker.clone();
-        let calendar_state = calendar_state.clone();
-        let calendar_view_button = calendar_view_button.clone();
-        let toast_overlay = toast_overlay.clone();
-        let profile_card = profile_card_provider.clone();
-        Rc::new(move |occ: EventOccurrence| {
-            window.present();
-            calendar_view_button.set_active(true);
-            open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
-        })
-    });
+    // Task reminders (T-05): the Tasks view's refresh funnel feeds the engine
+    // once the engine exists; seed it with the current snapshot so an alert
+    // due at launch fires without waiting for the first repaint.
+    {
+        let engine = reminders_engine.clone();
+        calendar_state.borrow_mut().task_reminders_refresh = Some(Rc::new(move |tasks| engine.borrow_mut().sync_tasks(tasks)));
+        reminders_engine.borrow_mut().sync_tasks(&merged_tasks_with_accounts(&calendar_state));
+    }
+    crate::reminders::spawn_reminder_loop(
+        app,
+        reminders_engine.clone(),
+        settings.clone(),
+        {
+            let window = window.clone();
+            let state = state.clone();
+            let worker = worker.clone();
+            let calendar_state = calendar_state.clone();
+            let calendar_view_button = calendar_view_button.clone();
+            let toast_overlay = toast_overlay.clone();
+            let profile_card = profile_card_provider.clone();
+            Rc::new(move |occ: EventOccurrence| {
+                window.present();
+                calendar_view_button.set_active(true);
+                open_event_editor_for(&window, &state, &worker, &calendar_state, &toast_overlay, &profile_card, &occ);
+            })
+        },
+        {
+            let window = window.clone();
+            let state = state.clone();
+            let calendar_state = calendar_state.clone();
+            let tasks_view = tasks_view.clone();
+            let tasks_view_button = tasks_view_button.clone();
+            Rc::new(move |task: CalendarTask| {
+                window.present();
+                tasks_view_button.set_active(true);
+                open_task_editor_for(&window, &state, &calendar_state, &tasks_view, &task);
+            })
+        },
+    );
     // --- Mail notification actions. `app.raise-window` and `app.open-mailbox`
     // are the click targets `mail_notifications::show_new_mail_notification`/
     // `show_send_failed_notification` set as their default action; both just
@@ -10294,9 +10320,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_state_for_activate = calendar_state.clone();
         let tasks_view_for_toggle = tasks_view.clone();
         let tasks_view_for_activate = tasks_view.clone();
+        let toast_overlay_for_toggle = toast_overlay.clone();
         crate::tasks_view::set_handlers(
             &tasks_view,
-            Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view_for_toggle, task, completed)),
+            Rc::new(move |previous, task, completed| route_task_toggle(&calendar_state, &tasks_view_for_toggle, &toast_overlay_for_toggle, previous, task, completed)),
             Rc::new(move |task| open_task_editor_for(&window, &state, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
         );
     }
@@ -10451,9 +10478,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let tasks_view = tasks_view.clone();
         let calendar_state_for_activate = calendar_state.clone();
         let tasks_view_for_activate = tasks_view.clone();
+        let toast_overlay_for_toggle = toast_overlay.clone();
         crate::lookout_view::set_handlers(
             &lookout_view,
-            Rc::new(move |task, completed| route_task_toggle(&calendar_state, &tasks_view, task, completed)),
+            Rc::new(move |previous, task, completed| route_task_toggle(&calendar_state, &tasks_view, &toast_overlay_for_toggle, previous, task, completed)),
             Rc::new(move |task| open_task_editor_for(&window, &state, &calendar_state_for_activate, &tasks_view_for_activate, &task)),
         );
     }

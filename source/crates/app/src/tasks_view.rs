@@ -351,9 +351,10 @@ pub struct TasksView {
     categories: Rc<RefCell<CategorySet>>,
 }
 
-/// One task row's checkbox flip: the caller should send the task (with
-/// status/completed/percent updated) to its account session.
-pub type ToggleHandler = Rc<dyn Fn(CalendarTask, bool) + 'static>;
+/// One task row's checkbox flip: the caller receives the pre-toggle task (for
+/// roll-forward and Undo) and the updated task (with status/completed/percent
+/// rewritten), then sends it to its account session.
+pub type ToggleHandler = Rc<dyn Fn(CalendarTask, CalendarTask, bool) + 'static>;
 /// A clicked row: the caller should open the task editor for it.
 pub(crate) type ActivateHandler = Rc<dyn Fn(CalendarTask) + 'static>;
 /// A flagged-email row's checkbox: the caller marks the message's flag
@@ -793,7 +794,7 @@ fn install_tasks_css() {
 /// the "group by list" mode. Rebuilds rows from scratch on every call - the
 /// same repaint-from-scratch convention as the calendar checklist.
 pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColorMap, list_names: &HashMap<CalendarId, String>) {
-    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _c| {}));
+    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _u, _c| {}));
     let activate = view.activate.borrow().clone().unwrap_or_else(|| Rc::new(|_t| {}));
     let sort = *view.sort.borrow();
     let group = *view.group.borrow();
@@ -864,7 +865,7 @@ pub fn set_my_day(view: &TasksView, pinned: &[CalendarTask], suggestions: &[Cale
     if *view.filter.borrow() != TasksFilter::MyDay {
         return;
     }
-    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _c| {}));
+    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _u, _c| {}));
     let activate = view.activate.borrow().clone().unwrap_or_else(|| Rc::new(|_t| {}));
     let show_completed = *view.show_completed.borrow();
     let categories: Vec<CategoryDef> = view.categories.borrow().categories.clone();
@@ -1053,6 +1054,18 @@ pub(crate) fn task_row(
     }
     row_box.append(&dot);
     row_box.append(&summary);
+    if task.rrule.is_some() {
+        let repeat = gtk::Image::from_icon_name("media-playlist-repeat-symbolic");
+        repeat.set_tooltip_text(Some("Repeating task"));
+        repeat.add_css_class("dim-label");
+        row_box.append(&repeat);
+    }
+    if task.reminder_minutes_before.is_some() {
+        let bell = gtk::Image::from_icon_name("alarm-symbolic");
+        bell.set_tooltip_text(Some("Reminder set"));
+        bell.add_css_class("dim-label");
+        row_box.append(&bell);
+    }
     if let Some(chips) = category_chips(&task, categories) {
         row_box.append(&chips);
     }
@@ -1078,7 +1091,7 @@ pub(crate) fn task_row(
                 updated.completed = Some(chrono::Utc::now());
                 updated.percent_complete = Some(100);
             }
-            toggle(updated, !task_completed(&task));
+            toggle(task.clone(), updated, !task_completed(&task));
         });
     }
     button.connect_clicked(move |_| activate(task.clone()));
@@ -1158,11 +1171,13 @@ mod tests {
             description: None,
             due: due.map(|d| Local.from_local_datetime(&d).unwrap().with_timezone(&chrono::Utc)),
             start: None,
+            rrule: None,
             created: None,
             completed: None,
             status,
             priority: TaskPriority(priority),
             percent_complete: percent,
+            reminder_minutes_before: None,
             categories: Vec::new(),
             href: None,
             etag: None,

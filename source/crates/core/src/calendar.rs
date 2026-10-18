@@ -402,9 +402,11 @@ pub struct TaskPriority(pub u8);
 /// One VTODO as it exists on the server. The CalDAV mirror of
 /// [`CalendarEvent`], carrying the same href/etag write metadata; unlike an
 /// event a task has no start/end span - `due` (or, rarely, `start` +
-/// `duration`) is its only temporal anchor, so recurrence is left unmodeled
-/// (RFC 5545 allows `RRULE` on VTODO but `icalendar`'s `Todo::repeats` is
-/// unimplemented, and per-occurrence task expansion is out of scope).
+/// `duration`) is its only temporal anchor.
+///
+/// A recurring task keeps its raw `RRULE` and is rolled forward in place when
+/// an occurrence is completed (RFC 5545 permits exactly one VTODO per series
+/// master; per-occurrence `RECURRENCE-ID` overrides are not modeled).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CalendarTask {
     pub uid: TaskUid,
@@ -419,8 +421,16 @@ pub struct CalendarTask {
     pub due: Option<DateTime<Utc>>,
     /// RFC 5545 §3.8.2.2: when the task starts. Only meaningful when a task
     /// has a `DURATION` instead of a `DUE` - the editor always writes `DUE`.
+    /// For a recurring task this is also the series anchor (`DTSTART`, which
+    /// RFC 5545 requires alongside `RRULE`).
     #[serde(default)]
     pub start: Option<DateTime<Utc>>,
+    /// Raw RFC 5545 `RECUR` value (`RRULE`), e.g. `FREQ=WEEKLY;BYDAY=MO`.
+    /// `None` for a one-off task. Kept unparsed, exactly like
+    /// [`CalendarEvent::rrule`], so a rule written by another client survives
+    /// a round trip; `lookout-dav` expands it for roll-forward.
+    #[serde(default)]
+    pub rrule: Option<String>,
     /// RFC 5545 §3.8.7.1 (`CREATED`): when the task was created, as recorded
     /// by the originating client/server. Used by the Tasks view's "created"
     /// sort (T-09). `None` when the server didn't supply it.
@@ -438,6 +448,11 @@ pub struct CalendarTask {
     /// (the RFC default is 0).
     #[serde(default)]
     pub percent_complete: Option<u8>,
+    /// Minutes before `due` the first `VALARM` fires (T-05); `None` for no
+    /// reminder. Signed so a trigger after the due time can round-trip. The
+    /// event model uses the same shape (`CalendarEvent::reminder_minutes_before`).
+    #[serde(default)]
+    pub reminder_minutes_before: Option<i64>,
     #[serde(default)]
     pub categories: Vec<String>,
     /// The resource's URL within its calendar collection, if known - the

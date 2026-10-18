@@ -278,7 +278,7 @@ pub fn set_handlers(view: &LookoutView, toggle: ToggleHandler, activate: Activat
 /// every call - the same repaint-from-scratch convention as the calendar
 /// checklist and the Tasks view.
 pub fn set_data(view: &LookoutView, data: &LookoutData) {
-    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _c| {}));
+    let toggle = view.toggle.borrow().clone().unwrap_or_else(|| Rc::new(|_t, _u, _c| {}));
     let activate = view.activate.borrow().clone().unwrap_or_else(|| Rc::new(|_t| {}));
     let now_local = Local::now();
     let calendar_now = crate::calendar_tz::display_zone().now();
@@ -960,11 +960,13 @@ mod tests {
             description: None,
             due: Some(Local.with_ymd_and_hms(2026, 8, due_day, 9, 0, 0).unwrap().with_timezone(&Utc)),
             start: None,
+            rrule: None,
             created: None,
             completed: None,
             status,
             priority: Default::default(),
             percent_complete: None,
+            reminder_minutes_before: None,
             categories: Vec::new(),
             href: None,
             etag: None,

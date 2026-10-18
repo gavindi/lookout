@@ -26,3 +26,4 @@ pub use config::{CalendarAccountConfig, CardDavAccountConfig, Credential};
 pub use error::{Error, Result};
 pub use freebusy::{build_vfreebusy_request, parse_schedule_response, parse_vfreebusy_intervals};
 pub use ical::{build_imip_vcalendar, build_vcalendar, build_vtodo_calendar, parse_imip_invitation, parse_vevents, parse_vevents_with_meta, parse_vtodos, parse_vtodos_with_meta};
+pub use recurrence::next_task_occurrence;

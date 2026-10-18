@@ -335,6 +335,42 @@ fn parse_reminder(event: &icalendar::Event) -> Option<i64> {
     Some(parse_ical_duration(unsigned).num_minutes())
 }
 
+/// Reads a VTODO's first `VALARM` as "minutes before `DUE`" (T-05). A
+/// relative trigger is resolved against `DUE` (`RELATED=END`) or, by the RFC
+/// default, `DTSTART`; an absolute `VALUE=DATE-TIME` trigger is converted
+/// straight to the same relative form. A task with no due time keeps no
+/// reminder - there is nothing sensible to anchor it to.
+fn parse_task_reminder(todo: &icalendar::Todo, due: Option<DateTime<Utc>>, start: Option<DateTime<Utc>>) -> Option<i64> {
+    let due = due?;
+    let alarm = todo.components().iter().find(|c| c.component_kind() == "VALARM")?;
+    let trigger = alarm.properties().get("TRIGGER")?;
+    let raw = trigger.value().trim();
+    let related_end = trigger.get_param_as("RELATED", |value| Some(value.eq_ignore_ascii_case("END"))).unwrap_or(false);
+    let anchor = if related_end { due } else { start.unwrap_or(due) };
+    let trigger_at = if let Some(unsigned) = raw.strip_prefix('-') {
+        anchor - parse_ical_duration(unsigned)
+    } else if raw.starts_with('P') || raw.starts_with("+P") {
+        anchor + parse_ical_duration(raw.strip_prefix('+').unwrap_or(raw))
+    } else {
+        // Absolute triggers are RFC 5545 DATE-TIME values; an unzoned value
+        // (no `Z`) is treated as UTC, the same fallback the event parser uses.
+        // The icalendar parser may hand the value back in its canonical
+        // ISO-form (`2026-07-20T16:00:00Z`) or the raw iCalendar form, so
+        // normalise away separators before parsing.
+        let normalised: String = raw.chars().filter(|c| *c != '-' && *c != ':').collect();
+        let utc = normalised.strip_suffix('Z').unwrap_or(&normalised).to_string();
+        let parsed = chrono::NaiveDateTime::parse_from_str(&utc, "%Y%m%dT%H%M%S").map(|naive| Utc.from_utc_datetime(&naive));
+        match parsed {
+            Ok(at) => at,
+            Err(e) => {
+                tracing::warn!(trigger = raw, "unparseable VTODO VALARM trigger: {e}");
+                return None;
+            }
+        }
+    };
+    Some((due - trigger_at).num_minutes())
+}
+
 fn to_utc(dpt: &DatePerhapsTime) -> Option<(DateTime<Utc>, bool)> {
     match dpt {
         DatePerhapsTime::Date(date) => Some((Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN)), true)),
@@ -524,7 +560,9 @@ pub fn build_imip_vcalendar(event: &CalendarEvent, method: ImipMethod) -> String
 /// - `DURATION`-based tasks (no `DUE`) get their due time computed from
 ///   `DTSTART` + `DURATION`; a `DURATION` with no `DTSTART` (relative to the
 ///   creation date per RFC 5545 §3.6.2) can't be anchored and is dropped.
-/// - Task `RRULE` (recurrence) is not modeled - see [`CalendarTask`].
+/// - A task's `RRULE` is carried verbatim and its first `VALARM` becomes
+///   [`CalendarTask::reminder_minutes_before`] (relative to `DUE`). Per-occurrence
+///   `RECURRENCE-ID` overrides and repeating/multiple alarms are not modeled.
 pub fn parse_vtodos(calendar_id: &CalendarId, ics: &str) -> Vec<CalendarTask> {
     parse_vtodos_with_meta(calendar_id, ics, None, None)
 }
@@ -576,6 +614,7 @@ fn convert_todo(calendar_id: &CalendarId, todo: &icalendar::Todo) -> Option<Cale
         description: todo.get_description().map(str::to_string),
         due,
         start,
+        rrule: todo.property_value("RRULE").map(str::to_string),
         created: todo.get_created(),
         completed: todo.get_completed(),
         status: match todo.get_status() {
@@ -586,6 +625,7 @@ fn convert_todo(calendar_id: &CalendarId, todo: &icalendar::Todo) -> Option<Cale
         },
         priority: TaskPriority(todo.property_value("PRIORITY").and_then(|p| p.parse().ok()).unwrap_or(0)),
         percent_complete: todo.get_percent_complete(),
+        reminder_minutes_before: parse_task_reminder(todo, due, start),
         categories: parse_categories(todo),
         // The parse side has no href/etag (those come from the enclosing
         // `multistatus` `<href>`/`getetag`, not the `calendar-data`) - the
@@ -625,8 +665,17 @@ fn build_vtodo(task: &CalendarTask) -> icalendar::Todo {
     if let Some(due) = task.due {
         vtodo.due(due);
     }
-    if let Some(start) = task.start {
+    // A recurring VTODO must carry DTSTART alongside RRULE (RFC 5545 §3.6.2).
+    // The editor has no separate start field, so a task with only a due date
+    // anchors its series on that due instant.
+    let start = task.start.or(task.rrule.as_ref().and(task.due));
+    if let Some(start) = start {
         vtodo.starts(start);
+    }
+    if let Some(rrule) = &task.rrule {
+        // Keep the server's RECUR value verbatim, exactly as `build_vevent`
+        // does; the editor builds it through the shared recurrence module.
+        vtodo.append_property(Property::new("RRULE", rrule.as_str()));
     }
     if let Some(created) = task.created {
         vtodo.created(created);
@@ -651,6 +700,11 @@ fn build_vtodo(task: &CalendarTask) -> icalendar::Todo {
     }
     if let Some(percent) = task.percent_complete {
         vtodo.percent_complete(percent);
+    }
+    if let Some(minutes) = task.reminder_minutes_before {
+        // Tasks remind relative to DUE (`RELATED=END`), matching the model's
+        // "minutes before due" and Graph's reminderDateTime semantics.
+        vtodo.alarm(Alarm::display("Reminder", Trigger::before_end(Duration::minutes(minutes))));
     }
     if !task.categories.is_empty() {
         vtodo.append_multi_property(Property::new("CATEGORIES", task.categories.join(",")));
@@ -1842,11 +1896,13 @@ END:VCALENDAR\r\n";
             description: Some("Call and confirm".to_string()),
             due: Some("2026-07-20T17:00:00Z".parse().unwrap()),
             start: Some("2026-07-15T09:00:00Z".parse().unwrap()),
+            rrule: None,
             created: Some("2026-07-01T08:30:00Z".parse().unwrap()),
             completed: None,
             status: TaskStatus::NeedsAction,
             priority: TaskPriority(3),
             percent_complete: Some(40),
+            reminder_minutes_before: None,
             categories: vec!["Work".to_string()],
             href: None,
             etag: None,
@@ -1903,6 +1959,44 @@ END:VCALENDAR\r\n";
         let tasks = parse_vtodos(&cal_id(), &ics);
         assert_eq!(tasks[0].due, None);
         assert_eq!(tasks[0].status, TaskStatus::NeedsAction);
+    }
+
+    #[test]
+    fn build_vtodo_calendar_round_trips_recurrence_and_reminder() {
+        let mut task = full_task();
+        task.rrule = Some("FREQ=WEEKLY;BYDAY=MO".to_string());
+        task.reminder_minutes_before = Some(30);
+        let ics = build_vtodo_calendar(&task);
+        assert!(ics.contains("RRULE:FREQ=WEEKLY;BYDAY=MO"), "the rule must be written verbatim: {ics}");
+        assert!(ics.contains("RELATED=END"), "the task alarm is anchored to DUE: {ics}");
+        let tasks = parse_vtodos(&cal_id(), &ics);
+        assert_eq!(tasks[0].rrule.as_deref(), Some("FREQ=WEEKLY;BYDAY=MO"));
+        assert_eq!(tasks[0].reminder_minutes_before, Some(30));
+    }
+
+    #[test]
+    fn recurring_todo_with_only_a_due_date_still_writes_dtstart() {
+        let mut task = full_task();
+        task.start = None;
+        task.rrule = Some("FREQ=DAILY".to_string());
+        let ics = build_vtodo_calendar(&task);
+        assert!(ics.contains("DTSTART"), "RFC 5545 requires DTSTART with RRULE: {ics}");
+        let tasks = parse_vtodos(&cal_id(), &ics);
+        assert_eq!(tasks[0].start, task.due);
+        assert_eq!(tasks[0].due, task.due);
+        assert_eq!(tasks[0].rrule.as_deref(), Some("FREQ=DAILY"));
+    }
+
+    #[test]
+    fn parses_absolute_and_after_due_task_alarms() {
+        let absolute = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:abs-alarm@example.com\r\nDTSTAMP:20260101T000000Z\r\nDUE:20260720T170000Z\r\nSUMMARY:Absolute\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER;VALUE=DATE-TIME:20260720T160000Z\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), absolute);
+        assert_eq!(tasks[0].reminder_minutes_before, Some(60));
+
+        // An after-due trigger stays representable as a negative lead time.
+        let after = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VTODO\r\nUID:after-alarm@example.com\r\nDTSTAMP:20260101T000000Z\r\nDUE:20260720T170000Z\r\nSUMMARY:After\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\nTRIGGER;RELATED=END:PT15M\r\nEND:VALARM\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let tasks = parse_vtodos(&cal_id(), after);
+        assert_eq!(tasks[0].reminder_minutes_before, Some(-15));
     }
 
     #[test]

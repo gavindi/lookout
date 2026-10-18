@@ -1165,7 +1165,7 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
             day_list_box.append(&crate::tasks_view::task_row(
                 &task,
                 &colors,
-                Rc::new(|_t, _c| {}),
+                Rc::new(|_t, _u, _c| {}),
                 activate.clone(),
                 &["caption"],
                 false,
@@ -2273,6 +2273,27 @@ pub(crate) fn merged_tasks(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec
         .collect()
 }
 
+/// The same merge as [`merged_tasks`], tagged with the account each task came
+/// from - the shape the reminder engine's `sync_tasks` needs to prune a
+/// disabled account's task alerts.
+pub(crate) fn merged_tasks_with_accounts(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<(AccountId, CalendarTask)> {
+    let st = calendar_state.borrow();
+    let mut out = Vec::new();
+    for (account_id, handle) in &st.accounts {
+        out.extend(handle.last_tasks.iter().cloned().map(|task| (account_id.clone(), task)));
+    }
+    for (email, handle) in &st.google_tasks {
+        let account_id = AccountId(format!("googletasks:{email}"));
+        out.extend(handle.last_tasks.iter().cloned().map(|task| (account_id.clone(), task)));
+    }
+    for (account_id, handle) in &st.graph_todo {
+        out.extend(handle.last_tasks.iter().cloned().map(|task| (account_id.clone(), task)));
+    }
+    let local = AccountId("local".to_string());
+    out.extend(st.local_tasks.iter().cloned().map(|task| (local.clone(), task)));
+    out
+}
+
 /// Repaints the Tasks view from every source's latest snapshot, setting the
 /// empty-state message to match what task sources exist (B: "you have no
 /// tasks" vs "you have nowhere to put tasks").
@@ -2310,6 +2331,12 @@ pub(crate) fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, 
     let suggestions = crate::my_day::suggestions(&tasks, &pins, today);
     crate::tasks_view::set_my_day(tasks_view, &pinned, &suggestions, &colors);
     crate::tasks_view::set_flagged_mail(tasks_view, &flagged);
+    // Keep the reminder engine's task snapshot in step with the one the view
+    // just painted (T-05). The hook is installed by the window once the engine
+    // exists; before that this is a no-op.
+    if let Some(hook) = calendar_state.borrow().task_reminders_refresh.clone() {
+        hook(&merged_tasks_with_accounts(calendar_state));
+    }
     // Every task change funnels through here (CalDAV and Google Tasks
     // `TasksUpdated` events, local saves, checkbox flips), so this is the
     // single point that keeps the Lookout dashboard's task section and the
@@ -2631,11 +2658,44 @@ pub(crate) fn insert_dashboard_occurrences(map: &mut HashMap<chrono::NaiveDate, 
     map.retain(|m, _| *m >= window[0] && *m <= window[window.len() - 1]);
 }
 
-/// Routes a completion-toggle (list checkbox) to the task's store: the
-/// checkbox already rewrote the status/completed/percent fields, so this is
-/// a plain update-in-place.
-pub(crate) fn route_task_toggle(calendar_state: &Rc<RefCell<CalendarUiState>>, tasks_view: &Rc<crate::tasks_view::TasksView>, task: CalendarTask, _completed: bool) {
+/// Routes a completion-toggle (list checkbox) to the task's store. A recurring
+/// task rolls forward in place to its next due date (T-06) instead of staying
+/// completed; the toast's Undo restores the pre-toggle task. Every other
+/// toggle is the plain status/completed/percent update the row built.
+pub(crate) fn route_task_toggle(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    toast_overlay: &adw::ToastOverlay,
+    previous: CalendarTask,
+    mut task: CalendarTask,
+    completed: bool,
+) {
+    let rolled = completed && crate::task_recurrence::roll_forward_if_completed(Some(&previous), &mut task);
+    let next_due = task.due;
     route_task_save(calendar_state, tasks_view, task.calendar_id.clone(), task);
+    if rolled {
+        let message = next_due.map_or_else(
+            || "Task completed".to_string(),
+            |due| {
+                format!(
+                    "Task completed \u{b7} next due {}",
+                    crate::calendar_tz::display_zone().occurrence_to_local(due, false).format("%a %d %b")
+                )
+            },
+        );
+        let toast = adw::Toast::new(&message);
+        toast.set_button_label(Some("Undo"));
+        let calendar_state = calendar_state.clone();
+        let tasks_view = tasks_view.clone();
+        toast.connect_button_clicked(move |_| {
+            // The completion write already rotated the resource's etag; drop
+            // it on the restore so an undo isn't rejected as a stale update.
+            let mut restore = previous.clone();
+            restore.etag = None;
+            route_task_save(&calendar_state, &tasks_view, restore.calendar_id.clone(), restore);
+        });
+        toast_overlay.add_toast(toast);
+    }
 }
 
 /// Opens the task editor for a brand-new task. The picker lists every

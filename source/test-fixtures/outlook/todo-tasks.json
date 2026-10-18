@@ -9,6 +9,12 @@
             "status": "inProgress",
             "dueDateTime": { "dateTime": "2026-08-09T09:00:00.0000000", "timeZone": "UTC" },
             "startDateTime": { "dateTime": "2026-08-08T09:00:00.0000000", "timeZone": "UTC" },
+            "recurrence": {
+                "pattern": { "type": "daily", "interval": 1 },
+                "range": { "type": "noEnd", "startDate": "2026-08-08", "recurrenceTimeZone": "UTC" }
+            },
+            "isReminderOn": true,
+            "reminderDateTime": { "dateTime": "2026-08-09T08:30:00.0000000", "timeZone": "UTC" },
             "createdDateTime": "2026-08-01T12:00:00Z",
             "lastModifiedDateTime": "2026-08-02T08:30:00Z",
             "categories": ["Errands", "Home"],

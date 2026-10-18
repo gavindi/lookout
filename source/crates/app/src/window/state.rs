@@ -1904,6 +1904,10 @@ pub(crate) struct GraphTodoHandle {
     pub(crate) error: Option<String>,
 }
 
+/// The window's task-reminder sink: every merged `(account, task)` snapshot,
+/// handed to the `ReminderEngine`'s `sync_tasks` on each Tasks-view repaint.
+pub(crate) type TaskRemindersRefresh = Rc<dyn Fn(&[(AccountId, CalendarTask)])>;
+
 pub(crate) struct CalendarUiState {
     pub(crate) accounts: HashMap<AccountId, CalendarAccountHandle>,
     pub(crate) displayed_month: chrono::NaiveDate,
@@ -1944,6 +1948,11 @@ pub(crate) struct CalendarUiState {
     /// used when no connected source supports tasks. Survives "Clear all
     /// caches" (it lives in the UI-state database, not a cache).
     pub(crate) local_tasks: Vec<CalendarTask>,
+    /// The task-reminder hook, registered by the window once the
+    /// `ReminderEngine` exists (T-05): it receives every source's merged
+    /// `(account, task)` snapshot on each `refresh_tasks_view`. `None` before
+    /// then, so an early repaint is a no-op.
+    pub(crate) task_reminders_refresh: Option<TaskRemindersRefresh>,
     /// Best-effort handle on the UI-state database for local-task writes;
     /// `None` when it couldn't open (local tasks then live in memory only).
     pub(crate) local_tasks_db: Option<Rc<RefCell<UiStateDb>>>,

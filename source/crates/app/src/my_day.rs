@@ -118,11 +118,13 @@ mod tests {
                     .with_timezone(&chrono::Utc)
             }),
             start: None,
+            rrule: None,
             created: None,
             completed: None,
             status: if completed { TaskStatus::Completed } else { TaskStatus::NeedsAction },
             priority: TaskPriority(priority),
             percent_complete: if completed { Some(100) } else { None },
+            reminder_minutes_before: None,
             categories: Vec::new(),
             href: None,
             etag: None,

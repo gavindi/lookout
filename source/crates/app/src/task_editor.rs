@@ -199,12 +199,69 @@ pub fn show_task_editor(
     let categorize_row = adw::ActionRow::builder().title("Categorize").build();
     categorize_row.add_suffix(&categorize_button);
 
+    // Reminder (T-05) and Repeat (T-06). Both are relative to the due date -
+    // a task with no due date has nothing to anchor them to, so the rows
+    // disable with the Due switch. Google Tasks has neither, so the rows are
+    // hidden for a `googletasks:` list (the calendar picker drives that).
+    let (reminder_labels, reminder_values, reminder_index) = task_reminder_choices(seed.as_ref().and_then(|t| t.reminder_minutes_before));
+    let reminder_refs: Vec<&str> = reminder_labels.iter().map(String::as_str).collect();
+    let reminder_model = gtk::StringList::new(&reminder_refs);
+    let reminder_dropdown = gtk::DropDown::builder().model(&reminder_model).valign(gtk::Align::Center).build();
+    reminder_dropdown.set_selected(reminder_index);
+    crate::privacy::mark_content(&reminder_dropdown);
+    let reminder_row = adw::ActionRow::builder().title("Remind me").build();
+    reminder_row.add_suffix(&reminder_dropdown);
+
+    // The series anchor is the due date (Lookout's only task date). Build the
+    // shareable Series popover once and read it on Save.
+    let series_start = seed
+        .as_ref()
+        .and_then(|t| t.due)
+        .map(|due| due.with_timezone(&Local).date_naive())
+        .unwrap_or_else(|| Local::now().date_naive());
+    let series = crate::recurrence::build_series_control(seed.as_ref().and_then(|t| t.rrule.as_deref()), crate::message_list::current_week_start(), series_start);
+    crate::privacy::mark_content(&series.button);
+    series.button.set_tooltip_text(Some(&series.summary()));
+    let repeat_row = adw::ActionRow::builder().title("Repeat").build();
+    repeat_row.add_suffix(&series.button);
+
+    // Keep the two schedule rows honest as the calendar/due state changes.
+    let apply_schedule_state: Rc<dyn Fn()> = {
+        let due_switch_row = due_switch_row.clone();
+        let calendar_dropdown = calendar_dropdown.clone();
+        let calendar_ids = calendar_ids.clone();
+        let reminder_row = reminder_row.clone();
+        let repeat_row = repeat_row.clone();
+        let reminder_dropdown = reminder_dropdown.clone();
+        let repeat_button = series.button.clone();
+        Rc::new(move || {
+            let selected = calendar_dropdown.selected() as usize;
+            let google = calendar_ids.get(selected).is_some_and(|id| id.0.starts_with("googletasks:"));
+            let due = due_switch_row.is_active();
+            reminder_row.set_visible(!google);
+            repeat_row.set_visible(!google);
+            reminder_dropdown.set_sensitive(due);
+            repeat_button.set_sensitive(due);
+        })
+    };
+    {
+        let apply = apply_schedule_state.clone();
+        due_switch_row.connect_active_notify(move |_| apply());
+    }
+    {
+        let apply = apply_schedule_state.clone();
+        calendar_dropdown.connect_selected_notify(move |_| apply());
+    }
+    apply_schedule_state();
+
     let fields_group = adw::PreferencesGroup::new();
     fields_group.add(&calendar_row);
     fields_group.add(&summary_row);
     fields_group.add(&priority_row);
     fields_group.add(&percent_row);
     fields_group.add(&categorize_row);
+    fields_group.add(&reminder_row);
+    fields_group.add(&repeat_row);
 
     let error_label = gtk::Label::builder().wrap(true).xalign(0.0).halign(gtk::Align::Start).css_classes(["error"]).build();
     crate::privacy::mark_ui(&error_label);
@@ -278,6 +335,9 @@ pub fn show_task_editor(
         let priority_dropdown = priority_dropdown.clone();
         let percent_spin = percent_spin.clone();
         let selected_categories = selected_categories.clone();
+        let reminder_dropdown = reminder_dropdown.clone();
+        let reminder_values = reminder_values.clone();
+        let series = series;
         let existing_meta = existing_meta.clone();
         let on_save = on_save;
         move |_button: &gtk::Button| {
@@ -321,7 +381,25 @@ pub fn show_task_editor(
                 Some((uid, href, etag)) => (uid.clone(), href.clone(), etag.clone()),
                 None => (TaskUid(uuid::Uuid::new_v4().to_string()), None, None),
             };
-            let task = CalendarTask {
+            // Google Tasks has no recurrence or reminder API. Its rows are
+            // hidden, and a save into such a list clears both rather than
+            // pretending they were stored.
+            let google_calendar = calendar_id.0.starts_with("googletasks:");
+            let due_active = due_switch_row.is_active();
+            let rrule = if due_active && !google_calendar { series.rrule(false) } else { None };
+            let reminder_minutes_before = if due_active && !google_calendar {
+                reminder_values.get(reminder_dropdown.selected() as usize).copied().flatten()
+            } else {
+                None
+            };
+            // A recurring task keeps the original series anchor (`DTSTART`);
+            // a brand-new series is anchored on the first due date.
+            let start = if rrule.is_some() {
+                existing.as_ref().filter(|task| task.rrule.is_some()).and_then(|task| task.start).or(due)
+            } else {
+                existing.as_ref().and_then(|t| t.start)
+            };
+            let mut task = CalendarTask {
                 uid,
                 calendar_id: calendar_id.clone(),
                 summary: Some(summary),
@@ -335,7 +413,8 @@ pub fn show_task_editor(
                     }
                 },
                 due,
-                start: existing.as_ref().and_then(|t| t.start),
+                start,
+                rrule,
                 // A new task is stamped now so it can be sorted by creation;
                 // an edit keeps whatever the server gave us (never over-write).
                 created: existing.as_ref().and_then(|t| t.created).or_else(|| existing.is_none().then(chrono::Utc::now)),
@@ -343,10 +422,22 @@ pub fn show_task_editor(
                 status,
                 priority: TaskPriority(priority_choices.get(priority_dropdown.selected() as usize).map(|(_, raw)| *raw).unwrap_or(0)),
                 percent_complete,
+                reminder_minutes_before,
                 categories: selected_categories.borrow().clone(),
                 href,
                 etag,
             };
+            // Refuse a rule Microsoft To Do can't store *before* submitting -
+            // Graph's structured recurrence is a strict subset of RFC 5545
+            // (e.g. no BYSETPOS first/last-weekday form).
+            if calendar_id.0.starts_with("todo:") && !lookout_graph::todo::todo_recurrence_supported(&task) {
+                error_label.set_label("Microsoft To Do can't store this repeat pattern. Choose a daily, weekly, monthly or yearly rule.");
+                error_label.set_visible(true);
+                return;
+            }
+            // Setting % complete to 100 is the editor's completion route; roll
+            // a recurring task just like the list's checkbox does.
+            crate::task_recurrence::roll_forward_if_completed(existing.as_ref(), &mut task);
             on_save(calendar_id, task);
             dialog.close();
         }
@@ -380,4 +471,55 @@ pub fn show_task_editor(
     }
 
     dialog.present();
+}
+
+/// The Remind-me dropdown's `(labels, minutes, selected index)`. Uses the
+/// shared calendar reminder presets with task wording, and keeps a value that
+/// isn't one of the presets (e.g. an arbitrary Graph `reminderDateTime`) as a
+/// synthetic "N minutes before/after" choice so editing a task never silently
+/// drops its reminder.
+fn task_reminder_choices(existing: Option<i64>) -> (Vec<String>, Vec<Option<i64>>, u32) {
+    let mut labels: Vec<String> = crate::settings::REMINDER_CHOICES
+        .iter()
+        .map(|(label, minutes)| if *minutes == Some(0) { "At time of task".to_string() } else { (*label).to_string() })
+        .collect();
+    let mut values: Vec<Option<i64>> = crate::settings::REMINDER_CHOICES.iter().map(|(_, minutes)| *minutes).collect();
+    let mut index = existing.and_then(|minutes| values.iter().position(|value| *value == Some(minutes))).unwrap_or(0) as u32;
+    if let Some(minutes) = existing {
+        if !values.contains(&Some(minutes)) {
+            labels.push(match minutes {
+                0 => "At time of task".to_string(),
+                before if before > 0 => format!("{before} minutes before"),
+                after => format!("{} minutes after", -after),
+            });
+            values.push(Some(minutes));
+            index = (labels.len() - 1) as u32;
+        }
+    }
+    (labels, values, index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_reminder_choices;
+
+    #[test]
+    fn task_reminder_choices_use_task_wording_and_default_to_none() {
+        let (labels, values, index) = task_reminder_choices(None);
+        assert_eq!(index, 0);
+        assert_eq!(values[0], None);
+        assert!(labels.iter().any(|label| label == "At time of task"));
+        assert!(!labels.iter().any(|label| label.contains("event")));
+    }
+
+    #[test]
+    fn custom_task_reminders_survive_the_editor() {
+        let (labels, values, index) = task_reminder_choices(Some(45));
+        assert_eq!(values[index as usize], Some(45));
+        assert_eq!(labels[index as usize], "45 minutes before");
+
+        let (labels, values, index) = task_reminder_choices(Some(-10));
+        assert_eq!(values[index as usize], Some(-10));
+        assert_eq!(labels[index as usize], "10 minutes after");
+    }
 }

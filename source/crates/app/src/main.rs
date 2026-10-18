@@ -82,6 +82,7 @@ mod signatures;
 mod snooze;
 mod task_editor;
 mod task_lists;
+mod task_recurrence;
 mod tasks_view;
 mod templates;
 mod theme;

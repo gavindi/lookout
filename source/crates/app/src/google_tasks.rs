@@ -516,11 +516,15 @@ pub fn convert_task(list_id: &str, gt: &GoogleTask) -> Option<CalendarTask> {
         description: gt.notes.clone(),
         due: gt.due.as_deref().and_then(parse_rfc3339),
         start: None,
+        // Google Tasks has no recurrence or reminder API (T-05/T-06): a task
+        // synced from Google never carries either.
+        rrule: None,
         created: None,
         completed: gt.completed.as_deref().and_then(parse_rfc3339),
         status: if completed { TaskStatus::Completed } else { TaskStatus::NeedsAction },
         priority: TaskPriority(0),
         percent_complete: if completed { Some(100) } else { None },
+        reminder_minutes_before: None,
         categories: Vec::new(),
         href: None,
         etag: None,

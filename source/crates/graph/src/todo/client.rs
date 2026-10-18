@@ -15,7 +15,7 @@ use lookout_core::CalendarTask;
 use serde_json::json;
 
 use crate::client::GraphClient;
-use crate::error::Result;
+use crate::error::{GraphError, Result};
 
 use super::{checklist_item_from_graph, linked_resource_from_graph, todo_list_from_graph, todo_task_from_graph, ChecklistStep, LinkedResource, TodoList};
 
@@ -26,7 +26,7 @@ const MAX_TASKS: usize = 5000;
 
 /// The `$select` fields the task read needs - exactly what the mapper consumes,
 /// so Graph doesn't return full task bodies or navigation properties.
-const TASK_SELECT: &str = "$select=id,title,body,importance,status,dueDateTime,startDateTime,completedDateTime,createdDateTime,categories";
+const TASK_SELECT: &str = "$select=id,title,body,importance,status,dueDateTime,startDateTime,completedDateTime,createdDateTime,categories,recurrence,reminderDateTime,isReminderOn";
 
 /// The Microsoft To Do HTTP operations, over a shared [`GraphClient`].
 pub struct TodoClient {
@@ -56,6 +56,7 @@ impl TodoClient {
     /// Creates `task` in `list_id`, returning Graph's copy (with its id/etag)
     /// when the response carried one.
     pub async fn create_task(&self, list_id: &str, task: &CalendarTask) -> Result<Option<CalendarTask>> {
+        ensure_recurrence_supported(task)?;
         let path = format!("me/todo/lists/{}/tasks", encode_segment(list_id));
         let created = self.graph.post(&path, &super::task_to_todo_body(task)).await?;
         Ok(todo_task_from_graph(&created, list_id))
@@ -64,6 +65,7 @@ impl TodoClient {
     /// Updates `task` in place, guarded by its etag (`If-Match`) so a concurrent
     /// change fails loudly (HTTP 412) rather than being clobbered.
     pub async fn update_task(&self, list_id: &str, task: &CalendarTask) -> Result<Option<CalendarTask>> {
+        ensure_recurrence_supported(task)?;
         let path = format!("me/todo/lists/{}/tasks/{}", encode_segment(list_id), encode_segment(&task.uid.0));
         let mut headers: Vec<(&str, &str)> = vec![("Prefer", "return=representation")];
         if let Some(etag) = task.etag.as_deref() {
@@ -123,6 +125,17 @@ impl TodoClient {
         let path = format!("me/todo/lists/{}/tasks/{}/linkedResources", encode_segment(list_id), encode_segment(task_id));
         let items = self.graph.get_all(&path, MAX_TASKS).await?;
         Ok(items.iter().filter_map(linked_resource_from_graph).collect())
+    }
+}
+
+/// Refuses a write whose RRULE Graph's recurrence model can't express, so a
+/// rule is never silently dropped from a task (the same guard the calendar
+/// client applies to events).
+fn ensure_recurrence_supported(task: &CalendarTask) -> Result<()> {
+    if super::todo_recurrence_supported(task) {
+        Ok(())
+    } else {
+        Err(GraphError::UnsupportedRecurrence(task.rrule.clone().unwrap_or_default()))
     }
 }
 

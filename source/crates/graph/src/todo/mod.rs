@@ -21,8 +21,14 @@
 //!   [`ChecklistStep`] so the transport is ready, but a task round-trips without
 //!   them; Graph's `PATCH` is partial, so Outlook's checklist items are never
 //!   clobbered.
-//! - **Recurrence** (`recurrence`): `T-06` / item 4.10, like VTODO `RRULE`.
-//! - **Reminders** (`reminderDateTime`/`isReminderOn`): `T-05` / item 4.10.
+//!
+//! Recurrence (`recurrence`, T-06) and reminders (`reminderDateTime` /
+//! `isReminderOn`, T-05) are carried: Graph's structured recurrence maps
+//! through the calendar module's `rrule_to_graph`/`recurrence_from_graph`, and
+//! an absolute Graph reminder becomes the model's "minutes before due". A
+//! reminder on a task with no due date is dropped (there is nothing to anchor
+//! it to), and a rule Graph cannot express is refused by the client rather
+//! than silently stored without recurrence.
 //!
 //! The flagged-email list (`linkedResources`) is *not* surfaced as its own
 //! source: Outlook's flagged mail already reaches Lookout through the M-10
@@ -37,10 +43,11 @@ pub mod session;
 
 pub use client::TodoClient;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use lookout_core::{CalendarId, CalendarTask, TaskPriority, TaskStatus, TaskUid};
 use serde_json::{json, Value};
 
+use crate::calendar::recurrence::{recurrence_from_graph, rrule_to_graph};
 use crate::calendar::{graph_date_time, parse_graph_date_time};
 
 /// The synthetic [`CalendarId`] prefix a Microsoft To Do list maps to.
@@ -123,24 +130,54 @@ pub fn todo_list_from_graph(value: &Value) -> Option<TodoList> {
 pub fn todo_task_from_graph(value: &Value, list_id: &str) -> Option<CalendarTask> {
     let id = value.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
     let status = status_from_graph(value.get("status").and_then(Value::as_str));
+    let due = value.get("dueDateTime").and_then(parse_graph_date_time).map(|(instant, _)| instant);
     Some(CalendarTask {
         uid: TaskUid(id.to_string()),
         calendar_id: graph_todo_calendar_id(list_id),
         summary: non_empty_str(value, "title"),
         description: body_text(value),
-        due: value.get("dueDateTime").and_then(parse_graph_date_time).map(|(instant, _)| instant),
+        due,
         start: value.get("startDateTime").and_then(parse_graph_date_time).map(|(instant, _)| instant),
+        rrule: value.get("recurrence").and_then(recurrence_from_graph),
         created: value.get("createdDateTime").and_then(parse_iso8601),
         completed: value.get("completedDateTime").and_then(parse_graph_date_time).map(|(instant, _)| instant),
         status,
         priority: priority_from_graph(value.get("importance").and_then(Value::as_str)),
         percent_complete: if status == TaskStatus::Completed { Some(100) } else { None },
+        reminder_minutes_before: reminder_minutes(value, due),
         categories: string_array(value, "categories"),
         // The Graph id doubles as the write target (an update/delete is
         // `/me/todo/lists/{list}/tasks/{id}`) - the `href` role.
         href: Some(id.to_string()),
         etag: etag(value),
     })
+}
+
+/// Graph's absolute `reminderDateTime` as the model's minutes-before-due.
+/// `isReminderOn` gates it; a reminder with no due date (or an unparseable
+/// one) is dropped rather than given a fabricated anchor.
+fn reminder_minutes(value: &Value, due: Option<DateTime<Utc>>) -> Option<i64> {
+    if !value.get("isReminderOn").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let due = due?;
+    let reminder = value.get("reminderDateTime").and_then(parse_graph_date_time).map(|(instant, _)| instant)?;
+    Some((due - reminder).num_minutes())
+}
+
+/// The date a task's recurrence is anchored on: its start when one was
+/// stored, else its due date (the editor's only visible date).
+fn task_anchor_date(task: &CalendarTask) -> Option<NaiveDate> {
+    task.start.or(task.due).map(|date| date.date_naive())
+}
+
+/// Whether Graph's structured recurrence can represent the task's rule.
+/// `true` with no rule; `false` for a rule outside Graph's model (e.g. the
+/// `BYSETPOS` first/last-weekday form) or a rule with no date to start from.
+pub fn todo_recurrence_supported(task: &CalendarTask) -> bool {
+    task.rrule
+        .as_deref()
+        .is_none_or(|rrule| task_anchor_date(task).and_then(|start| rrule_to_graph(rrule, start, None)).is_some())
 }
 
 /// The JSON body to `POST` (create) or `PATCH` (update) a Graph `todoTask`.
@@ -160,6 +197,22 @@ pub fn task_to_todo_body(task: &CalendarTask) -> Value {
     }
     if let Some(start) = task.start {
         body["startDateTime"] = graph_date_time(start, None);
+    }
+    if let Some(rrule) = task.rrule.as_deref() {
+        if let Some(recurrence) = task_anchor_date(task).and_then(|start| rrule_to_graph(rrule, start, None)) {
+            body["recurrence"] = recurrence;
+        }
+    }
+    match (task.reminder_minutes_before, task.due) {
+        (Some(minutes), Some(due)) => {
+            body["isReminderOn"] = json!(true);
+            body["reminderDateTime"] = graph_date_time(due - chrono::Duration::minutes(minutes), None);
+        }
+        // Clearing a reminder on a dated task writes the off switch. With no
+        // due date the model can't say whether Graph holds a reminder, so the
+        // property is left untouched rather than silently cleared.
+        (None, Some(_due)) => body["isReminderOn"] = json!(false),
+        (Some(_), None) | (None, None) => {}
     }
     if let Some(completed) = task.completed {
         body["completedDateTime"] = graph_date_time(completed, None);
@@ -286,6 +339,12 @@ mod tests {
             "status": "inProgress",
             "dueDateTime": { "dateTime": "2026-08-09T09:00:00.0000000", "timeZone": "UTC" },
             "startDateTime": { "dateTime": "2026-08-08T09:00:00.0000000", "timeZone": "UTC" },
+            "recurrence": {
+                "pattern": { "type": "daily", "interval": 1 },
+                "range": { "type": "noEnd", "startDate": "2026-08-08", "recurrenceTimeZone": "UTC" }
+            },
+            "isReminderOn": true,
+            "reminderDateTime": { "dateTime": "2026-08-09T08:30:00.0000000", "timeZone": "UTC" },
             "createdDateTime": "2026-08-01T12:00:00Z",
             "categories": ["Errands", "Home"],
             "checklistItems": [
@@ -375,6 +434,37 @@ mod tests {
     }
 
     #[test]
+    fn recurrence_and_reminder_round_trip_through_the_mapper() {
+        let task = todo_task_from_graph(&sample_task(), "list-1").unwrap();
+        assert_eq!(task.rrule.as_deref(), Some("FREQ=DAILY"));
+        assert_eq!(task.reminder_minutes_before, Some(30));
+
+        let body = task_to_todo_body(&task);
+        assert_eq!(body["recurrence"]["pattern"]["type"], "daily");
+        assert_eq!(body["recurrence"]["range"]["startDate"], "2026-08-08");
+        assert_eq!(body["isReminderOn"], true);
+        assert_eq!(body["reminderDateTime"]["dateTime"], "2026-08-09T08:30:00");
+        assert_eq!(body["reminderDateTime"]["timeZone"], "UTC");
+
+        // Clearing the reminder writes the off switch.
+        let mut cleared = task.clone();
+        cleared.reminder_minutes_before = None;
+        let body = task_to_todo_body(&cleared);
+        assert_eq!(body["isReminderOn"], false);
+        assert!(body.get("reminderDateTime").is_none());
+    }
+
+    #[test]
+    fn only_graph_representable_recurrence_is_supported() {
+        let mut task = todo_task_from_graph(&sample_task(), "list-1").unwrap();
+        assert!(todo_recurrence_supported(&task));
+        task.rrule = Some("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1".to_string());
+        assert!(!todo_recurrence_supported(&task));
+        task.rrule = None;
+        assert!(todo_recurrence_supported(&task));
+    }
+
+    #[test]
     fn priority_and_importance_map_both_ways() {
         for (priority, importance) in [(0u8, "normal"), (1, "high"), (4, "high"), (5, "normal"), (9, "low")] {
             assert_eq!(importance_to_graph(TaskPriority(priority)), importance);
@@ -423,6 +513,8 @@ mod tests {
         assert_eq!(tasks.len(), 2, "the fixture carries two tasks");
         assert_eq!(tasks[0].summary.as_deref(), Some("Buy milk"));
         assert_eq!(tasks[0].priority, TaskPriority(1));
+        assert_eq!(tasks[0].rrule.as_deref(), Some("FREQ=DAILY"));
+        assert_eq!(tasks[0].reminder_minutes_before, Some(30));
         assert_eq!(tasks[1].status, TaskStatus::Completed);
     }
 }

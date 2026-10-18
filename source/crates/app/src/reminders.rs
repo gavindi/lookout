@@ -1,27 +1,28 @@
-//! Calendar event reminders.
+//! Calendar event and task reminders.
 //!
 //! Every occurrence the CalDAV sessions report (`OccurrencesUpdated`) that
 //! carries a `reminder_minutes_before` (a `VALARM`) is fed into a
-//! [`ReminderEngine`] by the window code; a UI-thread tick (every
-//! [`ALERT_TICK`]) fires a `Gio.Notification` for each whose alert time has
-//! come, whose event hasn't started yet, and which hasn't already been shown,
-//! snoozed-past or dismissed. The notification carries Open / Snooze 5 min /
-//! Dismiss actions routed through app-level `GSimpleAction`s; fire-once and
-//! snooze state persists in the UI-state database
-//! (`UiStateDb::load_reminder_state` / `set_reminder_state`), so a restart
-//! never re-fires an alert the user already saw. Alerts only fire while the
-//! app is running - reminders while Lookout is closed are out of scope.
+//! [`ReminderEngine`] by the window code; the Tasks view's merged snapshot
+//! feeds task reminders the same way (`sync_tasks`, T-05). A UI-thread tick
+//! (every [`ALERT_TICK`]) fires a `Gio.Notification` for each whose alert time
+//! has come, which hasn't already been shown, snoozed-past or dismissed. The
+//! notification carries Open / Snooze 5 min / Dismiss actions routed through
+//! app-level `GSimpleAction`s; fire-once and snooze state persists in the
+//! UI-state database (`UiStateDb::load_reminder_state` / `set_reminder_state`),
+//! so a restart never re-fires an alert the user already saw. Alerts only fire
+//! while the app is running - reminders while Lookout is closed are out of
+//! scope.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use gtk::gio;
 use gtk::gio::prelude::{ActionMapExt, ApplicationExt};
 use gtk::glib;
-use lookout_core::{AccountId, EventOccurrence};
+use lookout_core::{AccountId, CalendarTask, EventOccurrence};
 
 /// How often the loop re-checks for due alerts. 30 s granularity means an
 /// alert can land up to 30 s late, which is fine for a desktop reminder.
@@ -62,6 +63,26 @@ pub struct DueAlert {
     pub starts_local: chrono::NaiveDateTime,
 }
 
+/// One task alert ready to be shown by the tick (T-05).
+#[derive(Debug, Clone)]
+pub struct DueTaskAlert {
+    pub task: CalendarTask,
+    /// The due time as wall-clock time in the display zone.
+    pub due_local: chrono::NaiveDateTime,
+    /// Whether the due time has already passed when the alert fires - the
+    /// notification then says "Overdue" (the task view still shows it).
+    pub overdue: bool,
+}
+
+/// The stable identity of one task's alert: `calendar|task:<uid>|due-utc`.
+/// The `task:` prefix keeps it disjoint from an event alert's key and is
+/// exactly the uid stored in the `reminder_state` table, so the persisted
+/// fire-once state maps back without a schema change.
+pub fn task_alert_key(task: &CalendarTask) -> String {
+    let due = task.due.map(|due| due.format("%Y-%m-%dT%H:%M:%SZ").to_string()).unwrap_or_default();
+    format!("{}|task:{}|{}", task.calendar_id.0, task.uid.0, due)
+}
+
 /// The fire-once/alert bookkeeping for every known occurrence.
 ///
 /// Owned by the UI thread (GTK is single-threaded) like the rest of the
@@ -78,6 +99,10 @@ pub struct ReminderEngine {
     //   means "no persistence" - alerts still fire, they just re-fire after
     //   a restart.
     index: std::collections::HashMap<String, (AccountId, EventOccurrence)>,
+    /// Every task currently carrying a reminder, keyed by [`task_alert_key`].
+    /// Replaced wholesale by [`ReminderEngine::sync_tasks`] on each Tasks-view
+    /// refresh, so completed/deleted tasks disappear without stale alerts.
+    task_index: std::collections::HashMap<String, (AccountId, CalendarTask)>,
     store: std::collections::HashMap<String, (String, Option<String>)>,
     ui_db: Option<Rc<RefCell<crate::ui_state_db::UiStateDb>>>,
 }
@@ -101,6 +126,7 @@ impl ReminderEngine {
         }
         ReminderEngine {
             index: std::collections::HashMap::new(),
+            task_index: std::collections::HashMap::new(),
             store: loaded,
             ui_db: store,
         }
@@ -116,6 +142,88 @@ impl ReminderEngine {
         for occ in occurrences {
             self.index.insert(alert_key(occ), (account_id.clone(), occ.clone()));
         }
+    }
+
+    /// Replaces the task alerts with the Tasks view's current merged snapshot
+    /// (`(account, task)` pairs from every CalDAV, Graph, Google and local
+    /// source). Only tasks with both a due time and a reminder are indexed; a
+    /// task that disappears or is completed simply stops being tracked, while
+    /// its persisted fire-once row stays until the pruning window passes.
+    pub fn sync_tasks(&mut self, tasks: &[(AccountId, CalendarTask)]) {
+        self.task_index.clear();
+        for (account_id, task) in tasks {
+            if task.due.is_none() || task.reminder_minutes_before.is_none() {
+                continue;
+            }
+            self.task_index.insert(task_alert_key(task), (account_id.clone(), task.clone()));
+        }
+    }
+
+    /// The task alerts to show at `now` (T-05): a reminder is due once
+    /// `due - reminder_minutes_before` has passed. Unlike an event alert this
+    /// keeps firing for an overdue task (once per occurrence) so a reminder
+    /// missed while the app was closed still surfaces; the notification then
+    /// says "Overdue". Persisted `fired`/`snoozed` state is honoured exactly as
+    /// for events, and each returned alert is marked fired immediately.
+    pub fn tick_tasks(&mut self, now: chrono::DateTime<chrono::Local>) -> Vec<DueTaskAlert> {
+        // Drop persisted rows for task occurrences more than a month old;
+        // their key embeds the due stamp, so the index needn't still hold the
+        // task to clear it.
+        let cutoff = (now - chrono::Duration::days(30)).with_timezone(&Utc);
+        let stale: Vec<String> = self
+            .store
+            .keys()
+            .filter(|key| key.contains("|task:"))
+            .filter(|key| {
+                key.rsplit('|')
+                    .next()
+                    .and_then(|stamp| chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H:%M:%SZ").ok())
+                    .is_some_and(|due| Utc.from_utc_datetime(&due) < cutoff)
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some((_, task)) = self.task_index.get(&key) {
+                self.clear_task_row(task);
+            }
+            self.store.remove(&key);
+        }
+
+        let now_utc = now.with_timezone(&Utc);
+        let zone = crate::calendar_tz::display_zone();
+        let mut due = Vec::new();
+        for (key, (_, task)) in &self.task_index {
+            let (Some(minutes), Some(due_at)) = (task.reminder_minutes_before, task.due) else {
+                continue;
+            };
+            let alert_at = due_at - chrono::Duration::minutes(minutes);
+            if alert_at > now_utc {
+                continue;
+            }
+            if let Some((state, snooze_until)) = self.store.get(key) {
+                if state == "fired" {
+                    continue;
+                }
+                if state == "snoozed" {
+                    if let Some(until) = snooze_until {
+                        if let Ok(until) = chrono::DateTime::parse_from_rfc3339(until) {
+                            if until.with_timezone(&Utc) > now_utc {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            due.push(DueTaskAlert {
+                task: task.clone(),
+                due_local: zone.occurrence_to_local(due_at, false),
+                overdue: due_at <= now_utc,
+            });
+        }
+        for alert in &due {
+            self.mark_task_fired(&alert.task);
+        }
+        due
     }
 
     /// The alerts to show at `now`: occurrences with a `reminder_minutes_before`,
@@ -202,6 +310,23 @@ impl ReminderEngine {
         self.store.insert(key, ("fired".to_string(), None));
     }
 
+    /// Snoozes a task alert until `now + SNOOZE_MINUTES`, the task-side twin
+    /// of [`Self::snooze`].
+    pub fn snooze_task(&mut self, task: &CalendarTask) {
+        let until = (chrono::Local::now() + chrono::Duration::minutes(SNOOZE_MINUTES)).to_utc().to_rfc3339();
+        let key = task_alert_key(task);
+        self.write_task_state(task, "snoozed", Some(&until));
+        self.store.insert(key, ("snoozed".to_string(), Some(until)));
+    }
+
+    /// Permanently dismisses a task alert, the task-side twin of
+    /// [`Self::dismiss`].
+    pub fn dismiss_task(&mut self, task: &CalendarTask) {
+        let key = task_alert_key(task);
+        self.write_task_state(task, "fired", None);
+        self.store.insert(key, ("fired".to_string(), None));
+    }
+
     /// Drops every occurrence ingested from `account_id` (a disabled GOA
     /// account): their alerts must not fire, and their index/database rows
     /// are removed so a re-enable starts clean.
@@ -210,6 +335,18 @@ impl ReminderEngine {
         for key in removed {
             if let Some((_, occ)) = self.index.remove(&key) {
                 self.clear_db_row(&occ);
+                self.store.remove(&key);
+            }
+        }
+        let removed_tasks: Vec<String> = self
+            .task_index
+            .iter()
+            .filter(|(_, (account, _))| account == account_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in removed_tasks {
+            if let Some((_, task)) = self.task_index.remove(&key) {
+                self.clear_task_row(&task);
                 self.store.remove(&key);
             }
         }
@@ -239,11 +376,44 @@ impl ReminderEngine {
         }
     }
 
+    /// The task twin of [`Self::write_state`]: the `reminder_state` table's
+    /// `uid` column carries the `task:` prefix so a task and an event can
+    /// never share a key.
+    fn write_task_state(&self, task: &CalendarTask, state: &str, snooze_until_utc: Option<&str>) {
+        let Some(due) = task.due else { return };
+        let due_utc = due.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let uid = format!("task:{}", task.uid.0);
+        if let Some(db) = &self.ui_db {
+            if let Err(e) = db.borrow().set_reminder_state(&task.calendar_id.0, &uid, &due_utc, state, snooze_until_utc) {
+                tracing::warn!(key = task_alert_key(task), "could not persist task reminder state: {e}");
+            }
+        }
+    }
+
+    /// Best-effort delete of a task's persisted reminder row.
+    fn clear_task_row(&self, task: &CalendarTask) {
+        let Some(due) = task.due else { return };
+        let due_utc = due.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let uid = format!("task:{}", task.uid.0);
+        if let Some(db) = &self.ui_db {
+            if let Err(e) = db.borrow().clear_reminder(&task.calendar_id.0, &uid, &due_utc) {
+                tracing::warn!(key = task_alert_key(task), "could not clear task reminder state: {e}");
+            }
+        }
+    }
+
     /// Persists `occ` as fired and updates the in-memory store - the
     /// fire-once step every returned alert goes through.
     fn mark_fired(&mut self, occ: &EventOccurrence) {
         let key = alert_key(occ);
         self.write_state(occ, "fired", None);
+        self.store.insert(key, ("fired".to_string(), None));
+    }
+
+    /// The task twin of [`Self::mark_fired`].
+    fn mark_task_fired(&mut self, task: &CalendarTask) {
+        let key = task_alert_key(task);
+        self.write_task_state(task, "fired", None);
         self.store.insert(key, ("fired".to_string(), None));
     }
 }
@@ -258,6 +428,20 @@ fn parse_action_target(param: Option<&glib::Variant>) -> Option<EventOccurrence>
         Ok(occ) => Some(occ),
         Err(e) => {
             tracing::warn!("reminder action target is not a serialized EventOccurrence: {e}");
+            None
+        }
+    }
+}
+
+/// Parses the string target of one of the task-reminder actions (the
+/// JSON-serialized [`CalendarTask`]). A missing or unparseable target is a
+/// no-op, matching [`parse_action_target`].
+fn parse_task_action_target(param: Option<&glib::Variant>) -> Option<CalendarTask> {
+    let json = param.and_then(|v| v.get::<String>())?;
+    match serde_json::from_str::<CalendarTask>(&json) {
+        Ok(task) => Some(task),
+        Err(e) => {
+            tracing::warn!("task reminder action target is not a serialized CalendarTask: {e}");
             None
         }
     }
@@ -297,27 +481,51 @@ fn show_notification(app: &adw::Application, alert: &DueAlert) {
     app.send_notification(Some(&notification_id(&alert.occurrence)), &notification);
 }
 
+/// Builds and sends one task reminder (T-05): title = the task's summary (or
+/// "(untitled)"), body = "Due at HH:MM" (or "Overdue · due …"), default action
+/// `app.open-task`, buttons Snooze 5 min and Dismiss. The notification id is
+/// the task alert key, so a re-fire under the same occurrence replaces rather
+/// than duplicates it.
+fn show_task_notification(app: &adw::Application, alert: &DueTaskAlert) {
+    let title = alert.task.summary.as_deref().unwrap_or("(untitled)");
+    let due = alert.due_local;
+    let body = if alert.overdue {
+        format!("Overdue \u{b7} due {}", due.format("%a %d %b, %H:%M"))
+    } else if due.date() == crate::calendar_tz::display_zone().today() {
+        format!("Due today at {}", due.format("%H:%M"))
+    } else {
+        format!("Due {} at {}", due.format("%a %d %b"), due.format("%H:%M"))
+    };
+    let notification = gio::Notification::new(title);
+    notification.set_body(Some(&body));
+    let json = serde_json::to_string(&alert.task).expect("CalendarTask serialization cannot fail");
+    let variant = glib::Variant::from(json);
+    notification.set_default_action_and_target_value("app.open-task", Some(&variant));
+    notification.add_button_with_target_value("Snooze 5 min", "app.snooze-task-reminder", Some(&variant));
+    notification.add_button_with_target_value("Dismiss", "app.dismiss-task-reminder", Some(&variant));
+    app.send_notification(Some(&task_alert_key(&alert.task)), &notification);
+}
+
 /// Wires the reminder loop into the application:
 ///
 /// * Registers the `open-event`, `snooze-reminder` and `dismiss-reminder`
-///   actions on `app`. All three take a string target holding the
-///   JSON-serialized [`EventOccurrence`]. `open-event` hands it to
-///   `open_event` (the window code's editor-opening closure);
-///   `snooze-reminder`/`dismiss-reminder` update the engine's persisted
-///   state and withdraw the notification.
+///   actions on `app` (and the task twins `open-task`,
+///   `snooze-task-reminder`, `dismiss-task-reminder`). All take a string target
+///   holding the JSON-serialized [`EventOccurrence`]/[`CalendarTask`].
+///   `open-event`/`open-task` hand it to the window's editor-opening closures;
+///   the snooze/dismiss actions update the engine's persisted state and
+///   withdraw the notification.
 /// * Runs one tick immediately (startup catch-up: an alert that came due
-///   while the app was closed still appears, as long as its event hasn't
-///   started), then a repeating [`ALERT_TICK`] timer.
+///   while the app was closed still appears), then a repeating [`ALERT_TICK`]
+///   timer, covering both events and tasks.
 /// * Each tick sends a notification per due alert when
-///   `settings.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED)` is true:
-///   title = the event's summary (or "(No title)"), body = "Starts at HH:MM",
-///   default action `app.open-event`, buttons Snooze 5 min (`app.snooze-reminder`)
-///   and Dismiss (`app.dismiss-reminder`), sent under `notification_id`.
+///   `settings.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED)` is true.
 pub fn spawn_reminder_loop(
     app: &adw::Application,
     engine: Rc<RefCell<ReminderEngine>>,
     settings: Rc<crate::settings::SettingsStore>,
     open_event: Rc<dyn Fn(EventOccurrence) + 'static>,
+    open_task: Rc<dyn Fn(CalendarTask) + 'static>,
 ) {
     let open_action = gio::SimpleAction::new("open-event", Some(glib::VariantTy::STRING));
     open_action.connect_activate({
@@ -328,6 +536,16 @@ pub fn spawn_reminder_loop(
         }
     });
     app.add_action(&open_action);
+
+    let open_task_action = gio::SimpleAction::new("open-task", Some(glib::VariantTy::STRING));
+    open_task_action.connect_activate({
+        let open_task = open_task.clone();
+        move |_, param| {
+            let Some(task) = parse_task_action_target(param) else { return };
+            open_task(task);
+        }
+    });
+    app.add_action(&open_task_action);
 
     let snooze_action = gio::SimpleAction::new("snooze-reminder", Some(glib::VariantTy::STRING));
     snooze_action.connect_activate({
@@ -353,6 +571,30 @@ pub fn spawn_reminder_loop(
     });
     app.add_action(&dismiss_action);
 
+    let snooze_task_action = gio::SimpleAction::new("snooze-task-reminder", Some(glib::VariantTy::STRING));
+    snooze_task_action.connect_activate({
+        let engine = engine.clone();
+        let app = app.clone();
+        move |_, param| {
+            let Some(task) = parse_task_action_target(param) else { return };
+            engine.borrow_mut().snooze_task(&task);
+            app.withdraw_notification(&task_alert_key(&task));
+        }
+    });
+    app.add_action(&snooze_task_action);
+
+    let dismiss_task_action = gio::SimpleAction::new("dismiss-task-reminder", Some(glib::VariantTy::STRING));
+    dismiss_task_action.connect_activate({
+        let engine = engine.clone();
+        let app = app.clone();
+        move |_, param| {
+            let Some(task) = parse_task_action_target(param) else { return };
+            engine.borrow_mut().dismiss_task(&task);
+            app.withdraw_notification(&task_alert_key(&task));
+        }
+    });
+    app.add_action(&dismiss_task_action);
+
     // CAL-20 / 3.17: opens an online-meeting join URL (the notification's
     // Join button) in the default browser.
     let join_action = gio::SimpleAction::new("join-meeting", Some(glib::VariantTy::STRING));
@@ -370,9 +612,14 @@ pub fn spawn_reminder_loop(
     let app = app.clone();
     let run_tick = move || {
         if settings.get_bool(crate::settings::CALENDAR_ALERTS_ENABLED) {
-            let due = engine.borrow_mut().tick(chrono::Local::now());
+            let now = chrono::Local::now();
+            let due = engine.borrow_mut().tick(now);
             for alert in due {
                 show_notification(&app, &alert);
+            }
+            let due_tasks = engine.borrow_mut().tick_tasks(now);
+            for alert in due_tasks {
+                show_task_notification(&app, &alert);
             }
         }
         glib::ControlFlow::Continue
@@ -625,5 +872,108 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].occurrence.uid.0, "other");
         assert!(engine.tick(now + Duration::minutes(20)).is_empty());
+    }
+
+    fn task(uid: &str, due: &str, minutes: Option<i64>) -> CalendarTask {
+        CalendarTask {
+            uid: lookout_core::TaskUid(uid.into()),
+            calendar_id: CalendarId("cal-test".into()),
+            summary: Some("Task".into()),
+            description: None,
+            due: Some(DateTime::parse_from_rfc3339(due).unwrap().with_timezone(&Utc)),
+            start: None,
+            rrule: None,
+            created: None,
+            completed: None,
+            status: lookout_core::TaskStatus::NeedsAction,
+            priority: lookout_core::TaskPriority(0),
+            percent_complete: None,
+            reminder_minutes_before: minutes,
+            categories: Vec::new(),
+            href: None,
+            etag: None,
+        }
+    }
+
+    fn persisted_task_row(db: &UiStateDb, task: &CalendarTask) -> Option<crate::ui_state_db::ReminderStateRow> {
+        let key = task_alert_key(task);
+        db.load_reminder_state()
+            .expect("test database should read")
+            .into_iter()
+            .find(|r| format!("{}|{}|{}", r.calendar_id, r.uid, r.start_utc) == key)
+    }
+
+    #[test]
+    fn tick_tasks_fires_a_due_reminder_once_and_persists_it() {
+        let now = chrono::Local::now();
+        let start = now + Duration::minutes(30);
+        let task = task("task-fires-once", &start.with_timezone(&Utc).to_rfc3339(), Some(15));
+        let (mut engine, db) = engine_with("task-fires-once", &[]);
+        engine.sync_tasks(&[(AccountId("test-account".into()), task.clone())]);
+
+        // Before the alert instant: nothing.
+        assert!(engine.tick_tasks(now + Duration::minutes(5)).is_empty());
+        // Once it passes: one alert, not overdue yet.
+        let due = engine.tick_tasks(now + Duration::minutes(16));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].task.uid.0, "task-fires-once");
+        assert!(!due[0].overdue);
+        // Fired once means never again, and the row is persisted.
+        assert!(engine.tick_tasks(now + Duration::minutes(25)).is_empty());
+        let row = persisted_task_row(&db.borrow(), &task).expect("the fired task alert must be persisted");
+        assert_eq!(row.state, "fired");
+        assert!(row.uid.starts_with("task:"));
+    }
+
+    #[test]
+    fn an_overdue_task_reminder_still_fires_with_the_overdue_flag() {
+        let now = chrono::Local::now();
+        // Due 10 minutes ago with a 15-minute reminder: the alert is overdue
+        // but must still surface when the app starts.
+        let due_at = now - Duration::minutes(10);
+        let task = task("task-overdue", &due_at.with_timezone(&Utc).to_rfc3339(), Some(15));
+        let (mut engine, _db) = engine_with("task-overdue", &[]);
+        engine.sync_tasks(&[(AccountId("test-account".into()), task)]);
+        let due = engine.tick_tasks(now);
+        assert_eq!(due.len(), 1);
+        assert!(due[0].overdue);
+    }
+
+    #[test]
+    fn sync_tasks_replaces_the_snapshot_and_skips_unreminded_tasks() {
+        let now = chrono::Local::now();
+        let start = now + Duration::minutes(30);
+        let reminded = task("kept", &start.with_timezone(&Utc).to_rfc3339(), Some(10));
+        let unreminded = task("ignored", &start.with_timezone(&Utc).to_rfc3339(), None);
+        let (mut engine, _db) = engine_with("task-sync", &[]);
+        engine.sync_tasks(&[(AccountId("a".into()), reminded.clone()), (AccountId("a".into()), unreminded)]);
+        assert_eq!(engine.task_index.len(), 1);
+
+        // A later snapshot without the task drops its index entry (the
+        // persisted row is left for the age-based prune).
+        engine.sync_tasks(&[]);
+        assert!(engine.task_index.is_empty());
+        assert!(engine.tick_tasks(now + Duration::minutes(21)).is_empty());
+    }
+
+    #[test]
+    fn snoozed_task_reminders_refire_after_the_window() {
+        let now = chrono::Local::now();
+        let start = now + Duration::minutes(10);
+        let task = task("task-snoozed", &start.with_timezone(&Utc).to_rfc3339(), Some(10));
+        let (mut engine, db) = engine_with("task-snooze", &[]);
+        engine.sync_tasks(&[(AccountId("a".into()), task.clone())]);
+
+        let due = engine.tick_tasks(now + Duration::minutes(1));
+        assert_eq!(due.len(), 1);
+        engine.snooze_task(&due[0].task);
+        let row = persisted_task_row(&db.borrow(), &task).expect("the snoozed task alert must be persisted");
+        assert_eq!(row.state, "snoozed");
+
+        assert!(engine.tick_tasks(now + Duration::minutes(2)).is_empty());
+        let due = engine.tick_tasks(now + Duration::minutes(7));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].task.uid.0, "task-snoozed");
+        assert!(persisted_task_row(&db.borrow(), &task).is_some_and(|row| row.state == "fired"));
     }
 }
