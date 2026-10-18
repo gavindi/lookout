@@ -1,6 +1,6 @@
 //! The Outlook-style ribbon: groups of icon+label controls, laid out either
 //! Simplified (one row, the label beside the icon) or Classic (the icon over
-//! the label, with a caption under each group).
+//! the label, with larger icons).
 //!
 //! The ribbon only presents widgets the caller has already built and wired.
 //! [`RibbonGroup`]'s `button`/`toggle`/`menu`/`split` swap a control's child
@@ -93,7 +93,7 @@ pub(crate) struct RibbonStyle {
 
 struct BandRegistration {
     root: glib::WeakRef<gtk::Box>,
-    /// The band's controls and captions. Held strongly so the layout survives
+    /// The band's controls. Held strongly so the layout survives
     /// as long as the widgets do; the widgets themselves are only weakly
     /// referenced, so a closed composer's band is dropped on the next prune
     /// (which runs whenever a band is created or the mode changes).
@@ -130,7 +130,6 @@ impl RibbonStyle {
 #[derive(Default)]
 struct BandState {
     controls: Vec<ControlParts>,
-    captions: Vec<glib::WeakRef<gtk::Label>>,
 }
 
 struct ControlParts {
@@ -140,7 +139,7 @@ struct ControlParts {
 }
 
 /// One band of controls (a module's/tab's ribbon row). Its [`RibbonGroup`]s
-/// carry the caption and divider between commands.
+/// carry the divider between commands.
 pub(crate) struct RibbonBand {
     style: RibbonStyle,
     root: gtk::Box,
@@ -184,24 +183,18 @@ impl RibbonBand {
 
     /// Add a named group. `build` dresses that group's controls and may return
     /// handles (e.g. a dynamic icon) for the caller to keep.
-    pub(crate) fn group<T>(&self, caption: &str, build: impl FnOnce(&RibbonGroup) -> T) -> T {
+    /// `name` isn't drawn; it is the group's accessible label.
+    pub(crate) fn group<T>(&self, name: &str, build: impl FnOnce(&RibbonGroup) -> T) -> T {
         let group_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).build();
         group_box.add_css_class("ribbon-group");
+        group_box.update_property(&[gtk::accessible::Property::Label(name)]);
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
         row.add_css_class("ribbon-group-row");
-        let caption_label = gtk::Label::builder().label(caption).build();
-        caption_label.add_css_class("ribbon-group-caption");
-        crate::privacy::mark_ui(&caption_label);
         group_box.append(&row);
-        group_box.append(&caption_label);
         let divider = gtk::Separator::new(gtk::Orientation::Vertical);
         divider.add_css_class("ribbon-divider");
         self.root.append(&group_box);
         self.root.append(&divider);
-        // A caption only shows in Classic; the mode can't change mid-build,
-        // so seed it here (`apply_band` handles later switches).
-        caption_label.set_visible(self.style.mode() == RibbonMode::Classic);
-        self.state.borrow_mut().captions.push(caption_label.downgrade());
         let group = RibbonGroup {
             style: self.style.clone(),
             state: self.state.clone(),
@@ -210,7 +203,7 @@ impl RibbonBand {
         build(&group)
     }
 
-    /// A bare run of controls with no caption and no divider (the trailing
+    /// A bare run of controls with no divider (the trailing
     /// overflow button), dressed just like a named group's.
     pub(crate) fn standalone(&self) -> RibbonGroup {
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
@@ -336,11 +329,6 @@ fn apply_band(root: &gtk::Box, state: &BandState, mode: RibbonMode) {
     } else {
         root.remove_css_class("ribbon-classic");
     }
-    for caption in &state.captions {
-        if let Some(caption) = caption.upgrade() {
-            caption.set_visible(mode == RibbonMode::Classic);
-        }
-    }
     for control in &state.controls {
         if let (Some(content), Some(image), Some(label)) = (control.content.upgrade(), control.image.upgrade(), control.label.upgrade()) {
             style_control(&content, &image, &label, mode);
@@ -418,22 +406,23 @@ mod tests {
 
         let content = button.child().and_downcast::<gtk::Box>().expect("button wears an icon+label child");
         let group_box = band.root().first_child().and_downcast::<gtk::Box>().expect("the band holds a group box");
-        let caption = group_box.last_child().expect("the group box holds its caption");
+        // A group draws no caption in either mode: its box holds only the row.
+        let only_row = |group_box: &gtk::Box| group_box.first_child().is_some() && group_box.first_child() == group_box.last_child();
         let row_orientation = |button: &gtk::Button| button.child().and_downcast::<gtk::Box>().expect("content").orientation();
 
-        // Simplified: one row, label beside the icon, no caption.
+        // Simplified: one row, label beside the icon.
         assert_eq!(row_orientation(&button), gtk::Orientation::Horizontal);
-        assert!(!caption.is_visible());
+        assert!(only_row(&group_box));
 
-        // Classic: icon over label, caption shown.
+        // Classic: icon over label, still no caption.
         style.set_mode(RibbonMode::Classic);
         assert_eq!(row_orientation(&button), gtk::Orientation::Vertical);
-        assert!(caption.is_visible());
+        assert!(only_row(&group_box));
 
         // And back.
         style.set_mode(RibbonMode::Simplified);
         assert_eq!(row_orientation(&button), gtk::Orientation::Horizontal);
-        assert!(!caption.is_visible());
+        assert!(only_row(&group_box));
         assert!(content.is_visible());
     }
 }

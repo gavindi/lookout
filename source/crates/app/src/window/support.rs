@@ -155,10 +155,10 @@ pub(crate) fn install_paned_css() {
         .ribbon-group-label {
             margin-right: 6px;
         }
-        /* The command ribbon's groups: a run of controls above a caption,
-           parted from its neighbour by a vertical rule. The caption and the
-           classic icon-over-label layout appear only in the Classic mode
-           (`ribbon.rs` toggles `.ribbon-classic` on the band).
+        /* The command ribbon's groups: a run of controls parted from its
+           neighbour by a vertical rule. The classic icon-over-label layout
+           appears only in the Classic mode (`ribbon.rs` toggles
+           `.ribbon-classic` on the band).
 
            The geometry must land on the *button* node, never the control's
            host: a `GtkButton`/`GtkToggleButton` is the button itself, but a
@@ -171,11 +171,6 @@ pub(crate) fn install_paned_css() {
         }
         .ribbon-group {
             margin: 0 2px;
-        }
-        .ribbon-group-caption {
-            font-size: 0.72em;
-            opacity: 0.65;
-            margin-top: 1px;
         }
         .ribbon-divider {
             margin: 3px 2px;
@@ -192,9 +187,6 @@ pub(crate) fn install_paned_css() {
         .ribbon-classic .ribbon-control > menubutton > button {
             padding: 4px 8px;
             min-height: 52px;
-        }
-        .ribbon-classic .ribbon-group-caption {
-            margin-top: 2px;
         }
         button.list-header-action {
             min-width: 24px;

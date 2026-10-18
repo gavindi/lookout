@@ -215,7 +215,6 @@ fn blur_css(mode: BlurMode) -> String {
              preferencesgroup label.heading,\n\
              preferencesgroup label.description,\n\
              preferencespage label.description,\n\
-             .ribbon-group-caption,\n\
              .{UI_CLASS},\n\
              .{UI_CLASS} label {{ filter: none; }}\n\
              /* Content keeps winning over chrome, even inside tagged controls. */\n\
@@ -304,7 +303,6 @@ mod tests {
             "row .title",
             "row .subtitle",
             "preferencesgroup label.heading",
-            ".ribbon-group-caption",
         ] {
             assert!(all.contains(selector), "all-text CSS should exempt {selector}");
         }
