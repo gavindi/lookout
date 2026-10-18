@@ -101,6 +101,7 @@ impl CalendarClient {
     /// Creates `event` in `calendar` and returns the server's copy (with its
     /// Graph id/`changeKey`).
     pub async fn create_event(&self, calendar: &CalendarInfo, event: &CalendarEvent) -> Result<CalendarEvent> {
+        ensure_recurrence_supported(event)?;
         let path = format!("{}/{}/events", self.calendars_root(calendar.owner.as_deref()), encode_segment(&calendar.href));
         let created = self.graph.post(&path, &event_create_body(event)).await?;
         event_from_graph(&created, &calendar.id).ok_or_else(malformed_event)
@@ -114,6 +115,7 @@ impl CalendarClient {
     /// `owner` is the event's calendar owner for a shared/delegated calendar
     /// (item 5.6 / CAL-25), or `None` for the user's own.
     pub async fn update_event(&self, event: &CalendarEvent, owner: Option<&str>) -> Result<CalendarEvent> {
+        ensure_recurrence_supported(event)?;
         let id = event.href.as_deref().ok_or_else(missing_event_id)?;
         let path = format!("{}/{}", self.events_root(owner), encode_segment(id));
         let mut headers: Vec<(&str, &str)> = vec![("Prefer", "return=representation")];
@@ -362,6 +364,17 @@ fn encode_segment(segment: &str) -> String {
     out
 }
 
+/// Refuses a write whose RRULE Graph's recurrence model can't represent.
+/// Without this, `event_fields` would omit `recurrence` and Graph would store
+/// a non-recurring event, silently losing the series.
+fn ensure_recurrence_supported(event: &CalendarEvent) -> Result<()> {
+    if super::event_recurrence_supported(event) {
+        Ok(())
+    } else {
+        Err(GraphError::UnsupportedRecurrence(event.rrule.clone().unwrap_or_default()))
+    }
+}
+
 /// A malformed create/update response (status `0` distinguishes it from a
 /// real HTTP status, as in `graph_rules`).
 fn malformed_event() -> GraphError {
@@ -580,6 +593,30 @@ mod tests {
         // No request is made; the client needs a server only to build the transport.
         let server = MockServer::start().await;
         assert!(client(&server).update_event(&event, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_event_refuses_a_recurrence_graph_cannot_express() {
+        let server = MockServer::start().await;
+        let mut event = event_from_graph(&event_json(), &calendar().id).unwrap();
+        event.href = None;
+        event.etag = None;
+        event.rrule = Some("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1".to_string());
+        // The guard runs before any HTTP request; no mock is mounted.
+        let result = client(&server).create_event(&calendar(), &event).await;
+        assert!(
+            matches!(result, Err(GraphError::UnsupportedRecurrence(ref rule)) if rule.contains("BYSETPOS")),
+            "expected the recurrence to be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_event_refuses_a_recurrence_graph_cannot_express() {
+        let server = MockServer::start().await;
+        let mut event = event_from_graph(&event_json(), &calendar().id).unwrap();
+        event.rrule = Some("FREQ=MONTHLY;BYDAY=MO".to_string());
+        let result = client(&server).update_event(&event, None).await;
+        assert!(matches!(result, Err(GraphError::UnsupportedRecurrence(_))), "expected the recurrence to be refused");
     }
 
     #[tokio::test]

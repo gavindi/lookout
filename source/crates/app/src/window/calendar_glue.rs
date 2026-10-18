@@ -1449,6 +1449,7 @@ pub(crate) fn open_event_editor_for(
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     let categories = state.borrow().app_config.borrow().categories.clone();
     let scheduling = scheduling_context(state, calendar_state);
+    let graph_calendars = graph_calendar_ids(calendar_state);
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -1465,6 +1466,7 @@ pub(crate) fn open_event_editor_for(
             read_only,
             read_only_note,
             calendar_prefs: &calendar_prefs,
+            graph_calendars: &graph_calendars,
             categories: &categories,
             suggested_attendees: &[],
             scheduling: Some(&scheduling),
@@ -1953,6 +1955,7 @@ pub(crate) fn show_new_event_editor(
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     let categories = state.borrow().app_config.borrow().categories.clone();
     let scheduling = scheduling_context(state, calendar_state);
+    let graph_calendars = graph_calendar_ids(calendar_state);
     crate::event_editor::show_event_editor(
         window,
         crate::event_editor::EventEditorPrefill {
@@ -1969,6 +1972,7 @@ pub(crate) fn show_new_event_editor(
             read_only: false,
             read_only_note: "",
             calendar_prefs: &calendar_prefs,
+            graph_calendars: &graph_calendars,
             categories: &categories,
             suggested_attendees: attendees,
             scheduling: Some(&scheduling),
@@ -2018,6 +2022,19 @@ pub(crate) fn calendar_account_is_graph(calendar_state: &Rc<RefCell<CalendarUiSt
         .accounts
         .values()
         .any(|handle| handle.graph && handle.calendars.iter().any(|calendar| calendar.id == *calendar_id))
+}
+
+/// The calendar ids served by the Microsoft Graph backend. The event editor
+/// uses this to refuse a recurrence pattern Graph's structured model can't
+/// hold (item 3.10 / CAL-13) instead of letting the write drop it.
+fn graph_calendar_ids(calendar_state: &Rc<RefCell<CalendarUiState>>) -> HashSet<CalendarId> {
+    calendar_state
+        .borrow()
+        .accounts
+        .values()
+        .filter(|handle| handle.graph)
+        .flat_map(|handle| handle.calendars.iter().map(|calendar| calendar.id.clone()))
+        .collect()
 }
 
 /// Routes a saved (created or edited) event to its account's session. An event

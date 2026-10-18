@@ -29,6 +29,7 @@ behaviour rather than an interpretation of the specs.
 | `delegated-calendars.json` | A Graph `GET /users/{id}/calendars` response, the calendars under another user's mailbox — pins the delegated-calendar mapping and its owner tag (CAL-25, item 5.6). |
 | `shared-mail-folders.json` | A Graph `GET /users/{id}/mailFolders` response, a shared mailbox's folders with their item counts — pins the shared-mailbox mapping (M-42, item 5.6). |
 | `messages-delta.json` | A Graph folder `GET /me/mailFolders/{id}/messages/delta` page: three live records (one carrying categories, importance, a flag and Focused/Other; one properties-only; one importance + Other) and a tombstone — pins the delta page's upsert/removal split and the value ↔ property mapping (A-06, item 5.7.1). |
+| `recurrence-rules.ics` | The six recurrence shapes Outlook writes: monthly day-of-month, monthly "second Tuesday" (`BYDAY=2TU`), monthly last weekday (`BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1`), yearly month/day, yearly fourth Thursday, and the Graph round-trip form with `WKST` — pins the Series builder (CAL-13, item 3.10). |
 
 These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`,
 `[MS-OXTNEF]`, RFC 6047, the Microsoft Graph reference) and verified by

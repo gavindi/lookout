@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.243" date="2026-10-18">
+      <description>
+        <p>The event editor's Series popover now builds Outlook's full recurrence set: monthly on a day-of-month or the Nth/last weekday, the first or last weekday, and yearly by month and day or month/Nth weekday, with a live preview and an end by count or date. Rules outside that set stay custom and are preserved verbatim, and Microsoft 365 calendars refuse a pattern Graph cannot store.</p>
+      </description>
+    </release>
     <release version="0.9.242" date="2026-10-17">
       <description>
         <p>The full privacy blur now hides content only: message, contact, calendar and task data stays blurred, while buttons, menus, tabs, column headers, settings rows and help text remain readable. Sensitive-information mode is unchanged.</p>

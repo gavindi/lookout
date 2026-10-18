@@ -326,6 +326,17 @@ fn local_anchor_date(instant: DateTime<Utc>, zone: Option<&str>) -> NaiveDate {
     instant.date_naive()
 }
 
+/// Whether Graph's recurrence model can represent `event`'s RRULE. `true` for
+/// an event that doesn't repeat; `false` for a rule outside the model's
+/// subset (notably the `BYSETPOS` "last weekday" form). The calendar client
+/// refuses such a write rather than silently dropping the recurrence.
+pub fn event_recurrence_supported(event: &CalendarEvent) -> bool {
+    event
+        .rrule
+        .as_deref()
+        .is_none_or(|rrule| recurrence::rrule_to_graph(rrule, local_anchor_date(event.start, event.time_zone.as_deref()), event.time_zone.as_deref()).is_some())
+}
+
 /// Resolves a Graph/Outlook time-zone name to its IANA name: an IANA name
 /// passes through, a Windows name (`"W. Europe Standard Time"`) maps through
 /// the shared CLDR table; anything else is `None`.
@@ -863,6 +874,18 @@ mod tests {
             "end": { "dateTime": "2026-10-15T10:00:00", "timeZone": "UTC" }
         });
         assert!(!event_from_graph(&value, &calendar_id()).unwrap().is_online_meeting);
+    }
+
+    #[test]
+    fn recurrence_support_matches_graphs_model() {
+        let mut event = event_from_graph(&sample_event(), &calendar_id()).unwrap();
+        assert!(event_recurrence_supported(&event), "no RRULE is always supported");
+
+        event.rrule = Some("FREQ=MONTHLY;BYDAY=2TU".to_string());
+        assert!(event_recurrence_supported(&event));
+
+        event.rrule = Some("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1".to_string());
+        assert!(!event_recurrence_supported(&event), "BYSETPOS has no Graph recurrence form");
     }
 
     #[test]

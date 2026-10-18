@@ -35,6 +35,11 @@ pub enum GraphError {
     /// last `Retry-After` Graph asked for, if it sent one.
     #[error("Graph throttled the request after {attempts} attempts")]
     Throttled { attempts: u32, retry_after: Option<Duration> },
+    /// The event's recurrence rule can't be expressed in Graph's structured
+    /// recurrence model. Returned instead of silently writing the event
+    /// without recurrence (the editor normally catches this first).
+    #[error("Microsoft 365 can't store this recurrence rule: {0}")]
+    UnsupportedRecurrence(String),
 }
 
 /// The crate's result alias.

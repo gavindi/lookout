@@ -195,6 +195,12 @@ pub struct EventEditorPrefill<'a> {
     /// hours and second time zone, the recurrence weekday order, and the
     /// default reminder for a new event.
     pub calendar_prefs: &'a crate::settings::CalendarPreferences,
+    /// Calendar ids served by the Microsoft Graph backend. Graph's recurrence
+    /// model can't express every RRULE this editor builds (notably the
+    /// `BYSETPOS` "last weekday" form), so Save refuses those with an inline
+    /// message instead of letting the server silently drop the recurrence
+    /// (item 3.10 / CAL-13).
+    pub graph_calendars: &'a HashSet<CalendarId>,
     /// The shared category master list (item 2.1 / CAL-07), offered by the
     /// editor's Categorize picker. Empty when the user has none yet.
     pub categories: &'a [crate::categories::CategoryDef],
@@ -586,7 +592,11 @@ pub fn show_event_editor(
         });
     }
 
-    let series = recurrence::build_series_control(existing.as_ref().and_then(|occ| occ.rrule.as_deref()), prefill.calendar_prefs.week_start);
+    let series = recurrence::build_series_control(
+        existing.as_ref().and_then(|occ| occ.rrule.as_deref()),
+        prefill.calendar_prefs.week_start,
+        initial_start.date(),
+    );
     series.button.set_tooltip_text(Some("Series"));
 
     let busy_model = gtk::StringList::new(&SHOW_AS_CHOICES.iter().map(|(_, label)| *label).collect::<Vec<_>>());
@@ -1189,6 +1199,7 @@ pub fn show_event_editor(
         let existing_meta = existing_meta.clone();
         let existing_attendees = existing_attendees.clone();
         let scope_dropdown = scope_dropdown.clone();
+        let graph_calendars = prefill.graph_calendars.clone();
         let on_save = on_save;
         // The parameter is annotated so the closure is created with a
         // higher-ranked `&Button` signature from the start - an unannotated
@@ -1202,18 +1213,29 @@ pub fn show_event_editor(
                 return;
             };
             attendees_field.commit_pending();
-            let rrule = match &series.unrepresentable_raw {
-                Some(raw) if series.current().is_none() => Some(raw.clone()),
-                _ => series.current().map(|rule| recurrence::to_rrule_string(&rule)),
-            };
+            let all_day = all_day_switch.is_active();
+            let zone = if all_day { None } else { selected_zone_name(&zone_dropdown) };
+            let start_local = date_time_from_form(&start_date, &start_hour, &start_minute, all_day);
+            let rrule = series.rrule(all_day);
+            // Graph's structured recurrence model can't hold every RRULE this
+            // builder offers. Refuse the save here, with the field the user can
+            // act on, rather than letting `lookout_graph` drop the recurrence
+            // (the transport refuses it too - this just names the problem).
+            if let Some(raw) = rrule.as_deref() {
+                if graph_calendars.contains(&calendar_id) && lookout_graph::rrule_to_graph(raw, start_local.date(), zone.as_deref()).is_none() {
+                    error_label.set_label("Microsoft 365 can't store this repeat pattern. Choose another pattern.");
+                    error_label.set_visible(true);
+                    return;
+                }
+            }
             let input = FormInput {
                 title: title_row.text().to_string(),
                 location: location_row.text().to_string(),
                 description: description_buffer.text(&description_buffer.start_iter(), &description_buffer.end_iter(), false).to_string(),
-                all_day: all_day_switch.is_active(),
-                time_zone: if all_day_switch.is_active() { None } else { selected_zone_name(&zone_dropdown) },
-                start_local: date_time_from_form(&start_date, &start_hour, &start_minute, all_day_switch.is_active()),
-                end_local: date_time_from_form(&end_date, &end_hour, &end_minute, all_day_switch.is_active()),
+                all_day,
+                time_zone: zone,
+                start_local,
+                end_local: date_time_from_form(&end_date, &end_hour, &end_minute, all_day),
                 attendee_tokens: attendees_field.addresses(),
                 existing_attendees: existing_attendees.clone(),
                 categories: selected_categories.borrow().clone(),
@@ -1845,10 +1867,7 @@ fn printable_event_html(
     } else {
         format!("{} – {}", start_local.format("%A, %B %-e, %Y · %H:%M"), end_local.format("%A, %B %-e, %Y · %H:%M"))
     };
-    let series_text = match &series.unrepresentable_raw {
-        Some(raw) => raw.clone(),
-        None => series.current().map(|rule| recurrence::describe(&rule)).unwrap_or_else(|| "Does not repeat".to_string()),
-    };
+    let series_text = series.summary();
     let mut rows: Vec<(&str, String)> = Vec::new();
     rows.push(("When", when));
     rows.push(("Series", series_text));
