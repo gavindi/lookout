@@ -3538,26 +3538,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             popover.set_child(Some(&menu));
         });
     }
-    // "More": a popover of reading-pane extras (currently "Save as .eml…").
-    // The popover's contents are rebuilt on every `show`, like
-    // `categorize_button`'s, so the enabled state can track whichever
-    // message is selected when it opens.
+    // "More": the ribbon's trailing overflow menu. It is shared by every
+    // module and tab (it lives outside the ribbon stack, so it stays pinned
+    // at the right edge), and its content has two parts:
+    //
+    //   - the overflowed ribbon controls, moved in by `RibbonOverflow` and
+    //     put straight back on their row when there is room again;
+    //   - on the Mail Home command band only, the reading-pane extras
+    //     ("Open in new window", "Save as .eml…", …), rebuilt on every
+    //     `show` so their enabled state tracks the current selection.
     let more_button = gtk::MenuButton::builder().icon_name("view-more-symbolic").build();
     more_button.set_tooltip_text(Some("More"));
     let more_popover = gtk::Popover::new();
+    let more_extras_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    more_extras_box.set_visible(false);
+    let more_overflow_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    more_overflow_box.add_css_class("ribbon-overflow");
+    more_overflow_box.set_visible(false);
+    let more_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    more_separator.set_visible(false);
+    let more_root = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    more_root.append(&more_overflow_box);
+    more_root.append(&more_separator);
+    more_root.append(&more_extras_box);
+    let more_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(480)
+        .build();
+    more_scroller.set_child(Some(&more_root));
+    more_popover.set_child(Some(&more_scroller));
     more_button.set_popover(Some(&more_popover));
-    {
-        let message_list = message_list.clone();
-        let state = state.clone();
-        let worker_for_menu = worker.clone();
-        let reading_stack_for_menu = reading_stack.clone();
-        let more_popover_for_menu = more_popover.clone();
-        more_popover.connect_show(move |popover| {
-            let has_selection = message_list.selected_summary().is_some();
-            let menu = build_more_menu(has_selection, &message_list, &state, &worker_for_menu, &reading_stack_for_menu, &more_popover_for_menu);
-            popover.set_child(Some(&menu));
-        });
-    }
 
     // --- Command ribbon (Mail Home). Every control above was created and
     // wired already; the ribbon only dresses it with an icon and a label,
@@ -3597,8 +3616,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             "Quick Steps",
         );
     });
-    // "More" is the overflow menu; it sits outside a group at the band's end.
-    command_band.standalone().menu(&more_button, "view-more-symbolic", "More");
+    // More is not part of this band: it is the trailing, always-visible
+    // overflow button shared by every module (see `RibbonOverflow`).
     // The dynamic glyphs now that every control is dressed.
     refresh_pin_button(&pin_icon, &message_list);
     refresh_flag_button(&flag_icon, &message_list);
@@ -4656,10 +4675,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Dress it as a ribbon control in a one-button band of its own, so it
     // carries the same `.ribbon-control`/`.flat` classes and the same
     // Simplified/Classic geometry as every module's controls instead of
-    // sitting at Adwaita's default size beside them.
+    // sitting at Adwaita's default size beside them. It is shrinkable: if
+    // even the icon-only ribbon page does not fit, Layout is the first
+    // control moved into More.
     let ribbon_chrome_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
     ribbon_chrome_band.standalone().menu(&ribbon_layout_button, "view-grid-symbolic", "Layout");
     let ribbon_chrome = ribbon_chrome_band.root().clone();
+
+    // The trailing More button is a band of its own and must remain visible
+    // at any width, so its natural width is always reserved by the overflow
+    // fit (it is never wrapped in the shrinkable scroller below).
+    let ribbon_more_band = crate::ribbon::RibbonBand::new(&ribbon_style, &[]);
+    ribbon_more_band.standalone().menu(&more_button, "view-more-symbolic", "More");
+    let ribbon_more = ribbon_more_band.root().clone();
 
     let icon_toolbar_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -4670,9 +4698,68 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .margin_top(6)
         .margin_bottom(6)
         .build();
+    // The ribbon pages have a large natural width, and a plain box would
+    // make that the window's minimum width - leaving the ribbon no room to
+    // overflow into More. A scrolled window with external scrollbars has a
+    // zero minimum while still allocating the page its current width; the
+    // overflow controller then hides/moves what no longer fits, so no
+    // scrollbar is ever shown or needed.
+    let ribbon_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .has_frame(false)
+        .kinetic_scrolling(false)
+        .hexpand(true)
+        .build();
     view_toolbar_stack.set_hexpand(true);
-    icon_toolbar_box.append(&view_toolbar_stack);
+    ribbon_scroller.set_child(Some(&view_toolbar_stack));
+    icon_toolbar_box.append(&ribbon_scroller);
     icon_toolbar_box.append(&ribbon_chrome);
+    icon_toolbar_box.append(&ribbon_more);
+
+    // The adaptive overflow controller: it measures the active ribbon page,
+    // drops labels when space is tight, then moves the controls that still
+    // do not fit (Layout first) into the More popover.
+    let ribbon_overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more_button, &more_overflow_box, &more_extras_box, &more_separator, &ribbon_more_band);
+    ribbon_overflow.add_band(&command_band);
+    ribbon_overflow.add_band(&view_band);
+    ribbon_overflow.add_band(&calendar_band);
+    ribbon_overflow.add_band(&tasks_band);
+    ribbon_overflow.add_band(&contacts_band);
+    ribbon_overflow.add_band(&lookout_band);
+    ribbon_overflow.add_band(&search_band);
+    ribbon_overflow.set_layout_band(&ribbon_chrome_band);
+    ribbon_overflow.set_mail_home_band(&command_band);
+    ribbon_overflow.attach(&icon_toolbar_box, &view_toolbar_stack);
+
+    // Rebuild the Mail Home extras (if that is the page showing) each time
+    // More opens. The overflowed controls live in the same popover and are
+    // maintained by the controller, so they are not disturbed here.
+    {
+        let message_list = message_list.clone();
+        let state = state.clone();
+        let worker_for_menu = worker.clone();
+        let reading_stack_for_menu = reading_stack.clone();
+        let more_extras_box = more_extras_box.clone();
+        let view_toolbar_stack = view_toolbar_stack.clone();
+        let command_toolbar = command_toolbar.clone();
+        let ribbon_overflow = ribbon_overflow.clone();
+        more_popover.connect_show(move |popover| {
+            while let Some(child) = more_extras_box.first_child() {
+                more_extras_box.remove(&child);
+            }
+            let mail_home_showing = view_toolbar_stack
+                .visible_child()
+                .is_some_and(|visible| visible == command_toolbar.clone().upcast::<gtk::Widget>());
+            more_extras_box.set_visible(mail_home_showing);
+            if mail_home_showing {
+                let has_selection = message_list.selected_summary().is_some();
+                let menu = build_more_menu(has_selection, &message_list, &state, &worker_for_menu, &reading_stack_for_menu, popover);
+                more_extras_box.append(&menu);
+            }
+            ribbon_overflow.sync_sections();
+        });
+    }
 
     // Menu bar + icon toolbar grouped onto their own shared black
     // background, rather than each row painting (or not painting) its own.

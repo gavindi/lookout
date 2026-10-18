@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.245" date="2026-10-19">
+      <description>
+        <p>The ribbon now adapts to the window width. Labels drop to icon-only first; when even that no longer fits, the Layout button and then the rightmost commands move into a More menu pinned at the far right. Overflowed commands remain fully live, keep their handlers and menus, and return to the ribbon when space comes back.</p>
+      </description>
+    </release>
     <release version="0.9.244" date="2026-10-18">
       <description>
         <p>The Classic ribbon layout no longer draws a small caption under each group. The group dividers remain, and each group's name is kept as an accessible label so screen readers still announce it; Simplified is unchanged.</p>

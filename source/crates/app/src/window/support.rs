@@ -188,6 +188,14 @@ pub(crate) fn install_paned_css() {
             padding: 4px 8px;
             min-height: 52px;
         }
+        /* Commands that overflowed from the ribbon into the More popover are
+           menu rows, not the ribbon's compressed strip geometry. */
+        .ribbon-overflow button.ribbon-control,
+        .ribbon-overflow .ribbon-control > button,
+        .ribbon-overflow .ribbon-control > menubutton > button {
+            padding: 5px 8px;
+            min-height: 24px;
+        }
         button.list-header-action {
             min-width: 24px;
             min-height: 24px;
