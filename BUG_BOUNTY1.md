@@ -96,6 +96,11 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
 18. **Mail cache overlays rebuilt on every read.** [mail/src/cache.rs:566-623](source/crates/mail/src/cache.rs#L566-L623), `LocalOverlays::load`.
     - **Cost:** every `load_messages`, `load_summaries` and search call (about 8 sites) scans all four overlay tables into HashMaps. `apply` then computes `follow_up_key` (a `String` allocation) four times per message.
     - **Fix:** compute the key once per summary. For small reads (`load_summaries` with a few uids) query the overlays with `WHERE message_key IN (…)` instead of whole-table loads. Switch the repeatedly used statements to `prepare_cached`.
+    - **Fixed:** every overlay read now goes through one `overlay_local` (`load_summaries` included):
+      - It computes each summary's `follow_up_key` once and passes it to the four appliers.
+      - Reads of up to `OVERLAY_KEYED_MAX` (512) summaries look their rows up by primary key via `message_key IN (SELECT value FROM json_each(?1))`. Larger reads still scan each table once.
+      - The overlay SELECTs and the hot read statements use `prepare_cached`, and the connection's statement cache is raised to 64.
+    - **Not changed:** `search`, `search_query` and `recent_messages` still parse each row's JSON twice; that is left as a follow-up.
 19. **`BodyCache::get` deep-clones `EmailBody`** (HTML that can be megabytes) on every hit. [state.rs:920-925](source/crates/app/src/window/state.rs#L920-L925).
     - **Wasteful callers:** [window.rs:10176](source/crates/app/src/window.rs#L10176) clones just to test `is_some()`; [connect.rs:872-886](source/crates/app/src/window/connect.rs#L872-L886) clones two or three times per `BodyFetched`.
     - **Fix:** store `Rc<EmailBody>` and add `contains()`.

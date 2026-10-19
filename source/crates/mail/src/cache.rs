@@ -391,7 +391,7 @@ const FULL_BODY_INDEX_BYTES: usize = 256 * 1024;
 
 /// Loads one cached summary by `(mailbox_id, uid)`, if present.
 fn load_summary_row(conn: &rusqlite::Connection, mailbox_id: &MailboxId, uid: Uid) -> Result<Option<EmailSummary>> {
-    let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+    let mut stmt = conn.prepare_cached("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
     let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
     match rows.next() {
         Some(Ok(data)) => Ok(serde_json::from_str(&data).ok()),
@@ -421,41 +421,56 @@ fn flag_status_code(status: FlagStatus) -> i64 {
     }
 }
 
-fn load_local_follow_ups(conn: &Connection) -> Result<HashMap<String, FollowUpFlag>> {
-    let mut stmt = conn.prepare("SELECT message_key, status, due, completed FROM follow_up_flags")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-        ))
-    })?;
+/// An overlay table's `SELECT` paired with the same query narrowed to the keys
+/// in a JSON array bound as `?1` (see [`load_overlay_table`]). Both halves are
+/// literals, so each is one `prepare_cached` entry.
+macro_rules! overlay_sql {
+    ($select:literal) => {
+        ($select, concat!($select, " WHERE message_key IN (SELECT value FROM json_each(?1))"))
+    };
+}
+
+/// Reads one overlay table into a map keyed by `message_key`: every row when
+/// `keys_json` is `None`, otherwise only the rows whose key is in that JSON
+/// array (a primary-key probe per key, see `OVERLAY_KEYED_MAX`).
+fn load_overlay_table<T>(
+    conn: &Connection,
+    (all_sql, keyed_sql): (&str, &str),
+    keys_json: Option<&str>,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(String, T)>,
+) -> Result<HashMap<String, T>> {
+    let mut stmt = conn.prepare_cached(if keys_json.is_some() { keyed_sql } else { all_sql })?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(keys_json), map)?;
     let mut out = HashMap::new();
     for row in rows {
-        let (key, status, due, completed) = row?;
-        let status = match status {
-            1 => FlagStatus::Flagged,
-            2 => FlagStatus::Complete,
-            _ => FlagStatus::NotFlagged,
-        };
-        out.insert(
-            key,
-            FollowUpFlag {
-                status,
-                start: None,
-                due: due.and_then(|t| DateTime::from_timestamp(t, 0)),
-                completed: completed.and_then(|t| DateTime::from_timestamp(t, 0)),
-            },
-        );
+        let (key, value) = row?;
+        out.insert(key, value);
     }
     Ok(out)
 }
 
+fn load_local_follow_ups(conn: &Connection, keys_json: Option<&str>) -> Result<HashMap<String, FollowUpFlag>> {
+    load_overlay_table(conn, overlay_sql!("SELECT message_key, status, due, completed FROM follow_up_flags"), keys_json, |row| {
+        let status = match row.get::<_, i64>(1)? {
+            1 => FlagStatus::Flagged,
+            2 => FlagStatus::Complete,
+            _ => FlagStatus::NotFlagged,
+        };
+        let flag = FollowUpFlag {
+            status,
+            start: None,
+            due: row.get::<_, Option<i64>>(2)?.and_then(|t| DateTime::from_timestamp(t, 0)),
+            completed: row.get::<_, Option<i64>>(3)?.and_then(|t| DateTime::from_timestamp(t, 0)),
+        };
+        Ok((row.get(0)?, flag))
+    })
+}
+
 /// Rewrites `summary`'s follow-up keywords to the local row's state, if it
 /// has one, so the UI reads one representation however the flag is stored.
-fn apply_local_follow_up(local: &HashMap<String, FollowUpFlag>, summary: &mut EmailSummary) {
-    let Some(flag) = local.get(&follow_up_key(summary)) else {
+/// `key` is the summary's [`follow_up_key`].
+fn apply_local_follow_up(local: &HashMap<String, FollowUpFlag>, key: &str, summary: &mut EmailSummary) {
+    let Some(flag) = local.get(key) else {
         return;
     };
     summary.keywords.retain(|k| !lookout_core::is_flag_keyword(k));
@@ -523,61 +538,54 @@ fn classification_from_code(code: i64) -> InferenceClassification {
     }
 }
 
-fn load_local_categories(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
-    let mut stmt = conn.prepare("SELECT message_key, category_keys FROM local_categories")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (key, json) = row?;
-        out.insert(key, serde_json::from_str(&json).unwrap_or_default());
-    }
-    Ok(out)
+fn load_local_categories(conn: &Connection, keys_json: Option<&str>) -> Result<HashMap<String, Vec<String>>> {
+    load_overlay_table(conn, overlay_sql!("SELECT message_key, category_keys FROM local_categories"), keys_json, |row| {
+        Ok((row.get(0)?, serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default()))
+    })
 }
 
-fn load_local_importance(conn: &Connection) -> Result<HashMap<String, Importance>> {
-    let mut stmt = conn.prepare("SELECT message_key, importance FROM local_importance")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (key, code) = row?;
-        out.insert(key, importance_from_code(code));
-    }
-    Ok(out)
+fn load_local_importance(conn: &Connection, keys_json: Option<&str>) -> Result<HashMap<String, Importance>> {
+    load_overlay_table(conn, overlay_sql!("SELECT message_key, importance FROM local_importance"), keys_json, |row| {
+        Ok((row.get(0)?, importance_from_code(row.get(1)?)))
+    })
 }
 
-fn load_local_inference(conn: &Connection) -> Result<HashMap<String, InferenceClassification>> {
-    let mut stmt = conn.prepare("SELECT message_key, classification FROM local_inference")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (key, code) = row?;
-        out.insert(key, classification_from_code(code));
-    }
-    Ok(out)
+fn load_local_inference(conn: &Connection, keys_json: Option<&str>) -> Result<HashMap<String, InferenceClassification>> {
+    load_overlay_table(conn, overlay_sql!("SELECT message_key, classification FROM local_inference"), keys_json, |row| {
+        Ok((row.get(0)?, classification_from_code(row.get(1)?)))
+    })
 }
 
 /// Rewrites `summary`'s category keywords to the local row's keys, if it has
 /// one - the `$Lookout-tag-*` keyword store for a folder that can't keep custom
 /// keywords (Exchange IMAP, item 5.4).
-fn apply_local_categories(local: &HashMap<String, Vec<String>>, summary: &mut EmailSummary) {
-    let Some(keys) = local.get(&follow_up_key(summary)) else {
+fn apply_local_categories(local: &HashMap<String, Vec<String>>, key: &str, summary: &mut EmailSummary) {
+    let Some(keys) = local.get(key) else {
         return;
     };
     summary.keywords.retain(|k| !k.starts_with(lookout_core::TAG_KEYWORD_PREFIX));
     summary.keywords.extend(keys.iter().map(|key| lookout_core::tag_keyword(key)));
 }
 
-fn apply_local_importance(local: &HashMap<String, Importance>, summary: &mut EmailSummary) {
-    if let Some(importance) = local.get(&follow_up_key(summary)) {
+fn apply_local_importance(local: &HashMap<String, Importance>, key: &str, summary: &mut EmailSummary) {
+    if let Some(importance) = local.get(key) {
         summary.importance = *importance;
     }
 }
 
-fn apply_local_classification(local: &HashMap<String, InferenceClassification>, summary: &mut EmailSummary) {
-    if let Some(classification) = local.get(&follow_up_key(summary)) {
+fn apply_local_classification(local: &HashMap<String, InferenceClassification>, key: &str, summary: &mut EmailSummary) {
+    if let Some(classification) = local.get(key) {
         summary.inference_classification = *classification;
     }
 }
+
+/// Reads of at most this many summaries look their overlay rows up by key;
+/// larger reads scan each overlay table once. On a Microsoft 365 account the
+/// Graph delta fills the overlay tables for most of the mailbox, so a scan to
+/// overlay a handful of messages (the body path's `load_summaries`, a search)
+/// deserializes far more rows than it uses - while for a whole folder, one
+/// scan per table is cheaper than thousands of primary-key probes.
+const OVERLAY_KEYED_MAX: usize = 512;
 
 /// Every locally-stored Outlook overlay (item 5.4), loaded once per read.
 #[derive(Default)]
@@ -589,33 +597,39 @@ struct LocalOverlays {
 }
 
 impl LocalOverlays {
-    fn load(conn: &Connection) -> Result<Self> {
+    /// Loads every overlay row (`keys_json` is `None`), or only the rows for
+    /// the [`follow_up_key`]s in that JSON array.
+    fn load(conn: &Connection, keys_json: Option<&str>) -> Result<Self> {
         Ok(LocalOverlays {
-            follow_ups: load_local_follow_ups(conn)?,
-            categories: load_local_categories(conn)?,
-            importance: load_local_importance(conn)?,
-            classification: load_local_inference(conn)?,
+            follow_ups: load_local_follow_ups(conn, keys_json)?,
+            categories: load_local_categories(conn, keys_json)?,
+            importance: load_local_importance(conn, keys_json)?,
+            classification: load_local_inference(conn, keys_json)?,
         })
     }
 
-    fn apply(&self, summary: &mut EmailSummary) {
-        apply_local_follow_up(&self.follow_ups, summary);
-        apply_local_categories(&self.categories, summary);
-        apply_local_importance(&self.importance, summary);
-        apply_local_classification(&self.classification, summary);
+    /// Applies the overlays to `summary`, whose [`follow_up_key`] is `key`.
+    fn apply(&self, key: &str, summary: &mut EmailSummary) {
+        apply_local_follow_up(&self.follow_ups, key, summary);
+        apply_local_categories(&self.categories, key, summary);
+        apply_local_importance(&self.importance, key, summary);
+        apply_local_classification(&self.classification, key, summary);
     }
 }
 
 /// Overlays every locally-stored Outlook property (follow-up flags, categories,
 /// importance, Focused/Other classification) onto `messages`, so the UI reads
 /// one representation however each value is stored (item 1.16, item 5.4).
-fn overlay_local(conn: &Connection, messages: &mut [EmailSummary]) -> Result<()> {
+fn overlay_local<'a>(conn: &Connection, messages: impl IntoIterator<Item = &'a mut EmailSummary>) -> Result<()> {
+    let messages: Vec<&mut EmailSummary> = messages.into_iter().collect();
     if messages.is_empty() {
         return Ok(());
     }
-    let overlays = LocalOverlays::load(conn)?;
-    for summary in messages.iter_mut() {
-        overlays.apply(summary);
+    let keys: Vec<String> = messages.iter().map(|summary| follow_up_key(summary)).collect();
+    let keys_json = if keys.len() <= OVERLAY_KEYED_MAX { Some(serde_json::to_string(&keys)?) } else { None };
+    let overlays = LocalOverlays::load(conn, keys_json.as_deref())?;
+    for (summary, key) in messages.into_iter().zip(&keys) {
+        overlays.apply(key, summary);
     }
     Ok(())
 }
@@ -695,6 +709,10 @@ impl Cache {
         // so this also upgrades databases created before it was set.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Room for every `prepare_cached` statement at once (rusqlite's default
+        // is 16): the hot read paths and the eight overlay lookups would
+        // otherwise evict the sync and delete statements, and each other.
+        conn.set_prepared_statement_cache_capacity(64);
         // `synchronous=FULL` (the default) fsyncs on every autocommit
         // commit, and this file is rewritten wholesale by every mailbox sync.
         // The data is disposable - it's rebuilt from the server - so NORMAL
@@ -1193,7 +1211,7 @@ impl Cache {
     /// window of a folder never synced in full (see `store_partial_messages`).
     pub fn load_messages(&self, mailbox_id: &MailboxId) -> Result<Vec<EmailSummary>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND partial = 0")?;
+        let mut stmt = conn.prepare_cached("SELECT data FROM messages WHERE mailbox_id = ?1 AND partial = 0")?;
         let rows = stmt.query_map([&mailbox_id.0], |row| row.get::<_, String>(0))?;
         let mut messages = Vec::new();
         for row in rows {
@@ -1260,7 +1278,7 @@ impl Cache {
             return Ok(HashMap::new());
         }
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+        let mut stmt = conn.prepare_cached("SELECT data FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
         let mut out = HashMap::new();
         for &uid in uids {
             let mut rows = stmt.query_map(rusqlite::params![mailbox_id.0, uid.0], |row| row.get::<_, String>(0))?;
@@ -1270,10 +1288,7 @@ impl Cache {
                 }
             }
         }
-        let overlays = LocalOverlays::load(&conn)?;
-        for summary in out.values_mut() {
-            overlays.apply(summary);
-        }
+        overlay_local(&conn, out.values_mut())?;
         Ok(out)
     }
 
@@ -1778,7 +1793,7 @@ impl Cache {
         // the UI thread runs this on every keystroke. Hits whose envelope row
         // is gone (e.g. the migration wiped the messages table once) fall out
         // of the JOIN rather than being skipped one by one.
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT messages.data FROM search_fts \
              JOIN messages ON messages.mailbox_id = search_fts.mailbox_id \
               AND messages.uid = search_fts.uid \
@@ -1800,7 +1815,7 @@ impl Cache {
         let now = Utc::now().timestamp();
         let mut snoozed: HashSet<(String, u32)> = HashSet::new();
         {
-            let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
+            let mut stmt = conn.prepare_cached("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
             let rows = stmt.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
             for row in rows {
                 snoozed.insert(row?);
@@ -1885,7 +1900,7 @@ impl Cache {
         let now = Utc::now().timestamp();
         let mut snoozed: HashSet<(String, u32)> = HashSet::new();
         {
-            let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
+            let mut stmt = conn.prepare_cached("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
             let rows = stmt.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
             for row in rows {
                 snoozed.insert(row?);
@@ -1916,7 +1931,7 @@ impl Cache {
     /// feed covers the folders the user actually syncs.
     pub fn recent_messages(&self, limit: usize) -> Result<Vec<EmailSummary>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT data FROM messages WHERE partial = 0 \
              ORDER BY json_extract(data, '$.date') DESC \
              LIMIT ?1",
@@ -1936,7 +1951,7 @@ impl Cache {
         let now = Utc::now().timestamp();
         let mut snoozed: HashSet<(String, u32)> = HashSet::new();
         {
-            let mut stmt = conn.prepare("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
+            let mut stmt = conn.prepare_cached("SELECT mailbox_id, uid FROM snoozed WHERE snoozed_until > ?1")?;
             let rows = stmt.query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?;
             for row in rows {
                 snoozed.insert(row?);
@@ -2696,7 +2711,7 @@ impl Cache {
         }
         let ids_json = serde_json::to_string(&ids)?;
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT data FROM messages WHERE mailbox_id = ?1 AND ( \
                trim(json_extract(data, '$.message_id'), '<> ') IN (SELECT value FROM json_each(?2)) \
                OR trim(json_extract(data, '$.in_reply_to'), '<> ') IN (SELECT value FROM json_each(?2)) \
@@ -3666,6 +3681,98 @@ mod tests {
         assert!(!loaded[0].keywords.iter().any(|k| k.starts_with(lookout_core::TAG_KEYWORD_PREFIX)));
         assert_eq!(loaded[0].importance, lookout_core::Importance::Normal);
         assert_eq!(loaded[0].inference_classification, lookout_core::InferenceClassification::Focused);
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A small read looks its overlay rows up by key and a large one scans the
+    /// tables (`OVERLAY_KEYED_MAX`); both must overlay exactly the same values,
+    /// including the `uid:` key of a message without a Message-ID, a tombstone
+    /// flag, and with rows present for keys outside the read.
+    #[test]
+    fn keyed_and_full_overlay_loads_agree() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let count = OVERLAY_KEYED_MAX as u32 + 20;
+        let messages: Vec<EmailSummary> = (1..=count)
+            .map(|uid| {
+                let summary = sample_summary(&mailbox_id, uid, None);
+                if uid % 7 == 0 {
+                    summary
+                } else {
+                    with_message_id(summary, &format!("m{uid}@x"))
+                }
+            })
+            .collect();
+        cache.replace_messages(&mailbox_id, UidValidity(1), &messages).unwrap();
+
+        let now = Utc::now();
+        let every = |n: u32| messages.iter().filter(move |m| m.uid.0 % n == 0).cloned().collect::<Vec<_>>();
+        cache.set_local_follow_ups(&every(3), &flagged(None), now).unwrap();
+        cache.set_local_follow_ups(&every(11), &FollowUpFlag::default(), now).unwrap();
+        cache.set_local_categories(&every(4), &["work".to_string()], now).unwrap();
+        cache.set_local_importance(&every(5), lookout_core::Importance::High, now).unwrap();
+        cache.set_local_inference(&every(2), lookout_core::InferenceClassification::Other, now).unwrap();
+        // Rows for messages this read never sees.
+        let stranger = with_message_id(sample_summary(&MailboxId::new(&account_id, "Archive"), 1, None), "elsewhere@x");
+        cache.set_local_importance(std::slice::from_ref(&stranger), lookout_core::Importance::Low, now).unwrap();
+
+        // The two loaders, side by side on the same raw summaries.
+        let keys: Vec<String> = messages.iter().map(follow_up_key).collect();
+        let keys_json = serde_json::to_string(&keys).unwrap();
+        let overlaid = |keys_json: Option<&str>| {
+            let conn = cache.conn.lock().unwrap();
+            let overlays = LocalOverlays::load(&conn, keys_json).unwrap();
+            let mut out = messages.clone();
+            for (summary, key) in out.iter_mut().zip(&keys) {
+                overlays.apply(key, summary);
+            }
+            out
+        };
+        // `EmailSummary` has no `PartialEq`; its sets are ordered, so its JSON
+        // compares deterministically.
+        let json = |summaries: &[EmailSummary]| summaries.iter().map(|m| serde_json::to_value(m).unwrap()).collect::<Vec<_>>();
+        let full = overlaid(None);
+        assert_eq!(json(&overlaid(Some(&keys_json))), json(&full));
+        assert_ne!(json(&full), json(&messages), "the fixture overlays something");
+
+        // And through the public reads: `load_messages` takes the full path,
+        // a few-uid `load_summaries` the keyed one.
+        let loaded = cache.load_messages(&mailbox_id).unwrap();
+        assert!(loaded.len() > OVERLAY_KEYED_MAX);
+        let wanted = [Uid(7), Uid(12), Uid(33), Uid(55), Uid(60), Uid(77)];
+        let few = cache.load_summaries(&mailbox_id, &wanted).unwrap();
+        assert_eq!(few.len(), wanted.len());
+        for uid in wanted {
+            let listed = loaded.iter().find(|m| m.uid == uid).unwrap();
+            let expected = full.iter().find(|m| m.uid == uid).unwrap();
+            assert_eq!(json(std::slice::from_ref(&few[&uid])), json(std::slice::from_ref(expected)), "uid {}", uid.0);
+            assert_eq!(json(std::slice::from_ref(listed)), json(std::slice::from_ref(expected)), "uid {}", uid.0);
+        }
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The keyed overlay lookup matches on the normalised key: a bracketed
+    /// Message-ID resolves to its bare row, and a message without one to its
+    /// `uid:` row.
+    #[test]
+    fn load_summaries_overlays_with_bracketed_and_missing_message_ids() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let bracketed = with_message_id(sample_summary(&mailbox_id, 1, None), "one@x");
+        let bare = sample_summary(&mailbox_id, 2, None);
+        assert!(bare.message_id.is_none());
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[bracketed.clone(), bare.clone()]).unwrap();
+        cache.set_local_importance(&[bracketed, bare], lookout_core::Importance::High, Utc::now()).unwrap();
+
+        let loaded = cache.load_summaries(&mailbox_id, &[Uid(1), Uid(2)]).unwrap();
+        assert_eq!(loaded[&Uid(1)].importance, lookout_core::Importance::High);
+        assert_eq!(loaded[&Uid(2)].importance, lookout_core::Importance::High);
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
