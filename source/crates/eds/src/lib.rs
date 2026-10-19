@@ -14,12 +14,14 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+mod address_book;
 mod discovery;
 mod error;
 mod keyfile;
 pub mod proxies;
 mod sources;
 
+pub use address_book::{people_from_card, search_query, EdsAddressBook, EdsPerson};
 pub use discovery::Eds;
 pub use error::{Error, Result};
 pub use sources::{EdsSource, EdsSourceKind};

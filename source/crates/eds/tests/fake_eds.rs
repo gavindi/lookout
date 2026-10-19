@@ -1,6 +1,7 @@
 //! Exercises `lookout_eds::Eds` against a hand-rolled fake EDS on a private
 //! `dbus-daemon` that each test starts for itself, giving real D-Bus-wire
-//! coverage of version detection and source listing without a GNOME session.
+//! coverage of version detection, source listing and address-book search
+//! without a GNOME session.
 //!
 //! Unlike `lookout-goa`'s `fake_goa`, this needs no `dbus-run-session`: the
 //! private bus has its own configuration, whose only service directory is a
@@ -15,10 +16,11 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use lookout_eds::{Eds, EdsSourceKind};
-use zbus::interface;
+use lookout_eds::{people_from_card, Eds, EdsAddressBook, EdsSourceKind};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::{fdo, interface};
 
 const SOURCES5: &str = "org.gnome.evolution.dataserver.Sources5";
 const CALENDAR8: &str = "org.gnome.evolution.dataserver.Calendar8";
@@ -264,4 +266,125 @@ async fn reads_sources_including_goa_backed_ones() {
     assert_eq!(goa_book.display_name, "Contacts");
     assert_eq!(goa_book.parent_uid.as_deref(), Some("cb7ed32b"));
     assert!(goa_book.enabled);
+}
+
+/// What the fake address-book backend saw.
+#[derive(Default)]
+struct BookLog {
+    opened_source: Option<String>,
+    open_calls: usize,
+    queries: Vec<String>,
+    closed: bool,
+}
+
+struct FakeAddressBookFactory {
+    backend_bus: String,
+    backend_path: String,
+    log: Arc<Mutex<BookLog>>,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.AddressBookFactory")]
+impl FakeAddressBookFactory {
+    fn open_address_book(&self, source_uid: &str) -> fdo::Result<(String, String)> {
+        if source_uid != "system-address-book" {
+            return Err(fdo::Error::Failed(format!("no such source: {source_uid}")));
+        }
+        self.log.lock().unwrap().opened_source = Some(source_uid.to_string());
+        Ok((self.backend_path.clone(), self.backend_bus.clone()))
+    }
+}
+
+struct FakeAddressBook {
+    cards: Vec<String>,
+    log: Arc<Mutex<BookLog>>,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.AddressBook")]
+impl FakeAddressBook {
+    fn open(&self) -> Vec<String> {
+        self.log.lock().unwrap().open_calls += 1;
+        Vec::new()
+    }
+
+    fn close(&self) {
+        self.log.lock().unwrap().closed = true;
+    }
+
+    fn get_contact_list(&self, query: &str) -> fdo::Result<Vec<String>> {
+        let mut log = self.log.lock().unwrap();
+        // Real backends refuse queries on a book that wasn't opened.
+        if log.open_calls == 0 {
+            return Err(fdo::Error::Failed("Backend is not opened yet".to_string()));
+        }
+        log.queries.push(query.to_string());
+        Ok(self.cards.clone())
+    }
+}
+
+#[tokio::test]
+async fn searches_an_address_book_through_the_backend_the_factory_names() {
+    let bus = PrivateBus::start(&[]);
+    let log = Arc::new(Mutex::new(BookLog::default()));
+    // Backend-per-process builds hand out a subprocess bus name and path; the
+    // book must be reached there, not on the factory's name.
+    let backend_bus = "org.gnome.evolution.dataserver.Subprocess.Backend.AddressBookx4242x2";
+    let backend_path = "/org/gnome/evolution/dataserver/Subprocess/Backend/AddressBook/4242/2";
+    let service = fake_eds(&bus, &[SOURCES5, ADDRESS_BOOK10], registry(&[])).await;
+    service
+        .object_server()
+        .at(
+            "/org/gnome/evolution/dataserver/AddressBookFactory",
+            FakeAddressBookFactory {
+                backend_bus: backend_bus.to_string(),
+                backend_path: backend_path.to_string(),
+                log: log.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let backend = bus.connect().await;
+    backend
+        .object_server()
+        .at(
+            backend_path,
+            FakeAddressBook {
+                cards: vec![
+                    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Zed Last\r\nEMAIL:zed@example.com\r\nEND:VCARD\r\n".to_string(),
+                    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann Example\r\nEMAIL;TYPE=WORK:ann@work.example\r\nEMAIL:ann@home.example\r\nEND:VCARD\r\n".to_string(),
+                    "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Team\r\nX-EVOLUTION-LIST:TRUE\r\nEMAIL:ann@work.example\r\nEND:VCARD\r\n".to_string(),
+                ],
+                log: log.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    backend.request_name(backend_bus).await.unwrap();
+
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+    assert!(EdsAddressBook::open(&eds, "no-such-book").await.is_err());
+
+    let book = EdsAddressBook::open(&eds, "system-address-book").await.unwrap();
+    assert_eq!(book.source_uid(), "system-address-book");
+    let cards = book.search(" Ann \"Q\" ", 10).await.unwrap();
+    let names: Vec<_> = cards.iter().map(|c| c.full_name.as_deref().unwrap()).collect();
+    assert_eq!(names, ["Ann Example", "Zed Last"], "sorted by name, list left out");
+    let addresses: Vec<String> = people_from_card(&cards[0]).into_iter().map(|p| p.address).collect();
+    assert_eq!(addresses, ["ann@work.example", "ann@home.example"]);
+
+    assert_eq!(book.search("ann", 1).await.unwrap().len(), 1);
+    assert!(book.search("   ", 10).await.unwrap().is_empty());
+    book.close().await;
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.opened_source.as_deref(), Some("system-address-book"));
+    assert_eq!(log.open_calls, 1);
+    assert_eq!(
+        log.queries,
+        [
+            r#"(and (exists "email") (or (beginswith "full_name" "Ann \"Q\"") (beginswith "nickname" "Ann \"Q\"") (beginswith "email" "Ann \"Q\"")))"#,
+            r#"(and (exists "email") (or (beginswith "full_name" "ann") (beginswith "nickname" "ann") (beginswith "email" "ann")))"#,
+        ],
+        "the blank search must not reach EDS"
+    );
+    assert!(log.closed);
 }

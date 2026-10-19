@@ -140,7 +140,34 @@ Add `source/crates/eds` (package `lookout-eds`) to the workspace, shaped like `l
 
 ## Phase 1 — Read EDS address books (option 1)
 
-### [ ] E1.1 — Querying address books (`M`)
+### [x] E1.1 — Querying address books (`M`)
+
+Done 2026-10-20 (v0.9.254). Where it differs from the plan below, following the E0.1 notes and
+a check against the live desktop:
+
+- **The query.** `search_query` builds
+  `(and (exists "email") (or (beginswith "full_name" q) (beginswith "nickname" q) (beginswith "email" q)))`:
+  - field names use underscores;
+  - the query is trimmed but not lower-cased, because EDS already ignores case and accents;
+  - `nickname` is kept for backends such as LDAP that translate the query themselves.
+- **`(exists "email")` is new.** Real books are full of phone-only cards: on this desktop, one
+  search returned 11 cards with only 4 addresses between them. Those cards would use up the
+  caller's `limit`, so EDS now leaves them out.
+- **What `search` returns.** It leaves out contact lists (`X-EVOLUTION-LIST:TRUE` or
+  `KIND:group`) and cards that don't parse. It sorts by name, then applies the limit. A blank
+  query never reaches EDS.
+- **Added for E1.2:** `EdsPerson { name, address, organization, title }` and
+  `people_from_card`, which gives one person per address. A card with no FN uses its structured
+  name, or no name at all, as with the Microsoft 365 book.
+- **Closing books.** `EdsAddressBook::close()` exists because EDS keeps a backend open for as
+  long as the shared connection lives.
+- **Tests.** Beyond the planned pure tests, a wire test in `fake_eds.rs` covers opening a book
+  through a factory that returns a subprocess bus name and path. The fake backend refuses
+  queries until `Open` has been called. The test also covers the exact query sent, the limit,
+  and a blank search, which must not reach EDS.
+- **Example:** `cargo run -p lookout-eds --example search_address_books -- <query>`.
+
+The original plan:
 
 In `lookout-eds`, add `address_book.rs`.
 
