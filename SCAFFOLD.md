@@ -24,7 +24,7 @@ alongside GOA ones, with secrets held in the GNOME keyring.
 source/crates/
 ├── core/         lookout-core   — pure domain types, zero I/O
 ├── goa/          lookout-goa    — GNOME Online Accounts discovery (zbus/D-Bus)
-├── eds/          lookout-eds    — Evolution Data Server client (zbus/D-Bus; EDS_TODO.md, not yet used by the app)
+├── eds/          lookout-eds    — Evolution Data Server client (zbus/D-Bus; EDS_TODO.md) — desktop address books in directory lookups
 ├── mail/         lookout-mail   — IMAP/SMTP account-session actor + SQLite cache
 ├── dav/          lookout-dav    — CalDAV/CardDAV client + iCalendar/RRULE + SQLite caches
 ├── graph/        lookout-graph  — Microsoft Graph client (paging, delta, throttling; Phase 5 backend)

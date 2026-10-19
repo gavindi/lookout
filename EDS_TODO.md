@@ -183,7 +183,49 @@ In `lookout-eds`, add `address_book.rs`.
   - building the S-expression, including escaping and non-ASCII input;
   - turning a vCard with several email addresses into one hit per address.
 
-### [ ] E1.2 — `EdsDirectoryBackend` (`M`)
+### [x] E1.2 — `EdsDirectoryBackend` (`M`)
+
+Done 2026-10-20 (v0.9.255). Notes:
+
+- **One shared connection.** Every directory source shares one process-wide `LiveDesktopBooks`.
+  It connects to EDS on the first lookup, through `Eds::connect`, which never starts EDS. It
+  keeps each book open between lookups.
+- **"Unavailable" is remembered for 60 s,** so a desktop without EDS doesn't pay a D-Bus round
+  trip per keystroke, while an EDS that starts later is still found.
+- **The source list is re-read on every lookup** (one `GetManagedObjects`, a few
+  milliseconds), so books added, removed or switched off on the desktop take effect without a
+  restart. The E1.4 item about `ObjectManager` signals is therefore only an optimisation now.
+- **Failures:**
+  - each book gets 3 s to open and 3 s to answer;
+  - a book whose search fails is dropped and reopened on the next lookup (EDS may have
+    restarted);
+  - when the source list itself fails, EDS counts as unavailable.
+- **Which books.** For now every enabled address book qualifies (`qualifying_books`); E1.3
+  narrows it. There is no setting yet (E1.4).
+- **Order.** The EDS backend goes last in `directory_source`, in both scopes, so a person found
+  in another directory keeps that directory's entry.
+- **Nameless cards.** A card with no name maps to `name: None`, which the suggestion rows
+  already show as the bare address. No fallback name is needed.
+- **Tests:**
+  - mapping;
+  - merging across books, case-insensitive de-duplication and the limit;
+  - an unavailable desktop adds nothing;
+  - qualifying books;
+  - EDS hits come after another directory's, through a real `DirectorySource` with its
+    debounce and worker. This test needs GTK and skips itself otherwise, like the other
+    GTK tests;
+  - EDS hits come after stored contacts, in `merge_contact_suggestions`;
+  - an ignored live test, `live_desktop_books`, runs against the session's real EDS. Run it
+    with `cargo test -p lookout-app live_desktop_books -- --ignored --nocapture`. On this
+    desktop: 8 hits, and 9 ms for a warm lookup.
+- **Follow-up, not done here:** in the composer, `merge_contact_suggestions` re-filters
+  directory hits with `directory_matches_prefix`, which needs the display name or the address
+  to start with the prefix. So EDS hits that matched only on the family name, the nickname or
+  an accent-insensitive comparison ("smi" for "Dave Smith", "emile" for "Émile") are dropped
+  there. The contact picker isn't affected. The Graph GAL already loses surname matches the
+  same way. Relaxing the filter to match the start of any word in the name would help both.
+
+The original plan:
 
 Add `source/crates/app/src/eds_directory.rs`.
 

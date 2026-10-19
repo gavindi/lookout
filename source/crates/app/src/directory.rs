@@ -16,12 +16,14 @@
 //! [`directory_source`] assembles the running backends for a suggestion
 //! surface: the Graph provider for each connected Microsoft 365 account whose
 //! directory search the user has opted into (and whose Graph consent is in
-//! place), plus one LDAP provider per enabled `AppConfig::ldap_directories`
-//! entry in scope. `Some(id)` scopes the source to that account (the composer's
-//! To/Cc/Bcc fields, sending from `id`); `None` unions every account's
-//! directories (the calendar attendee field, where an invitee isn't tied to the
-//! event's calendar account). A disabled, unconsented or unconfigured source
-//! simply contributes no hits.
+//! place), one LDAP provider per enabled `AppConfig::ldap_directories` entry
+//! in scope, and last the desktop's own address books over Evolution Data
+//! Server (`eds_directory`, EDS_TODO.md E1.2). `Some(id)` scopes the source to
+//! that account (the composer's To/Cc/Bcc fields, sending from `id`); `None`
+//! unions every account's directories (the calendar attendee field, where an
+//! invitee isn't tied to the event's calendar account). The desktop's books
+//! serve both scopes. A disabled, unconsented or unconfigured source simply
+//! contributes no hits.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -37,6 +39,7 @@ use lookout_core::AccountId;
 use lookout_graph::DirectoryPerson;
 
 use crate::app_config::{AppConfig, LdapDirectory};
+use crate::eds_directory::EdsDirectoryBackend;
 use crate::graph_directory::GraphDirectoryBackend;
 use crate::ldap_directory::LdapDirectoryBackend;
 use crate::other_accounts::SecretServiceKeyring;
@@ -97,7 +100,7 @@ fn directory_query(prefix: &str) -> Option<String> {
 /// Flattens each backend's hits into one list, de-duplicated on the bare
 /// address (case-insensitively) and bounded by `limit`. Backends are visited
 /// in order, so an entry from the first directory that has it wins.
-fn merge_directory_hits(per_backend: Vec<Vec<DirectoryPerson>>, limit: usize) -> Vec<DirectoryPerson> {
+pub(crate) fn merge_directory_hits(per_backend: Vec<Vec<DirectoryPerson>>, limit: usize) -> Vec<DirectoryPerson> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for hits in per_backend {
@@ -282,8 +285,9 @@ impl DirectorySource {
 /// invitee isn't tied to the event's calendar account). A Microsoft 365
 /// account contributes its Graph GAL only when the user has opted it in and
 /// its directory consent is in place ([`GraphDirectoryBackend::enabled`]); an
-/// LDAP directory contributes only when it is enabled and in scope. A source
-/// with no qualifying backend is valid and simply answers empty.
+/// LDAP directory contributes only when it is enabled and in scope. The
+/// desktop's address books ([`EdsDirectoryBackend`]) serve every scope and
+/// come last; without EDS they simply answer empty.
 pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<AccountId>, worker: Rc<Worker>) -> DirectorySource {
     // Read the config and the Graph-capable account ids out under one short
     // borrow. An account carries the Graph clients only when it is a
@@ -315,6 +319,11 @@ pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<Acc
             backends.push(Arc::new(backend));
         }
     }
+    // The desktop's address books (EDS_TODO.md E1.2) go last, so a person
+    // another directory also lists keeps that directory's entry. They aren't
+    // tied to an account, so the same backend serves both scopes; it connects
+    // to EDS on the first lookup and contributes nothing without it.
+    backends.push(Arc::new(EdsDirectoryBackend::desktop()));
     DirectorySource::new(backends, worker)
 }
 

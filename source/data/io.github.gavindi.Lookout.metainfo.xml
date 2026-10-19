@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.255" date="2026-10-20">
+      <description>
+        <p>Recipient suggestions, the contact picker and People search now include people from the desktop's own address books in GNOME Contacts and Evolution, alongside your accounts' contacts and directories.</p>
+      </description>
+    </release>
     <release version="0.9.254" date="2026-10-20">
       <description>
         <p>No visible changes. This release adds the groundwork for searching the desktop's own address books (GNOME Contacts and Evolution) when choosing recipients, which a later version will turn on.</p>

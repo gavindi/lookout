@@ -27,6 +27,7 @@ mod context_menu;
 mod conversation_view;
 mod datetime_picker;
 mod directory;
+mod eds_directory;
 mod event_editor;
 mod event_menu;
 mod folder_menu;
