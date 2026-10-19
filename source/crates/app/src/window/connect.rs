@@ -849,6 +849,10 @@ pub(crate) fn spawn_account_event_loop(
                         // A rules-engine evaluation (item 2.5 / M-14, A5b)
                         // waiting on this body now has what it needs.
                         crate::rules::evaluate_deferred_rules(&state, &account_id, &mailbox, uid, &body);
+                        // Shared from here on: the cache, a waiting action, a
+                        // conversation card and the reading pane all read the
+                        // same allocation.
+                        let body = Rc::new(body);
                         let should_render = {
                             let mut st = state.borrow_mut();
                             // Render if this is the request still in flight, or
@@ -869,7 +873,7 @@ pub(crate) fn spawn_account_event_loop(
                             // still looking at this message - a fetch that
                             // completed after they moved on is still worth
                             // keeping for when they come back.
-                            st.body_cache.insert(mailbox.clone(), uid, body.clone());
+                            st.body_cache.insert(mailbox.clone(), uid, Rc::clone(&body));
                             is_current
                         };
                         // A message-menu action waiting for this body (item
@@ -881,9 +885,9 @@ pub(crate) fn spawn_account_event_loop(
                                 _ => None,
                             }
                         };
-                        let waiting_body = waiter.as_ref().map(|_| body.clone());
+                        let waiting_body = waiter.as_ref().map(|_| Rc::clone(&body));
                         // A conversation card waiting on this body (item 1.7).
-                        conversation_body_arrived(&state, &mailbox, uid, body.clone());
+                        conversation_body_arrived(&state, &mailbox, uid, Rc::clone(&body));
                         if should_render {
                             tracing::debug!(?mailbox, uid = uid.0, "FetchBody: body arrived on UI thread");
                             render_body(&state, &reading_stack, &message_header, mailbox, uid, body);

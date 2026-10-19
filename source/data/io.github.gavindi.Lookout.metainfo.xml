@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.252" date="2026-10-20">
+      <description>
+        <p>Opening messages and scrolling the message list use less memory and CPU. Message bodies already loaded are shared rather than copied each time they're shown, and list rows reuse their category dots and display settings as you scroll.</p>
+      </description>
+    </release>
     <release version="0.9.251" date="2026-10-20">
       <description>
         <p>Opening a message, searching and other mail reads are faster, especially on Microsoft 365 accounts. Locally stored flags, categories, importance and Focused/Other settings are now looked up only for the messages being shown, instead of all being read on every load.</p>

@@ -2461,3 +2461,107 @@ fn copy_to_folder_records_recent_folder_and_undoes_by_revert_copy() {
         other => panic!("expected RevertCopy, got {other:?}"),
     }
 }
+
+// --- In-memory body cache (BUG_BOUNTY1.md, Tier 4 #19). ---
+
+fn cached_body_for(uid: u32) -> Rc<lookout_core::EmailBody> {
+    Rc::new(lookout_core::EmailBody {
+        uid: Uid(uid),
+        text_body: Some(format!("body {uid}")),
+        html_body: None,
+        calendar_ics: None,
+        parts: Vec::new(),
+        headers: Vec::new(),
+        auth_results: None,
+    })
+}
+
+/// A hit hands out the cached allocation rather than a copy, `contains`
+/// answers without promoting, the least recently used body is evicted first,
+/// and re-inserting a key replaces its entry.
+#[test]
+fn body_cache_shares_bodies_and_evicts_lru() {
+    let inbox = MailboxId("acct:INBOX".into());
+    let mut cache = BodyCache::new(2);
+    let one = cached_body_for(1);
+    cache.insert(inbox.clone(), Uid(1), Rc::clone(&one));
+    cache.insert(inbox.clone(), Uid(2), cached_body_for(2));
+
+    let hit = cache.get(&inbox, &Uid(1)).expect("cached");
+    assert!(Rc::ptr_eq(&hit, &one), "a hit shares the inserted body");
+
+    // uid 2 is now least recently used; `contains` must not promote it.
+    assert!(cache.contains(&inbox, &Uid(2)));
+    cache.insert(inbox.clone(), Uid(3), cached_body_for(3));
+    assert!(!cache.contains(&inbox, &Uid(2)), "the LRU entry is evicted");
+    assert!(cache.contains(&inbox, &Uid(1)) && cache.contains(&inbox, &Uid(3)));
+    assert!(cache.get(&inbox, &Uid(2)).is_none());
+
+    let replacement = cached_body_for(1);
+    cache.insert(inbox.clone(), Uid(1), Rc::clone(&replacement));
+    assert_eq!(cache.entries.len(), 2, "re-inserting replaces, never duplicates");
+    assert!(Rc::ptr_eq(&cache.get(&inbox, &Uid(1)).unwrap(), &replacement));
+}
+
+// --- Message-row bind (BUG_BOUNTY1.md, Tier 4 #20). ---
+
+/// A row's tag dot is recoloured in place on bind, never rebuilt.
+#[test]
+fn tag_dot_recolours_without_replacing_its_area() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let dot = TagDot::new("#808080", 8);
+    let area = dot.area.clone();
+    dot.set_rgb("#ff0000");
+    assert_eq!(dot.rgba(), hex_to_rgba("#ff0000"));
+    assert_eq!(dot.area, area, "the same widget is repainted");
+    dot.set_rgb("#00ff00");
+    assert_eq!(dot.rgba(), hex_to_rgba("#00ff00"));
+}
+
+/// One `RowDisplay` drives the avatar, the Select-mode checkbox and the
+/// preview line count, both on bind and for the rows already on screen.
+#[test]
+fn row_display_applies_select_mode_sender_images_and_preview_lines() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let avatar = gtk::Overlay::new();
+    let checkbox = gtk::CheckButton::new();
+    let preview = gtk::Label::new(Some("preview"));
+    let display = RowDisplay {
+        select_mode: false,
+        show_sender_images: true,
+        preview_lines: 2,
+    };
+    display.apply(&avatar, &checkbox, &preview);
+    assert!(avatar.is_visible() && !checkbox.is_visible());
+    assert!(preview.is_visible());
+    assert_eq!(preview.lines(), 2);
+
+    // Select mode swaps the avatar for the checkbox; 0 lines hides the preview.
+    let registry = Rc::new(RefCell::new(vec![RowDisplayRefs {
+        avatar: avatar.downgrade(),
+        checkbox: checkbox.downgrade(),
+        preview_label: preview.downgrade(),
+    }]));
+    update_row_display(
+        &registry,
+        RowDisplay {
+            select_mode: true,
+            preview_lines: 0,
+            ..display
+        },
+    );
+    assert!(!avatar.is_visible() && checkbox.is_visible());
+    assert!(!preview.is_visible());
+
+    // Sender images off hides the avatar outside Select mode too.
+    RowDisplay {
+        show_sender_images: false,
+        ..display
+    }
+    .apply(&avatar, &checkbox, &preview);
+    assert!(!avatar.is_visible() && !checkbox.is_visible());
+}

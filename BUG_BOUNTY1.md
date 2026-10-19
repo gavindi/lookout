@@ -104,10 +104,23 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
 19. **`BodyCache::get` deep-clones `EmailBody`** (HTML that can be megabytes) on every hit. [state.rs:920-925](source/crates/app/src/window/state.rs#L920-L925).
     - **Wasteful callers:** [window.rs:10176](source/crates/app/src/window.rs#L10176) clones just to test `is_some()`; [connect.rs:872-886](source/crates/app/src/window/connect.rs#L872-L886) clones two or three times per `BodyFetched`.
     - **Fix:** store `Rc<EmailBody>` and add `contains()`.
+    - **Fixed:**
+      - `BodyCache` stores `Rc<EmailBody>`, and `get`/`cached_body` hand out the shared allocation. A new `contains` replaces the `get(..).is_some()` probe.
+      - `render_body`, `conversation_body_arrived`, `with_message_body`/`BodyWaiter` and `selected_message_reply_context` take or return the `Rc`; every consumer only reads the body.
+      - `BodyFetched` wraps the body once and shares it between the cache, a waiting action, a conversation card and the reading pane, instead of deep-cloning it two or three times. The disk-cache paths wrap once too, and the reading pane's moves the body out of the map rather than cloning it.
+      - The pop-out window keeps `last_body` as an `Rc`.
 20. **Message-row bind churn.**
     - **Where:** [window.rs:1637-1648](source/crates/app/src/window.rs#L1637-L1648), [1590-1596](source/crates/app/src/window.rs#L1590-L1596), [1561-1574](source/crates/app/src/window.rs#L1561-L1574).
     - **Cost:** every scroll bind recreates the tag-dot `DrawingArea`s, deep-clones the `EmailSummary`, reads GSettings twice and decodes photos synchronously.
     - **Fix:** pre-create `MAX_TAG_DOTS` dot areas and toggle their visibility; store a cheap key (mailbox, uid) or an `Rc` instead of a clone; read the GSettings values once and refresh them on `changed`.
+    - **Fixed:**
+      - **Tag dots:** each row builds its `MAX_TAG_DOTS` dots once, as `TagDot`s whose colour lives in a `Cell`. Bind recolours them (skipping the redraw when the colour is unchanged) and hides the unused ones. `preset_dot_area` is now built on `TagDot`, so the drawing code exists once.
+      - **Summaries:** `MessageItem::Message` holds an `Rc<EmailSummary>`, and a row's `bound` keeps an `Rc` clone. The deep copy moves to the few handlers that need an owned summary (context menu, follow-up toggle, drag), which run on a click rather than on every bind.
+      - **Settings:** a shared `RowDisplay` cell (Select mode, "Show sender images", preview lines) replaces `select_mode_flag`. It is seeded from the settings and updated by the three controls that change them, so bind no longer reads GSettings. `RowDisplay::apply` is shared by bind and `update_row_display`.
+    - **Not changed:**
+      - Photo decoding: `sender_photo_texture` is already memoized per address, so only the first bind for a sender decodes. Making it async belongs with Tier 1 #7, which owns that cache.
+      - The Unified Inbox account label is a cheap lookup that only runs in that view.
+      - The cached settings no longer pick up changes made outside the app (e.g. `gsettings set`) until restart; every in-app control updates them.
 21. **Calendar draw path.** [calendar_view.rs:2785-2881](source/crates/app/src/calendar_view.rs#L2785-L2881).
     - **Cost:** `ellipsize_text` is O(n²), with a `format!` and a `text_extents` call per removed character. `css_color_rgb` reparses the RGBA for every chip on every frame.
     - **Fix:** binary-search the cut point, and parse colours once when the data is set. (Optional: switching cairo toy text to Pango would fix CJK, RTL and emoji rendering; flag it, don't do it in this pass.)

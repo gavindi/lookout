@@ -1590,20 +1590,52 @@ pub(crate) fn show_manage_categories_dialog(anchor: &gtk::Widget, state: Rc<RefC
     message_list.refresh();
 }
 
+/// A filled colour dot whose colour can change after it's built. The message
+/// list keeps `MAX_TAG_DOTS` of these per row and recolours them on bind
+/// rather than rebuilding the widgets for every row scrolled into view.
+#[derive(Clone)]
+pub(crate) struct TagDot {
+    pub(crate) area: gtk::DrawingArea,
+    color: Rc<std::cell::Cell<gtk::gdk::RGBA>>,
+}
+
+impl TagDot {
+    pub(crate) fn new(rgb: &str, size: i32) -> Self {
+        let area = gtk::DrawingArea::builder().width_request(size).height_request(size).build();
+        let color = Rc::new(std::cell::Cell::new(hex_to_rgba(rgb)));
+        let color_for_draw = color.clone();
+        area.set_draw_func(move |_, cr, w, h| {
+            let rgba = color_for_draw.get();
+            cr.set_source_rgb(rgba.red() as f64, rgba.green() as f64, rgba.blue() as f64);
+            let radius = (w.min(h) as f64) / 2.0 - 1.0;
+            if radius > 0.0 {
+                cr.arc(w as f64 / 2.0, h as f64 / 2.0, radius, 0.0, std::f64::consts::TAU);
+                let _ = cr.fill();
+            }
+        });
+        TagDot { area, color }
+    }
+
+    /// Repaints the dot in `rgb` (a `#rrggbb` preset colour); a no-op when
+    /// the colour is unchanged, so rebinding a row to the same tags is free.
+    pub(crate) fn set_rgb(&self, rgb: &str) {
+        let rgba = hex_to_rgba(rgb);
+        if self.color.get() != rgba {
+            self.color.set(rgba);
+            self.area.queue_draw();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rgba(&self) -> gtk::gdk::RGBA {
+        self.color.get()
+    }
+}
+
 /// A filled colour dot for a preset, painted directly (no CSS classes needed).
 /// Shared with the event/task editors' category pickers.
 pub(crate) fn preset_dot_area(rgb: &str, size: i32) -> gtk::DrawingArea {
-    let area = gtk::DrawingArea::builder().width_request(size).height_request(size).build();
-    let rgba = hex_to_rgba(rgb);
-    area.set_draw_func(move |_, cr, w, h| {
-        cr.set_source_rgb(rgba.red() as f64, rgba.green() as f64, rgba.blue() as f64);
-        let radius = (w.min(h) as f64) / 2.0 - 1.0;
-        if radius > 0.0 {
-            cr.arc(w as f64 / 2.0, h as f64 / 2.0, radius, 0.0, std::f64::consts::TAU);
-            let _ = cr.fill();
-        }
-    });
-    area
+    TagDot::new(rgb, size).area
 }
 
 /// A `MenuButton` showing the current category colour, whose popover is a 5×5
@@ -2446,7 +2478,7 @@ pub(crate) fn set_messages_read(state: &Rc<RefCell<UiState>>, message_list: &Mes
 /// `FetchBody` brings it (`UiState::body_waiter`, run by the `BodyFetched`
 /// handler). A newer request replaces a waiting one, and a body that never
 /// arrives simply drops it. A silent no-op when the account is offline.
-pub(crate) fn with_message_body(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, run: impl FnOnce(EmailBody) + 'static) {
+pub(crate) fn with_message_body(state: &Rc<RefCell<UiState>>, summary: &EmailSummary, run: impl FnOnce(Rc<EmailBody>) + 'static) {
     let cached = state.borrow_mut().cached_body(&summary.mailbox, summary.uid);
     if let Some(body) = cached {
         run(body);
@@ -2722,7 +2754,7 @@ pub(crate) fn command_targets_for(state: &Rc<RefCell<UiState>>, summaries: &[Ema
 pub(crate) fn selected_message_reply_context(
     message_list: &MessageListModel,
     state: &Rc<RefCell<UiState>>,
-) -> Option<(EmailSummary, EmailBody, String, async_channel::Sender<AccountCommand>)> {
+) -> Option<(EmailSummary, Rc<EmailBody>, String, async_channel::Sender<AccountCommand>)> {
     let summary = message_list.selected_summary()?;
 
     let account_id = mailbox_account_id(&summary.mailbox)?;

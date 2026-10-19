@@ -68,7 +68,7 @@ pub(crate) struct MessageWindowState {
     last_raw: Option<Vec<u8>>,
     /// The last parsed body, for re-renders and for the reply/forward
     /// prefill when the body cache has already evicted it.
-    last_body: Option<EmailBody>,
+    last_body: Option<Rc<EmailBody>>,
     header: crate::message_header::MessageHeader,
     web_view: webkit::WebView,
     content_stack: gtk::Stack,
@@ -543,14 +543,14 @@ fn render_raw(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowStat
         return;
     };
     entry.borrow_mut().last_raw = Some(raw.to_vec());
-    render_data(state, entry, &body, Some(raw));
+    render_data(state, entry, &Rc::new(body), Some(raw));
 }
 
 /// Renders a parsed body into the window, optionally with the raw bytes
 /// available to resolve `cid:` inline images. Applies the external-content
 /// policy (with this window's load-once override), rebuilds the attachment
 /// strip, and updates the header from the stored summary.
-fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowState>>, body: &EmailBody, raw: Option<&[u8]>) {
+fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowState>>, body: &Rc<EmailBody>, raw: Option<&[u8]>) {
     let (
         mailbox,
         uid,
@@ -659,7 +659,7 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
 
     {
         let mut e = entry.borrow_mut();
-        e.last_body = Some(body.clone());
+        e.last_body = Some(Rc::clone(body));
         e.rendered = true;
     }
 }

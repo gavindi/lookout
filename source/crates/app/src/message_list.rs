@@ -586,9 +586,10 @@ pub enum MessageItem {
     /// A collapsible conversation header - the date section's children when
     /// threading is on, itself the parent of its messages' rows.
     Thread(ThreadRow),
-    /// One message. Boxed because `EmailSummary` is large, and an unboxed
-    /// variant would size every section row to it too.
-    Message(Box<EmailSummary>),
+    /// One message. Behind a pointer because `EmailSummary` is large, and an
+    /// unboxed variant would size every section row to it too; an `Rc` so a
+    /// row's bind can keep the summary it shows without copying it.
+    Message(Rc<EmailSummary>),
 }
 
 pub struct SectionRow {
@@ -1789,7 +1790,7 @@ impl MessageListModel {
                     let new_keys: Vec<RowKey> = messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
                     let rows: Vec<glib::Object> = messages
                         .iter()
-                        .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
+                        .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(m.clone()))).upcast())
                         .collect();
                     // Store handle cloned and the borrow dropped *before*
                     // splicing: `items-changed` re-enters synchronously, and
@@ -1841,7 +1842,7 @@ impl MessageListModel {
                         .iter()
                         .map(|entry| match entry {
                             ThreadEntry::Thread(thread) => glib::BoxedAnyObject::new(MessageItem::Thread(thread.row.clone())).upcast(),
-                            ThreadEntry::Single(message) => glib::BoxedAnyObject::new(MessageItem::Message(Box::new(message.clone()))).upcast(),
+                            ThreadEntry::Single(message) => glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(message.clone()))).upcast(),
                         })
                         .collect();
                     // See the `Grouped` arm's comment: store handle cloned
@@ -1864,7 +1865,7 @@ impl MessageListModel {
                         let message_rows: Vec<glib::Object> = thread
                             .messages
                             .iter()
-                            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
+                            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(m.clone()))).upcast())
                             .collect();
                         let (thread_store, old_message_keys) = {
                             let mut threads = self.threads.borrow_mut();
@@ -2055,7 +2056,7 @@ impl MessageListModel {
         let new_keys: Vec<RowKey> = pinned.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
         let rows: Vec<glib::Object> = pinned
             .iter()
-            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Box::new(m.clone()))).upcast())
+            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(m.clone()))).upcast())
             .collect();
         let (store, old_keys) = {
             let mut sections = self.sections.borrow_mut();

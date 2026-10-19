@@ -497,7 +497,8 @@ pub(crate) fn request_conversation_bodies(ctx: &ConversationContext, keys: Vec<(
             glib::spawn_future_local(async move {
                 let Ok(Ok(bodies)) = reply_rx.recv().await else { return };
                 for (uid, body) in bodies {
-                    state.borrow_mut().body_cache.insert(mailbox.clone(), uid, body.clone());
+                    let body = Rc::new(body);
+                    state.borrow_mut().body_cache.insert(mailbox.clone(), uid, Rc::clone(&body));
                     conversation_body_arrived(&state, &mailbox, uid, body);
                 }
             });
@@ -515,7 +516,7 @@ pub(crate) fn request_conversation_bodies(ctx: &ConversationContext, keys: Vec<(
 /// A body arrived (from the server or the disk cache): fill its card if the
 /// conversation on screen is still waiting for it. Called for every
 /// `BodyFetched`, so it is a cheap no-op for anything else.
-pub(crate) fn conversation_body_arrived(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, body: EmailBody) {
+pub(crate) fn conversation_body_arrived(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, uid: Uid, body: Rc<EmailBody>) {
     let key = (mailbox.clone(), uid);
     let (index, mut card, load_once, dark) = {
         let st = state.borrow();

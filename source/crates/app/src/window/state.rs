@@ -210,9 +210,10 @@ pub(crate) struct MessageRowWidgets {
     /// `pin_icon`, on rows without a flag.
     pub(crate) flag_label: gtk::Label,
     pub(crate) flag_icon: gtk::Image,
-    /// The color-tag dots: one small circle per configured tag the message
-    /// carries, rebuilt on every bind.
+    /// The color-tag dots' container, and its `MAX_TAG_DOTS` dots: one small
+    /// circle per configured tag the message carries, recoloured on bind.
     pub(crate) tag_dots: gtk::Box,
+    pub(crate) tag_dot_areas: Vec<TagDot>,
     pub(crate) date_label: gtk::Label,
     pub(crate) preview_label: gtk::Label,
     pub(crate) action_box: gtk::Box,
@@ -224,7 +225,7 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) pin_btn: gtk::Button,
     /// The message this row currently shows. Set by `bind`, read by the
     /// quick-action handlers when they fire.
-    pub(crate) bound: Rc<RefCell<Option<EmailSummary>>>,
+    pub(crate) bound: Rc<RefCell<Option<Rc<EmailSummary>>>>,
     /// The conversation this row heads, when it's a conversation header -
     /// what its right-click menu acts on (item 1.17).
     pub(crate) bound_thread: Rc<RefCell<Option<ThreadId>>>,
@@ -257,17 +258,44 @@ pub(crate) fn apply_preview_lines(label: &gtk::Label, lines: i32) {
     label.set_lines(lines);
 }
 
-/// Applies the app-wide display settings to every live row in `registry`:
-/// avatar/checkbox visibility for Select mode and "Show sender images", and
-/// the preview line count. Dead weak references are dropped on the way.
-pub(crate) fn update_row_display(registry: &Rc<RefCell<Vec<RowDisplayRefs>>>, select_mode: bool, show_sender_images: bool, preview_lines: i32) {
+/// The app-wide settings every message row's display follows: Select mode,
+/// "Show sender images" and the preview line count. Held in one shared cell
+/// that `build_window` seeds from the settings and the three controls update,
+/// so a row's bind reads it instead of querying GSettings per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowDisplay {
+    pub(crate) select_mode: bool,
+    pub(crate) show_sender_images: bool,
+    pub(crate) preview_lines: i32,
+}
+
+impl RowDisplay {
+    /// The persisted settings, with Select mode off (it never persists).
+    pub(crate) fn from_settings(settings: &crate::settings::SettingsStore) -> Self {
+        RowDisplay {
+            select_mode: false,
+            show_sender_images: settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES),
+            preview_lines: settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES),
+        }
+    }
+
+    /// Applies these settings to one row: Select mode hides the avatar in
+    /// favour of the checkbox.
+    pub(crate) fn apply(self, avatar: &gtk::Overlay, checkbox: &gtk::CheckButton, preview: &gtk::Label) {
+        avatar.set_visible(!self.select_mode && self.show_sender_images);
+        checkbox.set_visible(self.select_mode);
+        apply_preview_lines(preview, self.preview_lines);
+    }
+}
+
+/// Applies `display` to every live row in `registry`. Dead weak references
+/// are dropped on the way.
+pub(crate) fn update_row_display(registry: &Rc<RefCell<Vec<RowDisplayRefs>>>, display: RowDisplay) {
     registry.borrow_mut().retain(|refs| {
         let (Some(avatar), Some(checkbox), Some(preview)) = (refs.avatar.upgrade(), refs.checkbox.upgrade(), refs.preview_label.upgrade()) else {
             return false;
         };
-        avatar.set_visible(!select_mode && show_sender_images);
-        checkbox.set_visible(select_mode);
-        apply_preview_lines(&preview, preview_lines);
+        display.apply(&avatar, &checkbox, &preview);
         true
     });
 }
@@ -772,7 +800,7 @@ pub(crate) struct PendingRawMessage {
 pub(crate) struct BodyWaiter {
     pub(crate) mailbox: MailboxId,
     pub(crate) uid: Uid,
-    pub(crate) run: Box<dyn FnOnce(EmailBody)>,
+    pub(crate) run: Box<dyn FnOnce(Rc<EmailBody>)>,
 }
 
 /// The single "Message details" dialog (item 1.10 / M-30) while one is open,
@@ -901,9 +929,11 @@ pub(crate) type PendingCidKey = (MailboxId, Uid, String);
 
 /// A small bounded LRU of recently-viewed message bodies, keyed by
 /// `(mailbox, uid)`, front = most recently used. See `BODY_CACHE_IN_MEMORY`.
+/// Bodies are shared (`Rc`): an HTML body can be megabytes, and every reader
+/// only borrows it, so a hit hands out the same allocation rather than a copy.
 pub(crate) struct BodyCache {
     pub(crate) capacity: usize,
-    pub(crate) entries: VecDeque<(MailboxId, Uid, EmailBody)>,
+    pub(crate) entries: VecDeque<(MailboxId, Uid, Rc<EmailBody>)>,
 }
 
 impl BodyCache {
@@ -915,16 +945,20 @@ impl BodyCache {
     }
 
     /// Returns the cached body for `(mailbox, uid)`, promoting it to most
-    /// recently used, or `None` on a miss. O(capacity) - the cache is tiny,
-    /// and bodies are cloned out anyway so the scan is not the cost.
-    pub(crate) fn get(&mut self, mailbox: &MailboxId, uid: &Uid) -> Option<EmailBody> {
+    /// recently used, or `None` on a miss. O(capacity) - the cache is tiny.
+    pub(crate) fn get(&mut self, mailbox: &MailboxId, uid: &Uid) -> Option<Rc<EmailBody>> {
         let pos = self.entries.iter().position(|(m, u, _)| m == mailbox && u == uid)?;
         let entry = self.entries.remove(pos).expect("position came from this deque");
         self.entries.push_front(entry);
-        Some(self.entries.front().expect("just pushed").2.clone())
+        Some(Rc::clone(&self.entries.front().expect("just pushed").2))
     }
 
-    pub(crate) fn insert(&mut self, mailbox: MailboxId, uid: Uid, body: EmailBody) {
+    /// Whether `(mailbox, uid)` is cached, without promoting it.
+    pub(crate) fn contains(&self, mailbox: &MailboxId, uid: &Uid) -> bool {
+        self.entries.iter().any(|(m, u, _)| m == mailbox && u == uid)
+    }
+
+    pub(crate) fn insert(&mut self, mailbox: MailboxId, uid: Uid, body: Rc<EmailBody>) {
         if let Some(pos) = self.entries.iter().position(|(m, u, _)| *m == mailbox && *u == uid) {
             self.entries.remove(pos);
         }
@@ -1696,7 +1730,7 @@ impl UiState {
     /// pop-out message window (item 1.9) and its reply buttons read this
     /// instead of the reading pane's single-message fetch state. `&mut`
     /// because `BodyCache::get` promotes the hit (LRU).
-    pub(crate) fn cached_body(&mut self, mailbox: &MailboxId, uid: Uid) -> Option<EmailBody> {
+    pub(crate) fn cached_body(&mut self, mailbox: &MailboxId, uid: Uid) -> Option<Rc<EmailBody>> {
         self.body_cache.get(mailbox, &uid)
     }
 

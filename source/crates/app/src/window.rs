@@ -785,9 +785,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .css_classes(["flat", "list-header-action"])
         .valign(gtk::Align::Center)
         .build();
-    // Whether Select mode is on, shared with the row factory so `bind` can
-    // decide each row's avatar/checkbox visibility (see `RowDisplayRefs`).
-    let select_mode_flag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Select mode and the two display settings rows follow, shared with the
+    // row factory so `bind` can apply them without a settings lookup per row
+    // (see `RowDisplay`, `RowDisplayRefs`).
+    let row_display: Rc<Cell<RowDisplay>> = Rc::new(Cell::new(RowDisplay::from_settings(&state.borrow().settings)));
     // Weak handles to every created row's display-dependent widgets, so a
     // change to Select mode, "Show sender images" or the preview line count
     // updates the rows already on screen in place (the list view recycles row
@@ -900,10 +901,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The follow-up flag's due label and icon (item 1.16), set in `bind`.
         let flag_label = gtk::Label::builder().css_classes(["caption"]).valign(gtk::Align::Center).visible(false).build();
         let flag_icon = gtk::Image::builder().pixel_size(12).valign(gtk::Align::Center).visible(false).build();
-        // One dot per configured color tag the message carries, filled in on
+        // One dot per configured color tag the message carries, up to
+        // `MAX_TAG_DOTS`: built once here, then recoloured and shown/hidden on
         // `bind`. Hidden when there are none (the container takes no space
         // when empty), so an untagged row is identical to today's.
         let tag_dots = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).valign(gtk::Align::Center).build();
+        let tag_dot_areas: Vec<TagDot> = (0..MAX_TAG_DOTS)
+            .map(|_| {
+                let dot = TagDot::new("#808080", 8);
+                dot.area.set_visible(false);
+                tag_dots.append(&dot.area);
+                dot
+            })
+            .collect();
         let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
         top_row.append(&sender_label);
         top_row.append(&attachment_icon);
@@ -1093,7 +1103,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The old per-bind connections accumulated on recycled rows (nothing
         // ever disconnected them), so a scrolled list eventually fired one
         // click at several messages at once.
-        let bound: Rc<RefCell<Option<EmailSummary>>> = Rc::new(RefCell::new(None));
+        let bound: Rc<RefCell<Option<Rc<EmailSummary>>>> = Rc::new(RefCell::new(None));
 
         // The conversation this row heads, when it's a conversation header.
         let bound_thread: Rc<RefCell<Option<ThreadId>>> = Rc::new(RefCell::new(None));
@@ -1172,7 +1182,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .upgrade()
                     .map(|list_item| list_item.position())
                     .filter(|pos| *pos != gtk::INVALID_LIST_POSITION);
-                let target = match (bound.borrow().clone(), bound_thread.borrow().clone()) {
+                let target = match (bound.borrow().as_deref().cloned(), bound_thread.borrow().clone()) {
                     (Some(summary), _) => MessageMenuTarget::Row {
                         summary: Box::new(summary),
                         position,
@@ -1312,7 +1322,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let bound = bound.clone();
             let message_list = message_list_for_rows.clone();
             follow_up_btn.connect_clicked(move |_| {
-                let Some(summary) = bound.borrow().clone() else { return };
+                let Some(summary) = bound.borrow().as_deref().cloned() else { return };
                 toggle_follow_up(&state, &message_list, vec![summary]);
             });
         }
@@ -1472,6 +1482,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     flag_label,
                     flag_icon,
                     tag_dots,
+                    tag_dot_areas,
                     date_label,
                     preview_label,
                     action_box,
@@ -1485,7 +1496,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         list_item.set_child(Some(&overlay));
     });
-    let select_mode_flag_for_bind = select_mode_flag.clone();
+    let row_display_for_bind = row_display.clone();
     let sender_photo_cache_for_bind = sender_photo_cache.clone();
     message_factory.connect_bind(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -1594,18 +1605,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.date_label.set_label(&format_row_date(summary.date, chrono::Utc::now()));
                 widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
                 // Display settings that don't change per message: the preview
-                // line count, and whether the avatar is shown at all. Select
-                // mode hides the avatar in favour of the checkbox.
-                let (show_sender_images, preview_lines) = {
-                    let st = state_clone2.borrow();
-                    (
-                        st.settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES),
-                        st.settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES),
-                    )
-                };
-                apply_preview_lines(&widgets.preview_label, preview_lines);
-                widgets.avatar.set_visible(!select_mode_flag_for_bind.get() && show_sender_images);
-                widgets.checkbox.set_visible(select_mode_flag_for_bind.get());
+                // line count, and whether the avatar is shown at all.
+                row_display_for_bind.get().apply(&widgets.avatar, &widgets.checkbox, &widgets.preview_label);
 
                 let unread = summary.is_unread();
                 widgets
@@ -1633,19 +1634,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 apply_flag_indicator(&widgets.flag_icon, Some(&widgets.flag_label), follow_up.as_ref());
                 set_flag_button_state(&widgets.follow_up_btn, follow_up.as_ref());
 
-                // Rebuild the category dots for this message, each painted
-                // directly in its category's preset colour.
-                while let Some(child) = widgets.tag_dots.first_child() {
-                    widgets.tag_dots.remove(&child);
-                }
+                // Recolour the row's category dots, each painted directly in
+                // its category's preset colour; the unused ones are hidden.
                 let tags_borrow = tags_for_bind.borrow();
                 let shown = crate::categories::categories_for_keywords(&tags_borrow, &summary.keywords);
-                for tag in shown.iter().take(MAX_TAG_DOTS) {
-                    widgets.tag_dots.append(&preset_dot_area(tag.color(), 8));
+                let mut tags = shown.iter().take(MAX_TAG_DOTS);
+                for dot in &widgets.tag_dot_areas {
+                    match tags.next() {
+                        Some(tag) => {
+                            dot.set_rgb(tag.color());
+                            dot.area.set_visible(true);
+                        }
+                        None => dot.area.set_visible(false),
+                    }
                 }
                 widgets.tag_dots.set_visible(!shown.is_empty());
 
-                *widgets.bound.borrow_mut() = Some((**summary).clone());
+                *widgets.bound.borrow_mut() = Some(Rc::clone(summary));
                 *widgets.bound_thread.borrow_mut() = None;
             }
             MessageItem::Thread(thread) => {
@@ -1917,24 +1922,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .menu_model(&sort_key_menu)
         .build();
     // The button's `active` state drives each row's avatar/checkbox swap; the
-    // shared `select_mode_flag` and the row registry make the swap reach rows
+    // shared `row_display` and the row registry make the swap reach rows
     // already on screen (see `update_row_display`). The one side effect that
     // isn't per-row is clearing the selection on exit.
     {
         let message_list = message_list.clone();
-        let state = state.clone();
-        let select_mode_flag = select_mode_flag.clone();
+        let row_display = row_display.clone();
         let row_display_registry = row_display_registry.clone();
         select_mode_button.connect_toggled(move |button| {
-            select_mode_flag.set(button.is_active());
-            let (show_sender_images, preview_lines) = {
-                let st = state.borrow();
-                (
-                    st.settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES),
-                    st.settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES),
-                )
+            let display = RowDisplay {
+                select_mode: button.is_active(),
+                ..row_display.get()
             };
-            update_row_display(&row_display_registry, button.is_active(), show_sender_images, preview_lines);
+            row_display.set(display);
+            update_row_display(&row_display_registry, display);
             if !button.is_active() {
                 // Leaving Select mode clears the selection - matches Gmail's
                 // "cancel selection" behavior and avoids stranding the
@@ -7057,12 +7058,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let row_display_registry = row_display_registry.clone();
-        let select_mode_flag = select_mode_flag.clone();
+        let row_display = row_display.clone();
         config_view.preview_lines_row.connect_selected_notify(move |row| {
             let lines = row.selected() as i32;
             state.borrow().settings.set_int(crate::settings::LAYOUT_PREVIEW_LINES, lines);
-            let show_sender_images = state.borrow().settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES);
-            update_row_display(&row_display_registry, select_mode_flag.get(), show_sender_images, lines);
+            let display = RowDisplay {
+                preview_lines: lines,
+                ..row_display.get()
+            };
+            row_display.set(display);
+            update_row_display(&row_display_registry, display);
         });
     }
     // Config → Appearance → "Show sender images": toggles the message-list
@@ -7070,12 +7075,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     {
         let state = state.clone();
         let row_display_registry = row_display_registry.clone();
-        let select_mode_flag = select_mode_flag.clone();
+        let row_display = row_display.clone();
         config_view.show_sender_images_row.connect_active_notify(move |row| {
             let show_sender_images = row.is_active();
             state.borrow().settings.set_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES, show_sender_images);
-            let lines = state.borrow().settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES);
-            update_row_display(&row_display_registry, select_mode_flag.get(), show_sender_images, lines);
+            let display = RowDisplay {
+                show_sender_images,
+                ..row_display.get()
+            };
+            row_display.set(display);
+            update_row_display(&row_display_registry, display);
         });
     }
     {
@@ -9822,7 +9831,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     body
                 };
-                render_body(state, reading_stack, message_header, MailboxId("debug:eml".into()), body.uid, body);
+                render_body(state, reading_stack, message_header, MailboxId("debug:eml".into()), body.uid, Rc::new(body));
             }
         }
 
@@ -10174,7 +10183,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
             }
 
-            let body_is_cached = state.borrow_mut().body_cache.get(&mailbox, &uid).is_some();
+            let body_is_cached = state.borrow().body_cache.contains(&mailbox, &uid);
             let should_request = {
                 let mut st = state.borrow_mut();
                 let is_same_request = st.pending_body_request.as_ref() == Some(&request);

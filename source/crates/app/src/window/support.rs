@@ -438,7 +438,7 @@ pub(crate) fn summary_is_draft(state: &UiState, summary: &EmailSummary) -> bool 
 
 /// Which summaries a message-row drag carries: the whole current selection
 /// when the dragged row is part of one, otherwise just that row's message.
-pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<EmailSummary>>>) -> Vec<EmailSummary> {
+pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<Rc<EmailSummary>>>>) -> Vec<EmailSummary> {
     let Some(row_summary) = bound.borrow().clone() else {
         return Vec::new();
     };
@@ -446,7 +446,7 @@ pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefC
     if selected.len() > 1 && selected.iter().any(|s| s.mailbox == row_summary.mailbox && s.uid == row_summary.uid) {
         selected
     } else {
-        vec![row_summary]
+        vec![(*row_summary).clone()]
     }
 }
 

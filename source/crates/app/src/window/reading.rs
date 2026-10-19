@@ -162,8 +162,8 @@ pub(crate) fn request_body_fetch(
     let mailbox_for_render = mailbox;
     glib::spawn_future_local(async move {
         let Ok(result) = reply_rx.recv().await else { return };
-        let Ok(bodies) = result else { return };
-        let Some(body) = bodies.get(&uid).cloned() else { return };
+        let Ok(mut bodies) = result else { return };
+        let Some(body) = bodies.remove(&uid).map(Rc::new) else { return };
         let still_current = state.borrow().pending_body_request.as_ref() == Some(&request_key);
         if !still_current {
             return;
@@ -427,7 +427,7 @@ pub(crate) fn show_message_details_dialog(state: &Rc<RefCell<UiState>>, parent: 
     // Seed the header block from the body cache when the message has already
     // been read this session; the raw fetch overwrites it with the
     // authoritative block when it lands.
-    let cached_headers = state.borrow_mut().cached_body(&summary.mailbox, summary.uid).map(|body| body.headers);
+    let cached_headers = state.borrow_mut().cached_body(&summary.mailbox, summary.uid).map(|body| body.headers.clone());
     headers_view.buffer().set_text(&match &cached_headers {
         Some(headers) => format_header_block(headers),
         None => "Loading…".to_string(),
@@ -1120,7 +1120,7 @@ pub(crate) fn render_body(
     message_header: &crate::message_header::MessageHeader,
     mailbox: MailboxId,
     uid: Uid,
-    body: lookout_core::EmailBody,
+    body: Rc<lookout_core::EmailBody>,
 ) {
     // Defense-in-depth for the direct `BodyFetched` caller: if this exact
     // message is already on screen, a duplicate body event must not route the
