@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.250" date="2026-10-19">
+      <description>
+        <p>Microsoft 365 and Google Tasks sign-in credentials are always stored in your own data and config folders. When the home directory variables are missing, they are no longer written to a shared temporary folder that other users on the computer could read. Existing sign-ins are unaffected.</p>
+      </description>
+    </release>
     <release version="0.9.249" date="2026-10-19">
       <description>
         <p>Outlook property sync on Microsoft 365 accounts no longer runs several times at once. Refreshing repeatedly no longer re-fetches the same categories, flags and Focused/Other changes or redraws the message list each time, and the sync never reads the mail cache on the interface thread.</p>

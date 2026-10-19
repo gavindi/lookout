@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use gtk::gio;
+use gtk::{gio, glib};
 use lookout_core::text::{base64url_encode, parse_query, percent_encode};
 use lookout_core::{CalendarId, CalendarTask, TaskPriority, TaskStatus, TaskUid};
 
@@ -249,12 +249,12 @@ fn client_id() -> String {
 /// `$XDG_CONFIG_HOME/lookout/google-tasks-oauth.json` - the file the Config
 /// view's Google Tasks row writes, so the client id survives without an env
 /// var (GUI apps aren't launched from a terminal).
+///
+/// Resolved through GLib, like `oauth_dir`, so it can never land in the
+/// shared temp dir, where a planted file could set the client id sign-in
+/// uses.
 pub fn client_id_file_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("lookout").join("google-tasks-oauth.json")
+    glib::user_config_dir().join("lookout").join("google-tasks-oauth.json")
 }
 
 fn load_client_id_file() -> Option<String> {
@@ -878,12 +878,12 @@ fn open_browser(url: &str) -> Result<(), String> {
     gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>).map_err(|e| format!("couldn't open a browser to authorize Google Tasks: {e}"))
 }
 
+/// `$XDG_DATA_HOME/lookout/oauth` via GLib, which falls back to the passwd
+/// home directory when `HOME` is unset - never the shared temp dir, where
+/// another local user could pre-create the directory and read or replace
+/// the refresh tokens.
 fn oauth_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("lookout").join("oauth")
+    glib::user_data_dir().join("lookout").join("oauth")
 }
 
 /// Emails and Google list ids are URL/path-safe already, but be defensive.
@@ -913,6 +913,19 @@ fn pkce_challenge(verifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refresh token and client id live under the user's data and config
+    /// dirs, never the shared temp dir (no env is set here: GLib caches these
+    /// dirs on first call).
+    #[test]
+    fn credential_paths_resolve_through_glib() {
+        let tokens = oauth_dir();
+        assert_eq!(tokens, glib::user_data_dir().join("lookout/oauth"));
+        assert!(!tokens.starts_with(std::env::temp_dir()));
+        let client_id = client_id_file_path();
+        assert_eq!(client_id, glib::user_config_dir().join("lookout/google-tasks-oauth.json"));
+        assert!(!client_id.starts_with(std::env::temp_dir()));
+    }
 
     #[test]
     fn google_calendar_id_round_trips() {

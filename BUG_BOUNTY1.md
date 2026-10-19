@@ -66,8 +66,10 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
 10. ✔ **Attachments and dragged `.eml` files are world-readable in shared `/tmp`.** [attachments.rs:719-731](source/crates/app/src/window/attachments.rs#L719-L731) and [support.rs:471](source/crates/app/src/window/support.rs#L471) use `std::fs::write` with umask permissions (usually 0644).
     - **Fix:** write into a private `0700` dir under `$XDG_RUNTIME_DIR/lookout/` (falling back to the user cache dir), creating each file with `mode(0o600)` and `create_new`.
 
-11. **`oauth_dir()` falls back to `temp_dir()`.** [microsoft_oauth.rs:638](source/crates/app/src/microsoft_oauth.rs#L638) and [google_tasks.rs:881](source/crates/app/src/google_tasks.rs#L881) put refresh tokens in a predictable, shared `/tmp/lookout/oauth/` when `HOME` and `XDG_DATA_HOME` are unset. Another user could pre-create that directory.
-    - **Fix:** return an error instead, or use `glib::user_data_dir()`, which never yields `/tmp`.
+11. ✔ **`oauth_dir()` falls back to `temp_dir()`.** [microsoft_oauth.rs](source/crates/app/src/microsoft_oauth.rs) and [google_tasks.rs](source/crates/app/src/google_tasks.rs) put refresh tokens in a predictable, shared `/tmp/lookout/oauth/` when `HOME` and `XDG_DATA_HOME` are unset. Another user could pre-create that directory. `client_id_file_path()` in `google_tasks.rs` had the same fallback for the Google OAuth client id.
+    - **Fixed:** both `oauth_dir()`s now use `glib::user_data_dir()`, and `client_id_file_path()` uses `glib::user_config_dir()`. GLib falls back to the passwd home directory when `HOME` is unset (then `/`, which fails safely), never the temp dir.
+    - **No migration:** in normal setups (desktop, Flatpak, Snap) GLib resolves to the same path as before, so existing sign-ins are found where they are.
+    - **Left for Tier 6 #29:** the five remaining `temp_dir()` fallbacks are disposable caches (`ui_state_db.rs`, `google_tasks.rs` tasks cache, mail and dav caches).
 
 12. ✔ **`write_atomic` temp-name collision.** [mail/src/cache.rs:131-140](source/crates/mail/src/cache.rs#L131-L140) suffixes the temp file with `process::id()`, while its comment claims this keeps concurrent blocking-pool *threads* apart.
     - **Failure:** threads share a pid, so two writers of the same attachment or `.eml` truncate the same tmp file, and the rename can publish a partial file.

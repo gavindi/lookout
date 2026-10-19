@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use gtk::gio;
+use gtk::{gio, glib};
 use lookout_core::text::{base64url_encode, parse_query, percent_encode};
 use lookout_core::AccountId;
 use lookout_mail::session::CredentialProvider;
@@ -635,12 +635,12 @@ fn open_browser(url: &str) -> Result<(), String> {
     gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>).map_err(|e| format!("couldn't open a browser to authorize this Microsoft account: {e}"))
 }
 
+/// `$XDG_DATA_HOME/lookout/oauth` via GLib, which falls back to the passwd
+/// home directory when `HOME` is unset - never the shared temp dir, where
+/// another local user could pre-create the directory and read or replace
+/// the refresh tokens.
 fn oauth_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("lookout").join("oauth")
+    glib::user_data_dir().join("lookout").join("oauth")
 }
 
 /// GOA account ids are D-Bus object paths (e.g.
@@ -668,6 +668,15 @@ fn pkce_challenge(verifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Refresh tokens live under the user's data dir, never the shared temp
+    /// dir (no env is set here: GLib caches these dirs on first call).
+    #[test]
+    fn oauth_dir_is_under_the_user_data_dir() {
+        let dir = oauth_dir();
+        assert_eq!(dir, glib::user_data_dir().join("lookout/oauth"));
+        assert!(!dir.starts_with(std::env::temp_dir()));
+    }
 
     #[test]
     fn pkce_verifier_and_challenge_are_spec_shaped() {
