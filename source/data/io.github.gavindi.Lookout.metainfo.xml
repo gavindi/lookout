@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.248" date="2026-10-19">
+      <description>
+        <p>Fixes a crash when moving the pointer off a person's profile card, clicking the person while their card was open, or hovering them again after the card had closed.</p>
+      </description>
+    </release>
     <release version="0.9.247" date="2026-10-19">
       <description>
         <p>Calendar event search. The title-bar search now follows the Calendar module and searches cached events by title, location, notes and attendees, showing a results list that opens the event editor. The calendar's Filter action focuses the search, results can be limited to the checked calendars, and a bounded background fetch fills in months that were never opened.</p>

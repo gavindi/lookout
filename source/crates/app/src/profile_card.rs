@@ -154,15 +154,13 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
             if active.borrow().is_some() {
                 return;
             }
-            cancel_timer(&timer);
             let context = context.clone();
             let widget = widget.clone();
             let resolve = resolve.clone();
             let active = active.clone();
-            let src = glib::timeout_add_local_once(std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
+            arm_timer(&timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
                 show_card(&context, &widget, &resolve, &active);
             });
-            *timer.borrow_mut() = Some(src);
         });
     }
     {
@@ -170,6 +168,20 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
         motion.connect_leave(move |_| cancel_timer(&timer));
     }
     widget.add_controller(motion);
+}
+
+/// Arms the hover-open timer in `timer`, replacing any pending one. The
+/// callback clears the slot before running `f`: once a one-shot source has
+/// fired GLib has destroyed it, and a later `cancel_timer` removing that stale
+/// id would panic in the (non-unwindable) GTK signal trampoline.
+fn arm_timer(timer: &Rc<RefCell<Option<glib::SourceId>>>, delay: std::time::Duration, f: impl FnOnce() + 'static) {
+    cancel_timer(timer);
+    let slot = timer.clone();
+    let src = glib::timeout_add_local_once(delay, move || {
+        slot.borrow_mut().take();
+        f();
+    });
+    *timer.borrow_mut() = Some(src);
 }
 
 /// Cancels a pending hover-open timer, if any.
@@ -612,5 +624,40 @@ mod tests {
             .map(|i| occurrence("E", Utc.with_ymd_and_hms(2026, 6, 2 + i, 9, 0, 0).unwrap(), None, &["ada@example.com"]))
             .collect();
         assert_eq!(shared_upcoming_events(&occurrences, "ada@example.com", now, Duration::days(90), 3).len(), 3);
+    }
+
+    #[test]
+    fn hover_timer_clears_its_slot_when_it_fires() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let fired = Rc::new(std::cell::Cell::new(false));
+        let fired_in_timer = fired.clone();
+        arm_timer(&timer, std::time::Duration::ZERO, move || fired_in_timer.set(true));
+        let context = glib::MainContext::default();
+        while !fired.get() {
+            context.iteration(true);
+        }
+        assert!(timer.borrow().is_none());
+        // Leaving or clicking after the card opened: removing the fired
+        // source's stale id used to panic here.
+        cancel_timer(&timer);
+    }
+
+    #[test]
+    fn cancelled_hover_timer_never_fires() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let fired = Rc::new(std::cell::Cell::new(false));
+        let fired_in_timer = fired.clone();
+        arm_timer(&timer, std::time::Duration::ZERO, move || fired_in_timer.set(true));
+        cancel_timer(&timer);
+        assert!(timer.borrow().is_none());
+        let context = glib::MainContext::default();
+        while context.iteration(false) {}
+        assert!(!fired.get());
     }
 }
