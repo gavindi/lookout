@@ -1430,6 +1430,10 @@ pub(crate) struct UiState {
     /// (also a `FoldersUpdated`/account-removal event), so a request that
     /// dies with a dropped connection can't suppress a later one.
     pub(crate) refreshing: HashSet<AccountId>,
+    /// Microsoft 365 property pulls in flight, and the newest Graph delta
+    /// cursor per account (see `GraphPropertySyncs`). Forgotten on account
+    /// removal.
+    pub(crate) graph_property_syncs: super::graph_sync::GraphPropertySyncs,
     /// How the message list is ordered, set from the list header's sort
     /// controls. Applied in `repopulate_message_list` - the single choke point
     /// every list rebuild passes through - so the order is uniform no matter

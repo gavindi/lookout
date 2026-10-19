@@ -3,7 +3,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gtk::glib;
@@ -17,6 +17,58 @@ use super::*;
 /// How often Outlook's per-message properties are re-read through Graph on
 /// Microsoft 365 accounts (item 5.4) - the snooze rescan's cadence.
 pub(crate) const GRAPH_PROPERTY_RESYNC: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Per-account bookkeeping for `sync_mail_properties_from_graph`: which
+/// accounts have a pull in flight, and the newest delta cursor this process
+/// has received. The connect timer, the periodic resync, F5 and the consent
+/// paths all trigger a pull, so without the in-flight set they overlap and
+/// fetch the same page twice. The session persists the same cursor, but only
+/// once it processes `ApplyRemoteMailProperties` - a pull started in between
+/// would read the stale one from the cache, so the in-memory copy wins.
+#[derive(Default)]
+pub(crate) struct GraphPropertySyncs {
+    in_flight: HashSet<AccountId>,
+    cursors: HashMap<AccountId, String>,
+}
+
+impl GraphPropertySyncs {
+    /// `None` when a pull is already running for `id` (the caller skips);
+    /// otherwise marks it running and returns the newest known cursor, if any.
+    pub(crate) fn try_begin(&mut self, id: &AccountId) -> Option<Option<String>> {
+        if !self.in_flight.insert(id.clone()) {
+            return None;
+        }
+        Some(self.cursors.get(id).cloned())
+    }
+
+    pub(crate) fn record_cursor(&mut self, id: &AccountId, cursor: String) {
+        self.cursors.insert(id.clone(), cursor);
+    }
+
+    pub(crate) fn finish(&mut self, id: &AccountId) {
+        self.in_flight.remove(id);
+    }
+
+    /// Drops all state for a removed account - its cache, and the cursor in
+    /// it, is deleted too, so a re-added account must start over.
+    pub(crate) fn forget(&mut self, id: &AccountId) {
+        self.in_flight.remove(id);
+        self.cursors.remove(id);
+    }
+}
+
+/// Releases an account's `GraphPropertySyncs` in-flight mark when a pull
+/// ends, on every path out of it (including an early return on error).
+struct PropertySyncGuard {
+    state: Rc<RefCell<UiState>>,
+    account_id: AccountId,
+}
+
+impl Drop for PropertySyncGuard {
+    fn drop(&mut self) {
+        self.state.borrow_mut().graph_property_syncs.finish(&self.account_id);
+    }
+}
 
 /// Every account's flagged mail, merged - what the Tasks view lists.
 pub(crate) fn all_flagged_mail(state: &Rc<RefCell<UiState>>) -> Vec<EmailSummary> {
@@ -223,10 +275,25 @@ pub(crate) fn sync_mail_properties_from_graph(state: &Rc<RefCell<UiState>>, acco
     let Some((client, cmd_tx, read_cache)) = target else {
         return;
     };
+    let Some(known_cursor) = state.borrow_mut().graph_property_syncs.try_begin(account_id) else {
+        tracing::debug!(%account_id, "Outlook property sync already in flight, skipping");
+        return;
+    };
     let zone = display_zone_tz();
     let categories = state.borrow().categories.clone();
+    let guard = PropertySyncGuard {
+        state: state.clone(),
+        account_id: account_id.clone(),
+    };
     glib::spawn_future_local(async move {
-        let cursor = read_cache.as_ref().and_then(|cache| cache.graph_delta_cursor().ok().flatten());
+        // The cache is only consulted until this process has seen a cursor
+        // of its own, and then off the GTK thread: the read contends for the
+        // cache connection with the session's write transactions.
+        let cursor = match (known_cursor, read_cache) {
+            (Some(cursor), _) => Some(cursor),
+            (None, Some(cache)) => gtk::gio::spawn_blocking(move || cache.graph_delta_cursor().ok().flatten()).await.ok().flatten(),
+            (None, None) => None,
+        };
         let taken_at = chrono::Utc::now();
         let delta = match client.property_delta(cursor.as_deref(), zone).await {
             Ok(delta) => delta,
@@ -235,6 +302,11 @@ pub(crate) fn sync_mail_properties_from_graph(state: &Rc<RefCell<UiState>>, acco
                 return;
             }
         };
+        // Recorded before the session has persisted it, so a pull starting
+        // in the meantime doesn't refetch this page from the old cursor.
+        if let Some(next) = delta.delta_link.clone() {
+            guard.state.borrow_mut().graph_property_syncs.record_cursor(&guard.account_id, next);
+        }
         let properties: Vec<lookout_mail::RemoteMailProperties> = delta
             .upserts
             .iter()
@@ -722,5 +794,43 @@ mod tests {
             vec!["work-items".to_string(), lookout_core::sanitize_tag_key("Personal")]
         );
         assert!(category_keys_for_names(&set, &[]).is_empty());
+    }
+
+    /// A second property pull for the same account is refused until the first
+    /// finishes; other accounts are independent.
+    #[test]
+    fn property_sync_runs_once_per_account_at_a_time() {
+        let a = AccountId("a".into());
+        let b = AccountId("b".into());
+        let mut syncs = GraphPropertySyncs::default();
+        assert_eq!(syncs.try_begin(&a), Some(None));
+        assert_eq!(syncs.try_begin(&a), None);
+        assert_eq!(syncs.try_begin(&b), Some(None));
+        syncs.finish(&a);
+        assert_eq!(syncs.try_begin(&a), Some(None));
+    }
+
+    /// The next pull starts from the newest cursor this process received,
+    /// even before the session has persisted it.
+    #[test]
+    fn property_sync_resumes_from_the_recorded_cursor() {
+        let a = AccountId("a".into());
+        let mut syncs = GraphPropertySyncs::default();
+        assert!(syncs.try_begin(&a).is_some());
+        syncs.record_cursor(&a, "c1".to_string());
+        syncs.record_cursor(&a, "c2".to_string());
+        syncs.finish(&a);
+        assert_eq!(syncs.try_begin(&a), Some(Some("c2".to_string())));
+    }
+
+    /// Removing an account drops both its in-flight mark and its cursor.
+    #[test]
+    fn property_sync_forget_clears_the_account() {
+        let a = AccountId("a".into());
+        let mut syncs = GraphPropertySyncs::default();
+        assert!(syncs.try_begin(&a).is_some());
+        syncs.record_cursor(&a, "c1".to_string());
+        syncs.forget(&a);
+        assert_eq!(syncs.try_begin(&a), Some(None));
     }
 }

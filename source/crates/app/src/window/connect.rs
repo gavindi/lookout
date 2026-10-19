@@ -1603,6 +1603,7 @@ pub(crate) fn teardown_goa_account(
         let mut st = state.borrow_mut();
         st.accounts.remove(account_id);
         st.refreshing.remove(account_id);
+        st.graph_property_syncs.forget(account_id);
         let belongs = |mailbox: &MailboxId| mailbox_account_id(mailbox).as_ref() == Some(account_id);
         st.unified_snapshots.retain(|mailbox, _| !belongs(mailbox));
         st.pending_optimistic_removals.retain(|mailbox, _| !belongs(mailbox));

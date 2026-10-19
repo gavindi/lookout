@@ -27,9 +27,12 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
    - **Failure:** `sync_and_push_rules_from_graph(state, account_id)` ignores `account_id` on the push and pushes every account. It is called once per M365 account from [connect.rs:344](source/crates/app/src/window/connect.rs#L344), so N accounts start N overlapping pushes, and each `client.create`s the same missing rule. The pull runs concurrently and can re-import a freshly created rule.
    - **Fix:** make `push_rules_to_graph` take `account_id`, run pull → push sequentially in one future, and add a per-account in-flight `HashSet<AccountId>` on `UiState`.
 
-3. **Duplicate deltas: `sync_mail_properties_from_graph` has no in-flight guard.** [graph_sync.rs:212-262](source/crates/app/src/window/graph_sync.rs#L212-L262).
-   - **Failure:** the connect timer, the periodic resync and F5 can overlap, read the same delta cursor and apply the same delta twice. The run also does a synchronous SQLite read on the GTK thread.
-   - **Fix:** use the same per-account in-flight set, and read the cursor via `spawn_cache_read`.
+3. ✔ **Overlapping Outlook property pulls: `sync_mail_properties_from_graph` has no in-flight guard.** [graph_sync.rs](source/crates/app/src/window/graph_sync.rs).
+   - **Failure:** six triggers (the connect timer, the 15-minute resync, F5, the global refresh and both consent paths) can overlap. Overlapping runs fetch the same delta page and each makes the session re-emit the message and flagged lists.
+   - **Stale cursor:** the session stores the next cursor only after it processes the command, so even a run started just after another finishes can refetch from the old cursor, and a late older run can step the stored cursor backwards.
+   - **GTK thread:** the cursor was read with a synchronous SQLite call on the main thread.
+   - **Milder than first reported:** the cache's `updated_at <= taken_at` guards stop an older run overwriting newer values, so no data is corrupted.
+   - **Fixed:** a per-account `GraphPropertySyncs` on `UiState` (in-flight set plus the newest cursor seen in-process), released by an RAII guard; the cache is read once per account via `gio::spawn_blocking`; the state is forgotten on account removal.
 
 4. ✔ **`settings.json` written non-atomically on the UI thread.** [app_config.rs:722-736](source/crates/app/src/app_config.rs#L722-L736) uses `save_at` with `std::fs::write`, which truncates then writes.
    - **Failure:** a crash mid-save loses all rules, identities, signatures and templates.

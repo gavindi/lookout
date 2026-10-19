@@ -657,6 +657,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         prefetching: HashSet::new(),
         folder_row_spinners: HashMap::new(),
         refreshing: HashSet::new(),
+        graph_property_syncs: Default::default(),
         sort_key: SortKey::from_action_state(&settings.get_string(crate::settings::SORT_KEY)).unwrap_or(SortKey::Date),
         sort_descending: settings.get_bool(crate::settings::SORT_DESCENDING),
         favorites: crate::folder_menu::dedup_in_order(settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId)),
