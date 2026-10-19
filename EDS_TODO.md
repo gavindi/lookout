@@ -58,9 +58,10 @@ Sizes: `S` under a day, `M` a few days, `L` a week or more.
 
 ## Phase 0 — Groundwork
 
-### [ ] E0.1 — Spike: EDS D-Bus surface and sandbox behaviour (`M`)
+### [x] E0.1 — Spike: EDS D-Bus surface and sandbox behaviour (`M`)
 
 The spike's output is a short notes section appended to this file, not code that ships.
+Done 2026-10-20; see [E0.1 spike notes](#e01-spike-notes).
 
 - Introspect a current GNOME install (`busctl --user introspect`) and record the following
   for every EDS version Lookout supports (decide the floor, e.g. the version in the oldest
@@ -412,3 +413,317 @@ Write an EDS backend module so EDS reads calendars and contacts straight from Lo
 - **Reading EDS calendars into Lookout.** For example, a calendar created only in GNOME
   Calendar's local storage. This isn't one of options 1–3; it would be E1's calendar
   counterpart, and it needs its own plan if wanted.
+
+---
+
+## E0.1 spike notes
+
+Run on 2026-10-20 on Ubuntu 26.10 with EDS 3.56.2, GNOME Shell 51, GLib 2.90 and Flatpak 1.18.4.
+Every call was a raw `Gio.DBusConnection` method call from a throwaway Python script, without
+libecal or libebook, so it sends exactly what `zbus` would send. The script ran on the host, and
+inside the sandbox through `flatpak run --talk-name=org.gnome.evolution.dataserver.*` on
+`org.gnome.Platform//50`. Each test source was created, exercised and then removed. Older EDS
+releases and the Snap were checked against upstream source, not run.
+
+### Verdict
+
+- **Pure Rust over `zbus` holds up.** Everything E1–E3 needs is a plain method call with
+  string or array arguments, so the `gir` fallback isn't needed.
+- **Minimum version: EDS 3.34 (September 2019).** The names `Sources5`, `Calendar8` and
+  `AddressBook10` are the same in every release from 3.34 to `master` (checked in
+  `CMakeLists.txt` at 3.34, 3.36, 3.40, 3.44, 3.46, 3.48, 3.50, 3.52, 3.56 and `master`).
+  Releases 3.28–3.32 used `Calendar7` and `AddressBook9`, so they count as unavailable (this
+  rules out RHEL 8).
+  - Comparing the introspection XML for 3.34 and 3.56 shows no method was removed or changed.
+    Later releases only added things: `AddressBook.ContainsEmail` and `Categories`, and the
+    `AddressBookView` sort and `DupContacts` members.
+  - So one set of proxies covers every supported release, and the "one module per version"
+    split in E0.2 isn't needed yet.
+- **The minimum version is set by the host's EDS, not the Flatpak runtime.** Lookout talks to
+  the host's services over the bus and never loads the runtime's EDS libraries, so the "oldest
+  GNOME runtime" test proposed in E0.1 doesn't apply.
+- **Detecting EDS.** `Sources5`, `Calendar8` and `AddressBook10` all have D-Bus activation
+  files, so any ordinary call starts EDS. To follow E1.4's "don't start it" rule, check with
+  `NameHasOwner` or `GetNameOwner` first, or send calls with `NO_AUTO_START`. On a GNOME
+  session EDS is always running anyway, because Shell's calendar server starts it.
+
+### Bus names and objects
+
+| Service | Bus name | Objects |
+|---|---|---|
+| Source registry | `org.gnome.evolution.dataserver.Sources5` | `/org/gnome/evolution/dataserver/SourceManager` (`SourceManager` and `ObjectManager`) and `…/SourceManager/Source_N`, one per source |
+| Calendar factory | `org.gnome.evolution.dataserver.Calendar8` | `…/CalendarFactory`, plus per-backend objects at the path `Open*` returns |
+| Address book factory | `org.gnome.evolution.dataserver.AddressBook10` | `…/AddressBookFactory`, plus per-backend objects |
+| Credential prompts | `org.gnome.evolution.dataserver.UserPrompter0` | Not needed. The Flatpak wildcard also covers it, which does no harm. |
+
+### Sources (`SourceManager`)
+
+- **Listing.** `ObjectManager.GetManagedObjects` on `…/SourceManager` returns every source,
+  100 sources in 8 ms. Each object's `org.gnome.evolution.dataserver.Source` interface carries
+  `UID`, `Data` (the whole `.source` key file as text) and `ConnectionStatus`.
+  - `Source_N` numbers aren't stable, so key sources by `UID`.
+  - Watch `InterfacesAdded` and `InterfacesRemoved` to notice sources being added or removed
+    (E1.4).
+- **Extra interfaces on a source object:**
+  - `Source.Writable.Write(s data)`, which replaces the key file;
+  - `Source.Removable.Remove()`, only on sources the user can delete (books and calendars
+    they created, and stand-alone mail accounts);
+  - `Source.RemoteCreatable` and `Source.RemoteDeletable`, on collection backends;
+  - `Source.OAuth2Support`.
+- **Creating.** `SourceManager.CreateSources(a{ss})` maps each chosen UID to its key-file text.
+  It returns nothing, and the source shows up through `InterfacesAdded` in under 0.2 s. Because
+  the caller picks the UID, a fixed mirror UID works.
+  - Groups EDS doesn't know survive the round trip, so a `[Lookout]` group with `Mirror=true`
+    works as the marker key.
+  - A source created this way always gets `Removable` and `Writable`.
+- **Removing.** Call `Source.Removable.Remove()`.
+  - **Leak:** for a local calendar or address book, EDS 3.56 deletes the `.source` file but
+    leaves `~/.local/share/evolution/{calendar,addressbook}/<uid>/` (`calendar.ics` or
+    `contacts.db`) on disk, and a Flatpak build has no access to delete it.
+  - The custom-file design below creates no such directory (checked).
+- **Key-file facts the E0.2 parser needs:**
+  - The kind is the group name: `[Address Book]`, `[Calendar]`, `[Task List]`, `[Memo List]`,
+    `[Mail Account]`, `[Mail Identity]`, `[Mail Transport]`, `[Collection]` or
+    `[Mail Signature]`. `BackendName` is in that group.
+  - `Enabled` and `Parent` are in `[Data Source]`.
+  - Translated `DisplayName[xx]=` keys appear (for example on `system-calendar`), so the
+    parser must accept `[locale]` key suffixes.
+  - **GOA:** the `[GNOME Online Accounts] AccountId=account_…` group sits only on the
+    `[Collection]` parent. Child books and calendars carry no GOA key, so `goa_account_id`
+    means following `Parent`.
+  - Built-in UIDs: `system-address-book` (the "Personal" book, not `Removable`),
+    `system-calendar`, `system-task-list`, and the `*-stub` parents (`local-stub`,
+    `webcal-stub`, `contacts-stub` and so on).
+  - Address books have no `Selected` key. Evolution's "Use in autocompletion" checkbox is
+    stored as `[Autocomplete] IncludeMe=`, which E1.3 could honour.
+
+### Factories and backend processes
+
+- **Opening.** `CalendarFactory.OpenCalendar(s uid)` (also `OpenTaskList` and `OpenMemoList`)
+  and `AddressBookFactory.OpenAddressBook(s uid)` return `(object_path, bus_name)`. Then call
+  `Open() -> as` on that object before running queries.
+- **Where the backend runs.** Always use the pair the factory returns; never build it yourself.
+  - **Default builds** (`ENABLE_BACKEND_PER_PROCESS=OFF`, the upstream default, as on this
+    Ubuntu): the bus name is the factory's own name (for example `…Calendar8`), and the path is
+    `/org/gnome/evolution/dataserver/Subprocess/<factory pid>/<n>`.
+  - **Per-process builds:** the bus name is
+    `org.gnome.evolution.dataserver.Subprocess.Backend.Calendarx<pid>x<n>` (or the
+    `AddressBook` equivalent), and the path is `…/Subprocess/Backend/Calendar/<pid>/<n>`.
+- **Sandboxes.** The Flatpak wildcard matches every name below
+  `org.gnome.evolution.dataserver.`, so it covers both cases. Snap's AppArmor rules match on
+  object paths, not bus names, so they cover both as well.
+- **Lifetime.** The factory closes a backend when the client that opened it disconnects. Keep
+  one connection open for as long as a handle is in use, and reopen the handle when the name
+  owner changes (EDS restarted).
+- **Speed.** Opening took under 35 ms, even for remote CardDAV and Microsoft 365 books, which
+  answer from EDS's local cache.
+
+### Address books
+
+- **Methods:**
+  - `GetContactList(s query) -> as`, which returns vCard 3.0 text;
+  - `GetContactListUids`;
+  - `GetView` (live results) and `GetCursor`;
+  - `ContainsEmail`, which was added after 3.34, so treat `UnknownMethod` as unsupported.
+- **Field names use underscores, as in `e_contact_field_name`:** `full_name`, `nickname`,
+  `email`, `file_as`. vCard names such as `FN` also work.
+  - **The hyphenated `"full-name"` in E0.1 and E1.1 silently returns no hits, with no
+    error.**
+- **`full_name` checks four fields.** It matches FN, the family name, the given name *or* the
+  nickname, in both the SQLite backend and the generic one (`compare_name` in
+  `e-book-backend-sexp.c`, and the full-name substitution in `e-book-sqlite.c`). So
+  `(or (beginswith "full_name" q) (beginswith "email" q))` already covers nicknames. Prefixes
+  of later words inside FN don't match ("smi" doesn't find "Dave Smith" when the card has no
+  `N`).
+- **Matching ignores case and accents:** `A` matches the same cards as `a`, `e` matches
+  "Émile", and `é` matches "Example". Lookout doesn't need to lower-case the query.
+- **`email beginswith`** matches the start of any of a card's email addresses (verified with
+  a second, mixed-case address), not the domain.
+- **Escaping:** `\"` and `\\` inside a string literal work. This was checked against a name
+  containing both.
+- **Queries some books reject:**
+  - Local (SQLite) books reject `#t` with "Invalid Query". Use
+    `(contains "x-evolution-any-field" "")` to match everything. CardDAV and Microsoft 365 books
+    accept `#t`.
+  - A malformed query returns an error (e-client-error 16, or e-cache-error 3). Treat it as
+    "no hits".
+- **The data can be thin.** The GOA Microsoft 365 book returned cards with only `EMAIL`, with
+  no `FN` or `N`. E1.2 must fall back to the address as the display name.
+- **Speed.** The first query on the Microsoft 365 book took 0.97 s (cold). After that, and on
+  local books, queries took under 10 ms.
+
+### Calendars
+
+- **Methods:**
+  - `CreateObjects(as ics, u opflags) -> as uids`;
+  - `ModifyObjects(as ics, s mod_type, u opflags)`;
+  - `RemoveObjects(a(ss) uid_rid, s mod_type, u opflags)`;
+  - `GetObject(s uid, s rid) -> s` and `GetObjectList(s sexp) -> as`;
+  - `GetView(s sexp) -> o`, `AddTimezone` and `GetTimezone`;
+  - properties `Writable`, `Capabilities`, `Online` and `Revision`.
+- **Each string must be one bare `VEVENT`.** A string wrapped in `VCALENDAR` is rejected with
+  "Invalid object", and the getters also return bare `VEVENT`s. This means
+  `build_vcalendar`'s output can't be passed straight in: events with a `TZID` would need
+  `AddTimezone` first, or UTC times with `VALUE=DATE` for all-day events (both verified).
+- **`mod_type`** is a list of GFlags nicks joined with `:`: `this`, `this-and-prior`,
+  `this-and-future`, `all` or `only-this`.
+  - An unknown nick is logged and treated as 0.
+  - On the local backend, `this` and `all` work for events that don't repeat, and `only-this`
+    returns NotSupported.
+- **`opflags`** (`ECalOperationFlags`, since 3.34):
+  - 0 means no flags (keep local, the default);
+  - 1 = conflict-fail, 2 = use-newer, 4 = keep-server, 8 = write-copy;
+  - 16 = disable iTIP messages.
+  - The mirror uses 0.
+- **Batches are all-or-nothing, and nothing is applied when one item fails:**
+  - one duplicate UID fails the whole `CreateObjects` with "Object ID already exists"
+    (e-cal-client-error 4);
+  - one unknown UID fails the whole `RemoveObjects` or `ModifyObjects` with "Object not found"
+    (error 1).
+  - So a writer has to plan from a fresh listing and fall back to one call per item when a
+    batch fails.
+- **Parsing is lenient.** Junk lines inside a `VEVENT` are accepted, and a missing `UID` is
+  generated by the backend.
+- **`X-` properties survive the round trip,** so `X-LOOKOUT-HASH` would work.
+- **Queries** `#t`, `(uid? "…")` and
+  `(occur-in-time-range? (make-time "YYYYMMDDTHHMMSSZ") (make-time "…"))` all work.
+- **Speed.** On the local backend, creating 100 events took 5 ms and removing them took 8 ms.
+- **Errors** come back as names like
+  `org.gtk.GDBus.UnmappedGError.Quark._e_2dcal_2dclient_2derror_2dquark.Code<N>`. The quark
+  and code are encoded in the name.
+
+### GNOME Shell
+
+- **How Shell picks calendars.** `gnome-shell-calendar-server` (`org.gnome.Shell.CalendarServer`)
+  filters sources through an `ESourceRegistryWatcher`. It takes a source that is enabled
+  (parents included) and has a `[Calendar]` group with `Selected=true`. The source code is the
+  same in Shell 45 and 51. It shows events only, never task lists or memos.
+- **It picks changes up while running (verified on Shell 51):**
+  - Events in a calendar created through `CreateSources` while Shell was running arrived as
+    `EventsAddedOrUpdated` within about 2 s, with no restart.
+  - Modifying an event sent `EventsAddedOrUpdated`, and removing one sent `EventsRemoved`.
+  - Writing `Selected=false` through `Source.Writable.Write` sent `ClientDisappeared` at once.
+  - Shell's event IDs are `<source uid>\n<event uid>\n<rid>`.
+
+### A read-only mirror is possible, through a custom file
+
+- **Plain local calendars can't be made read-only.** The `local` backend honours
+  `[Local Backend] Writable=false` *only when `CustomFile` is set* (`get_source_writable` in
+  `e-cal-backend-file.c`). A calendar whose data lives in EDS's own directory has no read-only
+  switch.
+- **With a custom file, it works (verified on the host and from the Flatpak):** a source with
+  `CustomFile=file:///abs/path.ics` and `Writable=false`.
+  - **Clients see it as read-only.** The backend reports `Writable=false`. GNOME Calendar
+    (`notify::readonly` in `gcal-calendar.c`) and Evolution read that flag and turn editing off.
+  - **The flag is advisory.** Another client's create, modify and remove calls still returned
+    OK, but the change lived only in memory (the backend skips saving when it isn't writable),
+    and the next reload of the file dropped it.
+  - **EDS watches the file** (a GFileMonitor plus an mtime check) and reloads it within about
+    0.3 s, both after an atomic rename and after an in-place rewrite. It compares the old and new
+    contents and sends per-event add, modify and remove notifications, so Shell receives only
+    the events that changed (verified from the signals).
+  - **The file is a whole `VCALENDAR`,** so `build_vcalendar` output, including `VTIMEZONE`s,
+    can be used as is. Stable UIDs (E2.2) still matter, because EDS matches events by UID.
+  - **It leaves nothing behind.** EDS creates no data directory for the source, and `Remove()`
+    leaves the file alone; Lookout deletes the file itself.
+  - **It works from sandboxes.** Flatpak mounts `~/.var/app/<id>/` at the same absolute path
+    on the host, so a file under `$XDG_DATA_HOME` is readable by the host's EDS with no extra
+    permission (tested with an equivalent host-backed path). Under Snap, use
+    `$SNAP_USER_COMMON`, not the per-revision `$SNAP_USER_DATA`.
+- This answers the open question about whether EDS accepts `file://` links for webcal: a webcal
+  source isn't needed.
+
+### Sandboxes
+
+- **Flatpak.** With no permission, every call fails with `ServiceUnknown`. With only
+  `--talk-name=org.gnome.evolution.dataserver.*`, everything above behaved the same as on the
+  host:
+  - listing sources and opening books and calendars;
+  - queries;
+  - `CreateSources`, `Write` and `Remove`;
+  - creating, modifying and removing events;
+  - the custom-file source.
+
+  GNOME Shell's calendar server isn't reachable from the sandbox, and isn't needed.
+- **E3 needs no file access.** The `Data` property returns the full key file of every source,
+  including mail accounts, identities and transports. So E3 can read Evolution's accounts over
+  D-Bus without `--filesystem=xdg-config/evolution/sources:ro` or Snap `personal-files`.
+- **Snap (from snapd source, not run).**
+  - snapd has `calendar-service` and `contacts-service` interfaces. They are implicit on
+    classic systems and set to `deny-auto-connection`, so each needs a manual `snap connect`
+    or an auto-connect grant from the Store.
+  - Their AppArmor rules match on object paths and interfaces. That covers the backend paths in
+    both process modes, `ObjectManager`, `Source`, `Source.Removable` and
+    `SourceManager.CreateSources`, but **not `Source.Writable`**. Under Snap the mirror source
+    has to be created complete, and changing its name or colour means removing it and creating
+    it again.
+
+### Keyring
+
+- **Evolution's items** have `xdg:schema=org.gnome.Evolution.Data.Source` and the attributes
+  `e-source-uid` and `eds-origin`. On the host, the item for a manual IMAP account was found
+  unlocked. The spike only searched and never fetched a secret.
+- **Flatpak:**
+  - `org.freedesktop.secrets` is unreachable by default (`ServiceUnknown`), and the manifest
+    doesn't grant `--talk-name=org.freedesktop.secrets`. With that permission the items would
+    be readable, because gnome-keyring has no per-app access control.
+  - The Secret portal can't help here, because it only gives an app its own private key.
+  - So in the current Flatpak, E3.3 falls back to asking for the password, as designed.
+- **Snap:** the `password-manager-service` plug, already declared, gives full Secret Service
+  access once connected, so the items are readable.
+- **Side finding, not checked in the app:** for the same reason, `SecretService::connect` in
+  `other_accounts.rs` should already fail in the Flatpak build, independently of EDS. It is
+  worth checking separately.
+
+### Recommended changes to the plan
+
+1. **E0.2.**
+   - Detect EDS by owner checks on the three bus names, without auto-starting it.
+   - One proxy set (EDS 3.34+) is enough.
+   - The parser accepts `DisplayName[xx]` keys and follows `Parent` to find the GOA collection.
+   - Record `[Autocomplete] IncludeMe`.
+2. **E1.1.**
+   - Use `(or (beginswith "full_name" q) (beginswith "email" q))`, with underscores and no
+     separate `nickname` term.
+   - Trim the query but don't lower-case it.
+   - Local books need `x-evolution-any-field` instead of `#t`.
+3. **E1.2.** Fall back to the email address when a card has no FN.
+4. **E1.3.** Consider skipping books whose `[Autocomplete] IncludeMe=false`, to match Evolution.
+5. **E2: switch to the custom-file design.**
+   - **E2.1:** create the source once, with the key file below; disabling the mirror is
+     `Remove()` plus deleting the file.
+   - **E2.3:** becomes "rewrite the `.ics` atomically when its content hash changes". No
+     per-event D-Bus writes, batch sizes or all-or-nothing handling, and `X-LOOKOUT-HASH` is
+     optional.
+   - **E2.5:** is solved, because the copy is read-only in GNOME Calendar and Evolution.
+   - If E2 stays with per-event D-Bus writes instead, it has to:
+     - send bare `VEVENT`s;
+     - plan each batch from a fresh listing, with a per-item fallback;
+     - clear all events before `Remove()`, because of the data-directory leak.
+6. **E3.1.** Read accounts from the `Data` property over D-Bus; no file permission is needed.
+7. **P.1.** The wildcard `--talk-name` is enough. Optionally add
+   `--talk-name=org.freedesktop.secrets` for E3.3 (see the side finding above).
+8. **P.2.** Not "unsupported": plug `contacts-service` (E1, E3) and `calendar-service` (E2), and
+   note that both need manual connection.
+
+Proposed key file for the mirror source:
+
+```ini
+[Data Source]
+DisplayName=Lookout
+Enabled=true
+Parent=local-stub
+
+[Calendar]
+BackendName=local
+Color=#3584e4
+Selected=true
+
+[Local Backend]
+CustomFile=file:///home/<user>/.var/app/io.github.gavindi.Lookout/data/lookout/eds-mirror.ics
+Writable=false
+
+[Lookout]
+Mirror=true
+Version=1
+```
