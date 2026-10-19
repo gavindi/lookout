@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/goa",
+    "crates/eds",
     "crates/mail",
     "crates/dav",
     "crates/graph",
@@ -28,7 +29,7 @@ imap-proto = { path = "crates/imap-proto" }
 async-imap = { path = "crates/async-imap" }
 
 [workspace.package]
-version = "0.9.252"
+version = "0.9.253"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/gavindi/lookout"
@@ -37,6 +38,7 @@ homepage = "https://lookout-mail.com/"
 [workspace.dependencies]
 lookout-core = { path = "crates/core" }
 lookout-goa = { path = "crates/goa" }
+lookout-eds = { path = "crates/eds" }
 lookout-mail = { path = "crates/mail" }
 lookout-dav = { path = "crates/dav" }
 lookout-graph = { path = "crates/graph" }

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.253" date="2026-10-20">
+      <description>
+        <p>No visible changes. This release adds groundwork for using the desktop's own address books and calendars (Evolution Data Server) in a later version.</p>
+      </description>
+    </release>
     <release version="0.9.252" date="2026-10-20">
       <description>
         <p>Opening messages and scrolling the message list use less memory and CPU. Message bodies already loaded are shared rather than copied each time they're shown, and list rows reuse their category dots and display settings as you scroll.</p>

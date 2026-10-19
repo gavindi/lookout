@@ -99,7 +99,8 @@ cargo run                 # build and launch
 ```bash
 cd source
 
-# Unit tests (whole workspace)
+# Unit tests (whole workspace). Includes lookout-eds's fake-EDS D-Bus tests,
+# which start their own private dbus-daemon (needs `dbus-daemon` on PATH)
 cargo test --workspace
 
 # Fake-GOA D-Bus test on an isolated session bus (real D-Bus-wire coverage

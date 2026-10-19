@@ -84,7 +84,36 @@ Done 2026-10-20; see [E0.1 spike notes](#e01-spike-notes).
 - Record whether Evolution's keyring items (the `org.gnome.Evolution.Data.Source` schema,
   attribute `e-source-uid`) are readable from the Flatpak build and the Snap build.
 
-### [ ] E0.2 — `lookout-eds` crate (`M`)
+### [x] E0.2 — `lookout-eds` crate (`M`)
+
+Done 2026-10-20 (v0.9.253). Where it differs from the plan below, following the E0.1 notes:
+
+- **One proxy set, not one module per version.** The bus names and the methods Lookout uses
+  haven't changed since EDS 3.34. `proxies.rs` explains how to add a second set if EDS ever
+  bumps a name.
+- **No `lookout-core` dependency yet.** Nothing in E0.2 uses it; E1.1 adds it for the vCard
+  parser.
+- **Detection never starts EDS.** `Eds::connect` asks the bus who owns `Sources5`, and treats
+  each factory as present when it is running or activatable. It returns `Ok(None)` for an
+  unknown version, including EDS 3.28–3.32, which ran `Sources5` with older factories.
+  `supports_address_books()` and `supports_calendars()` report the factories separately.
+  `Eds::connect_with(connection)` takes an existing connection.
+- **Source fields:**
+  - `enabled` is the *effective* state: the source and all its ancestors must be enabled, as
+    GNOME Shell decides.
+  - `display_name` uses the user's locale (`DisplayName[de]=…`).
+  - `goa_account_id` follows `Parent` up to the GOA collection.
+  - Built-in mail accounts (`local`, `vfolder`, `rss`) are listed as `MailAccount`; E3 has to
+    filter them out.
+- **`keyfile.rs`** (the pure GKeyFile reader planned for E3.1) is added now, because listing
+  sources needs it.
+- **The tests start their own private `dbus-daemon`** with an empty service directory, so they
+  run under plain `cargo test` without `dbus-run-session`. They never see or start the real
+  EDS. Beyond the three planned cases, they cover a partial install, an old release, and a
+  stopped but activatable registry that must not be started.
+- **`cargo run -p lookout-eds --example list_sources`** prints the live desktop's sources.
+
+The original plan:
 
 Add `source/crates/eds` (package `lookout-eds`) to the workspace, shaped like `lookout-goa`.
 
