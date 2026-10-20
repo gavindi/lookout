@@ -7484,6 +7484,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
+    // Config → People → "Include desktop address books" (EDS_TODO.md E1.4):
+    // persists the choice and flips the directory backend's switch, which
+    // every lookup reads, so composers already open follow it. Turning it off
+    // also closes the desktop's books and lets go of EDS.
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        config_view.eds_address_books_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::EDS_ADDRESS_BOOKS, enabled);
+            crate::eds_directory::set_enabled(enabled);
+            if !enabled {
+                worker.spawn(crate::eds_directory::disconnect_desktop());
+            }
+        });
+    }
 
     // Config → General → "Start Lookout at login": registers login
     // autostart with the session's Background portal when available (the
@@ -7751,6 +7767,27 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .contacts_file_as_row
             .set_selected(crate::settings::contact_file_as_index(&persisted.get_string(crate::settings::CONTACTS_FILE_AS)));
+        // People → "Include desktop address books": seed the switch, and the
+        // backend explicitly too - the notify handler doesn't fire when the
+        // stored value matches the switch's initial state. Then ask, off the
+        // GTK thread, whether the desktop has address books Lookout can reach
+        // at all (never starting EDS), and grey the switch out if not.
+        let eds_enabled = persisted.get_bool(crate::settings::EDS_ADDRESS_BOOKS);
+        config_view.eds_address_books_row.set_active(eds_enabled);
+        crate::eds_directory::set_enabled(eds_enabled);
+        {
+            let (tx, rx) = async_channel::bounded(1);
+            worker.spawn(async move {
+                let _ = tx.send(crate::eds_directory::desktop_available().await).await;
+            });
+            let row = config_view.eds_address_books_row.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(false) = rx.recv().await {
+                    row.set_sensitive(false);
+                    row.set_subtitle(crate::config_view::EDS_ADDRESS_BOOKS_UNAVAILABLE_SUBTITLE);
+                }
+            });
+        }
         // "Start Lookout at login": the setting is the source of truth for
         // the portal path; the managed XDG file is the fallback, so an
         // entry left over (or written while the portal was absent) counts

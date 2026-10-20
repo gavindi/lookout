@@ -293,11 +293,16 @@ pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<Acc
     // borrow. An account carries the Graph clients only when it is a
     // Microsoft 365 account with its own token (a shared mailbox borrows its
     // parent's and is skipped here - the parent is the one with the GAL).
-    let (config, graph_accounts) = {
+    //
+    // Also the GOA accounts whose contacts Lookout syncs itself (each has a
+    // contacts session, CardDAV or Graph), so the desktop backend skips EDS's
+    // copy of those address books (EDS_TODO.md E1.3).
+    let (config, graph_accounts, synced_goa) = {
         let st = state.borrow();
         let config = st.app_config.borrow().clone();
         let ids: Vec<AccountId> = st.accounts.iter().filter(|(_, handle)| handle.graph_pin.is_some()).map(|(id, _)| id.clone()).collect();
-        (config, ids)
+        let synced_goa: HashSet<String> = st.contact_cmd_tx.keys().filter_map(crate::eds_directory::goa_account_id).map(str::to_string).collect();
+        (config, ids, synced_goa)
     };
     let mut backends: Vec<Arc<dyn DirectoryBackend>> = Vec::new();
     for id in graph_accounts {
@@ -322,8 +327,10 @@ pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<Acc
     // The desktop's address books (EDS_TODO.md E1.2) go last, so a person
     // another directory also lists keeps that directory's entry. They aren't
     // tied to an account, so the same backend serves both scopes; it connects
-    // to EDS on the first lookup and contributes nothing without it.
-    backends.push(Arc::new(EdsDirectoryBackend::desktop()));
+    // to EDS on the first lookup and contributes nothing without it. It is
+    // added even while Config → People switches desktop books off: the switch
+    // is read on every lookup, so turning it on reaches open composers too.
+    backends.push(Arc::new(EdsDirectoryBackend::desktop(synced_goa)));
     DirectorySource::new(backends, worker)
 }
 

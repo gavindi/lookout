@@ -177,6 +177,9 @@ pub const CALENDAR_DEFAULT_REMINDER: &str = "calendar-default-reminder";
 /// People → "File contacts as": how a contact with no per-contact `file_as`
 /// is listed and sorted (P-07). One of [`lookout_core::FileAs`]'s strings.
 pub const CONTACTS_FILE_AS: &str = "contacts-file-as";
+/// People → "Include desktop address books" (EDS_TODO.md E1.4): directory
+/// lookups also search the desktop's EDS address books.
+pub const EDS_ADDRESS_BOOKS: &str = "eds-address-books";
 /// Tasks → "Sort by": how tasks are ordered within their group (T-09). One of
 /// [`TASK_SORT_KEYS`].
 pub const TASKS_SORT_KEY: &str = "tasks-sort-key";
@@ -349,6 +352,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(CALENDAR_SECONDARY_TZ, Value::String(String::new()));
     map.insert(CALENDAR_DEFAULT_REMINDER, Value::Int(-1));
     map.insert(CONTACTS_FILE_AS, Value::String("last-first".into()));
+    map.insert(EDS_ADDRESS_BOOKS, Value::Bool(true));
     map.insert(TASKS_SORT_KEY, Value::String("due".into()));
     map.insert(TASKS_GROUP_BY, Value::String("due".into()));
     map.insert(TASKS_SHOW_COMPLETED, Value::Bool(true));
@@ -1168,6 +1172,7 @@ mod tests {
         assert_eq!(store.get_int(CALENDAR_WORK_END), 18);
         assert_eq!(store.get_string(CALENDAR_PRIMARY_TZ), "");
         assert_eq!(store.get_int(CALENDAR_DEFAULT_REMINDER), -1);
+        assert!(store.get_bool(EDS_ADDRESS_BOOKS));
     }
 
     #[test]

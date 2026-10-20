@@ -379,6 +379,11 @@
       <summary>File contacts as</summary>
       <description>How a contact with no per-contact "File as" value is listed and sorted in the People screen: last-first ("Doe, Jane", Outlook's default), first-last ("Jane Doe") or company (the organisation name).</description>
     </key>
+    <key name="eds-address-books" type="b">
+      <default>true</default>
+      <summary>Include desktop address books</summary>
+      <description>Also suggest people from the desktop's own address books (GNOME Contacts and Evolution, through Evolution Data Server) in recipient autocomplete, the contact picker and People search. Books belonging to an online account whose contacts Lookout already syncs are skipped. Has no effect when Evolution Data Server isn't available.</description>
+    </key>
 
     <!-- Tasks -->
     <key name="tasks-sort-key" enum="io.github.gavindi.Lookout.TaskSortKey">

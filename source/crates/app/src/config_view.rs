@@ -392,6 +392,10 @@ pub struct ConfigView {
     /// "File contacts as" combo (Config → People, P-07); its selected index
     /// maps to `CONTACT_FILE_AS`.
     pub contacts_file_as_row: adw::ComboRow,
+    /// "Include desktop address books" switch (Config → People, EDS_TODO.md
+    /// E1.4), bound to `EDS_ADDRESS_BOOKS`. The caller greys it out when the
+    /// desktop has no Evolution Data Server Lookout can reach.
+    pub eds_address_books_row: adw::SwitchRow,
     /// "OAuth client id" row (Config → Google Tasks), exposed so the caller
     /// can wire its `activated` signal to the client-id dialog (and update
     /// the subtitle after a save).
@@ -521,6 +525,15 @@ fn placeholder_group(title: &str) -> adw::PreferencesGroup {
 /// window.rs's private `card_section` helper - duplicated here rather than
 /// shared so this module stays decoupled from window.rs, per its own
 /// data-in/widget-out convention).
+/// The "Include desktop address books" row's subtitle while the desktop's
+/// address books are reachable (and before that's known).
+pub const EDS_ADDRESS_BOOKS_SUBTITLE: &str = "Suggest people from GNOME Contacts and Evolution when choosing recipients";
+
+/// Its subtitle once the check finds no Evolution Data Server Lookout can
+/// reach - none installed or running, an unsupported version, or a sandbox
+/// without the permission.
+pub const EDS_ADDRESS_BOOKS_UNAVAILABLE_SUBTITLE: &str = "Not available - this desktop has no Evolution Data Server address books Lookout can reach";
+
 pub fn build() -> ConfigView {
     let accounts_group = adw::PreferencesGroup::builder().title("Accounts").build();
     let add_account_row = adw::ActionRow::builder()
@@ -840,6 +853,11 @@ pub fn build() -> ConfigView {
         .model(&gtk::StringList::new(&crate::settings::CONTACT_FILE_AS_LABELS))
         .build();
     contacts_settings_group.add(&contacts_file_as_row);
+    let eds_address_books_row = adw::SwitchRow::builder()
+        .title("Include desktop address books")
+        .subtitle(EDS_ADDRESS_BOOKS_SUBTITLE)
+        .build();
+    contacts_settings_group.add(&eds_address_books_row);
 
     // The real "Google Tasks" group (in the "Apps" section's place): the
     // OAuth client id the Tasks integration needs - Google has no public
@@ -1242,6 +1260,7 @@ pub fn build() -> ConfigView {
         calendar_secondary_tz_row,
         calendar_default_reminder_row,
         contacts_file_as_row,
+        eds_address_books_row,
         google_tasks_client_row,
         assistant_url_entry,
         assistant_token_row,

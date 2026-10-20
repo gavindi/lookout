@@ -243,7 +243,26 @@ Add `source/crates/app/src/eds_directory.rs`.
   - addresses are de-duplicated case-insensitively;
   - an unavailable EDS adds nothing.
 
-### [ ] E1.3 — Avoid duplicate address books (`S`)
+### [x] E1.3 — Avoid duplicate address books (`S`)
+
+Done 2026-10-20 (v0.9.256).
+
+- **The rule.** `eligible_books(&[EdsSource], &HashSet<String>)` in
+  `crates/app/src/eds_directory.rs` keeps every enabled address book, except one whose
+  `goa_account_id` is in the set. That covers several books from the same account (Google's
+  "Contacts" and "Other contacts", for example).
+- **"Already syncs".** A GOA account counts as synced when Lookout runs a contacts session for
+  it, CardDAV or Graph (the keys of `UiState::contact_cmd_tx`). `goa_account_id` maps the GOA
+  object path Lookout uses as an account id to the `account_…` id EDS records.
+- **What still appears.** A GOA account that is disabled in Lookout, or whose contacts Lookout
+  doesn't sync, keeps its EDS book.
+- **Snapshot.** The set is captured when a directory source is built, so a composer opened
+  before contacts discovery finishes still searches those books. Duplicate addresses are
+  merged anyway, so the cost is only wasted lookups.
+- **Not done:** Evolution's per-book `[Autocomplete] IncludeMe` flag (E0.1 suggested honouring
+  it). It isn't honoured, because GNOME Contacts never sets it and its default couldn't be
+  confirmed. Worth revisiting if users ask why an Evolution book with autocompletion turned
+  off still shows up.
 
 - By default, skip EDS address books whose `goa_account_id` matches a GOA account Lookout
   already syncs contacts for. Lookout's own CardDAV and Graph sync already shows those, so
@@ -253,7 +272,25 @@ Add `source/crates/app/src/eds_directory.rs`.
 - Write this rule as a pure function, `eligible_books(&[EdsSource], &HashSet<goa id>)`, and
   unit-test it.
 
-### [ ] E1.4 — Setting and lifecycle (`S`)
+### [x] E1.4 — Setting and lifecycle (`S`)
+
+Done 2026-10-20 (v0.9.256).
+
+- **The setting.** The GSettings key `eds-address-books` (bool, default `true`) backs a
+  **Config → People** switch, "Include desktop address books", with the subtitle "Suggest
+  people from GNOME Contacts and Evolution when choosing recipients".
+- **When EDS can't be reached.** At startup a check runs on the worker thread
+  (`desktop_available`, which never starts EDS). If it fails, the switch is greyed out and
+  its subtitle says no Evolution Data Server address books can be reached.
+- **Changes apply straight away.** The switch drives a process-wide flag that every lookup
+  reads, so composers already open follow it. The EDS backend is always added to
+  `directory_source` and simply answers nothing while the switch is off.
+- **Turning it off** also closes the open books and drops the EDS connection
+  (`disconnect_desktop`).
+- **The connection is lazy, and EDS is never started** (done in E1.2).
+- **No `ObjectManager` signals.** Instead of listening for them, every lookup re-reads the
+  source list (E1.2), so a book added in GNOME Contacts appears on the next keystroke without
+  a restart, and no signal subscription has to be kept alive.
 
 - Add a GSettings key in `source/data/gschema/io.github.gavindi.Lookout.gschema.xml`:
   `eds-address-books` (bool, default `true`).
