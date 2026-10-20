@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.259" date="2026-10-20">
+      <description>
+        <p>No visible changes. This release adds groundwork for a read-only copy of Lookout's events in Evolution Data Server, which GNOME Shell's clock and GNOME Calendar can show in a later version.</p>
+      </description>
+    </release>
     <release version="0.9.258" date="2026-10-20">
       <description>
         <p>The privacy blur's partial setting now also hides sender names and addresses in the message list.</p>

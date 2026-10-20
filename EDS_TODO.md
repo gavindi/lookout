@@ -362,7 +362,56 @@ Done 2026-10-20 (v0.9.257).
 
 ## Phase 2 — Show Lookout's events in the GNOME Shell clock (option 2)
 
-### [ ] E2.1 — The mirror calendar (`M`)
+### [x] E2.1 — The mirror calendar (`M`)
+
+Done 2026-10-20 (v0.9.259). Where it differs from the plan below, following the E0.1 custom-file design:
+
+- **A read-only custom file, not a local calendar of EDS's own.** The source is a `local`
+  calendar with `[Local Backend] CustomFile=file://…/eds-mirror.ics` and `Writable=false`.
+  GNOME Calendar and Evolution show it as read-only, EDS reloads the file when it changes, and
+  removing the source leaves no data directory behind (E0.1, "A read-only mirror is possible").
+  E2.3 therefore rewrites one whole `VCALENDAR`, not individual events over D-Bus.
+- **API.**
+  - `ensure_mirror_source(eds, ics_file) -> Result<String>` returns the fixed
+    `MIRROR_SOURCE_UID` (`io.github.gavindi.Lookout.mirror`).
+  - `remove_mirror_source(eds) -> Result<bool>` removes the source and deletes the `.ics` file
+    it pointed at, since EDS leaves custom files alone. An already-missing file isn't an error.
+  - `MIRROR_DISPLAY_NAME`, `MIRROR_COLOR` and the UID are exported for the app.
+- **The key file** has `DisplayName=Lookout`, `Enabled=true`, `Parent=local-stub`,
+  `BackendName=local`, `Selected=true`, `Color=#4d9dff` (Lookout's accent blue in
+  `data/themes/base.css`), the custom file marked `Writable=false`, and a `[Lookout]
+  Mirror=true / Version=1` marker. `file://` URIs are percent-encoded, so a path with spaces or
+  non-ASCII characters still works.
+- **Only marked sources are touched.** A source with the mirror UID but without the marker is
+  refused (`Error::SourceNotMirror`), never overwritten or removed. A mark is checked on every
+  call, not remembered from an earlier run.
+- **Creation and drift.**
+  - `SourceManager.CreateSources` creates the source with the UID Lookout chooses; nothing is
+    written to `~/.config/evolution/sources`.
+  - An existing marked source is left alone when the keys Lookout owns match. When one has
+    drifted (the data directory moved, an old display name or colour), its key file is
+    rewritten through `Source.Writable.Write`. Under Snap that method isn't in the AppArmor
+    profile (P.2), so a drifted source fails soft there; a correct one is never rewritten.
+  - `ensure_mirror_source` refuses an EDS without the calendar factory
+    (`Error::CalendarsUnavailable`) rather than creating a source nothing can read.
+- **The file isn't created here.** E2.3 owns its contents. `ensure_mirror_source` validates
+  that the path is absolute (EDS may run outside Lookout's sandbox and would resolve a relative
+  path against its own working directory) and points the source at it.
+- **Removal** calls `Source.Removable.Remove` first, then deletes the percent-decoded
+  `CustomFile`, and only accepts a plain absolute `file://` URI, so a hand-edited source can't
+  make Lookout delete an unrelated path. A refusal or a missing source leaves the file alone.
+- **Tests:**
+  - unit: the key file's contract, marker matching, URI round-trips (spaces, `%`, non-ASCII),
+    relative-path refusal, and drift detection;
+  - D-Bus wire tests against the fake registry: creation with the fixed UID and exact keys, an
+    existing mirror left alone, a moved custom file rewritten, an unmarked source refused for
+    both ensure and remove, removal deleting source and file, removal when absent, and an
+    address-book-only EDS refused;
+  - the fake registry now answers `CreateSources`, `Source.Writable` and `Source.Removable`.
+- **Not done here:** writing or syncing the `.ics` (E2.3), the setting and app wiring (E2.4),
+  or refreshing the source's colour when Lookout's accent changes.
+
+The original plan:
 
 In `lookout-eds`, add `mirror.rs`.
 

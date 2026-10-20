@@ -2,7 +2,7 @@
 /// Software released under the GPL3 license
 use std::collections::{HashMap, HashSet};
 
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 use crate::keyfile::{language_names, KeyFile};
 use crate::proxies::{SourceObjectManagerProxy, SOURCE_INTERFACE};
@@ -59,17 +59,36 @@ impl Eds {
     /// Lists every address book, calendar, task list and mail account the
     /// registry knows, sorted by kind, then display name, then UID.
     pub async fn sources(&self) -> Result<Vec<EdsSource>> {
-        let manager = SourceObjectManagerProxy::new(self.connection()).await?;
-        let objects = manager.get_managed_objects().await?;
-        let raw: Vec<(String, String)> = objects
-            .values()
-            .filter_map(|interfaces| {
-                let props = interfaces.get(SOURCE_INTERFACE)?;
-                Some((get_string(props, "UID")?, get_string(props, "Data")?))
-            })
-            .collect();
-        Ok(parse_sources(raw.iter().map(|(uid, data)| (uid.as_str(), data.as_str())), &language_names()))
+        let raw = managed_sources(self).await?;
+        Ok(parse_sources(raw.iter().map(|s| (s.uid.as_str(), s.data.as_str())), &language_names()))
     }
+}
+
+/// One source object as the registry lists it, before its key file is parsed.
+/// The object path is needed by callers that write to or remove a source;
+/// `UID` is the stable key, since `Source_N` paths are renumbered.
+pub(crate) struct ManagedSource {
+    pub path: OwnedObjectPath,
+    pub uid: String,
+    pub data: String,
+}
+
+/// Reads `GetManagedObjects` and keeps the source objects (every one with a
+/// `UID` and `Data`).
+pub(crate) async fn managed_sources(eds: &Eds) -> Result<Vec<ManagedSource>> {
+    let manager = SourceObjectManagerProxy::new(eds.connection()).await?;
+    let objects = manager.get_managed_objects().await?;
+    Ok(objects
+        .into_iter()
+        .filter_map(|(path, interfaces)| {
+            let props = interfaces.get(SOURCE_INTERFACE)?;
+            Some(ManagedSource {
+                path,
+                uid: get_string(props, "UID")?,
+                data: get_string(props, "Data")?,
+            })
+        })
+        .collect())
 }
 
 fn get_string(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {

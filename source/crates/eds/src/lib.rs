@@ -18,10 +18,12 @@ mod address_book;
 mod discovery;
 mod error;
 mod keyfile;
+mod mirror;
 pub mod proxies;
 mod sources;
 
 pub use address_book::{people_from_card, search_query, EdsAddressBook, EdsPerson};
 pub use discovery::Eds;
 pub use error::{Error, Result};
+pub use mirror::{ensure_mirror_source, remove_mirror_source, MIRROR_COLOR, MIRROR_DISPLAY_NAME, MIRROR_SOURCE_UID};
 pub use sources::{EdsSource, EdsSourceKind};

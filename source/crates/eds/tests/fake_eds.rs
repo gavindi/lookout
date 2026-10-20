@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lookout_eds::{people_from_card, Eds, EdsAddressBook, EdsSourceKind};
+use lookout_eds::{ensure_mirror_source, people_from_card, remove_mirror_source, Eds, EdsAddressBook, EdsSourceKind, MIRROR_SOURCE_UID};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{fdo, interface};
 
@@ -446,4 +446,177 @@ async fn listing_falls_back_to_match_all_when_any_field_is_rejected() {
     let book = EdsAddressBook::open(&eds, "system-address-book").await.unwrap();
     assert_eq!(book.all_contacts().await.unwrap().len(), 1);
     assert_eq!(log.lock().unwrap().queries, [any_field, "#t".to_string()]);
+}
+
+/// What the fake registry's `CreateSources`, `Source.Writable` and
+/// `Source.Removable` saw.
+#[derive(Default)]
+struct MirrorLog {
+    created: HashMap<String, String>,
+    writes: Vec<String>,
+    removes: usize,
+}
+
+struct FakeSourceManager {
+    log: Arc<Mutex<MirrorLog>>,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.SourceManager")]
+impl FakeSourceManager {
+    fn create_sources(&self, sources: HashMap<String, String>) {
+        self.log.lock().unwrap().created.extend(sources);
+    }
+}
+
+struct FakeSourceWritable {
+    log: Arc<Mutex<MirrorLog>>,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.Source.Writable")]
+impl FakeSourceWritable {
+    fn write(&self, data: &str) {
+        self.log.lock().unwrap().writes.push(data.to_string());
+    }
+}
+
+struct FakeSourceRemovable {
+    log: Arc<Mutex<MirrorLog>>,
+}
+
+#[interface(name = "org.gnome.evolution.dataserver.Source.Removable")]
+impl FakeSourceRemovable {
+    fn remove(&self) {
+        self.log.lock().unwrap().removes += 1;
+    }
+}
+
+/// A fake EDS that also answers `CreateSources`, with the shared log callers
+/// use to inspect what was written.
+async fn fake_eds_with_mirror_log(bus: &PrivateBus, names: &[&str], registry: FakeObjectManager) -> (zbus::Connection, Arc<Mutex<MirrorLog>>) {
+    let service = fake_eds(bus, names, registry).await;
+    let log = Arc::new(Mutex::new(MirrorLog::default()));
+    service.object_server().at(SOURCE_MANAGER_PATH, FakeSourceManager { log: log.clone() }).await.unwrap();
+    (service, log)
+}
+
+/// The key file an installed mirror source would carry, for tests that find
+/// an existing source. Paths under the test's temp directory need no
+/// percent-encoding.
+fn mirror_data(ics_file: &std::path::Path) -> String {
+    format!(
+        "[Data Source]\nDisplayName=Lookout\nEnabled=true\nParent=local-stub\n\n\
+         [Calendar]\nBackendName=local\nColor=#4d9dff\nSelected=true\n\n\
+         [Local Backend]\nCustomFile=file://{}\nWritable=false\n\n\
+         [Lookout]\nMirror=true\nVersion=1\n",
+        ics_file.display()
+    )
+}
+
+const FIRST_SOURCE_PATH: &str = "/org/gnome/evolution/dataserver/SourceManager/Source_0";
+
+#[tokio::test]
+async fn creates_the_mirror_source_with_a_fixed_uid_and_the_read_only_custom_file() {
+    let bus = PrivateBus::start(&[]);
+    let (_service, log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, CALENDAR8], registry(&[])).await;
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+    let file = bus.dir.join("eds-mirror.ics");
+
+    assert_eq!(ensure_mirror_source(&eds, &file).await.unwrap(), MIRROR_SOURCE_UID);
+    let log = log.lock().unwrap();
+    let data = log.created.get(MIRROR_SOURCE_UID).expect("the mirror source should be created");
+    assert!(data.contains("DisplayName=Lookout\n"));
+    assert!(data.contains("Parent=local-stub\n"));
+    assert!(data.contains("Selected=true\n"));
+    assert!(data.contains("Writable=false\n"));
+    assert!(data.contains(&format!("CustomFile=file://{}\n", file.display())));
+    assert!(data.ends_with("[Lookout]\nMirror=true\nVersion=1\n"));
+}
+
+#[tokio::test]
+async fn an_existing_mirror_is_left_alone() {
+    let bus = PrivateBus::start(&[]);
+    let file = bus.dir.join("eds-mirror.ics");
+    let data = mirror_data(&file);
+    let (_service, log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, CALENDAR8], registry(&[(MIRROR_SOURCE_UID, data.as_str())])).await;
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    assert_eq!(ensure_mirror_source(&eds, &file).await.unwrap(), MIRROR_SOURCE_UID);
+    let log = log.lock().unwrap();
+    assert!(log.created.is_empty(), "the source already exists");
+    assert!(log.writes.is_empty(), "nothing has drifted");
+}
+
+#[tokio::test]
+async fn a_mirror_whose_custom_file_moved_is_rewritten() {
+    let bus = PrivateBus::start(&[]);
+    let file = bus.dir.join("eds-mirror.ics");
+    let old = "[Data Source]\nDisplayName=Old\nEnabled=true\nParent=local-stub\n\n\
+         [Calendar]\nBackendName=local\nColor=#3584e4\nSelected=true\n\n\
+         [Local Backend]\nCustomFile=file:///old/place.ics\nWritable=false\n\n\
+         [Lookout]\nMirror=true\nVersion=1\n";
+    let (service, log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, CALENDAR8], registry(&[(MIRROR_SOURCE_UID, old)])).await;
+    service.object_server().at(FIRST_SOURCE_PATH, FakeSourceWritable { log: log.clone() }).await.unwrap();
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    assert_eq!(ensure_mirror_source(&eds, &file).await.unwrap(), MIRROR_SOURCE_UID);
+    let log = log.lock().unwrap();
+    assert!(log.created.is_empty(), "an existing source is updated, not recreated");
+    assert_eq!(log.writes.len(), 1);
+    let data = &log.writes[0];
+    assert!(data.contains("DisplayName=Lookout\n"));
+    assert!(data.contains(&format!("CustomFile=file://{}\n", file.display())));
+    assert!(data.contains("Color=#4d9dff\n"));
+}
+
+#[tokio::test]
+async fn a_source_with_the_mirror_uid_but_no_marker_is_never_touched() {
+    let bus = PrivateBus::start(&[]);
+    let data = "[Data Source]\nDisplayName=Lookout\nEnabled=true\nParent=local-stub\n\n[Calendar]\nBackendName=local\nSelected=true\n";
+    let (service, log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, CALENDAR8], registry(&[(MIRROR_SOURCE_UID, data)])).await;
+    service.object_server().at(FIRST_SOURCE_PATH, FakeSourceWritable { log: log.clone() }).await.unwrap();
+    service.object_server().at(FIRST_SOURCE_PATH, FakeSourceRemovable { log: log.clone() }).await.unwrap();
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    assert!(ensure_mirror_source(&eds, &bus.dir.join("eds-mirror.ics")).await.is_err());
+    assert!(remove_mirror_source(&eds).await.is_err());
+    let log = log.lock().unwrap();
+    assert!(log.created.is_empty());
+    assert!(log.writes.is_empty());
+    assert_eq!(log.removes, 0);
+}
+
+#[tokio::test]
+async fn removing_the_mirror_deletes_its_source_and_file() {
+    let bus = PrivateBus::start(&[]);
+    let file = bus.dir.join("eds-mirror.ics");
+    std::fs::write(&file, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n").unwrap();
+    let data = mirror_data(&file);
+    let (service, log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, CALENDAR8], registry(&[(MIRROR_SOURCE_UID, data.as_str())])).await;
+    service.object_server().at(FIRST_SOURCE_PATH, FakeSourceRemovable { log: log.clone() }).await.unwrap();
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    assert!(remove_mirror_source(&eds).await.unwrap());
+    assert_eq!(log.lock().unwrap().removes, 1);
+    assert!(!file.exists(), "the custom file is Lookout's to delete");
+}
+
+#[tokio::test]
+async fn removing_a_mirror_that_isnt_there_is_not_an_error() {
+    let bus = PrivateBus::start(&[]);
+    let (_service, _log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, CALENDAR8], registry(&[])).await;
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    assert!(!remove_mirror_source(&eds).await.unwrap());
+}
+
+#[tokio::test]
+async fn the_mirror_needs_calendar_support() {
+    // An address-book-only EDS: the source could be created, but nothing
+    // would ever read it as a calendar.
+    let bus = PrivateBus::start(&[]);
+    let (_service, log) = fake_eds_with_mirror_log(&bus, &[SOURCES5, ADDRESS_BOOK10], registry(&[])).await;
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    assert!(ensure_mirror_source(&eds, &bus.dir.join("eds-mirror.ics")).await.is_err());
+    assert!(log.lock().unwrap().created.is_empty());
 }
