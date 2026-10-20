@@ -19,6 +19,8 @@
 
         "--talk-name=org.gnome.OnlineAccounts",
 
+        "--talk-name=org.gnome.evolution.dataserver.*",
+
         "--talk-name=org.freedesktop.portal.Background",
 
         "--talk-name=org.kde.StatusNotifierWatcher",

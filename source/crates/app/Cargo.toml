@@ -71,6 +71,9 @@ maintainer = "Gavin Graham <gavindi@users.noreply.github.com>"
 copyright = "2026 Gavin Graham"
 license-file = ["../../../LICENSE", "0"]
 depends = "libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.5), libwebkitgtk-6.0-4, libglib2.0-0"
+# Optional: enables EDS address-book search and the desktop calendar mirror.
+# Lookout still runs without EDS, so this must never become a hard dependency.
+recommends = "evolution-data-server"
 section = "mail"
 priority = "optional"
 assets = [

@@ -659,7 +659,26 @@ dependency in this crate).
 
 ## Packaging (all phases)
 
-### [ ] P.1 — Flatpak (`S`)
+### [x] P.1 — Flatpak (`S`)
+
+Done 2026-10-21.
+
+- **The permission.** `source/flatpak/io.github.gavindi.Lookout.json` now grants
+  `--talk-name=org.gnome.evolution.dataserver.*`. The wildcard is needed because EDS uses
+  several names under that prefix (the `Sources5`, `Calendar8` and `AddressBook10`
+  factories, plus backend subprocess names that vary by build and process), and Flatpak
+  matches one bus name per entry.
+- **Verified by E0.1.** The spike ran listing, queries, `CreateSources`/`Write`/`Remove`
+  and the custom-file mirror both on the host and inside a Flatpak with exactly this
+  permission. It also covers `UserPrompter0`, which Lookout doesn't use.
+- **No filesystem permission.** E3 will read each source's `Data` property over D-Bus, so
+  `~/.config/evolution/sources` doesn't need to be mounted. The README records this.
+- **No secrets permission yet.** E3.3 isn't implemented; without
+  `--talk-name=org.freedesktop.secrets` it will fall back to asking for the password in
+  the Flatpak build. Granting keyring access is a separate decision for that item.
+- `source/flatpak/README.md` explains the new permission for reviewers.
+
+The original plan:
 
 - Add `--talk-name=org.gnome.evolution.dataserver.*` (a wildcard, because of the backend
   subprocess names; E0.1 confirms this).
@@ -677,7 +696,17 @@ dependency in this crate).
 - E3 needs `personal-files` read access to `~/.config/evolution/sources`, which requires
   Snap Store approval. Request it, or leave E3 out of the Snap build.
 
-### [ ] P.3 — Debian package (`S`)
+### [x] P.3 — Debian package (`S`)
+
+Done 2026-10-21.
+
+- **The field.** `source/crates/app/Cargo.toml`'s `[package.metadata.deb]` now has
+  `recommends = "evolution-data-server"`, which cargo-deb emits as `Recommends:`.
+- **Not a dependency.** The existing `depends` list is unchanged. Lookout starts and runs
+  without EDS; only the address-book and calendar-mirror features are unavailable.
+- The RPM metadata is unchanged, since this item covers Debian packaging.
+
+The original plan:
 
 - Add `Recommends: evolution-data-server` in `[package.metadata.deb]`. It must not be a
   hard `Depends`, because Lookout runs fine without EDS.
