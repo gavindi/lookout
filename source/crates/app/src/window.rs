@@ -7497,6 +7497,52 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 .set_int(crate::settings::CALENDAR_DEFAULT_REMINDER, crate::settings::default_reminder_at(row.selected()));
         });
     }
+
+    // Config → Calendar → EDS mirror (EDS_TODO.md E2.4/E2.5). Seeding the
+    // rows at startup is guarded off (`eds_mirror_seeding`) so a stored "on"
+    // doesn't toast before the availability check; the startup block below
+    // starts the mirror explicitly once it has seeded them.
+    let eds_mirror_seeding = Rc::new(Cell::new(true));
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let config_view = config_view.clone();
+        let toast_overlay = toast_overlay.clone();
+        let details_row = config_view.eds_mirror_details_row.clone();
+        let seeding = eds_mirror_seeding.clone();
+        config_view.eds_mirror_calendar_row.connect_active_notify(move |row| {
+            if seeding.get() {
+                return;
+            }
+            let enabled = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::EDS_MIRROR_CALENDAR, enabled);
+            let details = state.borrow().settings.get_bool(crate::settings::EDS_MIRROR_DETAILS);
+            details_row.set_sensitive(enabled);
+            let toast = toast_overlay.clone();
+            let row = row.clone();
+            let on_error: Rc<dyn Fn(String)> = Rc::new(move |message| {
+                let title = glib::markup_escape_text(&format!("Couldn't update the calendar mirror: {message}"));
+                toast.add_toast(adw::Toast::new(&title));
+                row.set_active(false);
+            });
+            crate::eds_mirror::apply_enabled(&calendar_state, &worker, enabled, details, on_error);
+        });
+    }
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        let calendar_state = calendar_state.clone();
+        let seeding = eds_mirror_seeding.clone();
+        config_view.eds_mirror_details_row.connect_active_notify(move |row| {
+            if seeding.get() {
+                return;
+            }
+            let details = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::EDS_MIRROR_DETAILS, details);
+            crate::eds_mirror::set_details(&calendar_state, &worker, details);
+        });
+    }
     // Config → People → "File contacts as" (P-07): persists the preference and
     // repaints the People list so a re-file is visible immediately.
     {
@@ -7792,6 +7838,41 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view
             .calendar_default_reminder_row
             .set_selected(crate::settings::default_reminder_index(persisted.get_int(crate::settings::CALENDAR_DEFAULT_REMINDER)));
+        // Calendar → EDS mirror (E2.4/E2.5): seed the switches while the
+        // handlers are suppressed, then start the mirror if it was on - which
+        // re-creates the EDS source if it went missing and refreshes the file.
+        let mirror_enabled = persisted.get_bool(crate::settings::EDS_MIRROR_CALENDAR);
+        let mirror_details = persisted.get_bool(crate::settings::EDS_MIRROR_DETAILS);
+        config_view.eds_mirror_details_row.set_active(mirror_details);
+        config_view.eds_mirror_calendar_row.set_active(mirror_enabled);
+        config_view.eds_mirror_details_row.set_sensitive(mirror_enabled);
+        eds_mirror_seeding.set(false);
+        if mirror_enabled {
+            crate::eds_mirror::apply_enabled(
+                &calendar_state,
+                &worker,
+                true,
+                mirror_details,
+                Rc::new(|e| tracing::warn!("EDS mirror couldn't start: {e}")),
+            );
+        }
+        {
+            let (tx, rx) = async_channel::bounded(1);
+            worker.spawn(async move {
+                let _ = tx.send(crate::eds_mirror::mirror_available().await).await;
+            });
+            let row = config_view.eds_mirror_calendar_row.clone();
+            let details = config_view.eds_mirror_details_row.clone();
+            glib::spawn_future_local(async move {
+                if let Ok(false) = rx.recv().await {
+                    row.set_subtitle(crate::config_view::EDS_MIRROR_UNAVAILABLE_SUBTITLE);
+                    if !row.is_active() {
+                        row.set_sensitive(false);
+                        details.set_sensitive(false);
+                    }
+                }
+            });
+        }
         config_view
             .contacts_file_as_row
             .set_selected(crate::settings::contact_file_as_index(&persisted.get_string(crate::settings::CONTACTS_FILE_AS)));
@@ -8695,6 +8776,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let keyring = keyring.clone();
                 let toast_overlay = toast_overlay.clone();
                 let refresh_hook = refresh_hook.clone();
+                let calendar_state = calendar_state.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let account_id = AccountId(account_id.to_string());
                     state.borrow_mut().accounts.remove(&account_id);
@@ -8721,6 +8803,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         tracing::warn!("could not remove cache for removed account {account_id}: {e}");
                     }
                     toast_overlay.add_toast(adw::Toast::new("Account removed"));
+                    // Its events must leave the desktop mirror now, not at the
+                    // next calendar refresh (EDS_TODO.md E2.4).
+                    crate::eds_mirror::request_sync(&calendar_state, &worker, None);
                     let refresh = refresh_hook.borrow().clone();
                     refresh();
                 })
@@ -8936,6 +9021,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             &refresh_contacts_ui,
                             &dashboard_refresh,
                         );
+                        // A disabled account's events leave the desktop
+                        // mirror straight away (EDS_TODO.md E2.4).
+                        crate::eds_mirror::request_sync(&calendar_state, &worker, None);
                     }
                     // Repaint the Config account list so the switch's new
                     // state and the service lists underneath stay current.
@@ -9304,6 +9392,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_overview_day = mail_overview_day.clone();
         let mail_overview_day_list = mail_overview_day_list.clone();
         let toast_overlay = toast_overlay.clone();
+        let worker = worker.clone();
         config_view.clear_cache_row.connect_activated(move |_| {
             match (lookout_mail::clear_all_caches(), lookout_dav::clear_all_caches()) {
                 (Ok(()), Ok(())) => toast_overlay.add_toast(adw::Toast::new("Cleared email, calendar and contacts caches")),
@@ -9316,6 +9405,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     toast_overlay.add_toast(adw::Toast::new(&title));
                 }
             }
+            // The mirror is derived from the calendar caches, so clear it too
+            // and let the request below (and the month resyncs after it)
+            // refill it from scratch (EDS_TODO.md E2.4).
+            crate::eds_mirror::clear_mirror_file();
+            crate::eds_mirror::request_sync(&calendar_state, &worker, None);
             let month = calendar_state.borrow().displayed_month;
             for handle in calendar_state.borrow_mut().accounts.values_mut() {
                 handle.last_occurrences.clear();

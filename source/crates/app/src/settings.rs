@@ -174,6 +174,12 @@ pub const CALENDAR_PRIMARY_TZ: &str = "calendar-primary-tz";
 pub const CALENDAR_SECONDARY_TZ: &str = "calendar-secondary-tz";
 /// Calendar → "Default reminder" (minutes before a new event; -1 = none).
 pub const CALENDAR_DEFAULT_REMINDER: &str = "calendar-default-reminder";
+/// Calendar → "Show Lookout events in the GNOME clock and calendar":
+/// mirrors Lookout's events into a read-only EDS calendar (EDS_TODO.md E2.4).
+pub const EDS_MIRROR_CALENDAR: &str = "eds-mirror-calendar";
+/// Calendar → "Include event notes": copies descriptions into the EDS mirror
+/// too (EDS_TODO.md E2.4); off by default for privacy.
+pub const EDS_MIRROR_DETAILS: &str = "eds-mirror-details";
 /// People → "File contacts as": how a contact with no per-contact `file_as`
 /// is listed and sorted (P-07). One of [`lookout_core::FileAs`]'s strings.
 pub const CONTACTS_FILE_AS: &str = "contacts-file-as";
@@ -351,6 +357,8 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(CALENDAR_PRIMARY_TZ, Value::String(String::new()));
     map.insert(CALENDAR_SECONDARY_TZ, Value::String(String::new()));
     map.insert(CALENDAR_DEFAULT_REMINDER, Value::Int(-1));
+    map.insert(EDS_MIRROR_CALENDAR, Value::Bool(false));
+    map.insert(EDS_MIRROR_DETAILS, Value::Bool(false));
     map.insert(CONTACTS_FILE_AS, Value::String("last-first".into()));
     map.insert(EDS_ADDRESS_BOOKS, Value::Bool(true));
     map.insert(TASKS_SORT_KEY, Value::String("due".into()));
@@ -1172,6 +1180,8 @@ mod tests {
         assert_eq!(store.get_int(CALENDAR_WORK_END), 18);
         assert_eq!(store.get_string(CALENDAR_PRIMARY_TZ), "");
         assert_eq!(store.get_int(CALENDAR_DEFAULT_REMINDER), -1);
+        assert!(!store.get_bool(EDS_MIRROR_CALENDAR));
+        assert!(!store.get_bool(EDS_MIRROR_DETAILS));
         assert!(store.get_bool(EDS_ADDRESS_BOOKS));
     }
 

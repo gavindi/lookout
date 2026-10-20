@@ -6,8 +6,8 @@
 //! toggle), a live Keyboard-shortcuts section (per-action
 //! capture rows over the `shortcuts` GSettings key), the Appearance page
 //! (theme, accent, window background, and the folder/message-list vertical-
-//! spacing choice), disabled placeholder
-//! sections mirroring the rest of the Phase 5 settings taxonomy (Privacy) and a live
+//! spacing choice), the Calendar settings (including the read-only EDS mirror),
+//! a Privacy section explaining the mirror, and a live
 //! Advanced section with a cache-clear action. Data-in/widget-out like
 //! `calendar_view.rs` and `folder_tree.rs`: the caller (window.rs) owns the
 //! session state and feeds plain display structs into `refresh`.
@@ -389,6 +389,13 @@ pub struct ConfigView {
     pub calendar_secondary_tz_row: adw::ComboRow,
     /// "Default reminder" preset combo (Config → Calendar).
     pub calendar_default_reminder_row: adw::ComboRow,
+    /// "Show Lookout events in the GNOME clock and calendar" switch
+    /// (Config → Calendar, EDS_TODO.md E2.4); bound to
+    /// `EDS_MIRROR_CALENDAR`.
+    pub eds_mirror_calendar_row: adw::SwitchRow,
+    /// "Include event notes" switch (Config → Calendar, E2.4), sensitive only
+    /// while the mirror is on; bound to `EDS_MIRROR_DETAILS`.
+    pub eds_mirror_details_row: adw::SwitchRow,
     /// "File contacts as" combo (Config → People, P-07); its selected index
     /// maps to `CONTACT_FILE_AS`.
     pub contacts_file_as_row: adw::ComboRow,
@@ -510,17 +517,6 @@ fn add_section(stack: &gtk::Stack, sections: &mut Vec<(&'static str, &'static st
     sections.push((label, name));
 }
 
-/// A disabled "Not implemented yet" placeholder group for a not-yet-built
-/// section of the Phase 5 settings taxonomy - same honest-disabled
-/// convention as the menu bar's Home/View ribbon tabs.
-fn placeholder_group(title: &str) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title(title).build();
-    let row = adw::ActionRow::builder().title("Not implemented yet").build();
-    row.set_sensitive(false);
-    group.add(&row);
-    group
-}
-
 /// Wraps `content` in the app's rounded/bordered ".card" treatment (mirrors
 /// window.rs's private `card_section` helper - duplicated here rather than
 /// shared so this module stays decoupled from window.rs, per its own
@@ -533,6 +529,16 @@ pub const EDS_ADDRESS_BOOKS_SUBTITLE: &str = "Show people from GNOME Contacts an
 /// reach - none installed or running, an unsupported version, or a sandbox
 /// without the permission.
 pub const EDS_ADDRESS_BOOKS_UNAVAILABLE_SUBTITLE: &str = "Not available - this desktop has no Evolution Data Server address books Lookout can reach";
+
+/// Calendar → "Show Lookout events in the GNOME clock and calendar" (EDS_TODO.md
+/// E2.4/E2.5). The copy is read-only in GNOME Calendar and Evolution.
+pub const EDS_MIRROR_SUBTITLE: &str = "Copy events into the desktop calendar as a read-only copy, so the GNOME clock and GNOME Calendar show them";
+
+/// Its subtitle once the check finds no Evolution Data Server calendar.
+pub const EDS_MIRROR_UNAVAILABLE_SUBTITLE: &str = "Not available - this desktop has no Evolution Data Server calendar Lookout can reach";
+
+/// The dependent "Include event notes" switch (EDS_TODO.md E2.4).
+pub const EDS_MIRROR_DETAILS_SUBTITLE: &str = "Also copy event notes; every app on the desktop can read them";
 
 pub fn build() -> ConfigView {
     let accounts_group = adw::PreferencesGroup::builder().title("Accounts").build();
@@ -843,6 +849,14 @@ pub fn build() -> ConfigView {
         .model(&gtk::StringList::new(&reminder_labels))
         .build();
     calendar_settings_group.add(&calendar_default_reminder_row);
+    let eds_mirror_calendar_row = adw::SwitchRow::builder()
+        .title("Show Lookout events in the GNOME clock and calendar")
+        .subtitle(EDS_MIRROR_SUBTITLE)
+        .build();
+    calendar_settings_group.add(&eds_mirror_calendar_row);
+    let eds_mirror_details_row = adw::SwitchRow::builder().title("Include event notes").subtitle(EDS_MIRROR_DETAILS_SUBTITLE).build();
+    eds_mirror_details_row.set_sensitive(false);
+    calendar_settings_group.add(&eds_mirror_details_row);
 
     // People (P-07): how a contact with no per-contact "File as" value is
     // listed and sorted in the People screen.
@@ -1051,7 +1065,13 @@ pub fn build() -> ConfigView {
     appearance_group.add(&conversation_include_sent_row);
     conversations_row.bind_property("active", &conversation_order_row, "sensitive").sync_create().build();
     conversations_row.bind_property("active", &conversation_include_sent_row, "sensitive").sync_create().build();
-    let privacy_group = placeholder_group("Privacy");
+    let privacy_group = adw::PreferencesGroup::builder().title("Privacy").build();
+    let mirror_privacy_row = adw::ActionRow::builder()
+        .title("Desktop calendar mirror")
+        .subtitle("When 'Show Lookout events in the GNOME clock and calendar' is on, event titles, times and locations (and notes, if allowed) are copied into the desktop's calendar store, where other apps on the desktop can read them. The copy is read-only in GNOME Calendar and Evolution.")
+        .build();
+    mirror_privacy_row.set_subtitle_lines(0);
+    privacy_group.add(&mirror_privacy_row);
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
 
@@ -1259,6 +1279,8 @@ pub fn build() -> ConfigView {
         calendar_primary_tz_row,
         calendar_secondary_tz_row,
         calendar_default_reminder_row,
+        eds_mirror_calendar_row,
+        eds_mirror_details_row,
         contacts_file_as_row,
         eds_address_books_row,
         google_tasks_client_row,

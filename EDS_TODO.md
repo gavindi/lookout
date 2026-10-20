@@ -545,32 +545,55 @@ The original plan:
 - Only one sync runs at a time. The pattern is `GraphPropertySyncs`: a later request
   coalesces into a single follow-up run.
 
-### [ ] E2.4 — Setting, privacy and cleanup (`S`)
+### [x] E2.4 — Setting, privacy and cleanup (`S`)
 
-- Add GSettings keys:
-  - `eds-mirror-calendar` (bool, default `false`);
-  - `eds-mirror-details` (bool, default `false`), which copies descriptions as well as
-    titles and locations.
-- Add a switch under **Settings → Calendar**: "Show Lookout events in the GNOME clock and
-  calendar". Below it, add a "Include event notes" switch that is active only when the
-  first one is on.
-- Turning the mirror off calls `remove_mirror_source`.
-- Removing an account syncs straight away, so that account's events leave the mirror.
-- Clearing caches (`clear_all_caches`) also clears the mirror, then refills it on the next
-  sync.
-- **Settings → Privacy** text: say that the mirror copies event titles and times into the
-  desktop's calendar store, where other apps on the desktop can read them.
+Done 2026-10-21.
 
-### [ ] E2.5 — Edits made in other apps (`S`)
+- **The settings.** `eds-mirror-calendar` (bool, default `false`) backs Config → Calendar
+  → "Show Lookout events in the GNOME clock and calendar". `eds-mirror-details` (bool,
+  default `false`) backs the dependent "Include event notes" switch, which is sensitive
+  only while the mirror is on. Both are in the schema, the `settings.rs` fallback
+  defaults, and the defaults test.
+- **Enabling and disabling.** `eds_mirror::apply_enabled` connects to EDS, creates the
+  source through `ensure_mirror_source(mirror_path())`, and only then turns the sync on;
+  disabling turns the sync off, then calls `remove_mirror_source`, which also deletes the
+  `.ics`. A failure while enabling shows a toast explaining it and resets the switch;
+  startup failures are logged instead, because the mirror is off by default and a
+  desktop without EDS shouldn't toast on every launch.
+- **Availability.** At Config startup `mirror_available()` (which never starts EDS) greys
+  the switch out with "Not available - this desktop has no Evolution Data Server
+  calendar Lookout can reach" when the calendar factory isn't there. A stored "on" stays
+  on, so it starts working when EDS appears.
+- **Startup.** The rows are seeded with their notification handlers suppressed, then the
+  stored setting is applied: enabling re-creates the EDS source if it has gone missing
+  and requests an immediate sync.
+- **Account removal.** Removing a manual account and disabling a GOA account both request
+  a sync straight away; the account has already left `CalendarUiState::accounts`, so its
+  cached events are no longer sources and drop out of the mirror.
+- **Clearing caches.** `clear_all_caches` deletes the mirror file and requests a sync;
+  the request (and the month resyncs that follow) refills it from the freshly fetched
+  calendar caches.
+- **Privacy.** Config → Privacy is now a real group with a "Desktop calendar mirror" row
+  explaining that titles, times and locations (and notes when allowed) are copied into
+  the desktop calendar store, where other apps can read them.
+- **Tests.** The settings-defaults test covers both new keys; the mirror's own tests now
+  include the E2.5 restoration case below.
 
-The mirror is meant to be copied one way. Edits made in GNOME Calendar are overwritten or
-removed at the next sync.
+### [x] E2.5 — Edits made in other apps (`S`)
 
-- If E0.1 finds a way to make the source read-only, use it.
-- If not, the next sync's comparison restores the original. Mention this in the setting's
-  subtitle ("read-only copy").
-- Test: an extra, unknown UID in the mirror gets removed, and an event whose hash differs
-  gets modified.
+Done 2026-10-21.
+
+- **Read-only, by design.** E2.1 already creates the source with
+  `[Local Backend] Writable=false`, and E0.1 verified that GNOME Calendar and Evolution
+  see that flag and turn editing off. There is no further write path to block, so E2.5
+  is solved by the existing custom-file source rather than new code; the setting's
+  subtitle now says "read-only copy".
+- **If something writes anyway.** The flag is advisory: another client's create/modify/
+  remove calls can return OK but are kept in memory only and disappear when EDS reloads
+  the file. Lookout's comparison still restores the file's intended contents, and adding
+  `foreign_edits_are_restored_or_removed` pins both halves: a VEVENT whose
+  `X-LOOKOUT-HASH` differs is a `modify`, and an unknown UID is a `remove`. That test
+  brings `eds_mirror` to 19 unit tests.
 
 ---
 

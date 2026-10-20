@@ -372,6 +372,16 @@
       <summary>Default reminder</summary>
       <description>Minutes before a new event its reminder defaults to; -1 means no default reminder.</description>
     </key>
+    <key name="eds-mirror-calendar" type="b">
+      <default>false</default>
+      <summary>Show Lookout events in the GNOME clock and calendar</summary>
+      <description>Copy Lookout's events into the desktop's calendar store (Evolution Data Server) as a read-only calendar, so GNOME Shell's clock and GNOME Calendar show them. Other apps on the desktop can read the copied titles, times and locations. Has no effect when Evolution Data Server isn't available.</description>
+    </key>
+    <key name="eds-mirror-details" type="b">
+      <default>false</default>
+      <summary>Include event notes in the mirror</summary>
+      <description>Also copy event descriptions into the desktop calendar mirror. Notes routinely hold dial-in codes, agendas and other private text, which every app on the desktop can read, so this is off by default.</description>
+    </key>
 
     <!-- People -->
     <key name="contacts-file-as" enum="io.github.gavindi.Lookout.ContactFileAs">

@@ -291,6 +291,56 @@ pub(crate) fn mirror_path() -> PathBuf {
     glib::user_data_dir().join("lookout").join("eds-mirror.ics")
 }
 
+/// Creates or finds the EDS source for the mirror, ready to read
+/// [`mirror_path`]. Returns a human-readable failure for the settings switch
+/// to toast; no EDS (or an EDS without its calendar factory) is the ordinary
+/// unavailable case, never an error dialog.
+pub(crate) async fn ensure_mirror() -> Result<(), String> {
+    let eds = lookout_eds::Eds::connect()
+        .await
+        .map_err(|e| format!("Couldn't reach Evolution Data Server: {e}"))?
+        .ok_or_else(|| "Evolution Data Server isn't available".to_string())?;
+    lookout_eds::ensure_mirror_source(&eds, &mirror_path())
+        .await
+        .map_err(|e| format!("Couldn't create the Lookout calendar: {e}"))?;
+    Ok(())
+}
+
+/// Removes Lookout's EDS source and the file it pointed at. A desktop without
+/// EDS has nothing to remove, which isn't an error.
+pub(crate) async fn remove_mirror() -> Result<bool, String> {
+    let Some(eds) = lookout_eds::Eds::connect().await.map_err(|e| format!("Couldn't reach Evolution Data Server: {e}"))? else {
+        return Ok(false);
+    };
+    lookout_eds::remove_mirror_source(&eds)
+        .await
+        .map_err(|e| format!("Couldn't remove the Lookout calendar: {e}"))
+}
+
+/// Whether this desktop exposes an EDS calendar factory the mirror can use.
+/// Like every other EDS check this never starts EDS.
+pub(crate) async fn mirror_available() -> bool {
+    match lookout_eds::Eds::connect().await {
+        Ok(Some(eds)) => eds.supports_calendars(),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::debug!("EDS mirror availability check failed: {e}");
+            false
+        }
+    }
+}
+
+/// Deletes the mirror file without touching the EDS source. Clearing the
+/// calendar caches uses this so the next sync starts from an empty mirror;
+/// EDS sees the file disappear and empties its view until the rewrite.
+pub(crate) fn clear_mirror_file() {
+    match std::fs::remove_file(mirror_path()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("couldn't clear the EDS mirror file: {e}"),
+    }
+}
+
 /// The first-of-month cache keys the rolling window can touch. The sessions
 /// bucket occurrences by the UTC date of their start, so this is the set of
 /// month caches worth reading.
@@ -514,6 +564,12 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 pub(crate) struct MirrorSyncState {
     pub(crate) enabled: bool,
     pub(crate) include_description: bool,
+    /// The latest switch position, even while an enable is still creating
+    /// the EDS source. `enabled` is the applied state.
+    desired_enabled: bool,
+    /// Bumped by every `apply_enabled`, so a slow earlier attempt can't
+    /// override a newer switch position.
+    generation: u64,
     running: bool,
     pending: bool,
     debounce: Option<glib::SourceId>,
@@ -543,10 +599,78 @@ impl MirrorSyncState {
     }
 }
 
-/// E2.4 will call this with the `eds-mirror-calendar` and
-/// `eds-mirror-details` settings. Turning it on syncs at once, so the startup
-/// trigger isn't the only way the first calendar appears.
-#[allow(dead_code)] // E2.4 adds the setting and its switch.
+/// E2.4's switch: ensures EDS has the mirror source before enabling the sync,
+/// and removes the source after disabling it. `on_error` runs on the main
+/// thread (the startup caller logs, the settings switch resets itself and
+/// toasts); everything fails soft, so an unavailable EDS is never fatal.
+pub(crate) fn apply_enabled(calendar_state: &Rc<RefCell<CalendarUiState>>, worker: &Rc<Worker>, enabled: bool, include_description: bool, on_error: Rc<dyn Fn(String)>) {
+    let generation = {
+        let mut state = calendar_state.borrow_mut();
+        state.eds_mirror.generation = state.eds_mirror.generation.wrapping_add(1);
+        state.eds_mirror.desired_enabled = enabled;
+        state.eds_mirror.generation
+    };
+    if !enabled {
+        set_enabled(calendar_state, worker, false, include_description);
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        worker.spawn(async move {
+            let _ = result_tx.send(remove_mirror().await).await;
+        });
+        glib::spawn_future_local(async move {
+            if let Ok(Err(e)) = result_rx.recv().await {
+                on_error(e);
+            }
+        });
+        return;
+    }
+
+    let (result_tx, result_rx) = async_channel::bounded(1);
+    worker.spawn(async move {
+        let _ = result_tx.send(ensure_mirror().await).await;
+    });
+    let calendar_state = calendar_state.clone();
+    let worker = worker.clone();
+    glib::spawn_future_local(async move {
+        // A later toggle superseded this one: don't re-enable a mirror the
+        // user has since switched off (or let an older attempt race a newer
+        // one). If the user is now off, clean up any source the attempt made.
+        if calendar_state.borrow().eds_mirror.generation != generation {
+            let desired = calendar_state.borrow().eds_mirror.desired_enabled;
+            if !desired {
+                worker.spawn(async {
+                    let _ = remove_mirror().await;
+                });
+            }
+            return;
+        }
+        match result_rx.recv().await {
+            Ok(Ok(())) => {
+                let details = calendar_state.borrow().eds_mirror.include_description;
+                set_enabled(&calendar_state, &worker, true, details);
+            }
+            Ok(Err(e)) => on_error(e),
+            Err(_) => on_error("The mirror setup stopped before it finished".to_string()),
+        }
+    });
+}
+
+/// Updates the "Include event notes" choice without changing whether the
+/// mirror is on. If it is already running, request a rewrite with the new
+/// privacy choice; a pending setup picks the value up when it completes.
+pub(crate) fn set_details(calendar_state: &Rc<RefCell<CalendarUiState>>, worker: &Rc<Worker>, include_description: bool) {
+    let enabled = {
+        let mut state = calendar_state.borrow_mut();
+        state.eds_mirror.include_description = include_description;
+        state.eds_mirror.enabled
+    };
+    if enabled {
+        request_sync(calendar_state, worker, None);
+    }
+}
+
+/// Applies the `eds-mirror-calendar` and `eds-mirror-details` settings to
+/// the sync. Turning it on (or changing the description setting) syncs at
+/// once, so the startup trigger isn't the only way the first calendar appears.
 pub(crate) fn set_enabled(calendar_state: &Rc<RefCell<CalendarUiState>>, worker: &Rc<Worker>, enabled: bool, include_description: bool) {
     let changed = {
         let mut state = calendar_state.borrow_mut();
@@ -1032,6 +1156,16 @@ mod tests {
         let calendar = std::fs::read_to_string(&path).unwrap();
         assert!(!calendar.contains("Inside"), "{calendar}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreign_edits_are_restored_or_removed() {
+        let event = build(&occurrence());
+        let existing = vec![(event.uid.clone(), "edited-in-another-app".to_string()), ("lookout-extra".to_string(), "x".to_string())];
+        let plan = plan(std::slice::from_ref(&event), &existing);
+        assert_eq!(plan.modify, vec![event.uid.clone()], "a changed hash is restored from Lookout");
+        assert_eq!(plan.remove, vec!["lookout-extra".to_string()], "an unknown event is removed");
+        assert!(plan.create.is_empty());
     }
 
     #[test]
