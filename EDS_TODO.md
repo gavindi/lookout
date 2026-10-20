@@ -426,7 +426,39 @@ In `lookout-eds`, add `mirror.rs`.
 - `remove_mirror_source(eds)` deletes the source and all its events.
 - Never touch a source without the marker key.
 
-### [ ] E2.2 — Turning occurrences into mirror events (`S`)
+### [x] E2.2 — Turning occurrences into mirror events (`S`)
+
+Done 2026-10-21.
+
+- **API.** `mirror_event(occurrence, include_description, hidden_calendars) ->
+  Option<MirrorEvent>` in `source/crates/app/src/eds_mirror.rs`. `None` means "don't
+  mirror this": the occurrence is cancelled or its calendar is hidden. `MirrorEvent`
+  carries the stable `uid`, its `hash`, the `start`/`end` for E2.3's window bookkeeping,
+  and `component`, the `VEVENT` (with any `VTIMEZONE`) ready to sit inside the mirror's
+  one `VCALENDAR`.
+- **The UID** is `lookout-` plus 128 bits of SHA-256 over the source calendar, source
+  UID and occurrence start. It survives a re-read and an edit, while another instance
+  of a series, another event or another calendar gets a different one.
+- **The hash** is SHA-256 over a canonical text of exactly the copied fields - summary,
+  start, end, all-day, time zone, location and (when allowed) description - so a change
+  to an attendee, category, reminder or href never forces a rewrite. An all-day
+  occurrence's stored time zone is dropped before hashing, because the copy doesn't use
+  it.
+- **What is copied:** summary, start/end, the all-day flag, the time zone and the
+  location; the description only when `include_description`. Attendees, organizer,
+  reminders, categories, sensitivity, "Show as", sequence and the conference URL are
+  never copied. `rrule`, `rdates`, `exdates` and `recurrence_id` are cleared, so every
+  copy is a single non-repeating event.
+- **The property.** `build_vcalendar`'s `VCALENDAR` wrapper is cut off, keeping the
+  `VEVENT` and its `VTIMEZONE` (EDS's custom-file source wants a whole calendar, and
+  E2.3 concatenates these components), and `X-LOOKOUT-HASH:<hash>` is inserted before
+  `END:VEVENT`.
+- **Tests:** UID stability and uniqueness; all-day and zoned conversion; recurrence
+  stripped; hash changes for each copied field but not for untracked ones; descriptions
+  only when allowed and unchanged hashes when they aren't; cancelled and hidden
+  occurrences dropped; the component is a bare, single `VEVENT` carrying its hash.
+
+The original plan:
 
 Write this as a pure function in `source/crates/app/src/eds_mirror.rs`.
 

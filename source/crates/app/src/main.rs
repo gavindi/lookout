@@ -29,6 +29,7 @@ mod datetime_picker;
 mod desktop_contacts;
 mod directory;
 mod eds_directory;
+mod eds_mirror;
 mod event_editor;
 mod event_menu;
 mod folder_menu;
