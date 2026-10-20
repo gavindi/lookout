@@ -112,6 +112,8 @@ enum ContactsBucketKind {
     ContactLists,
     Deleted,
     Category(String),
+    /// One of the desktop's address books (E1.5), by display name.
+    DesktopBook(String),
 }
 
 fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
@@ -120,7 +122,7 @@ fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
         ContactsBucketKind::Favourites => "Favourites".to_string(),
         ContactsBucketKind::ContactLists => "Your contact lists".to_string(),
         ContactsBucketKind::Deleted => "Deleted".to_string(),
-        ContactsBucketKind::Category(name) => name.clone(),
+        ContactsBucketKind::Category(name) | ContactsBucketKind::DesktopBook(name) => name.clone(),
     }
 }
 
@@ -136,6 +138,11 @@ pub struct ContactsCategoryChoice {
 impl ContactsCategoryChoice {
     pub fn label(&self) -> String {
         contacts_bucket_label(&self.kind)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn members(&self) -> &[(AccountId, String, lookout_dav::ContactRecord)] {
+        &self.contacts
     }
 }
 
@@ -1340,9 +1347,10 @@ fn append_contacts_choice_row(list: &gtk::ListBox, label: &str, chrome: bool) ->
 
 /// Rebuilds the People screen's left pane: each connected account gets a
 /// header followed by its four fixed buckets (Your Contacts/Favourites/Your
-/// contact lists/Deleted), then every distinct vCard `CATEGORIES` tag found
-/// across all accounts gets its own row under a trailing "Categories"
-/// header. Header rows aren't part of `categories` and can't be selected;
+/// contact lists/Deleted), then the desktop's address books (E1.5) get one
+/// read-only row each under a "Desktop" header, then every distinct vCard
+/// `CATEGORIES` tag found across all accounts gets its own row under a
+/// trailing "Categories" header. Header rows aren't part of `categories` and can't be selected;
 /// each selectable row stashes its index into `categories` on itself (see
 /// `contacts_category_list.connect_row_selected` in `build`), since a row's
 /// position in the widget no longer matches its index in that list once
@@ -1420,6 +1428,17 @@ pub fn refresh_contacts_category_ui(
             }
         }
 
+        // The desktop's address books (E1.5), read-only. Kept out of "Your
+        // Contacts" (that's the accounts' contacts), but a starred desktop
+        // contact still shows under Favourites.
+        let desktop_books: Vec<(String, Vec<crate::desktop_contacts::DesktopRecord>)> = st
+            .desktop_contacts
+            .iter()
+            .map(|book| (book.display_name.clone(), crate::desktop_contacts::desktop_records(book)))
+            .collect();
+        let mut favourite_candidates = all_contacts.clone();
+        favourite_candidates.extend(desktop_books.iter().flat_map(|(_, records)| records.iter().cloned()));
+
         // Outlook's fixed People rail, ahead of the per-account sections: the
         // four buckets over every account at once (UX-65). Favourites keeps
         // the full contact list - membership depends on `starred_contacts`,
@@ -1432,10 +1451,11 @@ pub fn refresh_contacts_category_ui(
             ContactsBucketKind::Deleted,
         ] {
             let members = match kind {
-                ContactsBucketKind::Favourites | ContactsBucketKind::AllContacts => all_contacts.clone(),
+                ContactsBucketKind::Favourites => favourite_candidates.clone(),
+                ContactsBucketKind::AllContacts => all_contacts.clone(),
                 ContactsBucketKind::ContactLists => all_lists.clone(),
                 ContactsBucketKind::Deleted => all_deleted.clone(),
-                ContactsBucketKind::Category(_) => continue,
+                ContactsBucketKind::Category(_) | ContactsBucketKind::DesktopBook(_) => continue,
             };
             let label = contacts_bucket_label(&kind);
             rows.push(ContactsCategoryChoice { kind, contacts: members });
@@ -1504,6 +1524,24 @@ pub fn refresh_contacts_category_ui(
                 append_contacts_choice_row(category_list, &contacts_bucket_label(&ContactsBucketKind::Deleted), true),
                 Some(rows.len() - 1),
             ));
+        }
+
+        if !desktop_books.is_empty() {
+            let desktop_header = append_contacts_header_row(category_list, "Desktop");
+            crate::privacy::mark_ui(&desktop_header);
+            desktop_header.set_tooltip_text(Some("Address books from GNOME Contacts and Evolution - read-only here"));
+            row_widgets.push((desktop_header, None));
+            for (name, records) in desktop_books {
+                // A book's name can be an address (a GOA account's), so it
+                // blurs under privacy mode like an account header.
+                let row = append_contacts_choice_row(category_list, &name, false);
+                crate::privacy::mark(&row);
+                rows.push(ContactsCategoryChoice {
+                    kind: ContactsBucketKind::DesktopBook(name),
+                    contacts: records,
+                });
+                row_widgets.push((row, Some(rows.len() - 1)));
+            }
         }
 
         if !category_members.is_empty() {
@@ -1998,20 +2036,27 @@ pub fn spawn_contacts_discovery(
                         refresh_contacts_ui.clone(),
                     );
                 }
-                if started.is_empty() {
+                // The desktop's address books (E1.5) are read once the
+                // synced accounts are known, so E1.3 can skip GOA copies; the
+                // People screen shows when either has contacts.
+                let has_desktop = crate::desktop_contacts::reload_now(&state, &worker).await;
+                if started.is_empty() && !has_desktop {
                     show_page("contacts-empty");
                 } else {
                     show_page("contacts");
                 }
             }
             Err(e) => {
-                show_page("contacts-empty");
                 if e.is_service_unavailable() {
                     state.borrow_mut().goa_unavailable = true;
                     refresh_config();
                 } else {
                     toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts contacts: {e}"))));
                 }
+                // Without GOA there are no account contacts, but the desktop
+                // may still have address books (E1.5).
+                let has_desktop = crate::desktop_contacts::reload_now(&state, &worker).await;
+                show_page(if has_desktop { "contacts" } else { "contacts-empty" });
             }
         }
     });

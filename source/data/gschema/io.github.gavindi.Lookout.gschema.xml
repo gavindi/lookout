@@ -382,7 +382,7 @@
     <key name="eds-address-books" type="b">
       <default>true</default>
       <summary>Include desktop address books</summary>
-      <description>Also suggest people from the desktop's own address books (GNOME Contacts and Evolution, through Evolution Data Server) in recipient autocomplete, the contact picker and People search. Books belonging to an online account whose contacts Lookout already syncs are skipped. Has no effect when Evolution Data Server isn't available.</description>
+      <description>Also suggest people from the desktop's own address books (GNOME Contacts and Evolution, through Evolution Data Server) in recipient autocomplete, the contact picker and People search, and list those books read-only in the People screen's Desktop section. Books belonging to an online account whose contacts Lookout already syncs are skipped. Has no effect when Evolution Data Server isn't available.</description>
     </key>
 
     <!-- Tasks -->

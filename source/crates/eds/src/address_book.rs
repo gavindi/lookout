@@ -54,6 +54,23 @@ impl EdsAddressBook {
         Ok(cards_from_vcards(&vcards, limit, &self.source_uid))
     }
 
+    /// Every card in the book, contact lists included, in EDS's order. A card
+    /// that doesn't parse is skipped. For browsing a whole book (the People
+    /// screen), where [`search`](Self::search) is for recipient lookup.
+    pub async fn all_contacts(&self) -> Result<Vec<VCard>> {
+        // EDS's SQLite-backed books (local, and the caches of remote ones)
+        // reject `#t`; an empty any-field match is their "everything". Fall
+        // back to `#t` for a backend that doesn't know the any-field form.
+        let vcards = match self.proxy.get_contact_list(MATCH_ALL).await {
+            Ok(vcards) => vcards,
+            Err(e) => {
+                tracing::debug!("EDS: {MATCH_ALL} failed on {} ({e}); retrying with #t", self.source_uid);
+                self.proxy.get_contact_list("#t").await?
+            }
+        };
+        Ok(parse_vcards(&vcards, &self.source_uid))
+    }
+
     /// Releases the backend. Errors are ignored: a book that can't be closed
     /// is closed anyway when the connection goes.
     pub async fn close(self) {
@@ -62,6 +79,9 @@ impl EdsAddressBook {
         }
     }
 }
+
+/// The EBook S-expression matching every card in a SQLite-backed book.
+const MATCH_ALL: &str = r#"(contains "x-evolution-any-field" "")"#;
 
 /// The EBook S-expression for a prefix search on `query` among contacts that
 /// have an email address, or `None` when the trimmed query is empty.
@@ -101,7 +121,15 @@ fn escape(value: &str) -> String {
 /// Parses the backend's vCards, drops contact lists and unparseable cards,
 /// sorts by name and keeps the first `limit`.
 fn cards_from_vcards(vcards: &[String], limit: usize, source_uid: &str) -> Vec<VCard> {
-    let mut cards: Vec<VCard> = vcards
+    let mut cards: Vec<VCard> = parse_vcards(vcards, source_uid).into_iter().filter(|card| !is_list(card)).collect();
+    cards.sort_by_cached_key(sort_key);
+    cards.truncate(limit);
+    cards
+}
+
+/// Parses the backend's vCards, skipping (and logging) any that don't parse.
+fn parse_vcards(vcards: &[String], source_uid: &str) -> Vec<VCard> {
+    vcards
         .iter()
         .filter_map(|text| match VCard::parse(text) {
             Ok(card) => Some(card),
@@ -110,11 +138,7 @@ fn cards_from_vcards(vcards: &[String], limit: usize, source_uid: &str) -> Vec<V
                 None
             }
         })
-        .filter(|card| !is_list(card))
-        .collect();
-    cards.sort_by_cached_key(sort_key);
-    cards.truncate(limit);
-    cards
+        .collect()
 }
 
 /// Evolution marks contact lists with `X-EVOLUTION-LIST:TRUE` (their `EMAIL`

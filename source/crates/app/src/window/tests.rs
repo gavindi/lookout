@@ -727,6 +727,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         contacts_refresh: None,
         contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
         contacts_details_refresh: None,
+        desktop_contacts: Vec::new(),
         ui_db: None,
         settings: Rc::new(crate::settings::resolve()),
         app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),
@@ -2564,4 +2565,102 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
     }
     .apply(&avatar, &checkbox, &preview);
     assert!(!avatar.is_visible() && !checkbox.is_visible());
+}
+
+#[test]
+fn people_sidebar_lists_desktop_books_read_only() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    use crate::contacts_view::{contact_identity, rebuild_contacts_list_ui, refresh_contacts_category_ui, ContactsCategoryChoice, ContactsListEntry};
+
+    let state = test_state(Vec::new());
+    let desktop_card = test_contact("ann@desktop.example");
+    let desktop_account = crate::desktop_contacts::desktop_account_id("system-address-book");
+    {
+        let mut st = state.borrow_mut();
+        st.contacts_by_account.insert(
+            AccountId("account_a".into()),
+            crate::contacts_view::test_snapshot(
+                "Alpha",
+                vec![lookout_dav::ContactRecord {
+                    href: "/a/grace.vcf".into(),
+                    etag: None,
+                    card: test_contact("grace@example.com"),
+                }],
+            ),
+        );
+        st.desktop_contacts = vec![crate::eds_directory::DesktopBook {
+            uid: "system-address-book".into(),
+            display_name: "Personal".into(),
+            cards: vec![desktop_card.clone()],
+        }];
+        st.starred_contacts.insert((desktop_account.clone(), contact_identity(&desktop_card)));
+    }
+
+    let category_list = gtk::ListBox::new();
+    let contact_list = gtk::ListBox::new();
+    let categories: Rc<RefCell<Vec<ContactsCategoryChoice>>> = Rc::new(RefCell::new(Vec::new()));
+    let contacts: Rc<RefCell<Vec<ContactsListEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected = Rc::new(RefCell::new(HashSet::new()));
+    let refresh_actions: Rc<dyn Fn()> = Rc::new(|| {});
+    let details_refresh: Rc<dyn Fn()> = Rc::new(|| {});
+    refresh_contacts_category_ui(
+        &state,
+        &category_list,
+        &contact_list,
+        &categories,
+        &contacts,
+        None,
+        &selected,
+        &refresh_actions,
+        &details_refresh,
+    );
+
+    // A "Desktop" header, then one row per book, after the account sections.
+    let mut headers = Vec::new();
+    let mut child = category_list.first_child();
+    while let Some(row) = child {
+        if let Some(label) = row.downcast_ref::<gtk::ListBoxRow>().and_then(|r| r.child()).and_then(|c| c.downcast::<gtk::Label>().ok()) {
+            if label.has_css_class("heading") {
+                headers.push(label.text().to_string());
+            }
+        }
+        child = row.next_sibling();
+    }
+    assert_eq!(headers, ["Alpha", "Desktop"]);
+    let labels: Vec<String> = categories.borrow().iter().map(|c| c.label()).collect();
+    assert_eq!(labels.last().map(String::as_str), Some("Personal"));
+
+    let desktop_index = categories.borrow().len() - 1;
+    let choice = categories.borrow()[desktop_index].clone();
+    assert_eq!(choice.members().len(), 1);
+    let (account, label, record) = &choice.members()[0];
+    assert_eq!(account, &desktop_account);
+    assert_eq!(label, "Personal");
+    assert!(record.href.is_empty(), "desktop contacts are display-only");
+
+    // "Your Contacts" stays the accounts'; Favourites also offers starred desktop contacts.
+    let your_contacts = categories.borrow().iter().find(|c| c.label() == "Your Contacts").cloned().unwrap();
+    assert!(your_contacts.members().iter().all(|(account, _, _)| account.0 == "account_a"));
+    let favourites = categories.borrow()[0].clone();
+    assert_eq!(favourites.label(), "Favourites");
+    assert!(favourites.members().iter().any(|(account, _, _)| account == &desktop_account));
+
+    // Showing the book lists its contact as a desktop entry, which can't be written.
+    rebuild_contacts_list_ui(
+        &contact_list,
+        &categories,
+        &contacts,
+        desktop_index as i32,
+        &state,
+        &selected,
+        &refresh_actions,
+        &details_refresh,
+    );
+    let entries = contacts.borrow();
+    assert_eq!(entries.len(), 1);
+    assert!(crate::desktop_contacts::is_desktop_entry(&entries[0]));
+    assert!(entries[0].href.is_empty());
+    assert_eq!(entries[0].category_label, "Personal");
 }

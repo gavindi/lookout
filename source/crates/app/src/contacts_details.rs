@@ -47,7 +47,8 @@ pub struct ContactsDetailsActions {
     pub open_message: OpenMessageFn,
     pub events_for_person: EventsForPersonFn,
     /// Open the contact editor in the pane (the host handles the dialog
-    /// fallback when the entry isn't writable).
+    /// fallback when the entry isn't writable, and opens GNOME Contacts for a
+    /// desktop contact).
     pub edit: Rc<dyn Fn(&ContactsListEntry)>,
     /// Delete the contact (with the host's usual Undo toast).
     pub delete: Rc<dyn Fn(&ContactsListEntry)>,
@@ -380,8 +381,17 @@ fn build_actions(entry: &ContactsListEntry, address: &EmailAddress, actions: &Co
     }
     row.append(&chat);
 
-    let edit = action_button("document-edit-symbolic", "Edit");
-    edit.set_tooltip_text(Some("Edit this contact in the details pane"));
+    // A desktop contact (E1.5) is read-only here: its "edit" opens GNOME
+    // Contacts instead, through the same `edit` action.
+    let edit = if crate::desktop_contacts::is_desktop_entry(entry) {
+        let button = action_button("x-office-address-book-symbolic", "Open in GNOME Contacts");
+        button.set_tooltip_text(Some("Desktop contacts are read-only in Lookout - edit them in GNOME Contacts"));
+        button
+    } else {
+        let button = action_button("document-edit-symbolic", "Edit");
+        button.set_tooltip_text(Some("Edit this contact in the details pane"));
+        button
+    };
     {
         let actions = actions.clone();
         let entry = entry.clone();

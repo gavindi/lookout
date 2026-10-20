@@ -578,6 +578,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_refresh: None,
         contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
         contacts_details_refresh: None,
+        desktop_contacts: Vec::new(),
         ui_db,
         settings: settings.clone(),
         app_config: Rc::new(RefCell::new(crate::app_config::load())),
@@ -4356,9 +4357,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let search_refine_button = search_refine_button.clone();
         let state = state.clone();
         let calendar_main = calendar_main.clone();
+        let worker = worker.clone();
         contacts_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 current_module.set("contacts");
+                // Re-read the desktop's address books (E1.5), so a contact
+                // added in GNOME Contacts shows without waiting for the timer.
+                crate::desktop_contacts::reload(&state, &worker);
                 exit_calendar_search_if_active(&state, &calendar_main, &search_entry);
                 scope_stack.set_visible_child_name("mail");
                 search_refine_button.set_visible(true);
@@ -4375,6 +4380,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     win.present();
                 }
             }
+        });
+    }
+    // The People screen's Desktop section (E1.5) also refreshes on a timer
+    // while Lookout runs, at the CardDAV poll's cadence.
+    {
+        let state = state.clone();
+        let worker = worker.clone();
+        glib::timeout_add_local(crate::desktop_contacts::RELOAD_INTERVAL, move || {
+            crate::desktop_contacts::reload(&state, &worker);
+            glib::ControlFlow::Continue
         });
     }
     {
@@ -6559,6 +6574,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let state = state.clone();
             let toast_overlay = toast_overlay.clone();
             Rc::new(move |entry: &ContactsListEntry| {
+                // Desktop contacts (E1.5) are read-only here; GNOME Contacts edits them.
+                if crate::desktop_contacts::is_desktop_entry(entry) {
+                    crate::desktop_contacts::open_in_gnome_contacts(entry, &toast_overlay);
+                    return;
+                }
                 let details = contacts_details.clone();
                 let entry_owned = entry.clone();
                 let on_save = {
@@ -6924,7 +6944,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             else {
                 return;
             };
-            if entry.href.is_empty() {
+            if crate::desktop_contacts::is_desktop_entry(&entry) {
+                // A desktop contact's "open for editing" is GNOME Contacts (E1.5).
+                crate::desktop_contacts::open_in_gnome_contacts(&entry, &toast_overlay);
+            } else if entry.href.is_empty() {
                 // Deleted-bucket cards are display-only (their server
                 // metadata is gone with the card) - keep the read-only
                 // details dialog for them.
@@ -7484,9 +7507,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         });
     }
-    // Config → People → "Include desktop address books" (EDS_TODO.md E1.4):
-    // persists the choice and flips the directory backend's switch, which
-    // every lookup reads, so composers already open follow it. Turning it off
+    // Config → People → "Include desktop address books" (EDS_TODO.md E1.4,
+    // E1.5): persists the choice and flips the directory backend's switch,
+    // which every lookup reads, so composers already open follow it, and
+    // refills or clears the People screen's Desktop section. Turning it off
     // also closes the desktop's books and lets go of EDS.
     {
         let state = state.clone();
@@ -7498,6 +7522,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if !enabled {
                 worker.spawn(crate::eds_directory::disconnect_desktop());
             }
+            // Fill (or, switched off, clear) the People screen's Desktop section.
+            crate::desktop_contacts::reload(&state, &worker);
         });
     }
 

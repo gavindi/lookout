@@ -296,6 +296,8 @@ impl FakeAddressBookFactory {
 
 struct FakeAddressBook {
     cards: Vec<String>,
+    /// Queries this backend answers with an "Invalid query" error.
+    rejects: Vec<String>,
     log: Arc<Mutex<BookLog>>,
 }
 
@@ -317,6 +319,9 @@ impl FakeAddressBook {
             return Err(fdo::Error::Failed("Backend is not opened yet".to_string()));
         }
         log.queries.push(query.to_string());
+        if self.rejects.iter().any(|rejected| rejected == query) {
+            return Err(fdo::Error::Failed(format!("Invalid query: {query}")));
+        }
         Ok(self.cards.clone())
     }
 }
@@ -353,6 +358,7 @@ async fn searches_an_address_book_through_the_backend_the_factory_names() {
                     "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann Example\r\nEMAIL;TYPE=WORK:ann@work.example\r\nEMAIL:ann@home.example\r\nEND:VCARD\r\n".to_string(),
                     "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Team\r\nX-EVOLUTION-LIST:TRUE\r\nEMAIL:ann@work.example\r\nEND:VCARD\r\n".to_string(),
                 ],
+                rejects: Vec::new(),
                 log: log.clone(),
             },
         )
@@ -387,4 +393,57 @@ async fn searches_an_address_book_through_the_backend_the_factory_names() {
         "the blank search must not reach EDS"
     );
     assert!(log.closed);
+}
+
+/// Serves one fake address book (behind a fake factory on the source
+/// registry's connection) and returns the connections keeping it alive.
+async fn serve_book(bus: &PrivateBus, cards: Vec<String>, rejects: Vec<String>, log: Arc<Mutex<BookLog>>) -> zbus::Connection {
+    let backend_path = "/org/gnome/evolution/dataserver/Subprocess/7/1";
+    let service = fake_eds(bus, &[SOURCES5, ADDRESS_BOOK10], registry(&[])).await;
+    service
+        .object_server()
+        .at(
+            "/org/gnome/evolution/dataserver/AddressBookFactory",
+            FakeAddressBookFactory {
+                backend_bus: ADDRESS_BOOK10.to_string(),
+                backend_path: backend_path.to_string(),
+                log: log.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    service.object_server().at(backend_path, FakeAddressBook { cards, rejects, log }).await.unwrap();
+    service
+}
+
+#[tokio::test]
+async fn lists_a_whole_book_including_contact_lists() {
+    let bus = PrivateBus::start(&[]);
+    let log = Arc::new(Mutex::new(BookLog::default()));
+    let cards = vec![
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Phone Only\r\nTEL:+61 7 5555 0100\r\nEND:VCARD\r\n".to_string(),
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Team\r\nX-EVOLUTION-LIST:TRUE\r\nEMAIL:ann@work.example\r\nEND:VCARD\r\n".to_string(),
+        "garbage".to_string(),
+    ];
+    let _service = serve_book(&bus, cards, Vec::new(), log.clone()).await;
+
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+    let book = EdsAddressBook::open(&eds, "system-address-book").await.unwrap();
+    let names: Vec<_> = book.all_contacts().await.unwrap().into_iter().map(|c| c.full_name.unwrap()).collect();
+    assert_eq!(names, ["Phone Only", "Team"], "phone-only cards and lists are kept; garbage is skipped");
+    assert_eq!(log.lock().unwrap().queries, [r#"(contains "x-evolution-any-field" "")"#]);
+}
+
+#[tokio::test]
+async fn listing_falls_back_to_match_all_when_any_field_is_rejected() {
+    let bus = PrivateBus::start(&[]);
+    let log = Arc::new(Mutex::new(BookLog::default()));
+    let any_field = r#"(contains "x-evolution-any-field" "")"#.to_string();
+    let cards = vec!["BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann\r\nEND:VCARD\r\n".to_string()];
+    let _service = serve_book(&bus, cards, vec![any_field.clone()], log.clone()).await;
+
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+    let book = EdsAddressBook::open(&eds, "system-address-book").await.unwrap();
+    assert_eq!(book.all_contacts().await.unwrap().len(), 1);
+    assert_eq!(log.lock().unwrap().queries, [any_field, "#t".to_string()]);
 }

@@ -44,6 +44,11 @@ const BOOK_TIMEOUT: Duration = Duration::from_secs(3);
 /// keystroke, while an EDS that starts later is still found.
 const UNAVAILABLE_RETRY: Duration = Duration::from_secs(60);
 
+/// How long listing a whole book for the People screen may take. Longer than
+/// a lookup's [`BOOK_TIMEOUT`]: it's a background refresh, and a large book's
+/// vCards (photos included) take a while to cross the bus.
+const LIST_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The `eds-address-books` setting, mirrored here so the backend - which runs
 /// on the worker thread, away from GSettings - can read it on every lookup.
 static DESKTOP_BOOKS_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -52,6 +57,18 @@ static DESKTOP_BOOKS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// with the stored setting at startup and whenever the Config switch changes.
 pub(crate) fn set_enabled(enabled: bool) {
     DESKTOP_BOOKS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether desktop address books are switched on (Config → People).
+pub(crate) fn enabled() -> bool {
+    DESKTOP_BOOKS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// The GOA account ids (`account_…`) whose contacts Lookout syncs itself -
+/// each has a contacts session, CardDAV or Graph - so EDS's copy of their
+/// address books is skipped (E1.3).
+pub(crate) fn synced_goa_accounts(state: &crate::window::UiState) -> HashSet<String> {
+    state.contact_cmd_tx.keys().filter_map(goa_account_id).map(str::to_string).collect()
 }
 
 /// The one process-wide live desktop every [`EdsDirectoryBackend::desktop`] shares.
@@ -64,6 +81,25 @@ fn live_desktop() -> Arc<LiveDesktopBooks> {
 /// lookup (once the feature is on again) reconnects. Runs on the worker.
 pub(crate) async fn disconnect_desktop() {
     live_desktop().disconnect().await;
+}
+
+/// One desktop address book with every card in it, for the People screen's
+/// "Desktop" section (E1.5).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DesktopBook {
+    pub uid: String,
+    pub display_name: String,
+    pub cards: Vec<lookout_core::VCard>,
+}
+
+/// Every eligible desktop book with all its cards (same books, connection
+/// and on/off switch as the directory lookups). `None` when the feature is
+/// off or EDS is unavailable. Runs on the worker.
+pub(crate) async fn desktop_books_snapshot(synced_goa: HashSet<String>) -> Option<Vec<DesktopBook>> {
+    if !enabled() {
+        return None;
+    }
+    live_desktop().snapshot(&synced_goa).await
 }
 
 /// Whether the desktop offers address books Lookout can read: a supported
@@ -189,6 +225,82 @@ impl LiveDesktopBooks {
             }
         }
     }
+
+    /// Every eligible book with all of its cards, for the People screen
+    /// (E1.5). `None` when EDS is unavailable; a book that fails or times out
+    /// is left out (and reopened next time).
+    async fn snapshot(&self, synced_goa: &HashSet<String>) -> Option<Vec<DesktopBook>> {
+        let mut state = self.state.lock().await;
+        let wanted = prepare(&mut state, synced_goa).await?;
+        let Connection::Connected { books, .. } = &mut *state else {
+            return None;
+        };
+        let listings = wanted
+            .iter()
+            .filter_map(|source| books.get(&source.uid).map(|book| (source, book)))
+            .map(|(source, book)| async move {
+                let result = tokio::time::timeout(LIST_TIMEOUT, book.all_contacts()).await;
+                (source, result)
+            });
+        let results = futures_util::future::join_all(listings).await;
+        let mut snapshot = Vec::new();
+        let mut failed = Vec::new();
+        for (source, result) in results {
+            match result {
+                Ok(Ok(cards)) => snapshot.push(DesktopBook {
+                    uid: source.uid.clone(),
+                    display_name: source.display_name.clone(),
+                    cards,
+                }),
+                Ok(Err(e)) => {
+                    tracing::debug!("EDS directory: listing {} failed: {e}", source.uid);
+                    failed.push(source.uid.clone());
+                }
+                Err(_) => tracing::debug!("EDS directory: listing {} took longer than {LIST_TIMEOUT:?}", source.uid),
+            }
+        }
+        for uid in failed {
+            books.remove(&uid);
+        }
+        Some(snapshot)
+    }
+}
+
+/// Gets `state` connected (unless EDS was found unavailable recently),
+/// re-reads the source list (one `GetManagedObjects`, a few milliseconds, so
+/// a book added, removed or switched off on the desktop is picked up without
+/// a restart) and opens or closes books to match. Returns the eligible books
+/// in merge order, or `None` when EDS is unavailable.
+async fn prepare(state: &mut Connection, synced_goa: &HashSet<String>) -> Option<Vec<EdsSource>> {
+    if let Connection::Unavailable { since } = *state {
+        if since.elapsed() < UNAVAILABLE_RETRY {
+            return None;
+        }
+    }
+    if !matches!(*state, Connection::Connected { .. }) {
+        *state = match Eds::connect().await {
+            Ok(Some(eds)) if eds.supports_address_books() => Connection::Connected { eds, books: HashMap::new() },
+            Ok(_) => Connection::Unavailable { since: Instant::now() },
+            Err(e) => {
+                tracing::debug!("EDS directory: couldn't connect: {e}");
+                Connection::Unavailable { since: Instant::now() }
+            }
+        };
+    }
+    let Connection::Connected { eds, books } = state else {
+        return None;
+    };
+    let sources = match eds.sources().await {
+        Ok(sources) => sources,
+        Err(e) => {
+            tracing::debug!("EDS directory: couldn't list sources, treating EDS as unavailable: {e}");
+            *state = Connection::Unavailable { since: Instant::now() };
+            return None;
+        }
+    };
+    let wanted: Vec<EdsSource> = eligible_books(&sources, synced_goa).into_iter().cloned().collect();
+    sync_open_books(eds, books, &wanted).await;
+    Some(wanted)
 }
 
 #[derive(Default)]
@@ -206,39 +318,12 @@ enum Connection {
 impl DesktopBooks for LiveDesktopBooks {
     async fn search(&self, query: &str, limit: usize, synced_goa: &HashSet<String>) -> Vec<Vec<EdsPerson>> {
         let mut state = self.state.lock().await;
-        if let Connection::Unavailable { since } = *state {
-            if since.elapsed() < UNAVAILABLE_RETRY {
-                return Vec::new();
-            }
-        }
-        if !matches!(*state, Connection::Connected { .. }) {
-            *state = match Eds::connect().await {
-                Ok(Some(eds)) if eds.supports_address_books() => Connection::Connected { eds, books: HashMap::new() },
-                Ok(_) => Connection::Unavailable { since: Instant::now() },
-                Err(e) => {
-                    tracing::debug!("EDS directory: couldn't connect: {e}");
-                    Connection::Unavailable { since: Instant::now() }
-                }
-            };
-        }
-        let Connection::Connected { eds, books } = &mut *state else {
+        let Some(wanted) = prepare(&mut state, synced_goa).await else {
             return Vec::new();
         };
-
-        // Re-read the source list on every lookup (one `GetManagedObjects`,
-        // a few milliseconds), so a book added, removed or switched off on the
-        // desktop is picked up without a restart.
-        let sources = match eds.sources().await {
-            Ok(sources) => sources,
-            Err(e) => {
-                tracing::debug!("EDS directory: couldn't list sources, treating EDS as unavailable: {e}");
-                *state = Connection::Unavailable { since: Instant::now() };
-                return Vec::new();
-            }
+        let Connection::Connected { books, .. } = &mut *state else {
+            return Vec::new();
         };
-        let wanted = eligible_books(&sources, synced_goa);
-        sync_open_books(eds, books, &wanted).await;
-
         let lookups = wanted.iter().filter_map(|source| books.get(&source.uid)).map(|book| async move {
             let result = tokio::time::timeout(BOOK_TIMEOUT, book.search(query, limit)).await;
             (book.source_uid().to_string(), result)
@@ -267,7 +352,7 @@ impl DesktopBooks for LiveDesktopBooks {
 
 /// Opens the wanted books that aren't open yet and closes the ones no longer
 /// wanted. A book that fails to open is skipped (and retried next lookup).
-async fn sync_open_books(eds: &Eds, books: &mut HashMap<String, EdsAddressBook>, wanted: &[&EdsSource]) {
+async fn sync_open_books(eds: &Eds, books: &mut HashMap<String, EdsAddressBook>, wanted: &[EdsSource]) {
     let stale: Vec<String> = books.keys().filter(|uid| !wanted.iter().any(|source| &source.uid == *uid)).cloned().collect();
     for uid in stale {
         if let Some(book) = books.remove(&uid) {
@@ -581,5 +666,25 @@ mod tests {
             first.iter().filter(|p| p.name.is_some()).count()
         );
         assert_eq!(first, second, "a repeated lookup answers the same");
+    }
+
+    /// The People screen's full-book listing (E1.5) against the session's
+    /// real EDS, read only. Ignored by default; run with
+    /// `cargo test -p lookout-app live_desktop_snapshot -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_desktop_snapshot() {
+        let worker = Worker::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        worker.spawn(async move {
+            let started = Instant::now();
+            let books = desktop_books_snapshot(HashSet::new()).await;
+            let _ = tx.send((books, started.elapsed()));
+        });
+        let (books, took) = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        let books = books.expect("EDS should be available for this test");
+        let cards: usize = books.iter().map(|b| b.cards.len()).sum();
+        println!("{} books, {cards} cards in {took:?}", books.len());
+        assert!(!books.is_empty());
     }
 }

@@ -527,7 +527,7 @@ fn placeholder_group(title: &str) -> adw::PreferencesGroup {
 /// data-in/widget-out convention).
 /// The "Include desktop address books" row's subtitle while the desktop's
 /// address books are reachable (and before that's known).
-pub const EDS_ADDRESS_BOOKS_SUBTITLE: &str = "Suggest people from GNOME Contacts and Evolution when choosing recipients";
+pub const EDS_ADDRESS_BOOKS_SUBTITLE: &str = "Show people from GNOME Contacts and Evolution in People, read-only, and suggest them when choosing recipients";
 
 /// Its subtitle once the check finds no Evolution Data Server Lookout can
 /// reach - none installed or running, an unsupported version, or a sandbox

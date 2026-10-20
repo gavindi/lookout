@@ -302,9 +302,57 @@ Done 2026-10-20 (v0.9.256).
 - Re-read the source list when the registry announces new or removed sources (the
   `ObjectManager` signals), so a book added in GNOME Contacts appears without a restart.
 
-### [ ] E1.5 — Stretch: EDS books in the People module (`L`)
+### [x] E1.5 — Stretch: EDS books in the People module (`L`)
 
-Optional, and only after E1.1–E1.4 have shipped.
+Done 2026-10-20 (v0.9.257).
+
+- **What appears.** The People sidebar gains a **Desktop** section, after the account sections,
+  with one row per eligible EDS book. These are the same books, connection and setting as the
+  directory lookups (E1.2–E1.4), so GOA books Lookout already syncs stay out.
+- **Data.** `UiState::desktop_contacts` holds the books (`DesktopBook { uid, display_name,
+  cards }`). `EdsAddressBook::all_contacts()` lists a whole book with
+  `(contains "x-evolution-any-field" "")`, falling back to `#t`. On this desktop that was
+  10 books and 253 cards in 17 ms.
+- **Read-only, using the existing marker.** Desktop entries carry an empty `href`, which is the
+  People screen's display-only marker, shared with the Deleted bucket. So the editor, Delete
+  and the ribbon's Edit stay off without new checks. Their account id is `eds:<source uid>`
+  (`desktop_contacts::is_desktop_entry`).
+- **"Open in GNOME Contacts"** replaces Edit in the details pane, and row activation does the
+  same.
+  - GNOME Contacts can't be pointed at an EDS UID: its `show-contact` action takes a folks
+    individual id. So Lookout runs `gnome-contacts --email <first address>` (or
+    `--search <name>`) when the command is installed alongside it, which selects the contact.
+  - Otherwise (GNOME Contacts installed as a Flatpak, or Lookout sandboxed) it D-Bus-activates
+    `org.gnome.Contacts`, which opens the app without selecting the contact.
+  - When neither works, a toast says so. **P.1** needs `--talk-name=org.gnome.Contacts` for the
+    D-Bus route from the Flatpak.
+- **Favourites.** "Your Contacts" stays the accounts' contacts, but a starred desktop contact
+  also shows under Favourites. Stars use the same local store, keyed by the `eds:` account id.
+- **Refresh.** The section reloads:
+  - when contacts discovery finishes, so the GOA accounts to skip are known (discovery now
+    shows the People page when only desktop books exist);
+  - whenever the People screen is shown;
+  - every 15 minutes;
+  - when the setting changes; switching it off clears the section.
+
+  A reload that a newer one overtakes is dropped, and an unchanged result doesn't repaint.
+- **The setting's subtitle** now mentions the People section.
+- **Tests:**
+  - lookout-eds wire tests: a whole-book listing keeps phone-only cards and contact lists, and
+    the any-field query falls back to `#t`;
+  - desktop entries are told apart by account id, are display-only and keep book order;
+  - the GNOME Contacts arguments: address first, then name, never placeholder text;
+  - a GTK-gated sidebar test: the Desktop header and book row, read-only members, Favourites but
+    not "Your Contacts", and read-only list entries. It was checked to fail when the section is
+    removed;
+  - an ignored live test, `live_desktop_snapshot`.
+- **Not done:**
+  - desktop cards' `CATEGORIES` don't join the Categories section;
+  - a desktop contact isn't found by the profile card's "is this a known contact" lookup
+    (`find_contact_by_address`), so its address isn't treated as a stored contact elsewhere;
+  - if the People screen showed its empty page and desktop books appear later (the setting is
+    switched on, or EDS starts), the page switches only after the next contacts discovery,
+    which is at restart.
 
 - List eligible EDS books as read-only address books in the Contacts view, using a
   `ContactsAccountSnapshot`-style provider, with a "Desktop" section in the sidebar.

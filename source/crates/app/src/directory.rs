@@ -301,7 +301,7 @@ pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<Acc
         let st = state.borrow();
         let config = st.app_config.borrow().clone();
         let ids: Vec<AccountId> = st.accounts.iter().filter(|(_, handle)| handle.graph_pin.is_some()).map(|(id, _)| id.clone()).collect();
-        let synced_goa: HashSet<String> = st.contact_cmd_tx.keys().filter_map(crate::eds_directory::goa_account_id).map(str::to_string).collect();
+        let synced_goa = crate::eds_directory::synced_goa_accounts(&st);
         (config, ids, synced_goa)
     };
     let mut backends: Vec<Arc<dyn DirectoryBackend>> = Vec::new();

@@ -1037,6 +1037,11 @@ pub(crate) struct UiState {
     /// (UX-65) - set once the details widgets exist, and called whenever the
     /// selection changes or the list is rebuilt. A no-op until wired.
     pub(crate) contacts_details_refresh: Option<Rc<dyn Fn()>>,
+    /// The desktop's own address books (EDS_TODO.md E1.5), shown read-only
+    /// in the People screen's "Desktop" section. Refilled by
+    /// `desktop_contacts::reload`; empty when the feature is off or the
+    /// desktop has no Evolution Data Server.
+    pub(crate) desktop_contacts: Vec<crate::eds_directory::DesktopBook>,
     /// The UI-state database backing `starred_contacts`, opened best-effort
     /// at startup. `None` when the database couldn't be opened - favourites
     /// then fall back to session-only, never an error.

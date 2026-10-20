@@ -26,6 +26,7 @@ mod contacts_view;
 mod context_menu;
 mod conversation_view;
 mod datetime_picker;
+mod desktop_contacts;
 mod directory;
 mod eds_directory;
 mod event_editor;
