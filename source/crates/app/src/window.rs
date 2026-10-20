@@ -5872,11 +5872,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         calendar_groups: state.borrow().app_config.borrow().calendar_groups.clone(),
         hidden_calendars: state.borrow().app_config.borrow().hidden_calendars.clone(),
         calendar_sidebar_action: None,
+        eds_mirror: Default::default(),
     }));
     // The calendar handle `render_body` reaches for when an incoming iMIP
     // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
     // applied without every render path carrying a calendar reference.
     state.borrow_mut().calendar_state = Some(calendar_state.clone());
+
+    // EDS mirror (E2.3): the startup request and the once-a-day tick are
+    // wired now; both are no-ops until E2.4 turns the mirror on.
+    crate::eds_mirror::request_sync(&calendar_state, &worker, None);
+    crate::eds_mirror::start_daily_sync(calendar_state.clone(), worker.clone());
 
     // My Day (item 4.9 / T-02): prune stale days and load today's pin set into
     // the in-memory mirror before the first Tasks repaint.

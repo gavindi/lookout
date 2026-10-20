@@ -2553,6 +2553,14 @@ pub(crate) fn connect_calendar_account(
                                 callback(occ);
                             }
                         }
+                        // E2.3: a month that overlaps the mirror window may
+                        // have changed the cached occurrences the file is
+                        // built from. The debounce lets a whole sync burst
+                        // settle into one rewrite (and gives Graph's
+                        // app-side cache store time to land).
+                        if crate::eds_mirror::month_overlaps_window(month, chrono::Utc::now()) {
+                            crate::eds_mirror::request_sync(&calendar_state, &cache_worker, Some(crate::eds_mirror::SYNC_DEBOUNCE));
+                        }
                     }
                     CalendarSessionEvent::Error(message) => {
                         let title = glib::markup_escape_text(&format!("{}: {message}", calendar_account_label(&calendar_state, &account_id)));
@@ -2642,6 +2650,7 @@ pub(crate) fn spawn_webcal_session(
         }
     }
 
+    let mirror_worker = worker.clone();
     worker.spawn(lookout_dav::subscription::run_subscription_session(subscriptions, cmd_rx, evt_tx));
 
     glib::spawn_future_local(async move {
@@ -2683,6 +2692,9 @@ pub(crate) fn spawn_webcal_session(
                 if calendar_view::mini_month(&mini_calendar) == month {
                     let event_days = calendar_event_days(&calendar_state, month);
                     calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+                }
+                if crate::eds_mirror::month_overlaps_window(month, chrono::Utc::now()) {
+                    crate::eds_mirror::request_sync(&calendar_state, &mirror_worker, Some(crate::eds_mirror::SYNC_DEBOUNCE));
                 }
             }
         }

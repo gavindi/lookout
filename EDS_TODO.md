@@ -483,7 +483,47 @@ Write this as a pure function in `source/crates/app/src/eds_mirror.rs`.
     changes;
   - cancelled events and events on hidden calendars are dropped.
 
-### [ ] E2.3 — Sync by comparison (`M`)
+### [x] E2.3 — Sync by comparison (`M`)
+
+Done 2026-10-21.
+
+- **The file, not per-event D-Bus writes.** Following E0.1's custom-file design, a sync
+  rewrites the mirror's whole `eds-mirror.ics` atomically (pid-suffixed temp file plus
+  rename) when the content changed, so EDS's file monitor sees one coherent calendar.
+  There are no `CreateObjects`/`ModifyObjects` calls, batch sizes or all-or-nothing
+  handling. The file lives at `$XDG_DATA_HOME/lookout/eds-mirror.ics`
+  (`eds_mirror::mirror_path()`); E2.4 hands that path to `ensure_mirror_source`.
+- **The comparison.** `plan(desired: &[MirrorEvent], existing: &[(uid, hash)]) ->
+  MirrorPlan { create, modify, remove }` is still the pure heart. `X-LOOKOUT-HASH` (and
+  the UID) are read back from the existing file with `existing_events`; the file is
+  rewritten only when the plan is non-empty or the file is missing/empty. This also
+  removes an unknown UID someone added by hand.
+- **The window.** A rolling 7 days back to 60 days ahead, filtered by overlap so a
+  multi-day event that began before it still appears. `mirror_months` returns the
+  first-of-month `CalendarCache` keys the window can touch, and the sync opens each
+  account's cache and each webcal subscription's (`webcal-<id>`) on the blocking pool -
+  never the GTK thread. Deduplication is by mirror UID, and events are ordered by start
+  then UID.
+- **The file.** `build_calendar` emits one `VCALENDAR` with a fixed header, the
+  `VEVENT`s (and any `VTIMEZONE`s) from E2.2, deduplicated `VTIMEZONE`s by `TZID`, and a
+  stable event order. `DTSTAMP` is generated per build, which is why the comparison uses
+  event hashes rather than byte equality.
+- **When.** A month that overlaps the window triggers a request with a 5 s trailing-edge
+  debounce from both the CalDAV/Graph `OccurrencesUpdated` loop and the webcal
+  `SubscriptionsUpdated` loop; the window also requests once at startup and once a day.
+  `MirrorSyncState` allows one run at a time, and a request during a run coalesces into
+  a single follow-up (the `GraphPropertySyncs` rule).
+- **Still off.** `MirrorSyncState::enabled` defaults to false and nothing sets it until
+  E2.4's setting, so the triggers are no-ops for now. `set_enabled` is the E2.4 entry
+  point; turning it on requests an immediate sync, and changing the description setting
+  refreshes the file.
+- **Tests:** the plan's empty/unchanged/create/modify/remove cases; reading hashes back
+  from a built calendar; timezone dedupe and event ordering; the month window and its
+  overlap predicate; the rolling-window filter (past, far-future, cancelled and hidden
+  events dropped); an end-to-end cache-to-file sync that writes once, skips an unchanged
+  second run, and rewrites after a deletion; and the run/coalesce state machine.
+
+The original plan:
 
 - Plan the changes with a pure function, `plan(desired: &[MirrorEvent], existing: &[(uid,
   hash)]) -> MirrorPlan { create, modify, remove }`, and unit-test it thoroughly. Cases:

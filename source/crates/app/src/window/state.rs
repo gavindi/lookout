@@ -2029,6 +2029,10 @@ pub(crate) struct CalendarUiState {
     /// search when a month syncs or an event changes (the loop has no
     /// `Worker`/search-entry references of its own).
     pub(crate) calendar_search_refresh: Option<Rc<dyn Fn()>>,
+    /// The EDS mirror sync's pacing state (E2.3): whether it's enabled, the
+    /// debounce timer for a calendar refresh, and the in-flight/coalesced
+    /// flags. E2.4 wires the settings to it.
+    pub(crate) eds_mirror: crate::eds_mirror::MirrorSyncState,
     /// The current day's My Day pin set (item 4.9 / T-02), mirrored from the
     /// UI-state database so the Tasks view can label its rows Add/Remove and
     /// resolve the pinned tasks without a database read per repaint. Today's
