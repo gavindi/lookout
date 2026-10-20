@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.258" date="2026-10-20">
+      <description>
+        <p>The privacy blur's partial setting now also hides sender names and addresses in the message list.</p>
+      </description>
+    </release>
     <release version="0.9.257" date="2026-10-20">
       <description>
         <p>People now has a Desktop section listing the address books from GNOME Contacts and Evolution. They are read-only in Lookout, and "Open in GNOME Contacts" takes you to the contact to edit it there.</p>

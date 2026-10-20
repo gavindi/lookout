@@ -2664,3 +2664,15 @@ fn people_sidebar_lists_desktop_books_read_only() {
     assert!(entries[0].href.is_empty());
     assert_eq!(entries[0].category_label, "Personal");
 }
+
+#[test]
+fn sender_label_keeps_the_privacy_tag_through_read_state_changes() {
+    // A row's bind replaces the sender label's whole class list; the partial
+    // ("Sensitive") blur only reaches labels that still carry the tag.
+    for unread in [true, false] {
+        let classes = sender_label_classes(unread);
+        assert!(classes.contains(&crate::privacy::SENSITIVE_CLASS), "unread={unread}: {classes:?}");
+    }
+    assert!(sender_label_classes(true).contains(&"message-sender-unread"));
+    assert!(sender_label_classes(false).contains(&"message-sender-read"));
+}

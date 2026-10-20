@@ -1610,9 +1610,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 row_display_for_bind.get().apply(&widgets.avatar, &widgets.checkbox, &widgets.preview_label);
 
                 let unread = summary.is_unread();
-                widgets
-                    .sender_label
-                    .set_css_classes(if unread { &["message-sender-unread"] } else { &["message-sender-read"] });
+                widgets.sender_label.set_css_classes(sender_label_classes(unread));
                 widgets
                     .subject_label
                     .set_css_classes(if unread { &["message-subject-unread"] } else { &["message-subject-read"] });
@@ -1694,9 +1692,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // an unread member makes the conversation's sender, subject,
                 // and date read as unread.
                 let unread = thread.has_unread;
-                widgets
-                    .thread_sender
-                    .set_css_classes(if unread { &["message-sender-unread"] } else { &["message-sender-read"] });
+                widgets.thread_sender.set_css_classes(sender_label_classes(unread));
                 widgets
                     .thread_subject
                     .set_css_classes(if unread { &["message-subject-unread"] } else { &["message-subject-read"] });

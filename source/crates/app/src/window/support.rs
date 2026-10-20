@@ -717,6 +717,18 @@ pub(crate) fn set_pin_button_state(button: &gtk::Button, pinned: bool) {
     button.set_icon_name(pin_icon_name(pinned));
 }
 
+/// The CSS classes for a message or conversation row's sender label: the
+/// read/unread weight plus the privacy blur's sensitive tag. The row's bind
+/// replaces the label's whole class list with these, so the tag `connect_setup`
+/// added has to be part of it or the partial blur never reaches the sender.
+pub(crate) fn sender_label_classes(unread: bool) -> &'static [&'static str] {
+    if unread {
+        &["message-sender-unread", crate::privacy::SENSITIVE_CLASS]
+    } else {
+        &["message-sender-read", crate::privacy::SENSITIVE_CLASS]
+    }
+}
+
 /// The message-list importance glyph + tooltip for a message's Outlook
 /// importance (`!` for high, `↓` for low). `Normal` has no glyph and is
 /// never shown; the caller gates on that.
