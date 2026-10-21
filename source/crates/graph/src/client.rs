@@ -21,6 +21,26 @@ const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Ceiling on any single retry wait.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(120);
 
+/// The HTTP client every [`GraphClient`] shares, so the app's many Graph
+/// clients (one per feature and account) use one connection pool and reuse
+/// TLS sessions instead of each handshaking with Graph on its own.
+#[cfg(not(test))]
+static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(reqwest::Client::new);
+
+/// A handle on [`HTTP`]; cloning only bumps a reference count. The app runs
+/// one tokio runtime, so pooled connections never outlive theirs. Tests build
+/// a runtime each, so they get a fresh client to keep a dead runtime's
+/// connection out of the next test.
+#[cfg(not(test))]
+fn shared_http() -> reqwest::Client {
+    HTTP.clone()
+}
+
+#[cfg(test)]
+fn shared_http() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
 /// One page of a `/delta` query: the collected items and the `@odata.deltaLink`
 /// cursor to persist for the next incremental sync.
 #[derive(Debug, Clone, Default)]
@@ -30,8 +50,8 @@ pub struct DeltaPage {
 }
 
 /// A Microsoft Graph client over a [`TokenProvider`]. Cheap to clone-by-`Arc`
-/// at call sites; holds one `reqwest::Client` (its connection pool) and the
-/// token provider.
+/// at call sites; holds a handle on the shared `reqwest::Client` (one
+/// connection pool for every Graph client) and the token provider.
 pub struct GraphClient {
     http: reqwest::Client,
     base_url: String,
@@ -48,7 +68,7 @@ impl GraphClient {
     /// A client against an explicit service root (tests, sovereign clouds).
     pub fn with_base_url(tokens: Arc<dyn TokenProvider>, base_url: impl Into<String>) -> Self {
         GraphClient {
-            http: reqwest::Client::new(),
+            http: shared_http(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             tokens,
             max_retries: DEFAULT_MAX_RETRIES,

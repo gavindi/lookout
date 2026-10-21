@@ -308,7 +308,7 @@ pub(crate) fn sender_photo_texture(state: &Rc<RefCell<UiState>>, address: &str, 
         return cached.clone();
     }
     let texture = find_contact_by_address(state, address, None)
-        .and_then(|(_, entry)| entry.card.photo)
+        .and_then(|(_, entry)| Rc::unwrap_or_clone(entry.record).card.photo)
         .and_then(|photo| photo.data)
         .and_then(|data| gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok());
     cache.borrow_mut().insert(address.to_string(), texture.clone());
@@ -1025,10 +1025,14 @@ pub(crate) struct UiState {
     /// state only - not persisted - and read by `rebuild_contacts_list_ui`
     /// to filter the visible bucket.
     pub(crate) contacts_filter: String,
-    /// Repaints the People screen when `contacts_filter` changes - set once
-    /// the contacts widgets exist, and called by both the pane's own search
-    /// box and the module-aware title-bar search. A no-op until wired.
+    /// Repaints the whole People screen (bucket rail and list) when the
+    /// contacts behind it change, such as the desktop's address books - set
+    /// once the contacts widgets exist. A no-op until wired.
     pub(crate) contacts_refresh: Option<Rc<dyn Fn()>>,
+    /// Rebuilds only the People middle list for the selected bucket, for
+    /// changes that can't affect the bucket rail: the search query, the
+    /// Filter/Sort options and "File contacts as". A no-op until wired.
+    pub(crate) contacts_list_refresh: Option<Rc<dyn Fn()>>,
     /// The People list's Filter menu options (UX-65): a category to narrow
     /// to plus the "has email" / "has phone" quick filters, applied alongside
     /// `contacts_filter` by `rebuild_contacts_list_ui`. Session state only.

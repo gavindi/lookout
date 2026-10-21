@@ -546,7 +546,7 @@ impl std::fmt::Display for TokenRequestError {
 }
 
 async fn post_token_request(params: &[(&str, &str)]) -> Result<TokenResponse, TokenRequestError> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let resp = client
         .post(TOKEN_URL)
         .form(&params)

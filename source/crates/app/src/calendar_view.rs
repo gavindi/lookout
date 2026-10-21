@@ -1134,10 +1134,15 @@ impl SlotRange {
     }
 }
 
+/// Each calendar's parsed `(r, g, b)` colour, as the Cairo draw path wants it.
+type CalendarRgb = HashMap<CalendarId, (f64, f64, f64)>;
+
 #[derive(Clone)]
 struct TimeGridData {
     occurrences: Rc<RefCell<Vec<EventOccurrence>>>,
-    colors: Rc<RefCell<HashMap<CalendarId, String>>>,
+    /// Each calendar's colour, parsed once per `set_time_grid` so the draw
+    /// path never re-parses a hex string.
+    colors: Rc<RefCell<CalendarRgb>>,
     /// The consecutive local dates currently displayed, one per column.
     dates: Rc<RefCell<Vec<NaiveDate>>>,
     chips: Rc<RefCell<Vec<TimeChip>>>,
@@ -1828,7 +1833,7 @@ pub fn set_time_grid(
     *t.on_drag.borrow_mut() = on_drag;
     *t.anchor.borrow_mut() = anchor;
     *t.data.occurrences.borrow_mut() = occurrences.to_vec();
-    *t.data.colors.borrow_mut() = colors.clone();
+    *t.data.colors.borrow_mut() = colors.iter().map(|(id, color)| (id.clone(), calendar_colors::rgb(color))).collect();
 
     // A new render pass repaints the whole grid: the previously highlighted
     // range no longer corresponds to visible positions, and any armed chip
@@ -2769,20 +2774,13 @@ fn paint_entry(cr: &gtk::cairo::Context, (x, y, w, h): (f64, f64, f64, f64), cor
 /// lower alpha so the grid stays readable under it); `fg` is the canvas's
 /// theme foreground, the text colour on every entry.
 #[allow(clippy::too_many_arguments)]
-fn paint_chip(
-    cr: &gtk::cairo::Context,
-    gutter: f64,
-    chip: &TimeChip,
-    occ: &EventOccurrence,
-    colors: &HashMap<CalendarId, String>,
-    col_width: f64,
-    hovered: bool,
-    alpha: f64,
-    fg: (f64, f64, f64),
-) {
-    let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
+fn paint_chip(cr: &gtk::cairo::Context, gutter: f64, chip: &TimeChip, occ: &EventOccurrence, colors: &CalendarRgb, col_width: f64, hovered: bool, alpha: f64, fg: (f64, f64, f64)) {
+    let rgb = colors
+        .get(&occ.calendar_id)
+        .copied()
+        .unwrap_or_else(|| calendar_colors::rgb(calendar_colors::DEFAULT_CHECK_COLOR));
     let (cx, cy, cw, ch) = chip_geometry(gutter, chip, col_width);
-    let look = entry_look(css_color_rgb(color), occ.show_as, occ.status, hovered, alpha);
+    let look = entry_look(rgb, occ.show_as, occ.status, hovered, alpha);
     let corners = entry_corners(chip.starts, chip.ends, chip.all_day || chip.span > 1);
     let content = entry_content(occ, ch);
     paint_entry(cr, (cx, cy, cw, ch), corners, &look, &content, fg, ch >= 30.0);
@@ -2823,8 +2821,8 @@ fn entry_content(occ: &EventOccurrence, height: f64) -> EntryContent<'_> {
 
 /// Paints one event block in the Schedule view's lanes with the shared UX-57
 /// entry look, so a schedule block reads like the Day/Week chips.
-fn paint_schedule_block(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), color: &str, occ: &EventOccurrence, hovered: bool, fg: (f64, f64, f64)) {
-    let look = entry_look(css_color_rgb(color), occ.show_as, occ.status, hovered, 0.95);
+fn paint_schedule_block(cr: &gtk::cairo::Context, rect: (f64, f64, f64, f64), rgb: (f64, f64, f64), occ: &EventOccurrence, hovered: bool, fg: (f64, f64, f64)) {
+    let look = entry_look(rgb, occ.show_as, occ.status, hovered, 0.95);
     let content = EntryContent {
         title: occ.summary.as_deref().unwrap_or("(untitled)"),
         meta: None,
@@ -2847,37 +2845,36 @@ fn paint_right_text(cr: &gtk::cairo::Context, text: &str, right_x: f64, y: f64, 
     advance
 }
 /// Truncates `text` with an ellipsis so it fits within `max_width` at the
-/// current font size, measuring with cairo's toy-text extents. Chips are
-/// short strings, so linear truncation is plenty.
-fn ellipsize_text(cr: &gtk::cairo::Context, text: &str, max_width: f64) -> String {
+/// current font size, measuring with cairo's toy-text extents. Binary-searches
+/// the cut on char boundaries: toy text has no kerning, so a longer prefix is
+/// never narrower, and the search finds the same cut a char-by-char loop would
+/// in O(log n) measurements. (Toy text also can't shape CJK, RTL or emoji;
+/// moving to Pango would fix that.)
+pub(crate) fn ellipsize_text(cr: &gtk::cairo::Context, text: &str, max_width: f64) -> String {
     if max_width <= 0.0 {
         return String::new();
     }
-    if cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0) <= max_width {
+    let width = |s: &str| cr.text_extents(s).map(|e| e.x_advance()).unwrap_or(0.0);
+    if width(text) <= max_width {
         return text.to_string();
     }
-    let mut truncated = text.to_string();
-    while !truncated.is_empty() {
-        truncated.pop();
-        let candidate = format!("{truncated}…");
-        if cr.text_extents(&candidate).map(|e| e.x_advance()).unwrap_or(0.0) <= max_width {
-            return candidate;
+    // Every proper prefix's end, shortest first; `ends[0] == 0` is the bare
+    // ellipsis.
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // The longest fitting prefix: `ends[..lo]` all fit, `ends[hi..]` don't.
+    let (mut lo, mut hi) = (0, ends.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if width(&format!("{}…", &text[..ends[mid]])) <= max_width {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    "…".to_string()
-}
-
-/// Parses a `#rgb`/`#rrggbb`/`#rrggbbaa` hex colour to an `(r, g, b)` tuple in
-/// 0..=1 for Cairo, falling back to a neutral grey on anything unparseable.
-fn css_color_rgb(color: &str) -> (f64, f64, f64) {
-    let body = color.trim_start_matches('#');
-    let expanded = if body.len() == 3 && body.chars().all(|c| c.is_ascii_hexdigit()) {
-        body.chars().flat_map(|c| [c, c]).collect::<String>()
-    } else {
-        body.to_string()
-    };
-    let rgba = gtk::gdk::RGBA::parse(format!("#{expanded}")).unwrap_or_else(|_| gtk::gdk::RGBA::new(0.6, 0.6, 0.6, 1.0));
-    (rgba.red() as f64, rgba.green() as f64, rgba.blue() as f64)
+    match lo.checked_sub(1) {
+        Some(i) => format!("{}…", &text[..ends[i]]),
+        None => "…".to_string(),
+    }
 }
 
 /// A chronological (agenda-style) list of the displayed day's month, from the
@@ -3087,11 +3084,12 @@ const SCHEDULE_HEADER_HEIGHT: f64 = 22.0;
 /// Vertical inset of an event block within its lane.
 const SCHEDULE_BLOCK_INSET: f64 = 3.0;
 
-/// One calendar's lane in the Schedule view: its display name, its colour and
-/// the event blocks laid out across the shared horizontal timeline.
+/// One calendar's lane in the Schedule view: its display name, its colour
+/// (parsed once when the lanes are built) and the event blocks laid out across
+/// the shared horizontal timeline.
 struct ScheduleLane {
     label: String,
-    color: String,
+    rgb: (f64, f64, f64),
     blocks: Vec<ScheduleBlock>,
 }
 
@@ -3279,7 +3277,7 @@ fn set_schedule(
         blocks.sort_by_key(|b| (b.start_minutes, b.end_minutes));
         lanes.push(ScheduleLane {
             label: label.clone(),
-            color: colors.get(id).cloned().unwrap_or_else(|| calendar_colors::DEFAULT_CHECK_COLOR.to_string()),
+            rgb: calendar_colors::rgb(colors.get(id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR)),
             blocks,
         });
     }
@@ -3410,7 +3408,7 @@ fn paint_schedule(cr: &gtk::cairo::Context, width: f64, height: f64, state: &Sch
         // The lane's event blocks.
         for (block_index, block) in lane.blocks.iter().enumerate() {
             let rect = schedule_block_rect(lane_index, block, width);
-            paint_schedule_block(cr, rect, &lane.color, &block.occ, hover == Some((lane_index, block_index)), fg);
+            paint_schedule_block(cr, rect, lane.rgb, &block.occ, hover == Some((lane_index, block_index)), fg);
         }
 
         // Row separator.
@@ -4966,6 +4964,47 @@ fn first_grid_day(month: NaiveDate, week_start: chrono::Weekday) -> NaiveDate {
 mod tests {
     use super::*;
 
+    /// The char-by-char cut `ellipsize_text` replaced, kept as the reference
+    /// its binary search must agree with.
+    fn linear_ellipsize(cr: &gtk::cairo::Context, text: &str, max_width: f64) -> String {
+        if max_width <= 0.0 {
+            return String::new();
+        }
+        if cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0) <= max_width {
+            return text.to_string();
+        }
+        let mut truncated = text.to_string();
+        while !truncated.is_empty() {
+            truncated.pop();
+            let candidate = format!("{truncated}…");
+            if cr.text_extents(&candidate).map(|e| e.x_advance()).unwrap_or(0.0) <= max_width {
+                return candidate;
+            }
+        }
+        "…".to_string()
+    }
+
+    /// The binary-searched cut matches the old linear one on ASCII and
+    /// multi-byte titles at every width from nothing to more than enough.
+    #[test]
+    fn ellipsize_text_matches_the_linear_cut() {
+        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 10, 10).unwrap();
+        let cr = gtk::cairo::Context::new(&surface).unwrap();
+        cr.select_font_face("Sans", FontSlant::Normal, FontWeight::Bold);
+        cr.set_font_size(ENTRY_TITLE_SIZE);
+        let fixtures = ["Weekly planning sync", "Café — Überprüfung der Zahlen", "Lunch 🍜 with 李雷", "x", ""];
+        for text in fixtures {
+            let full = cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0);
+            let mut width = 0.0;
+            while width <= full + 4.0 {
+                assert_eq!(ellipsize_text(&cr, text, width), linear_ellipsize(&cr, text, width), "{text:?} at {width}");
+                width += 0.5;
+            }
+            // Exactly the full width still fits without an ellipsis.
+            assert_eq!(ellipsize_text(&cr, text, full.max(0.1)), text);
+        }
+    }
+
     /// The second-zone gutter (CAL-10) labels each primary hour row with the
     /// same instant elsewhere, on the first shown date: whole-hour offsets in
     /// the compact style, half-hour ones with minutes, and DST on either side
@@ -6027,7 +6066,7 @@ mod tests {
         let state = ScheduleState {
             lanes: vec![ScheduleLane {
                 label: "Work".to_string(),
-                color: "#3584e4".to_string(),
+                rgb: calendar_colors::rgb("#3584e4"),
                 blocks: vec![block],
             }],
             date: day,

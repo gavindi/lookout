@@ -587,6 +587,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         starred_contacts,
         contacts_filter: String::new(),
         contacts_refresh: None,
+        contacts_list_refresh: None,
         contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
         contacts_details_refresh: None,
         desktop_contacts: Vec::new(),
@@ -3244,7 +3245,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // The People pane's search box (P-06): filters the visible bucket by
     // name, email or organisation. Wired once `refresh_contacts_ui` exists,
     // below.
+    // `search-changed` waits for a 150 ms pause in typing (GTK's default,
+    // spelled out here because the list rebuild depends on it), so a fast
+    // typist repaints the list once rather than per keystroke.
     let contacts_search_entry = gtk::SearchEntry::builder()
+        .search_delay(150)
         .placeholder_text("Search contacts")
         .tooltip_text("Search contacts")
         .css_classes(["contacts-search-entry"])
@@ -4592,7 +4597,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if current_module.get() == "contacts" {
                 search_debounce.set(search_debounce.get() + 1);
                 state.borrow_mut().contacts_filter = query.to_string();
-                if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                let refresh = state.borrow().contacts_list_refresh.clone();
+                if let Some(refresh) = refresh {
                     refresh();
                 }
                 return;
@@ -6534,7 +6540,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let entries = contacts_entries.borrow();
             let selected_entries: Vec<ContactsListEntry> = entries
                 .iter()
-                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(&entry.card))))
+                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
                 .cloned()
                 .collect();
             // Edit needs exactly one selected contact; Delete any number.
@@ -6544,8 +6550,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 1 => selected_entries.first(),
                 _ => None,
             };
-            contacts_edit_button.set_sensitive(single.is_some_and(|entry| !entry.href.is_empty()));
-            contacts_delete_button.set_sensitive(!selected_entries.is_empty() && selected_entries.iter().any(|entry| !entry.href.is_empty()));
+            contacts_edit_button.set_sensitive(single.is_some_and(|entry| !entry.href().is_empty()));
+            contacts_delete_button.set_sensitive(!selected_entries.is_empty() && selected_entries.iter().any(|entry| !entry.href().is_empty()));
         }
     });
 
@@ -6768,11 +6774,48 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             refresh_contacts_ui(idx);
         }));
     }
+    // The list-only repaint: the search box, the Filter/Sort menu and "File
+    // contacts as" change only what the middle list shows, so they rebuild
+    // just that list for the selected bucket and leave the bucket rail (and
+    // the birthdays calendar) alone. With no bucket selected (nothing synced
+    // yet) it falls back to the full repaint.
+    {
+        let state_for_hook = state.clone();
+        let state = state.clone();
+        let contacts_category_list = contacts_category_list.clone();
+        let contacts_list = contacts_list.clone();
+        let contacts_categories = contacts_categories.clone();
+        let contacts_entries = contacts_entries.clone();
+        let contacts_selected = contacts_selected.clone();
+        let refresh_contacts_actions = refresh_contacts_actions.clone();
+        let contacts_details_refresh = contacts_details_refresh.clone();
+        let refresh_contacts_ui = refresh_contacts_ui.clone();
+        state_for_hook.borrow_mut().contacts_list_refresh = Some(Rc::new(move || {
+            let idx = contacts_category_list
+                .selected_row()
+                .and_then(|row| unsafe { row.data::<usize>("contacts-choice-index") })
+                .map(|idx| unsafe { *idx.as_ref() } as i32);
+            match idx {
+                Some(idx) => rebuild_contacts_list_ui(
+                    &contacts_list,
+                    &contacts_categories,
+                    &contacts_entries,
+                    idx,
+                    &state,
+                    &contacts_selected,
+                    &refresh_contacts_actions,
+                    &contacts_details_refresh,
+                ),
+                None => refresh_contacts_ui(None),
+            }
+        }));
+    }
     {
         let state = state.clone();
         contacts_search_entry.connect_search_changed(move |entry| {
             state.borrow_mut().contacts_filter = entry.text().to_string();
-            if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+            let refresh = state.borrow().contacts_list_refresh.clone();
+            if let Some(refresh) = refresh {
                 refresh();
             }
         });
@@ -6781,7 +6824,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // The Filter/Sort ▾ menu (UX-65), rebuilt on each open so the category
     // list is always current. Sort writes the shared "File contacts as"
     // preference; the filters live on `contacts_filter_options` and repaint
-    // the list in place via the `contacts_refresh` hook.
+    // the list in place via the `contacts_list_refresh` hook.
     {
         let state = state.clone();
         let button = contacts_filter_button.clone();
@@ -6810,7 +6853,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 sort_dropdown.connect_selected_notify(move |dropdown| {
                     let value = crate::settings::contact_file_as_at(dropdown.selected());
                     state.borrow().settings.set_string(crate::settings::CONTACTS_FILE_AS, value);
-                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                    let refresh = state.borrow().contacts_list_refresh.clone();
+                    if let Some(refresh) = refresh {
                         refresh();
                     }
                 });
@@ -6850,7 +6894,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let selected = dropdown.selected();
                     let value = if selected == 0 { None } else { categories.get(selected as usize - 1).cloned() };
                     state.borrow_mut().contacts_filter_options.category = value;
-                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                    let refresh = state.borrow().contacts_list_refresh.clone();
+                    if let Some(refresh) = refresh {
                         refresh();
                     }
                 });
@@ -6865,7 +6910,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let state = state.clone();
                 has_email.connect_active_notify(move |switch| {
                     state.borrow_mut().contacts_filter_options.has_email = switch.is_active();
-                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                    let refresh = state.borrow().contacts_list_refresh.clone();
+                    if let Some(refresh) = refresh {
                         refresh();
                     }
                 });
@@ -6880,7 +6926,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let state = state.clone();
                 has_phone.connect_active_notify(move |switch| {
                     state.borrow_mut().contacts_filter_options.has_phone = switch.is_active();
-                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                    let refresh = state.borrow().contacts_list_refresh.clone();
+                    if let Some(refresh) = refresh {
                         refresh();
                     }
                 });
@@ -6893,7 +6940,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let popover = popover.clone();
                 clear.connect_clicked(move |_| {
                     state.borrow_mut().contacts_filter_options = crate::contacts_view::ContactsFilterOptions::default();
-                    if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                    let refresh = state.borrow().contacts_list_refresh.clone();
+                    if let Some(refresh) = refresh {
                         refresh();
                     }
                     popover.popdown();
@@ -6918,12 +6966,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let Some(entry) = contacts_entries
                 .borrow()
                 .iter()
-                .find(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(&entry.card))))
+                .find(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
                 .cloned()
             else {
                 return;
             };
-            if entry.href.is_empty() {
+            if entry.href().is_empty() {
                 show_contact_details_dialog(&window, &entry);
             } else {
                 show_contact_editor_for(&window, &state, &toast_overlay, &entry);
@@ -6939,7 +6987,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let entries: Vec<ContactsListEntry> = contacts_entries
                 .borrow()
                 .iter()
-                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(&entry.card))))
+                .filter(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
                 .cloned()
                 .collect();
             delete_contact_entries(&state, &toast_overlay, &entries);
@@ -6960,7 +7008,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if crate::desktop_contacts::is_desktop_entry(&entry) {
                 // A desktop contact's "open for editing" is GNOME Contacts (E1.5).
                 crate::desktop_contacts::open_in_gnome_contacts(&entry, &toast_overlay);
-            } else if entry.href.is_empty() {
+            } else if entry.href().is_empty() {
                 // Deleted-bucket cards are display-only (their server
                 // metadata is gone with the card) - keep the read-only
                 // details dialog for them.
@@ -7561,7 +7609,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.contacts_file_as_row.connect_selected_notify(move |row| {
             let value = crate::settings::contact_file_as_at(row.selected());
             state.borrow().settings.set_string(crate::settings::CONTACTS_FILE_AS, value);
-            if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+            let refresh = state.borrow().contacts_list_refresh.clone();
+            if let Some(refresh) = refresh {
                 refresh();
             }
         });

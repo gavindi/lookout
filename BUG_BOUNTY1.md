@@ -128,14 +128,31 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
 21. **Calendar draw path.** [calendar_view.rs:2785-2881](source/crates/app/src/calendar_view.rs#L2785-L2881).
     - **Cost:** `ellipsize_text` is O(n²), with a `format!` and a `text_extents` call per removed character. `css_color_rgb` reparses the RGBA for every chip on every frame.
     - **Fix:** binary-search the cut point, and parse colours once when the data is set. (Optional: switching cairo toy text to Pango would fix CJK, RTL and emoji rendering; flag it, don't do it in this pass.)
+    - **Fixed:**
+      - `ellipsize_text` binary-searches the cut on char boundaries: O(log n) `text_extents` calls instead of one per removed character. Toy text has no kerning, so it finds the same cut; `ellipsize_text_matches_the_linear_cut` checks that against the old loop on ASCII, accented, emoji and CJK titles at every half-pixel width. `schedule_grid`'s copy of the old loop is gone and it calls `ellipsize_text`.
+      - The time grid parses each calendar's colour once in `set_time_grid`, and Schedule lanes once in `set_schedule`; `paint_chip` and `paint_schedule_block` take the parsed `(r, g, b)`.
+      - `css_color_rgb` and `tasks_view::parse_css_color` were copies; both are now `calendar_colors::rgb`.
+      - Pango is not done; `ellipsize_text`'s doc comment flags it.
 22. **Contacts list rebuilt on every keystroke and every poll.** [contacts_view.rs:1592-1637](source/crates/app/src/contacts_view.rs#L1592-L1637), [2146-2160](source/crates/app/src/contacts_view.rs#L2146-L2160).
     - **Cost:** the search has no debounce. Each rebuild deep-clones every record, and `sort_by_key` lowercases on every comparison.
     - **Fix:** debounce the search by 150 ms, use `sort_by_cached_key`, skip the rebuild when the poll diff is empty, and clone `Rc`s rather than records.
+    - **Fixed:**
+      - **Debounce:** both search boxes are `gtk::SearchEntry`, whose `search-changed` already waits 150 ms (GTK's default `search-delay`), so no timer was added; the People box now sets it explicitly. The real cost was that every search went through `contacts_refresh`, which rebuilt the bucket rail and re-ran the birthdays refresh as well as the list.
+      - **List-only repaint:** a new `contacts_list_refresh` hook rebuilds just the middle list for the selected bucket. Both searches, the Filter/Sort menu and Config → "File contacts as" use it; with no bucket selected it falls back to the full repaint. Sync and the desktop books still repaint everything.
+      - **Unchanged polls:** `ContactsAccountSnapshot::same_content` (name, books and records; `ContactRecord` and `AddressBookInfo` now derive `PartialEq`) drops a poll that changed nothing before the deleted-diff and the repaint.
+      - **Sharing:** bucket members are `ContactMember = (AccountId, Rc<str>, Rc<ContactRecord>)`, each record wrapped once per rebuild and shared by every bucket it sits in. `ContactsListEntry` holds the `Rc<ContactRecord>` with `card()`/`href()`/`etag()` accessors.
+      - Both sorts (accounts, entries) use `sort_by_cached_key`.
+      - **Not changed:** `ContactsAccountSnapshot.contacts` stays `Vec<ContactRecord>` (#23 owns moving the snapshots to `Arc`), so a rail rebuild still copies each record once.
 23. **Assistant prompt clones everything.** [window.rs:9547-9557](source/crates/app/src/window.rs#L9547-L9557) clones every occurrence and every contact snapshot, photos included, per prompt.
     - **Fix:** wrap the snapshots in `Arc` in `UiState`.
 24. **Per-request `reqwest::Client`.**
     - **Where:** [assistant.rs:93,122,185](source/crates/app/src/assistant.rs#L93), `post_token_request` ([microsoft_oauth.rs:549](source/crates/app/src/microsoft_oauth.rs#L549)), [reading.rs:696](source/crates/app/src/window/reading.rs#L696), [google_tasks.rs:301](source/crates/app/src/google_tasks.rs#L301); each `GraphClient::new` ([graph/src/client.rs:51](source/crates/graph/src/client.rs#L51)) also builds its own.
     - **Fix:** one shared `LazyLock<reqwest::Client>`, which gets connection-pool and TLS-session reuse. Keep dav's per-account client, because it carries the `accept_invalid_certs` setting.
+    - **Fixed:**
+      - **Graph:** every `GraphClient` takes a handle on one `LazyLock` client in `graph/src/client.rs` (`shared_http`), so the ~25 Graph clients share one pool with no call-site changes.
+      - **App:** a new `crate::http::client()` does the same for the assistant (×3), both OAuth `post_token_request`s, `GoogleTasksClient` and one-click unsubscribe. Per-request timeouts are unchanged.
+      - **Tests:** the app runs one tokio runtime, but each test builds its own, and a pooled connection from a finished test's runtime would fail in the next. Under `cfg(test)` both helpers return a fresh client.
+      - **Not changed:** dav's per-account client and the webcal subscription loop's per-session client.
 25. **Minor:**
     - `undo_stack.remove(0)` at [mail_actions.rs:2655](source/crates/app/src/window/mail_actions.rs#L2655) should use a `VecDeque`.
     - The calendar search backfill timer ([calendar_search.rs:221-239](source/crates/app/src/window/calendar_search.rs#L221-L239)) needs a generation check so it can't clear a newer search's indicator.

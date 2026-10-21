@@ -693,7 +693,7 @@ pub(crate) fn message_source_text(bytes: &[u8]) -> String {
 /// answer with); a non-2xx response or a transport failure is an error the
 /// caller surfaces as a toast (and may fall back to the mailto action).
 pub(crate) async fn post_one_click_unsubscribe(url: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let response = client
         .post(url)
         .form(&[("List-Unsubscribe", "One-Click")])

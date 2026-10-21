@@ -364,12 +364,12 @@ fn paint_grid(cr: &gtk::cairo::Context, width: f64, height: f64, state: &GridSta
         cr.set_font_size(12.0);
         cr.set_source_rgba(0.15, 0.15, 0.17, if row.organizer { 1.0 } else { 0.9 });
         cr.move_to(8.0, y + 16.0);
-        let _ = cr.show_text(&ellipsize(cr, &row.label, LABEL_WIDTH - 16.0));
+        let _ = cr.show_text(&crate::calendar_view::ellipsize_text(cr, &row.label, LABEL_WIDTH - 16.0));
         if let Some(subtitle) = &row.subtitle {
             cr.set_font_size(9.5);
             cr.set_source_rgba(0.5, 0.5, 0.5, 1.0);
             cr.move_to(8.0, y + 29.0);
-            let _ = cr.show_text(&ellipsize(cr, subtitle, LABEL_WIDTH - 16.0));
+            let _ = cr.show_text(&crate::calendar_view::ellipsize_text(cr, subtitle, LABEL_WIDTH - 16.0));
         }
 
         if row.loading {
@@ -483,22 +483,6 @@ fn hatch_rect(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, rgb: (f6
     }
     let _ = cr.stroke();
     let _ = cr.restore();
-}
-
-/// Truncates `text` to fit `max_width` with an ellipsis.
-fn ellipsize(cr: &gtk::cairo::Context, text: &str, max_width: f64) -> String {
-    if cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0) <= max_width {
-        return text.to_string();
-    }
-    let mut truncated = text.to_string();
-    while !truncated.is_empty() {
-        truncated.pop();
-        let candidate = format!("{truncated}…");
-        if cr.text_extents(&candidate).map(|e| e.x_advance()).unwrap_or(0.0) <= max_width {
-            return candidate;
-        }
-    }
-    "…".to_string()
 }
 
 /// The "Suggested times" heuristic (CAL-19): scan `date`'s working hours for

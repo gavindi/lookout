@@ -90,7 +90,7 @@ pub async fn delete_token() -> Result<(), String> {
 /// with a message, so a misconfigured host explains itself.
 pub async fn test_connection(base_url: &str, token: &str) -> Result<(), String> {
     let url = models_url(base_url)?;
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut request = client.get(&url).timeout(std::time::Duration::from_secs(10));
     if !token.is_empty() {
         request = request.bearer_auth(token);
@@ -119,7 +119,7 @@ pub async fn test_connection(base_url: &str, token: &str) -> Result<(), String> 
 /// not an error.
 pub async fn list_models(base_url: &str, token: &str) -> Result<Vec<String>, String> {
     let url = models_url(base_url)?;
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut request = client.get(&url).timeout(std::time::Duration::from_secs(10));
     if !token.is_empty() {
         request = request.bearer_auth(token);
@@ -182,7 +182,7 @@ pub async fn chat_completions(base_url: &str, token: &str, agent: &str, body: &s
         return Err("No agent selected - choose one in Settings → Assistant".to_string());
     }
     let url = endpoint_url(base_url, "chat/completions")?;
-    let client = reqwest::Client::new();
+    let client = crate::http::client();
     let mut request = client.post(&url).timeout(std::time::Duration::from_secs(30)).json(body);
     if !token.is_empty() {
         request = request.bearer_auth(token);

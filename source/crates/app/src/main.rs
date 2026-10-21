@@ -48,6 +48,7 @@ mod graph_pin;
 mod graph_rules;
 #[cfg(test)]
 mod gtk_test;
+mod http;
 mod identities;
 mod ignored_conversations;
 mod invite_conflicts;

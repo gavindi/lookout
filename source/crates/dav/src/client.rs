@@ -114,7 +114,7 @@ pub async fn fetch_webcal_ics(http: &reqwest::Client, url: &reqwest::Url) -> Res
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AddressBookInfo {
     pub account_id: AccountId,
     pub display_name: String,
@@ -135,7 +135,7 @@ impl AddressBookInfo {
 /// collection-relative `href` and current `getetag` of its server-side
 /// object. The write path needs both - a card fetched without them can't be
 /// PUT/DELETEd back with the `If-Match` precondition guard.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContactRecord {
     pub href: String,
     pub etag: Option<String>,

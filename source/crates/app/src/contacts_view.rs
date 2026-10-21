@@ -87,6 +87,16 @@ pub(crate) fn resolve_contact_lists(contacts: &[lookout_dav::ContactRecord]) -> 
     lists
 }
 
+impl ContactsAccountSnapshot {
+    /// Whether `other` would show the same People screen: the same name,
+    /// books and records. `suggestions` and `contact_lists` are derived from
+    /// the records, so they aren't compared. A poll that finds nothing new
+    /// (the usual case) is dropped on this, skipping the full repaint.
+    pub(crate) fn same_content(&self, other: &ContactsAccountSnapshot) -> bool {
+        self.display_name == other.display_name && self.books == other.books && self.contacts == other.contacts
+    }
+}
+
 /// A bare snapshot for tests: no books (the write path's pickers aren't
 /// exercised), just the display name and the given contact records.
 #[cfg(test)]
@@ -126,13 +136,19 @@ fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
     }
 }
 
+/// One contact in a People bucket: its account, the account's label and the
+/// record. Label and record are shared, so a contact that sits in several
+/// buckets (its account's, "Your contacts", Favourites, each category) costs
+/// a reference count per bucket rather than a deep copy.
+pub(crate) type ContactMember = (AccountId, Rc<str>, Rc<ContactRecord>);
+
 /// A `Category` bucket can span multiple accounts (the same tag used in two
 /// address books), so contacts are tagged with their own account rather than
 /// the choice carrying one account for all of them.
 #[derive(Clone)]
 pub struct ContactsCategoryChoice {
     kind: ContactsBucketKind,
-    contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)>,
+    contacts: Vec<ContactMember>,
 }
 
 impl ContactsCategoryChoice {
@@ -141,7 +157,7 @@ impl ContactsCategoryChoice {
     }
 
     #[cfg(test)]
-    pub(crate) fn members(&self) -> &[(AccountId, String, lookout_dav::ContactRecord)] {
+    pub(crate) fn members(&self) -> &[ContactMember] {
         &self.contacts
     }
 }
@@ -192,13 +208,26 @@ pub struct ContactsListEntry {
     pub account_id: AccountId,
     pub account_label: String,
     pub category_label: String,
-    pub card: VCard,
-    /// The server-side object metadata for `card`, needed by the editor to
-    /// PUT/DELETE the contact back (`If-Match` guards against clobbering).
-    /// `href` is empty for entries that only ever display a card (the
-    /// in-memory Deleted bucket), where no write is possible.
-    pub href: String,
-    pub etag: Option<String>,
+    /// The card plus the server-side object metadata the editor needs to
+    /// PUT/DELETE it back (`If-Match` guards against clobbering), shared with
+    /// the bucket it was listed from rather than copied.
+    pub record: Rc<ContactRecord>,
+}
+
+impl ContactsListEntry {
+    pub fn card(&self) -> &VCard {
+        &self.record.card
+    }
+
+    /// Empty for entries that only ever display a card (the in-memory
+    /// Deleted bucket, the desktop's books), where no write is possible.
+    pub fn href(&self) -> &str {
+        &self.record.href
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        self.record.etag.as_deref()
+    }
 }
 
 /// A write command for one account's contact session (CardDAV or Graph), sent
@@ -427,7 +456,7 @@ pub fn show_contact_details_dialog(window: &adw::ApplicationWindow, entry: &Cont
     let dialog = gtk::Window::builder()
         .transient_for(window)
         .modal(true)
-        .title(vcard_display_name(&entry.card))
+        .title(vcard_display_name(entry.card()))
         .default_width(520)
         .default_height(420)
         .build();
@@ -435,7 +464,7 @@ pub fn show_contact_details_dialog(window: &adw::ApplicationWindow, entry: &Cont
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
 
     let details = gtk::Label::builder()
-        .label(vcard_details_text(&entry.account_label, &entry.category_label, &entry.card))
+        .label(vcard_details_text(&entry.account_label, &entry.category_label, entry.card()))
         .xalign(0.0)
         .yalign(0.0)
         .selectable(true)
@@ -537,11 +566,18 @@ fn route_contact_update(state: &Rc<RefCell<UiState>>, account_id: AccountId, hre
 /// `route_contact_update` on the same path. A display-only entry (the Deleted
 /// bucket, `href` empty) can't be written and is skipped.
 pub fn save_contact_entry(state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, entry: &ContactsListEntry, card: VCard) {
-    if entry.href.is_empty() {
+    if entry.href().is_empty() {
         toast_overlay.add_toast(adw::Toast::new("This contact can't be saved here."));
         return;
     }
-    route_contact_update(state, entry.account_id.clone(), entry.href.clone(), entry.etag.clone(), card, toast_overlay);
+    route_contact_update(
+        state,
+        entry.account_id.clone(),
+        entry.href().to_string(),
+        entry.etag().map(str::to_string),
+        card,
+        toast_overlay,
+    );
 }
 
 /// Routes a deleted contact to its account's session (`Delete` with the
@@ -557,7 +593,7 @@ fn route_contact_delete(state: &Rc<RefCell<UiState>>, account_id: AccountId, hre
 /// session, toasting a single aggregate outcome instead of one toast per
 /// card. Deleted-bucket cards (`href` empty, display-only) are skipped.
 pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, entries: &[ContactsListEntry]) {
-    let writable: Vec<ContactsListEntry> = entries.iter().filter(|entry| !entry.href.is_empty()).cloned().collect();
+    let writable: Vec<ContactsListEntry> = entries.iter().filter(|entry| !entry.href().is_empty()).cloned().collect();
     if writable.is_empty() {
         toast_overlay.add_toast(adw::Toast::new("No deletable contacts selected."));
         return;
@@ -565,8 +601,8 @@ pub fn delete_contact_entries(state: &Rc<RefCell<UiState>>, toast_overlay: &adw:
     let mut replies = Vec::new();
     for entry in &writable {
         let Some(reply_rx) = dispatch_contact_command(state, &entry.account_id, move |reply| ContactCommand::Delete {
-            href: entry.href.clone(),
-            etag: entry.etag.clone(),
+            href: entry.href().to_string(),
+            etag: entry.etag().map(str::to_string),
             reply,
         }) else {
             toast_overlay.add_toast(adw::Toast::new("The contacts session isn't running."));
@@ -615,10 +651,10 @@ pub fn show_contact_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCe
         window,
         crate::contacts_editor::ContactEditorPrefill {
             books: &books,
-            existing: Some(&entry.card),
+            existing: Some(entry.card()),
             prefill: None,
-            href: &entry.href,
-            etag: entry.etag.as_deref(),
+            href: entry.href(),
+            etag: entry.etag(),
         },
         // A create callback for an edit is unreachable; the dialog only
         // fires it on the blank form.
@@ -708,9 +744,7 @@ pub fn find_contact_by_address(state: &Rc<RefCell<UiState>>, address: &str, pref
                         account_id: account_id.clone(),
                         account_label: snapshot.display_name.clone(),
                         category_label: contacts_bucket_label(&ContactsBucketKind::AllContacts),
-                        card: record.card.clone(),
-                        href: record.href.clone(),
-                        etag: record.etag.clone(),
+                        record: Rc::new(record.clone()),
                     },
                 ));
             }
@@ -1097,7 +1131,7 @@ pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<R
 /// `parse_all` imports), or as an Outlook CSV file (P-08, §4.6), per
 /// `format`.
 pub fn export_current_contacts(window: &adw::ApplicationWindow, format: ContactFileFormat, entries: &Rc<RefCell<Vec<ContactsListEntry>>>, toast_overlay: &adw::ToastOverlay) {
-    let cards: Vec<VCard> = entries.borrow().iter().map(|entry| entry.card.clone()).collect();
+    let cards: Vec<VCard> = entries.borrow().iter().map(|entry| entry.card().clone()).collect();
     if cards.is_empty() {
         toast_overlay.add_toast(adw::Toast::new("Nothing to export in this category."));
         return;
@@ -1379,43 +1413,41 @@ pub fn refresh_contacts_category_ui(
     {
         let st = state.borrow();
         let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
-        accounts.sort_by_key(|(_, data)| data.display_name.to_lowercase());
+        accounts.sort_by_cached_key(|(_, data)| data.display_name.to_lowercase());
 
         // Every distinct CATEGORIES tag across every account, so the same
         // tag used by contacts in two different address books still gets
         // one combined row rather than one per account.
-        let mut category_members: HashMap<String, Vec<(AccountId, String, lookout_dav::ContactRecord)>> = HashMap::new();
+        let mut category_members: HashMap<String, Vec<ContactMember>> = HashMap::new();
         // The same three aggregates the fixed top-level buckets use, built
         // while walking the accounts so the second pass doesn't re-derive them.
-        let mut all_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = Vec::new();
-        let mut all_lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> = Vec::new();
-        let mut all_deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = Vec::new();
+        let mut all_contacts: Vec<ContactMember> = Vec::new();
+        let mut all_lists: Vec<ContactMember> = Vec::new();
+        let mut all_deleted: Vec<ContactMember> = Vec::new();
+        // Each account's members and deleted cards, wrapped once here and
+        // shared by the per-account rows below.
+        let mut per_account: Vec<(Vec<ContactMember>, Vec<ContactMember>)> = Vec::with_capacity(accounts.len());
 
         for &(account_id, account) in &accounts {
-            let account_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account
-                .contacts
-                .iter()
-                .map(|record| (account_id.clone(), account.display_name.clone(), record.clone()))
-                .collect();
+            let label: Rc<str> = Rc::from(account.display_name.as_str());
+            let account_contacts: Vec<ContactMember> = account.contacts.iter().map(|record| (account_id.clone(), label.clone(), Rc::new(record.clone()))).collect();
 
-            for (_, _, record) in &account_contacts {
-                for tag in &record.card.categories {
-                    category_members
-                        .entry(tag.clone())
-                        .or_default()
-                        .push((account_id.clone(), account.display_name.clone(), record.clone()));
+            for member in &account_contacts {
+                for tag in &member.2.card.categories {
+                    category_members.entry(tag.clone()).or_default().push(member.clone());
                 }
-                if record.card.is_contact_list() {
-                    all_lists.push((account_id.clone(), account.display_name.clone(), record.clone()));
+                if member.2.card.is_contact_list() {
+                    all_lists.push(member.clone());
                 }
             }
-            all_contacts.extend(account_contacts);
+            all_contacts.extend(account_contacts.iter().cloned());
 
+            let mut deleted: Vec<ContactMember> = Vec::new();
             for card in st.deleted_contacts.get(account_id).into_iter().flatten() {
-                all_deleted.push((
+                deleted.push((
                     account_id.clone(),
-                    account.display_name.clone(),
-                    lookout_dav::ContactRecord {
+                    label.clone(),
+                    Rc::new(ContactRecord {
                         // Deleted-bucket cards are display-only (the diff
                         // against a poll only kept the card, not its server
                         // metadata): an empty href marks them as not writable,
@@ -1423,15 +1455,17 @@ pub fn refresh_contacts_category_ui(
                         href: String::new(),
                         etag: None,
                         card: card.clone(),
-                    },
+                    }),
                 ));
             }
+            all_deleted.extend(deleted.iter().cloned());
+            per_account.push((account_contacts, deleted));
         }
 
         // The desktop's address books (E1.5), read-only. Kept out of "Your
         // Contacts" (that's the accounts' contacts), but a starred desktop
         // contact still shows under Favourites.
-        let desktop_books: Vec<(String, Vec<crate::desktop_contacts::DesktopRecord>)> = st
+        let desktop_books: Vec<(String, Vec<ContactMember>)> = st
             .desktop_contacts
             .iter()
             .map(|book| (book.display_name.clone(), crate::desktop_contacts::desktop_records(book)))
@@ -1462,30 +1496,8 @@ pub fn refresh_contacts_category_ui(
             row_widgets.push((append_contacts_choice_row(category_list, &label, true), Some(rows.len() - 1)));
         }
 
-        for &(account_id, account) in &accounts {
-            let account_contacts: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account
-                .contacts
-                .iter()
-                .map(|record| (account_id.clone(), account.display_name.clone(), record.clone()))
-                .collect();
-            let lists: Vec<(AccountId, String, lookout_dav::ContactRecord)> = account_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
-            let deleted: Vec<(AccountId, String, lookout_dav::ContactRecord)> = st
-                .deleted_contacts
-                .get(account_id)
-                .into_iter()
-                .flatten()
-                .map(|card| {
-                    (
-                        account_id.clone(),
-                        account.display_name.clone(),
-                        lookout_dav::ContactRecord {
-                            href: String::new(),
-                            etag: None,
-                            card: card.clone(),
-                        },
-                    )
-                })
-                .collect();
+        for (&(_, account), (account_contacts, deleted)) in accounts.iter().zip(per_account) {
+            let lists: Vec<ContactMember> = account_contacts.iter().filter(|(_, _, record)| record.card.is_contact_list()).cloned().collect();
 
             // The header row shows the account's display name/address, so it
             // blurs under privacy mode ("Categories" below stays sharp).
@@ -1625,7 +1637,7 @@ pub fn rebuild_contacts_list_ui(
         .selected_row()
         .and_then(|row| unsafe { row.data::<usize>("contacts-entry-index") })
         .map(|idx| unsafe { *idx.as_ref() })
-        .and_then(|idx| contacts.borrow().get(idx).map(|entry| (entry.account_id.clone(), contact_identity(&entry.card))));
+        .and_then(|idx| contacts.borrow().get(idx).map(|entry| (entry.account_id.clone(), contact_identity(entry.card()))));
 
     while let Some(child) = contact_list.first_child() {
         contact_list.remove(&child);
@@ -1664,15 +1676,13 @@ pub fn rebuild_contacts_list_ui(
             .filter(|(_, _, record)| filter.is_empty() || contact_matches_filter(&record.card, &filter))
             .map(|(account_id, account_label, record)| ContactsListEntry {
                 account_id,
-                account_label,
+                account_label: account_label.to_string(),
                 category_label: category_label.clone(),
-                card: record.card,
-                href: record.href,
-                etag: record.etag,
+                record,
             })
             .collect()
     };
-    entries.sort_by_key(|entry| entry.card.file_as_key(file_as).to_lowercase());
+    entries.sort_by_cached_key(|entry| entry.card().file_as_key(file_as).to_lowercase());
 
     // Drop any selection whose contact isn't in this list - a category
     // switch, or an unstar removing a contact from Favourites - so the
@@ -1680,7 +1690,7 @@ pub fn rebuild_contacts_list_ui(
     // visible. Keyed by `(account_id, identity)`, so a star-toggle rebuild
     // (which re-sorts the same entries) leaves selections untouched.
     {
-        let live: HashSet<(AccountId, String)> = entries.iter().map(|entry| (entry.account_id.clone(), contact_identity(&entry.card))).collect();
+        let live: HashSet<(AccountId, String)> = entries.iter().map(|entry| (entry.account_id.clone(), contact_identity(entry.card()))).collect();
         selected.borrow_mut().retain(|key| live.contains(key));
     }
 
@@ -1758,7 +1768,7 @@ pub fn rebuild_contacts_list_ui(
     let mut row_widgets: Vec<(gtk::ListBoxRow, usize)> = Vec::new();
     let mut current_letter: Option<char> = None;
     for (entry_index, entry) in entries.iter().enumerate() {
-        let sort_key = entry.card.file_as_key(file_as);
+        let sort_key = entry.card().file_as_key(file_as);
         let letter = contact_letter(&sort_key);
         if current_letter != Some(letter) {
             append_contacts_header_row(contact_list, &letter.to_string());
@@ -1766,12 +1776,12 @@ pub fn rebuild_contacts_list_ui(
         }
 
         let name = gtk::Label::builder()
-            .label(vcard_display_name(&entry.card))
+            .label(vcard_display_name(entry.card()))
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         let email = gtk::Label::builder()
-            .label(vcard_primary_email(&entry.card))
+            .label(vcard_primary_email(entry.card()))
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["dim-label", "caption"])
@@ -1788,7 +1798,7 @@ pub fn rebuild_contacts_list_ui(
         text_box.append(&name);
         text_box.append(&email);
 
-        let identity = contact_identity(&entry.card);
+        let identity = contact_identity(entry.card());
         // Multi-select checkbox, left of the avatar: toggling it adds the
         // contact to (or removes it from) `selected`, driving the ribbon's
         // Edit/Delete sensitivity. Deliberately a checkbox rather than
@@ -1858,8 +1868,8 @@ pub fn rebuild_contacts_list_ui(
             });
         }
 
-        let display_name = vcard_display_name(&entry.card);
-        let primary_email = vcard_primary_email(&entry.card);
+        let display_name = vcard_display_name(entry.card());
+        let primary_email = vcard_primary_email(entry.card());
         // The avatar: coloured initials underneath, the contact's `PHOTO` on
         // top when the card carries embedded bytes (same shape as the mail
         // list's sender avatar). A photo-less or undecodable card keeps the
@@ -1870,7 +1880,7 @@ pub fn rebuild_contacts_list_ui(
             .build();
         avatar_label.add_css_class(crate::message_header::avatar_color_class(&primary_email));
         let avatar_photo = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).css_classes(["avatar-photo"]).build();
-        if let Some(texture) = entry.card.photo.as_ref().and_then(contact_photo_texture) {
+        if let Some(texture) = entry.card().photo.as_ref().and_then(contact_photo_texture) {
             avatar_photo.set_paintable(Some(&texture));
         }
         let avatar = gtk::Overlay::builder()
@@ -1909,7 +1919,7 @@ pub fn rebuild_contacts_list_ui(
         .and_then(|key| {
             row_widgets
                 .iter()
-                .find(|(_, idx)| contact_identity(&contacts.borrow()[*idx].card) == key.1 && contacts.borrow()[*idx].account_id == key.0)
+                .find(|(_, idx)| contact_identity(contacts.borrow()[*idx].card()) == key.1 && contacts.borrow()[*idx].account_id == key.0)
                 .cloned()
         })
         .or_else(|| row_widgets.first().cloned());
@@ -2178,6 +2188,9 @@ pub fn sync_contacts_account(
         while let Ok((is_first, result)) = rx.recv().await {
             match result {
                 Ok(contacts) => {
+                    if state.borrow().contacts_by_account.get(&account_id).is_some_and(|previous| previous.same_content(&contacts)) {
+                        continue;
+                    }
                     let mut st = state.borrow_mut();
                     // The snapshots the loop sends are the *complete* contact
                     // set for the account (rebuilt from the cache after the
@@ -2903,6 +2916,24 @@ mod tests {
             etag: None,
             card,
         }
+    }
+
+    /// A re-poll that finds the same records is the same content; a changed
+    /// etag, card or account name is not.
+    #[test]
+    fn same_content_spots_a_poll_that_changed_nothing() {
+        let with_etag = |etag: &str, card: VCard| lookout_dav::ContactRecord {
+            href: "/b/ann.vcf".to_string(),
+            etag: Some(etag.to_string()),
+            card,
+        };
+        let ann = person_card("ann", "ann@example.com");
+        let before = test_snapshot("Work", vec![with_etag("1", ann.clone())]);
+        assert!(before.same_content(&test_snapshot("Work", vec![with_etag("1", ann.clone())])));
+        assert!(!before.same_content(&test_snapshot("Work", vec![with_etag("2", ann.clone())])));
+        assert!(!before.same_content(&test_snapshot("Work", vec![with_etag("1", person_card("ann", "ann@example.org"))])));
+        assert!(!before.same_content(&test_snapshot("Home", vec![with_etag("1", ann.clone())])));
+        assert!(!before.same_content(&test_snapshot("Work", Vec::new())));
     }
 
     fn group_card(uid: &str, name: &str, members: &[&str]) -> VCard {

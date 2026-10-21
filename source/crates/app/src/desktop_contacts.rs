@@ -55,23 +55,24 @@ pub(crate) fn is_desktop_entry(entry: &ContactsListEntry) -> bool {
 }
 
 /// One People-screen row's data: `(account, account label, record)`.
-pub(crate) type DesktopRecord = (AccountId, String, lookout_dav::ContactRecord);
+pub(crate) type DesktopRecord = crate::contacts_view::ContactMember;
 
 /// A desktop book's cards as the People screen's rows. The empty `href`
 /// marks them display-only.
 pub(crate) fn desktop_records(book: &DesktopBook) -> Vec<DesktopRecord> {
     let account_id = desktop_account_id(&book.uid);
+    let label: Rc<str> = Rc::from(book.display_name.as_str());
     book.cards
         .iter()
         .map(|card| {
             (
                 account_id.clone(),
-                book.display_name.clone(),
-                lookout_dav::ContactRecord {
+                label.clone(),
+                Rc::new(lookout_dav::ContactRecord {
                     href: String::new(),
                     etag: None,
                     card: card.clone(),
-                },
+                }),
             )
         })
         .collect()
@@ -162,7 +163,7 @@ pub(crate) fn gnome_contacts_args(card: &VCard) -> Vec<String> {
 pub(crate) fn open_in_gnome_contacts(entry: &ContactsListEntry, toast_overlay: &adw::ToastOverlay) {
     if let Some(program) = glib::find_program_in_path("gnome-contacts") {
         let mut argv: Vec<std::ffi::OsString> = vec![program.into_os_string()];
-        argv.extend(gnome_contacts_args(&entry.card).into_iter().map(Into::into));
+        argv.extend(gnome_contacts_args(entry.card()).into_iter().map(Into::into));
         let argv_refs: Vec<&std::ffi::OsStr> = argv.iter().map(|arg| arg.as_os_str()).collect();
         match gio::Subprocess::newv(&argv_refs, gio::SubprocessFlags::NONE) {
             Ok(process) => {
@@ -213,9 +214,11 @@ mod tests {
             account_id: AccountId(account.to_string()),
             account_label: "Personal".to_string(),
             category_label: "Personal".to_string(),
-            card: card("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann\r\nEND:VCARD\r\n"),
-            href: String::new(),
-            etag: None,
+            record: Rc::new(lookout_dav::ContactRecord {
+                href: String::new(),
+                etag: None,
+                card: card("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Ann\r\nEND:VCARD\r\n"),
+            }),
         }
     }
 
@@ -241,7 +244,7 @@ mod tests {
         assert_eq!(records.len(), 2);
         for (account, label, record) in &records {
             assert_eq!(account, &AccountId("eds:143ac57f".to_string()));
-            assert_eq!(label, "Galaxy Users");
+            assert_eq!(&**label, "Galaxy Users");
             assert!(record.href.is_empty(), "an empty href keeps the editor and Delete off");
             assert!(record.etag.is_none());
         }

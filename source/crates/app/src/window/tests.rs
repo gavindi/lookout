@@ -627,9 +627,9 @@ fn find_contact_by_address_matches_across_accounts_case_insensitively() {
     // Case/whitespace-insensitive exact match on the address string.
     let (account_id, entry) = find_contact_by_address(&state, "  ada.lovelace@example.com ", None).expect("found in an address book");
     assert_eq!(account_id, AccountId("account_b".into()));
-    assert_eq!(entry.card.emails[0].address, "Ada.Lovelace@Example.com");
-    assert_eq!(entry.href, "/b/ada.vcf");
-    assert_eq!(entry.etag.as_deref(), Some("etag-b"));
+    assert_eq!(entry.card().emails[0].address, "Ada.Lovelace@Example.com");
+    assert_eq!(entry.href(), "/b/ada.vcf");
+    assert_eq!(entry.etag(), Some("etag-b"));
     // The email's own account is preferred when it also has the contact.
     state
         .borrow_mut()
@@ -725,6 +725,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         starred_contacts: HashSet::new(),
         contacts_filter: String::new(),
         contacts_refresh: None,
+        contacts_list_refresh: None,
         contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
         contacts_details_refresh: None,
         desktop_contacts: Vec::new(),
@@ -2637,12 +2638,17 @@ fn people_sidebar_lists_desktop_books_read_only() {
     assert_eq!(choice.members().len(), 1);
     let (account, label, record) = &choice.members()[0];
     assert_eq!(account, &desktop_account);
-    assert_eq!(label, "Personal");
+    assert_eq!(&**label, "Personal");
     assert!(record.href.is_empty(), "desktop contacts are display-only");
 
     // "Your Contacts" stays the accounts'; Favourites also offers starred desktop contacts.
     let your_contacts = categories.borrow().iter().find(|c| c.label() == "Your Contacts").cloned().unwrap();
     assert!(your_contacts.members().iter().all(|(account, _, _)| account.0 == "account_a"));
+    // The rail's bucket and the account's own share each record rather than
+    // holding copies.
+    let both: Vec<ContactsCategoryChoice> = categories.borrow().iter().filter(|c| c.label() == "Your Contacts").cloned().collect();
+    assert_eq!(both.len(), 2);
+    assert!(Rc::ptr_eq(&both[0].members()[0].2, &both[1].members()[0].2));
     let favourites = categories.borrow()[0].clone();
     assert_eq!(favourites.label(), "Favourites");
     assert!(favourites.members().iter().any(|(account, _, _)| account == &desktop_account));
@@ -2661,7 +2667,7 @@ fn people_sidebar_lists_desktop_books_read_only() {
     let entries = contacts.borrow();
     assert_eq!(entries.len(), 1);
     assert!(crate::desktop_contacts::is_desktop_entry(&entries[0]));
-    assert!(entries[0].href.is_empty());
+    assert!(entries[0].href().is_empty());
     assert_eq!(entries[0].category_label, "Personal");
 }
 

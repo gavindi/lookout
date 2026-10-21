@@ -541,7 +541,7 @@ pub fn set_nav(view: &TasksView, rows: &[TasksNavRow], selected: &TasksFilter) {
             let color = color.clone();
             let dot = gtk::DrawingArea::builder().width_request(10).height_request(10).valign(gtk::Align::Center).build();
             dot.set_draw_func(move |_, cr, width, height| {
-                let (r, g, b) = parse_css_color(&color);
+                let (r, g, b) = crate::calendar_colors::rgb(&color);
                 let radius = width.min(height) as f64 / 2.0 - 1.0;
                 cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius.max(1.0), 0.0, 2.0 * std::f64::consts::PI);
                 cr.set_source_rgba(r, g, b, 1.0);
@@ -1009,7 +1009,7 @@ pub(crate) fn task_row(
         .to_string();
     let dot = gtk::DrawingArea::builder().width_request(10).height_request(10).valign(gtk::Align::Center).build();
     dot.set_draw_func(move |_, cr, width, height| {
-        let (r, g, b) = parse_css_color(&color);
+        let (r, g, b) = crate::calendar_colors::rgb(&color);
         let radius = width.min(height) as f64 / 2.0 - 1.0;
         cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
         cr.set_source_rgba(r, g, b, 1.0);
@@ -1123,7 +1123,7 @@ fn category_chips(task: &CalendarTask, categories: &[CategoryDef]) -> Option<gtk
             .to_string();
         let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
         dot.set_draw_func(move |_, cr, width, height| {
-            let (r, g, b) = parse_css_color(&color);
+            let (r, g, b) = crate::calendar_colors::rgb(&color);
             let radius = width.min(height) as f64 / 2.0 - 0.5;
             cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius.max(1.0), 0.0, 2.0 * std::f64::consts::PI);
             cr.set_source_rgba(r, g, b, 1.0);
@@ -1137,20 +1137,6 @@ fn category_chips(task: &CalendarTask, categories: &[CategoryDef]) -> Option<gtk
         boxed.append(&chip);
     }
     Some(boxed)
-}
-
-/// Parses a `#rgb`/`#rrggbb` hex colour to an `(r, g, b)` tuple in 0..=1 for
-/// Cairo, falling back to a neutral grey on anything unparseable.
-/// `pub(crate)` for the Lookout dashboard's event rows.
-pub(crate) fn parse_css_color(color: &str) -> (f64, f64, f64) {
-    let body = color.trim_start_matches('#');
-    let expanded = if body.len() == 3 && body.chars().all(|c| c.is_ascii_hexdigit()) {
-        body.chars().flat_map(|c| [c, c]).collect::<String>()
-    } else {
-        body.to_string()
-    };
-    let rgba = gtk::gdk::RGBA::parse(format!("#{expanded}")).unwrap_or_else(|_| gtk::gdk::RGBA::new(0.6, 0.6, 0.6, 1.0));
-    (f64::from(rgba.red()), f64::from(rgba.green()), f64::from(rgba.blue()))
 }
 
 #[cfg(test)]

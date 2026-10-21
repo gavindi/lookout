@@ -106,6 +106,20 @@ pub fn rgba_to_hex(r: f32, g: f32, b: f32) -> String {
     format!("#{:02x}{:02x}{:02x}", byte(r), byte(g), byte(b))
 }
 
+/// Parses a `#rgb`/`#rrggbb`/`#rrggbbaa` hex colour to an `(r, g, b)` tuple in
+/// 0..=1 for Cairo, falling back to a neutral grey on anything unparseable.
+/// Callers that paint every frame parse once when their data is set.
+pub fn rgb(color: &str) -> (f64, f64, f64) {
+    let body = color.trim_start_matches('#');
+    let expanded = if body.len() == 3 && body.chars().all(|c| c.is_ascii_hexdigit()) {
+        body.chars().flat_map(|c| [c, c]).collect::<String>()
+    } else {
+        body.to_string()
+    };
+    let rgba = gtk::gdk::RGBA::parse(format!("#{expanded}")).unwrap_or_else(|_| gtk::gdk::RGBA::new(0.6, 0.6, 0.6, 1.0));
+    (f64::from(rgba.red()), f64::from(rgba.green()), f64::from(rgba.blue()))
+}
+
 /// The colour a calendar falls back to when the user asks for "Automatic
 /// colour" (item 3.13 / CAL-32): its server-advertised colour when there is
 /// one, else the palette colour at its position in `index` (wrapping), the
@@ -218,5 +232,15 @@ mod tests {
         assert_eq!(automatic_color(None, 1), CALENDAR_PALETTE[1]);
         // The palette wraps for an index past its end (a long calendar list).
         assert_eq!(automatic_color(None, CALENDAR_PALETTE.len()), CALENDAR_PALETTE[0]);
+    }
+
+    #[test]
+    fn rgb_parses_hex_forms_and_falls_back_to_grey() {
+        let close = |(r, g, b): (f64, f64, f64), (er, eg, eb): (f64, f64, f64)| (r - er).abs() < 1e-3 && (g - eg).abs() < 1e-3 && (b - eb).abs() < 1e-3;
+        assert!(close(rgb("#fff"), (1.0, 1.0, 1.0)));
+        assert!(close(rgb("#3584e4"), (0x35 as f64 / 255.0, 0x84 as f64 / 255.0, 0xe4 as f64 / 255.0)));
+        assert!(close(rgb("#ff000080"), (1.0, 0.0, 0.0)));
+        assert!(close(rgb("not a colour"), (0.6, 0.6, 0.6)));
+        assert!(close(rgb(""), (0.6, 0.6, 0.6)));
     }
 }

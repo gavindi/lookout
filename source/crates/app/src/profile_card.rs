@@ -230,7 +230,7 @@ fn show_card(context: &ContextProvider, widget: &gtk::Widget, resolve: &PersonRe
 
 /// Builds the card's contents for one person.
 fn build_card(ctx: &ProfileCardContext, address: &EmailAddress, account_id: Option<&AccountId>) -> gtk::Widget {
-    let contact = crate::contacts_view::find_contact_by_address(&ctx.state, &address.address, account_id).map(|(_, entry)| entry.card);
+    let contact = crate::contacts_view::find_contact_by_address(&ctx.state, &address.address, account_id).map(|(_, entry)| Rc::unwrap_or_clone(entry.record).card);
 
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

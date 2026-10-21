@@ -1200,7 +1200,7 @@ pub(crate) fn append_overview_event_row(grid: &gtk::Grid, row: i32, prefix_text:
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR).to_string();
     let dot = gtk::DrawingArea::builder().width_request(8).height_request(8).valign(gtk::Align::Center).build();
     dot.set_draw_func(move |_, cr, width, height| {
-        let (r, g, b) = crate::tasks_view::parse_css_color(&color);
+        let (r, g, b) = calendar_colors::rgb(&color);
         let radius = width.min(height) as f64 / 2.0 - 1.0;
         cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
         cr.set_source_rgba(r, g, b, 1.0);

@@ -174,20 +174,20 @@ impl ContactsDetailsPane {
         };
         self.root.set_visible_child_name("details");
 
-        let display_name = vcard_display_name(&entry.card);
-        let primary_email = vcard_primary_email(&entry.card);
+        let display_name = vcard_display_name(entry.card());
+        let primary_email = vcard_primary_email(entry.card());
         let address = EmailAddress {
             name: Some(display_name.clone()),
             address: primary_email.clone(),
         };
 
-        self.header_slot.append(&build_header(&entry.card, &display_name, &primary_email));
+        self.header_slot.append(&build_header(entry.card(), &display_name, &primary_email));
         self.actions_slot.append(&build_actions(entry, &address, actions));
 
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         fill_overview(&self.overview, entry, actions);
-        fill_contact_info(&self.contact_info, &entry.card);
+        fill_contact_info(&self.contact_info, entry.card());
         spawn_recent_mail(&self.emails, &address, entry, state, worker, actions, &self.generation, generation);
         spawn_files(&self.files, &address, entry, state, worker, actions, &self.generation, generation);
     }
@@ -216,14 +216,14 @@ impl ContactsDetailsPane {
     {
         clear_box(&self.edit_slot);
 
-        let form = crate::contacts_editor::build_contact_form(Some(&entry.card), None, true);
+        let form = crate::contacts_editor::build_contact_form(Some(entry.card()), None, true);
         self.edit_slot.append(&form.body);
 
         let footer = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
         footer.set_halign(gtk::Align::End);
         let delete_button = gtk::Button::with_label("Delete");
         delete_button.add_css_class("destructive-action");
-        delete_button.set_sensitive(!entry.href.is_empty());
+        delete_button.set_sensitive(!entry.href().is_empty());
         let cancel_button = gtk::Button::with_label("Cancel");
         let save_button = gtk::Button::with_label("Save");
         save_button.add_css_class("suggested-action");
@@ -360,9 +360,9 @@ fn build_actions(entry: &ContactsListEntry, address: &EmailAddress, actions: &Co
 
     // GNOME has no telephony, so where Outlook offers "Call" Lookout offers
     // the contact's own chat address (IMPP) or website instead.
-    let (icon, label, uri) = if let Some(uri) = entry.card.impp.iter().map(|im| im.uri.trim()).find(|uri| !uri.is_empty()) {
+    let (icon, label, uri) = if let Some(uri) = entry.card().impp.iter().map(|im| im.uri.trim()).find(|uri| !uri.is_empty()) {
         ("user-available-symbolic", "Chat", Some(uri.to_string()))
-    } else if let Some(uri) = entry.card.urls.iter().map(|url| url.trim()).find(|url| !url.is_empty()) {
+    } else if let Some(uri) = entry.card().urls.iter().map(|url| url.trim()).find(|url| !url.is_empty()) {
         ("web-browser-symbolic", "Website", Some(uri.to_string()))
     } else {
         ("user-available-symbolic", "Chat", None)
@@ -401,7 +401,7 @@ fn build_actions(entry: &ContactsListEntry, address: &EmailAddress, actions: &Co
 
     let delete = action_button("user-trash-symbolic", "Delete");
     delete.set_tooltip_text(Some("Delete this contact"));
-    delete.set_sensitive(!entry.href.is_empty());
+    delete.set_sensitive(!entry.href().is_empty());
     {
         let actions = actions.clone();
         let entry = entry.clone();
@@ -415,7 +415,7 @@ fn build_actions(entry: &ContactsListEntry, address: &EmailAddress, actions: &Co
 /// Fills the Overview tab: the key contact fields, then upcoming shared
 /// events.
 fn fill_overview(container: &gtk::Box, entry: &ContactsListEntry, actions: &ContactsDetailsActions) {
-    let card = &entry.card;
+    let card = entry.card();
     let mut any = false;
     if !card.emails.is_empty() {
         container.append(&section_heading("Email"));

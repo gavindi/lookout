@@ -380,7 +380,7 @@ fn event_row(occ: &EventOccurrence, colors: &CalendarColorMap, now: NaiveDateTim
     let color = colors.get(&occ.calendar_id).map(String::as_str).unwrap_or(DEFAULT_CHECK_COLOR).to_string();
     let dot = gtk::DrawingArea::builder().width_request(10).height_request(10).valign(gtk::Align::Center).build();
     dot.set_draw_func(move |_, cr, width, height| {
-        let (r, g, b) = tasks_view::parse_css_color(&color);
+        let (r, g, b) = crate::calendar_colors::rgb(&color);
         let radius = width.min(height) as f64 / 2.0 - 1.0;
         cr.arc(width as f64 / 2.0, height as f64 / 2.0, radius, 0.0, 2.0 * std::f64::consts::PI);
         cr.set_source_rgba(r, g, b, 1.0);
