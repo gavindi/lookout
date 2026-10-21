@@ -389,6 +389,11 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
 - `outbox` is the local outgoing-mail queue (§4.6, item 0.3): `payload` is an opaque JSON BLOB the
   session owns (`send::OutboxMessage`), `not_before` schedules it, and `state`/`attempts` drive the
   retry backoff. Append-only, so it needs no `user_version` wipe.
+- The Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, library only so far) reuses this cache
+  as is: a folder delta is stored with `upsert_messages` (the incremental counterpart of
+  `replace_messages`) and `delete_messages`, and its Outlook properties through
+  `apply_remote_mail_properties`. Its folder ids aren't paths, so the delimiter-based
+  `forget_mailbox_tree`/`rekey_snoozed` don't apply to it.
 - `graph_uids`/`graph_uid_space` are the Graph mail transport's identity map (MAIL_GRAPH_OVERVIEW.md
   item 5.7.3): `graph_uids()` returns or allocates one account-unique `Uid` per Graph message id in
   one `IMMEDIATE` transaction, `graph_ids_for()` reverses it, and `graph_uid_validity()` is the

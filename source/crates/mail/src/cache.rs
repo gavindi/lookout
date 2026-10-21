@@ -1126,6 +1126,38 @@ impl Cache {
         Ok(())
     }
 
+    /// Upserts `messages` into `mailbox_id` without touching the rest of the
+    /// folder: the incremental counterpart of `replace_messages`, for a source
+    /// that reports only what changed, such as a Graph folder delta
+    /// (MAIL_GRAPH_OVERVIEW.md item 5.7.4). Removals go through
+    /// `delete_messages`. Rows are written complete (a `partial` prefetch row
+    /// is promoted), and the search index is rewritten only for rows whose
+    /// envelope changed, keeping any full-body index text `store_body` added.
+    pub fn upsert_messages(&self, mailbox_id: &MailboxId, uidvalidity: UidValidity, messages: &[EmailSummary]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut exists = tx.prepare_cached("SELECT 1 FROM messages WHERE mailbox_id = ?1 AND uid = ?2")?;
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO messages (mailbox_id, uid, uidvalidity, data, partial) VALUES (?1, ?2, ?3, ?4, 0) \
+                 ON CONFLICT(mailbox_id, uid) DO UPDATE SET uidvalidity = excluded.uidvalidity, data = excluded.data, partial = 0 \
+                 WHERE messages.data IS NOT excluded.data OR messages.partial != 0",
+            )?;
+            for msg in messages {
+                let is_new = !exists.exists(rusqlite::params![mailbox_id.0, msg.uid.0])?;
+                let data = serde_json::to_string(msg)?;
+                if upsert.execute(rusqlite::params![mailbox_id.0, msg.uid.0, uidvalidity.0, data])? > 0 {
+                    index_preserving_body(&tx, msg, is_new)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Indexes a never-opened folder's newest-N envelope window, as fetched
     /// by the background prefetch, so the folder's recent mail is searchable
     /// before the user ever opens it. The rows are stored `partial`: `search`
@@ -2682,10 +2714,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Applies every locally-stored Outlook overlay (follow-up flags,
-    /// categories, importance, Focused/Other) to `messages`, for summaries that
-    /// came from the server rather than from a cache read, which overlays them
-    /// already.
     /// The Graph mail transport's `UidValidity` for this account
     /// (MAIL_GRAPH_OVERVIEW.md item 5.7.3): one value for every folder, fixed
     /// (at random) when the Uid map is created. It changes only when the map
@@ -2756,6 +2784,10 @@ impl Cache {
         Ok(conn.execute("DELETE FROM graph_uids WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.uid = graph_uids.uid)", [])?)
     }
 
+    /// Applies every locally-stored Outlook overlay (follow-up flags,
+    /// categories, importance, Focused/Other) to `messages`, for summaries that
+    /// came from the server rather than from a cache read, which overlays them
+    /// already.
     pub fn overlay_follow_ups(&self, messages: &mut [EmailSummary]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         overlay_local(&conn, messages)
@@ -5506,6 +5538,38 @@ mod tests {
         );
         let path = cache.attachment_path(&mailbox_id, Uid(1), UidValidity(9), part);
         assert_eq!(path.parent(), Some(cache.attachments_dir.as_path()));
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn upsert_messages_changes_only_the_rows_it_is_given() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "AAMkAGINBOX=");
+        let validity = UidValidity(5);
+        cache
+            .replace_messages(&mailbox_id, validity, &[sample_summary(&mailbox_id, 1, None), sample_summary(&mailbox_id, 2, None)])
+            .unwrap();
+        cache.store_body(&mailbox_id, Uid(2), validity, &sample_body("zebracrossing in the body")).unwrap();
+
+        // A delta naming only uid 2 (changed) and uid 3 (new).
+        let mut changed = sample_summary(&mailbox_id, 2, None);
+        changed.subject = Some("renamed".to_string());
+        cache.upsert_messages(&mailbox_id, validity, &[changed, sample_summary(&mailbox_id, 3, None)]).unwrap();
+
+        let uids: Vec<u32> = cache.load_messages(&mailbox_id).unwrap().iter().map(|m| m.uid.0).collect();
+        assert_eq!(uids.len(), 3, "uid 1 is untouched, not deleted: {uids:?}");
+        assert_eq!(cache.load_summary(&mailbox_id, Uid(2)).unwrap().unwrap().subject.as_deref(), Some("renamed"));
+        assert_eq!(cache.search("zebracrossing", 10).unwrap().len(), 1, "the full-body index text survives the envelope change");
+        assert_eq!(cache.search("renamed", 10).unwrap().len(), 1);
+
+        // A partial prefetch row is promoted to a complete one.
+        let other = MailboxId::new(&account_id, "AAMkAGOTHER=");
+        cache.store_partial_messages(&other, validity, &[sample_summary(&other, 9, None)]).unwrap();
+        assert!(!cache.has_messages(&other).unwrap());
+        cache.upsert_messages(&other, validity, &[sample_summary(&other, 9, None)]).unwrap();
+        assert!(cache.has_messages(&other).unwrap());
+        cache.upsert_messages(&other, validity, &[]).unwrap();
         let _ = remove_account_cache(&account_id);
     }
 }

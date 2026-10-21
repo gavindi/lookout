@@ -21,3 +21,6 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 
 [dev-dependencies]
 wiremock = "0.6"
+# Only for the Graph-mail-into-the-mail-cache round trip (tests/graph_mail_cache.rs,
+# MAIL_GRAPH_OVERVIEW.md item 5.7.4); lookout-mail never depends on this crate.
+lookout-mail.workspace = true
