@@ -13,6 +13,9 @@ base64.workspace = true
 chrono.workspace = true
 chrono-tz = "0.10"
 lookout-core.workspace = true
+# The Graph mail session (MAIL_GRAPH_OVERVIEW.md item 5.7.5) speaks the mail
+# crate's `AccountCommand`/`AccountEvent` contract and stores into its `Cache`.
+lookout-mail.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -21,6 +24,3 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 
 [dev-dependencies]
 wiremock = "0.6"
-# Only for the Graph-mail-into-the-mail-cache round trip (tests/graph_mail_cache.rs,
-# MAIL_GRAPH_OVERVIEW.md item 5.7.4); lookout-mail never depends on this crate.
-lookout-mail.workspace = true

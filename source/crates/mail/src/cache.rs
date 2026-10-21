@@ -2759,6 +2759,22 @@ impl Cache {
         Ok(uids)
     }
 
+    /// The Uid behind each Graph message id in `graph_ids` that the map
+    /// already knows - the non-allocating counterpart of
+    /// [`Self::graph_uids`], for ids that arrive as delta tombstones: a
+    /// message deleted before this cache ever saw it must not burn a Uid.
+    pub fn graph_uids_existing(&self, graph_ids: &[String]) -> Result<HashMap<String, Uid>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT uid FROM graph_uids WHERE graph_id = ?1")?;
+        let mut uids = HashMap::new();
+        for graph_id in graph_ids {
+            if let Some(uid) = stmt.query_row([graph_id], |row| row.get::<_, u32>(0)).optional()? {
+                uids.insert(graph_id.clone(), Uid(uid));
+            }
+        }
+        Ok(uids)
+    }
+
     /// The Graph message id behind each of `uids` that has one; Uids with no
     /// mapping are left out.
     pub fn graph_ids_for(&self, uids: &[Uid]) -> Result<HashMap<Uid, String>> {
@@ -5441,6 +5457,19 @@ mod tests {
         assert_eq!(ids.get(&Uid(1)).map(String::as_str), Some("g-old"));
         assert_eq!(ids.get(&Uid(4)).map(String::as_str), Some("g-later"));
         assert!(!ids.contains_key(&Uid(99)));
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn graph_uids_existing_never_allocates_for_an_unknown_id() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let uids = cache.graph_uids(&["known"]).unwrap();
+        let existing = cache.graph_uids_existing(&["known".to_string(), "never-seen".to_string()]).unwrap();
+        assert_eq!(existing.get("known"), Some(&uids[0]));
+        assert!(!existing.contains_key("never-seen"));
+        // The lookup didn't touch the allocator: the next new id gets Uid 2.
+        assert_eq!(cache.graph_uids(&["next"]).unwrap(), vec![Uid(2)]);
         let _ = remove_account_cache(&account_id);
     }
 

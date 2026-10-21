@@ -10,9 +10,11 @@
 //! `todo`, it is deliberately pure - no HTTP, no [`GraphClient`] - so every
 //! rule is unit-testable against inline JSON. The HTTP transport lives in
 //! [`client`] (`MailClient`). The whole-message, folder and attachment
-//! mapping for the Graph mail transport (item 5.7.2) lives in [`message`], and
-//! how Graph ids become `MailboxId`/`Uid`/part numbers (item 5.7.3) in
-//! [`identity`].
+//! mapping for the Graph mail transport (item 5.7.2) lives in [`message`], how
+//! Graph ids become `MailboxId`/`Uid`/part numbers (item 5.7.3) in
+//! [`identity`], and the account-session actor that drives all of it over the
+//! mail crate's `AccountCommand`/`AccountEvent` seam (item 5.7.5) in
+//! [`session`].
 //!
 //! [`GraphClient`]: crate::client::GraphClient
 //!
@@ -37,6 +39,7 @@
 pub mod client;
 pub mod identity;
 pub mod message;
+pub mod session;
 
 pub use client::MailClient;
 pub use identity::{allocation_order, attachment_id_from_part, graph_folder_id, graph_mailbox_id, graph_part_number};
@@ -45,6 +48,7 @@ pub use message::{
     mail_folder_from_graph, mailbox_from_graph, message_from_graph, search_param, GraphAttachment, GraphMessage, MailFolder, MailFolderDelta, MessagePatch, MessageSummaryDelta,
     WellKnownFolders, ATTACHMENT_SELECT, BODY_SELECT, FOLDER_SELECT, SUMMARY_SELECT, WELL_KNOWN_FOLDER_NAMES,
 };
+pub use session::{run_graph_mail_session, GraphMailSessionConfig, DEFAULT_POLL_INTERVAL};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Offset, SecondsFormat, TimeZone, Utc};
 use lookout_core::{EmailAddress, FlagStatus, FollowUpFlag, Importance};

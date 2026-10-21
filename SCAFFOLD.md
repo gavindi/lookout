@@ -84,7 +84,7 @@ composite string keys:
 | `EventUid(String)` | iCalendar `UID` | Unique only within a `CalendarId` |
 | `TaskUid(String)` | VTODO `UID` | Same scoping as `EventUid` |
 
-On the optional Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, library only so far) the
+On the optional Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, the session actor exists but is not wired into the app until item 5.7.6) the
 same types carry Graph identities (`lookout_graph::mail::identity`):
 
 | Type | Graph shape | Notes |
@@ -389,7 +389,8 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
 - `outbox` is the local outgoing-mail queue (§4.6, item 0.3): `payload` is an opaque JSON BLOB the
   session owns (`send::OutboxMessage`), `not_before` schedules it, and `state`/`attempts` drive the
   retry backoff. Append-only, so it needs no `user_version` wipe.
-- The Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, library only so far) reuses this cache
+- The Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, session actor at
+  `lookout_graph::mail::session`, not wired until item 5.7.6) reuses this cache
   as is: a folder delta is stored with `upsert_messages` (the incremental counterpart of
   `replace_messages`) and `delete_messages`, and its Outlook properties through
   `apply_remote_mail_properties`. Its folder ids aren't paths, so the delimiter-based
@@ -438,6 +439,11 @@ send", item 1.14); `RescheduleOutbox` moves a row's due time with a fresh retry 
 "Retry"). After every outbox change, and once at session start before connecting, the session
 emits `OutboxContents` with the decoded rows (`OutboxItem`), which drives the app's
 scheduled-messages banner and dialog and a scheduled draft's "Cancel send" bar.
+On the Graph mail transport (`lookout_graph::mail::session`, item 5.7.5) the same
+`outbox` table is the offline/undo/schedule queue, but a due row is delivered with Graph's
+MIME form of `sendMail` (`Content-Type: text/rfc822`) rather than SMTP: the raw bytes the
+mail crate built are posted unchanged, with a `Bcc:` header added because Graph derives the
+recipients from the MIME headers (Exchange strips it on delivery).
 
 **Snooze (item 1.15).** `SnoozeMessages` moves the messages to the account's top-level "Scheduled"
 folder (created on demand) after tagging them `$Lookout-snooze-<unix>`

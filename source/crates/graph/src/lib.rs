@@ -39,6 +39,7 @@ pub use contacts::{contact_folder_from_graph, contact_from_graph, contact_to_gra
 pub use error::{GraphError, Result};
 pub use mail::client::MailClient;
 pub use mail::identity::{allocation_order, attachment_id_from_part, graph_folder_id, graph_mailbox_id, graph_part_number};
+pub use mail::session::{run_graph_mail_session, GraphMailSessionConfig, DEFAULT_POLL_INTERVAL};
 pub use mail::{
     attachment_from_graph, body_part_from_attachment, categories_body, classification_body, comment_body, destination_body, draft_body, email_body_from_graph,
     email_summary_from_graph, flag_body, flag_from_graph, folder_name_body, importance_body, mail_folder_from_graph, mailbox_from_graph, message_from_graph, message_id_filter,

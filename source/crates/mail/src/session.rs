@@ -1141,7 +1141,11 @@ pub struct OutboxItem {
 
 /// The UI's view of the outbox rows, oldest due first. Rows whose payload
 /// doesn't decode are skipped - the drain drops them when they come due.
-fn outbox_items(entries: Vec<crate::cache::OutboxEntry>) -> Vec<OutboxItem> {
+///
+/// Public so the Graph mail session (MAIL_GRAPH_OVERVIEW.md item 5.7.5), which
+/// drives the same local outbox over `sendMail`, reports `OutboxContents` in
+/// exactly the shape the app already renders.
+pub fn outbox_items(entries: Vec<crate::cache::OutboxEntry>) -> Vec<OutboxItem> {
     let mut items: Vec<OutboxItem> = entries
         .into_iter()
         .filter_map(|entry| {

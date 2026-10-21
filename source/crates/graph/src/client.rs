@@ -49,6 +49,13 @@ pub struct DeltaPage {
     pub delta_link: Option<String>,
 }
 
+/// A request body: JSON for the ordinary endpoints, or raw bytes with their
+/// own `Content-Type` for Graph's MIME `sendMail`.
+enum RequestBody<'a> {
+    Json(&'a Value),
+    Raw { bytes: &'a [u8], content_type: &'a str },
+}
+
 /// A Microsoft Graph client over a [`TokenProvider`]. Cheap to clone-by-`Arc`
 /// at call sites; holds a handle on the shared `reqwest::Client` (one
 /// connection pool for every Graph client) and the token provider.
@@ -236,10 +243,29 @@ impl GraphClient {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// A `POST` of a raw request body with an explicit `Content-Type`, for the
+    /// endpoints that take bytes rather than JSON - Graph's MIME `sendMail`
+    /// (`Content-Type: text/rfc822`), which the local outbox drains through so
+    /// it sends the exact RFC 5322 message the mail crate built (attachments,
+    /// iMIP payloads and read receipts included). Returns the parsed response
+    /// or `Value::Null` for an empty `202`.
+    pub async fn post_raw(&self, path: &str, bytes: &[u8], content_type: &str) -> Result<Value> {
+        let response = self.send_request(Method::POST, path, Some(RequestBody::Raw { bytes, content_type }), &[]).await?;
+        let body = response.bytes().await?;
+        if body.is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::from_slice(&body)?)
+    }
+
     /// The token-authenticated request loop: sends the request, waits out
     /// throttling, and returns the successful response for the caller to decode
     /// (JSON for [`Self::send_json`], raw bytes for [`Self::get_bytes`]).
     async fn send_response(&self, method: Method, path: &str, body: Option<&Value>, headers: &[(&str, &str)]) -> Result<reqwest::Response> {
+        self.send_request(method, path, body.map(RequestBody::Json), headers).await
+    }
+
+    async fn send_request(&self, method: Method, path: &str, body: Option<RequestBody<'_>>, headers: &[(&str, &str)]) -> Result<reqwest::Response> {
         let url = self.absolute(path);
         let mut attempt = 0u32;
         loop {
@@ -248,8 +274,11 @@ impl GraphClient {
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
-            if let Some(body) = body {
-                request = request.json(body);
+            if let Some(body) = body.as_ref() {
+                request = match body {
+                    RequestBody::Json(value) => request.json(value),
+                    RequestBody::Raw { bytes, content_type } => request.header(reqwest::header::CONTENT_TYPE, *content_type).body(bytes.to_vec()),
+                };
             }
             let response = request.send().await?;
             let status = response.status();
@@ -634,6 +663,21 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn post_raw_sends_the_bytes_and_content_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .and(header("Content-Type", "text/rfc822"))
+            .and(wiremock::matchers::body_string("Subject: hi\r\n\r\nbody"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        let response = client(&server).post_raw("me/sendMail", b"Subject: hi\r\n\r\nbody", "text/rfc822").await.unwrap();
+        assert_eq!(response, Value::Null);
     }
 
     #[tokio::test]

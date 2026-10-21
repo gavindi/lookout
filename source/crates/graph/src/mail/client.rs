@@ -76,6 +76,27 @@ impl MailClient {
         Ok(page_items(&page).first().and_then(|message| message.get("id")).and_then(Value::as_str).map(str::to_string))
     }
 
+    /// [`Self::resolve_message_id`] scoped to one folder - used to find the
+    /// *draft* copy of a Message-ID without risking the sent copy Exchange
+    /// filed in Sent Items after the same message went out.
+    pub async fn resolve_message_id_in(&self, folder_id: &str, message_id: &str) -> Result<Option<String>> {
+        let filter = percent_encode(&super::message_id_filter(message_id));
+        let path = format!("me/mailFolders/{}/messages?$filter={filter}&$select=id", encode_segment(folder_id));
+        let page = self.graph.get_with_headers(&path, &IMMUTABLE_ID).await?;
+        Ok(page_items(&page).first().and_then(|message| message.get("id")).and_then(Value::as_str).map(str::to_string))
+    }
+
+    /// Saves raw RFC 5322 bytes as a new draft (`POST /me/messages` with
+    /// `Content-Type: text/rfc822`), returning it with its id. MIME is the only
+    /// form that preserves the compose session's stable `Message-ID` and Bcc
+    /// header, which repeated autosaves use to replace rather than duplicate
+    /// (MAIL_GRAPH_OVERVIEW.md item 5.7.5). [`Self::create_draft`] remains the
+    /// JSON form for callers that only have an [`OutgoingMessage`].
+    pub async fn create_draft_mime(&self, raw: &[u8]) -> Result<Option<GraphMessage>> {
+        let created = self.graph.post_raw("me/messages", raw, "text/rfc822").await?;
+        Ok(message_from_graph(&created, None))
+    }
+
     /// Reads one message's synced properties by Graph id, or `None` when it no
     /// longer exists. `zone` interprets a follow-up flag's due date.
     pub async fn get_properties(&self, graph_id: &str, zone: Option<chrono_tz::Tz>) -> Result<Option<MessageProperties>> {
@@ -155,6 +176,16 @@ impl MailClient {
     pub async fn send_scheduled(&self, message: &OutgoingMessage, deferred_send_at: Option<DateTime<Utc>>) -> Result<()> {
         let body = json!({ "message": outgoing_message_body(message, deferred_send_at) });
         self.graph.post("me/sendMail", &body).await.map(|_| ())
+    }
+
+    /// Sends an already-built RFC 5322 message through Graph's MIME form of
+    /// `sendMail` (`Content-Type: text/rfc822`). The local outbox (item 0.3)
+    /// stores the exact bytes the mail crate built, so draining it over Graph
+    /// must not re-render them through the JSON [`OutgoingMessage`] shape -
+    /// MIME is the only form that preserves attachments, an iMIP payload and a
+    /// read-receipt report faithfully (MAIL_GRAPH_OVERVIEW.md item 5.7.5).
+    pub async fn send_mime(&self, raw: &[u8]) -> Result<()> {
+        self.graph.post_raw("me/sendMail", raw, "text/rfc822").await.map(|_| ())
     }
 
     /// Sends `message` **as** a shared mailbox (`owner`, a Graph user id or
@@ -264,6 +295,18 @@ impl MailClient {
             }
         }
         Ok(delta)
+    }
+
+    /// One message at list-row weight (`GET /me/messages/{id}`), or `None` when
+    /// it no longer exists. Used after a copy, whose `copy` response carries
+    /// only the new id, so the target folder gets a complete row.
+    pub async fn get_summary(&self, graph_id: &str, zone: Option<chrono_tz::Tz>) -> Result<Option<GraphMessage>> {
+        let path = format!("me/messages/{}?{SUMMARY_SELECT}", encode_segment(graph_id));
+        match self.graph.get_with_headers(&path, &IMMUTABLE_ID).await {
+            Ok(value) => Ok(message_from_graph(&value, zone)),
+            Err(GraphError::Status { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// One message with its body and headers (`GET /me/messages/{id}`): the
@@ -771,6 +814,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_message_id_in_scopes_the_filter_to_a_folder() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/mailFolders/drafts-id/messages"))
+            .and(query_param("$filter", "internetMessageId eq '<abc@contoso.com>'"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": "draft-1" }] })))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            client(&server).resolve_message_id_in("drafts-id", "<abc@contoso.com>").await.unwrap().as_deref(),
+            Some("draft-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mime_draft_is_posted_to_the_messages_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/messages"))
+            .and(header("Content-Type", "text/rfc822"))
+            .and(wiremock::matchers::body_string("Message-ID: <d@lookout.local>\r\n\r\nhi"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "d1", "isDraft": true, "internetMessageId": "<d@lookout.local>"
+            })))
+            .mount(&server)
+            .await;
+
+        let draft = client(&server).create_draft_mime(b"Message-ID: <d@lookout.local>\r\n\r\nhi").await.unwrap().unwrap();
+        assert_eq!(draft.graph_id, "d1");
+        assert!(draft.is_draft);
+        assert_eq!(draft.message_id.as_deref(), Some("<d@lookout.local>"));
+    }
+
+    #[tokio::test]
+    async fn send_mime_posts_the_raw_bytes_as_rfc822() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/sendMail"))
+            .and(header("Content-Type", "text/rfc822"))
+            .and(wiremock::matchers::body_string("Subject: raw\r\n\r\nbody"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        client(&server).send_mime(b"Subject: raw\r\n\r\nbody").await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_failed_write_maps_to_a_status_error() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
@@ -913,6 +1006,28 @@ mod tests {
         assert_eq!(message.graph_id, "AAMkAGMSG1=");
         assert!(raw["body"]["content"].as_str().unwrap().contains("quarterly numbers"));
         assert!(client.get_message("gone", None).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_summary_reads_a_row_without_a_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/m1"))
+            .and(header("Prefer", "IdType=\"ImmutableId\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(summary_json("m1")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = client(&server);
+        let summary = client.get_summary("m1", None).await.unwrap().unwrap();
+        assert_eq!(summary.graph_id, "m1");
+        assert_eq!(summary.subject.as_deref(), Some("Hello"));
+        assert!(client.get_summary("gone", None).await.unwrap().is_none());
     }
 
     #[tokio::test]
