@@ -144,6 +144,10 @@ async fn the_graph_session_syncs_reads_and_writes_native_properties() {
     assert_eq!(folders.iter().filter(|folder| folder.role == lookout_core::MailboxRole::Inbox).count(), 1);
     let messages = cache.load_messages(&inbox).unwrap();
     assert_eq!(messages.len(), 3, "the Inbox rows");
+    // The Inbox's next delta cursor is persisted (item 5.7.8), so a restart
+    // resumes incrementally under the same Uids instead of re-reading the
+    // whole folder.
+    assert!(cache.graph_folder_cursor(&inbox).unwrap().is_some(), "the Inbox delta cursor is persisted");
     let report = messages.iter().find(|message| message.message_id.as_deref() == Some("<report-1@contoso.com>")).unwrap();
     assert!(report.is_unread());
     assert!(report.is_flagged_for_follow_up(), "the Graph flag rode the 5.4 overlay");
@@ -190,6 +194,11 @@ async fn the_graph_session_syncs_reads_and_writes_native_properties() {
     commands.send(AccountCommand::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), session).await.expect("the session stopped").unwrap();
 
+    // The cursor survives the session and a fresh cache handle, so the next
+    // launch reads only the folder's changes.
     drop(cache);
+    let reopened = Cache::open(&account_id).unwrap();
+    assert!(reopened.graph_folder_cursor(&inbox).unwrap().is_some(), "the persisted cursor survives a reopen");
+    drop(reopened);
     let _ = remove_account_cache(&account_id);
 }

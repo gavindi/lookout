@@ -14,7 +14,10 @@
 //!   notifications need a public HTTPS `notificationUrl` a desktop app cannot
 //!   host (R1), so the actor polls - the open folder on every
 //!   [`GraphMailSessionConfig::poll_interval`] and one other folder per tick in
-//!   a rotation.
+//!   a rotation. Each folder's `@odata.deltaLink` is persisted in the cache
+//!   (item 5.7.8), so a restart resumes incrementally instead of re-reading
+//!   every folder; an expired cursor is cleared and the folder resnapshots
+//!   under the same Uids.
 //! - **Identity.** Graph ids map onto the IMAP-shaped `MailboxId`/`Uid`/
 //!   `UidValidity` through items 5.7.3's helpers and the cache's `graph_uids`
 //!   map, so a moved message keeps its Uid and the rest of Lookout never learns
@@ -247,9 +250,10 @@ struct GraphMailSession {
     well_known: WellKnownFolders,
     /// The folder-hierarchy delta cursor (`/me/mailFolders/delta`).
     folder_delta_cursor: Option<String>,
-    /// Each folder's messages delta cursor, in memory: item 5.7.8 persists
-    /// them; until then a restart simply resyncs each open folder from scratch
-    /// under the same Uids (item 5.7.3's stable validity).
+    /// Each folder's messages delta cursor, loaded from and persisted to the
+    /// cache (item 5.7.8). A restart resumes from these; an expired one is
+    /// cleared and the folder resyncs under the same Uids (item 5.7.3's
+    /// stable validity).
     folder_cursors: HashMap<MailboxId, String>,
     current: Option<MailboxId>,
     /// Lookout category key → Graph category display name, learned from Graph
@@ -282,6 +286,12 @@ impl GraphMailSession {
                 self.folders = folders;
                 let _ = self.events.send(AccountEvent::FoldersUpdated(self.folders.clone())).await;
             }
+        }
+        // Resume each folder from its persisted delta cursor (item 5.7.8): a
+        // restart then delivers only what changed instead of re-reading every
+        // folder in full. An expired cursor is handled in `sync_mailbox`.
+        if let Some(Ok(cursors)) = cache_op(&self.cache, |cache| cache.graph_folder_cursors()).await {
+            self.folder_cursors = cursors;
         }
         self.current = self
             .folders
@@ -411,6 +421,14 @@ impl GraphMailSession {
     /// whose subtree walk is delimiter-based (item 5.7.4 rule 4).
     async fn forget_mailbox(&mut self, id: &MailboxId) {
         self.folder_cursors.remove(id);
+        if let Some(Err(e)) = cache_op(&self.cache, {
+            let id = id.clone();
+            move |cache| cache.clear_graph_folder_cursor(&id)
+        })
+        .await
+        {
+            tracing::warn!(%id, "couldn't clear a deleted folder's Graph delta cursor: {e}");
+        }
         let cached = cache_op(&self.cache, {
             let id = id.clone();
             move |cache| cache.load_messages(&id)
@@ -490,6 +508,16 @@ impl GraphMailSession {
                 Err(e) if e.is_delta_reset() && cursor.is_some() => {
                     tracing::info!(%mailbox, "graph mail: an expired message delta cursor, resyncing the folder");
                     self.folder_cursors.remove(mailbox);
+                    // Clear the persisted cursor too, so a restart while the
+                    // snapshot below is failing doesn't retry the dead link.
+                    if let Some(Err(clear_error)) = cache_op(&self.cache, {
+                        let mailbox = mailbox.clone();
+                        move |cache| cache.clear_graph_folder_cursor(&mailbox)
+                    })
+                    .await
+                    {
+                        tracing::warn!(%mailbox, "couldn't clear the expired Graph delta cursor: {clear_error}");
+                    }
                     cursor = None;
                 }
                 Err(e) => {
@@ -505,9 +533,7 @@ impl GraphMailSession {
                 }
             }
         };
-        if let Some(link) = delta.delta_link.take() {
-            self.folder_cursors.insert(mailbox.clone(), link);
-        }
+        let next_cursor = delta.delta_link.take();
 
         // A read that started from no cursor is the folder's whole current
         // set (a first sync, or a 410 reset), so stale cached rows must go
@@ -515,6 +541,22 @@ impl GraphMailSession {
         let full = cursor.is_none();
         let changed = full || !delta.upserts.is_empty() || !delta.removals.is_empty();
         let stored = self.store_delta(mailbox, delta, taken_at, full).await;
+        // Advance the cursor only after the page it describes has actually
+        // been stored (item 5.7.8): persisting it before a failed cache write
+        // would skip those changes on the next poll.
+        if stored.is_some() {
+            if let Some(link) = next_cursor {
+                self.folder_cursors.insert(mailbox.clone(), link.clone());
+                if let Some(Err(e)) = cache_op(&self.cache, {
+                    let mailbox = mailbox.clone();
+                    move |cache| cache.set_graph_folder_cursor(&mailbox, &link)
+                })
+                .await
+                {
+                    tracing::warn!(%mailbox, "couldn't persist the Graph delta cursor: {e}");
+                }
+            }
+        }
         if announce || (self.current.as_ref() == Some(mailbox) && changed) {
             self.emit_mailbox(mailbox, true).await;
         }

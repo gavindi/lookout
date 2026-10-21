@@ -812,6 +812,19 @@ impl Cache {
                 cursor TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+            -- The Graph mail transport's per-folder message delta cursors
+            -- (MAIL_GRAPH_OVERVIEW.md item 5.7.8), keyed by the account-scoped
+            -- `MailboxId`. Persisted so a restart resumes each folder from its
+            -- own `@odata.deltaLink` instead of re-reading the whole folder;
+            -- an expired cursor (410) is cleared and the folder resyncs as a
+            -- snapshot under the same Uids. Append-only, so no `user_version`
+            -- wipe, and empty on IMAP accounts. `graph_delta_cursor` above
+            -- stays the 5.4 per-message property sync's single cursor.
+            CREATE TABLE IF NOT EXISTS graph_folder_cursors (
+                mailbox_id TEXT PRIMARY KEY,
+                cursor TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS bodies (
                 mailbox_id TEXT NOT NULL,
                 uid INTEGER NOT NULL,
@@ -931,6 +944,10 @@ impl Cache {
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if stored < ENVELOPE_CACHE_VERSION {
             conn.execute("DELETE FROM messages", [])?;
+            // A Graph folder cursor describes the rows that were just wiped;
+            // keeping it would let the next incremental page skip the
+            // messages the wipe removed from the cache. Force a snapshot.
+            conn.execute("DELETE FROM graph_folder_cursors", [])?;
         }
         if stored < BODY_CACHE_VERSION {
             conn.execute("DELETE FROM bodies", [])?;
@@ -2553,6 +2570,51 @@ impl Cache {
         Ok(conn
             .query_row("SELECT cursor FROM graph_delta_cursor WHERE id = 1", [], |row| row.get::<_, String>(0))
             .optional()?)
+    }
+
+    /// Every persisted Graph mail per-folder delta cursor, keyed by mailbox.
+    /// Loaded once when a Graph mail session starts, so a restart resumes each
+    /// folder from where it left off instead of re-reading it in full.
+    pub fn graph_folder_cursors(&self) -> Result<HashMap<MailboxId, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT mailbox_id, cursor FROM graph_folder_cursors")?;
+        let rows = stmt.query_map([], |row| Ok((MailboxId(row.get(0)?), row.get(1)?)))?;
+        let mut cursors = HashMap::new();
+        for row in rows {
+            let (mailbox, cursor) = row?;
+            cursors.insert(mailbox, cursor);
+        }
+        Ok(cursors)
+    }
+
+    /// The persisted messages delta cursor for one folder, if any.
+    pub fn graph_folder_cursor(&self, mailbox: &MailboxId) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT cursor FROM graph_folder_cursors WHERE mailbox_id = ?1", [&mailbox.0], |row| row.get::<_, String>(0))
+            .optional()?)
+    }
+
+    /// Persists one folder's next messages delta cursor. Only called after the
+    /// page it came from has been stored, so a failed cache write can never
+    /// move the cursor past changes that were not applied.
+    pub fn set_graph_folder_cursor(&self, mailbox: &MailboxId, cursor: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO graph_folder_cursors (mailbox_id, cursor, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(mailbox_id) DO UPDATE SET cursor = excluded.cursor, updated_at = excluded.updated_at",
+            rusqlite::params![&mailbox.0, cursor, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Drops one folder's persisted delta cursor, forcing its next sync to
+    /// read a whole snapshot. Used when Graph expires the cursor (410) and
+    /// when a folder is deleted.
+    pub fn clear_graph_folder_cursor(&self, mailbox: &MailboxId) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM graph_folder_cursors WHERE mailbox_id = ?1", [&mailbox.0])?;
+        Ok(())
     }
 
     /// The locally-stored Focused/Other sender overrides (M-03).
@@ -5474,6 +5536,40 @@ mod tests {
     }
 
     #[test]
+    fn graph_folder_cursors_round_trip_survive_a_reopen_and_clear_one_at_a_time() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        let archive = MailboxId::new(&account_id, "Archive");
+
+        assert_eq!(cache.graph_folder_cursor(&inbox).unwrap(), None);
+        assert!(cache.graph_folder_cursors().unwrap().is_empty());
+
+        cache.set_graph_folder_cursor(&inbox, "inbox-cursor-1").unwrap();
+        cache.set_graph_folder_cursor(&archive, "archive-cursor-1").unwrap();
+        assert_eq!(cache.graph_folder_cursor(&inbox).unwrap().as_deref(), Some("inbox-cursor-1"));
+        let all = cache.graph_folder_cursors().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get(&archive).map(String::as_str), Some("archive-cursor-1"));
+
+        // A newer page replaces that folder's cursor, not the other folder's.
+        cache.set_graph_folder_cursor(&inbox, "inbox-cursor-2").unwrap();
+        assert_eq!(cache.graph_folder_cursor(&inbox).unwrap().as_deref(), Some("inbox-cursor-2"));
+        drop(cache);
+
+        // A restart sees both cursors, so each folder resumes incrementally.
+        let reopened = Cache::open(&account_id).unwrap();
+        assert_eq!(reopened.graph_folder_cursor(&inbox).unwrap().as_deref(), Some("inbox-cursor-2"));
+        assert_eq!(reopened.graph_folder_cursor(&archive).unwrap().as_deref(), Some("archive-cursor-1"));
+
+        // An expired/deleted folder's cursor is cleared alone.
+        reopened.clear_graph_folder_cursor(&inbox).unwrap();
+        assert_eq!(reopened.graph_folder_cursor(&inbox).unwrap(), None);
+        assert_eq!(reopened.graph_folder_cursor(&archive).unwrap().as_deref(), Some("archive-cursor-1"));
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
     fn a_lost_graph_uid_map_starts_over_under_a_new_validity() {
         let account_id = temp_account_id();
         let cache = Cache::open(&account_id).unwrap();
@@ -5494,6 +5590,8 @@ mod tests {
         let cache = Cache::open(&account_id).unwrap();
         cache.graph_uids(&["g1", "g2"]).unwrap();
         let validity = cache.graph_uid_validity().unwrap();
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        cache.set_graph_folder_cursor(&inbox, "stale-cursor").unwrap();
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         drop(cache);
         {
@@ -5503,6 +5601,7 @@ mod tests {
         let cache = Cache::open(&account_id).unwrap();
         assert_eq!(cache.graph_uid_validity().unwrap(), validity);
         assert_eq!(cache.graph_uids(&["g2", "g1"]).unwrap(), vec![Uid(2), Uid(1)]);
+        assert_eq!(cache.graph_folder_cursor(&inbox).unwrap(), None, "an envelope wipe also drops Graph delta cursors");
         let _ = remove_account_cache(&account_id);
     }
 
