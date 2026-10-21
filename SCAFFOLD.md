@@ -399,6 +399,10 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
   restart resumes incrementally; an expired cursor is cleared and the folder
   resnapshots under the same Uids. Switching an account between transports
   clears its per-account cache: the two folder/Uid spaces can't be merged.
+  Its tests are `crates/graph/tests/graph_mail_cache.rs` (fixtures into the
+  cache), `graph_mail_session.rs` (a fake Graph server driving the real
+  session) and the ignored, read-only `graph_mail_integration.rs` live-tenant
+  harness (item 5.7.9).
 - `graph_uids`/`graph_uid_space` are the Graph mail transport's identity map (MAIL_GRAPH_OVERVIEW.md
   item 5.7.3): `graph_uids()` returns or allocates one account-unique `Uid` per Graph message id in
   one `IMMEDIATE` transaction, `graph_ids_for()` reverses it, and `graph_uid_validity()` is the

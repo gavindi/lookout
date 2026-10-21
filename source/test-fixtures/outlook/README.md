@@ -39,7 +39,9 @@ These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`
 `[MS-OXTNEF]`, RFC 6047, the Microsoft Graph reference) and verified by
 `crates/mail/tests/outlook_fixtures.rs`, the decoder's own tests and the Graph
 mapping's tests (`graph_automatic_replies`), which parse every one through the
-same code the app uses.
+same code the app uses. The optional Graph mail transport (A-06) also
+round-trips `invite.eml` and `auth-results.eml` through its `/$value` MIME path
+in `crates/graph/tests/graph_mail_session.rs` (item 5.7.9).
 
 ## Synthetic binaries
 

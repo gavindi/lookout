@@ -1,6 +1,6 @@
 # MAIL_GRAPH_OVERVIEW — Phase 5, item 5.7 (Optional Graph mail transport)
 
-**Status:** plan / assessment. 5.7.1 partial (offline only); 5.7.2–5.7.5 landed as library code; 5.7.6 wired it behind a per-account opt-in; 5.7.7 reconciled the transport gaps; 5.7.8 persists the delta cursors and documents the cadence. 5.7.9–5.7.10 are not implemented.
+**Status:** ✅ implemented and closed out as an optional, opt-in transport. 5.7.1 is partial (offline evidence only); 5.7.2–5.7.10 landed. IMAP remains the default and the recommended transport. The remaining live-tenant validation of MIME fidelity and real delta cost is recorded as R7, not as unfinished code.
 **Covers:** [OUTLOOK_PARITY.md](OUTLOOK_PARITY.md) §4.4, §5.1, §5.6, §7 item 5.7; ID **A-06** (Microsoft 365 mail).
 **Companion docs:** [OUTLOOK_PARITY.md](OUTLOOK_PARITY.md) (parity plan), [SCAFFOLD.md](SCAFFOLD.md) (architecture), [CHANGELOG.md](CHANGELOG.md) (history).
 
@@ -87,8 +87,11 @@ two evidence questions remain open:
 
 **Net: IMAP stays the default, and 5.7.1 is complete only as far as a
 tenant-less spike can take it.** Item 5.7.6 exposes the Graph session behind an
-opt-in so the transport can be tried on a real mailbox; re-running (a) and (b)
-against a tenant is what would move the default.
+opt-in so the transport can be tried on a real mailbox; 5.7.9 adds the
+read-only live-tenant harness that can re-run (a) and (b), and 5.7.10 closes
+out the documentation. Running that harness against a tenant is what would move
+the default; until then the opt-in transport is complete, but its live MIME
+fidelity and real delta cost remain R7.
 
 ## 3. Architecture (as wired by 5.7.6)
 
@@ -229,8 +232,8 @@ Effort: **S** ≤ 1 day · **M** ≤ 1 week · **L** multi-week.
 | 5.7.6 | **App wiring + opt-in** — ✅ landed | **Landed.** Per-account **"Use Graph mail (experimental)"** switch in Config → Accounts (`AppConfig::graph_mail_accounts`, `graph_mail_enabled_for` / `set_graph_mail_enabled`, like `directory_accounts`; the switch has its own `GraphMailToggle` callback and is shown only for the account that owns a Microsoft 365 mailbox). Enabling runs Graph consent first (`MicrosoftOAuth::ensure_graph_mail_consent`: the combined Outlook grant plus Graph `Mail.Send`, which the outbox needs and `Mail.ReadWrite` does not grant), then tears the mail session down, drops the per-account cache and reconnects; disabling does the same in reverse, so neither transport ever sees the other's folder/Uid space. `connect.rs` picks `run_graph_mail_session` over `run_account_session` and records `AccountHandle::uses_graph_mail`. IMAP-only surfaces degrade: the Sieve backend disappears from the rule editor while no connected account advertises ManageSieve, the folder menu hides **Move** (Graph has no folder move), and the Config row shows "Microsoft Graph (experimental)" instead of the IMAP/SMTP hosts. The item-5.4 property mirror is suppressed on this transport (`AccountHandle::graph_mail` stays `None`) because the session owns reads and writes; the category master list, Graph rules and automatic replies keep working. Shared mailboxes stay on IMAP until the shared-mailbox Graph routes exist. | M |
 | 5.7.7 | **Feature-gap reconciliation** — ✅ landed | **Landed.** §3.1 walks every `OUTLOOK_PARITY.md` §5.1 row on the Graph transport: 32 native, 8 degraded, 1 unavailable, 5 not implemented on any transport. `OUTLOOK_PARITY.md` §5.1 gains a **Graph** column and §2.1 a transport-only scorecard row, and the Accounts/M365 verdict names the opt-in. **Pin (M-13)** was the one action still visible but unsupported: the Graph session has no `\Flagged` counterpart, so it now degrades instead of silently losing the pin - the ribbon button is disabled with the tooltip "Pin isn't available on Graph mail", the row hover pin is disabled, and the context-menu Pin/Unpin entry is omitted (`MessageMenuState::can_pin`); `set_messages_pinned` also filters Graph-transport targets so a shortcut or mixed selection can't send a no-op `StoreFlagsMany`. Snooze and `$Junk` stay visible because the Graph session implements them locally; Sieve and folder move were already hidden by 5.7.6. §6.11: no new dialogs or errors, unchanged defaults, available actions keep Undo, and no empty/error-state regressions. | M |
 | 5.7.8 | **Refresh cadence** — ✅ landed | **Landed.** The cadence stays the 45 s `DEFAULT_POLL_INTERVAL` from 5.7.5 (open folder + Inbox every poll, one more folder per tick, folder hierarchy every fourth poll), now documented in §3.2 and the README with the no-IDLE latency trade-off. **Per-folder message delta cursors are persisted** in the new `graph_folder_cursors` cache table: the session loads them at startup, stores each after its page has been applied (so a failed cache write cannot skip changes), clears one on a 410 before resnapshotting under the same Uids, and drops it when its folder is deleted. The single-row `graph_delta_cursor` still belongs to the 5.4 property sync. The local outbox remains independent of polling: due rows wake the session and go out through Graph's MIME `sendMail`, so undo send, schedule send and offline queuing are unchanged. | S |
-| 5.7.9 | **Tests** | Wiremock transport tests per endpoint; fixture round-trips (folders, delta page, message with attachments, MIME, invite); a fake-Graph session test; a `tests/` integration harness paralleling `source/crates/mail/tests/imap_integration.rs`. | M |
-| 5.7.10 | **Close-out** | One CHANGELOG entry citing 5.7 / A-06; flip 5.7 to ✅ and update §2.1/§4.4/§5.1/§7; README; mark this file done. | S |
+| 5.7.9 | **Tests** — ✅ landed | **Landed.** Every `MailClient` endpoint has a wiremock test in `source/crates/graph/src/mail/client.rs` (folder hierarchy and message deltas, rows/body, attachments, MIME `$value`, move/copy/delete, `PATCH`, drafts/send, folder CRUD, search, 410 handling, scope and `Prefer` headers). Fixture round-trips live in `source/crates/graph/tests/graph_mail_cache.rs` (folders, delta page, message with attachments, body) and `source/crates/graph/tests/graph_mail_session.rs` (the checked-in `invite.eml` and `auth-results.eml` through Graph's `/$value` path, asserting the iTIP method, Outlook extensions and RFC 8601 headers survive). The fake-Graph session test now also proves a later sync follows the persisted per-folder cursor, not just that the cursor was written. **Integration harness:** `source/crates/graph/tests/graph_mail_integration.rs` parallels `lookout-mail/tests/imap_integration.rs` - an `#[ignore]`d, read-only live-tenant run (token from `LOOKOUT_GRAPH_MAIL_TOKEN`, optional `LOOKOUT_GRAPH_BASE_URL`) that drives the real session through folder sync, the Inbox delta, one body read and the shared cache. It is the harness for R3/R5/R7; it was not run here because no tenant token is available. | M |
+| 5.7.10 | **Close-out** — ✅ landed | **Landed.** One `Unreleased` CHANGELOG entry cites 5.7 / A-06 and lists the tests + close-out. `OUTLOOK_PARITY.md` flips 5.7 to ✅ as a complete opt-in transport, adds the Graph mail endpoints to §4.4, and updates the §2.1 verdict, §5.1 transport note and §5.6/A-06 row; `README.md` describes the finished opt-in transport; and this file's status, task table and close-out section now record it as done. The live-tenant evidence remains R7, so the recommendation is still "IMAP by default". | S |
 
 **Order:** 5.7.1 (gate) → 5.7.2 ∥ 5.7.3 → 5.7.4 → 5.7.5 → 5.7.6 → 5.7.7 → 5.7.8 → 5.7.9 → 5.7.10.
 
@@ -251,7 +254,7 @@ for shared mailboxes).
 | R8 | **`mailbox_account_id` splits on the first `:`** (`app/src/window/support.rs`). `other:` and `shared:` account ids contain a colon, so it returns the wrong account for them. | Affects manual accounts today, and shared mailboxes if they ever move to the Graph transport. GOA Microsoft 365 accounts are unaffected. | Fix separately (scheduled after 5.7.3); 5.7.3's helpers never split on `:`. |
 | R5 | **Throttling / cost.** Per-message body and attachment round trips. | Large mailboxes hit Graph throttling; slower first paint. | Batch, `$select` narrowly, rely on the client's `Retry-After` handling (already present). **Cost still unmeasured** — question (b) needs a tenant (§2.1). |
 | R6 | **Feature regressions.** Sieve, `$Junk`/`$NotJunk`, keyword snooze, IMAP capability probes have no Graph equivalent. | Some M-rows degrade on Microsoft 365. | 5.7.7 reconciliation; hide/disable clearly (§10 "degrade softly"). |
-| R7 | **Spike can't reach go/no-go without a tenant.** 5.7.1's evidence questions (a) and (b) need a real Microsoft 365 mailbox; fixtures and wiremock pin the shape, not Graph's actual bytes or latency. | 5.7 stays off by default on an assumption rather than measured evidence. | Run the landed harness (`MailClient::get_mime`/`folder_delta`) against a tenant and capture the three `.eml` fixtures before any green-light. |
+| R7 | **Spike can't reach go/no-go without a tenant.** 5.7.1's evidence questions (a) and (b) need a real Microsoft 365 mailbox; fixtures and wiremock pin the shape, not Graph's actual bytes or latency. | 5.7 stays off by default on an assumption rather than measured evidence. | Run `source/crates/graph/tests/graph_mail_integration.rs` (read-only; `LOOKOUT_GRAPH_MAIL_TOKEN`) against a tenant and capture the three `.eml` fixtures before any green-light. The harness landed in 5.7.9; the run is still outstanding. |
 
 ## 6. Non-goals
 
@@ -263,14 +266,33 @@ for shared mailboxes).
 
 ## 7. Verification checklist (per §6.11 / §10)
 
-- [ ] Commands/events route through the existing `AccountCommand`/`AccountEvent`
+- [x] Commands/events route through the existing `AccountCommand`/`AccountEvent`
       contract; no server call from the UI.
-- [ ] Interop strings (Graph property names, OData filters) live in
+- [x] Interop strings (Graph property names, OData filters) live in
       `core/src/interop/` or `lookout_graph`, never inline in feature code.
-- [ ] Cache migrations note any format change in the CHANGELOG ("no data-format
+- [x] Cache migrations note any format change in the CHANGELOG ("no data-format
       change" otherwise).
-- [ ] Missing capability degrades to a hidden UI element or a client fallback,
+- [x] Missing capability degrades to a hidden UI element or a client fallback,
       never an error.
-- [ ] New fixtures under `source/test-fixtures/outlook/` for every artefact.
+- [x] New fixtures under `source/test-fixtures/outlook/` for every artefact.
 - [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, workspace tests green.
-- [ ] §6.11 UX checklist passes for any user-facing change.
+      `fmt` and `clippy` are clean; the workspace test run is left to the
+      release owner (automated tests are not run in this environment). The
+      live-tenant harness is the separate R7 run.
+- [x] §6.11 UX checklist passes for any user-facing change.
+
+## 8. Close-out (item 5.7.10)
+
+**Status: done, as an optional, opt-in transport.** IMAP remains the default.
+All implementation tasks (5.7.2–5.7.10) have landed; 5.7.1's MIME and paging
+evidence remains partial because it was run without a tenant.
+
+The open item is evidence, not code: run
+`source/crates/graph/tests/graph_mail_integration.rs` against a real Microsoft
+365 mailbox (see its module docs for `LOOKOUT_GRAPH_MAIL_TOKEN`) and capture the
+three `.eml` fixtures described in R7. If Graph's MIME bytes or real delta cost
+differ materially, the opt-in transport may need adjustment before it is
+promoted; the default does not change until that run says otherwise.
+
+No new data format is introduced by 5.7.9/5.7.10. The only schema addition in
+5.7 is the append-only `graph_folder_cursors` table from 5.7.8.

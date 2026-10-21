@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use lookout_core::{AccountId, MailboxId, SystemFlagBit, Uid};
+use lookout_core::{parse_imip_method, AccountId, ImipMethod, MailboxId, SystemFlagBit, Uid};
 use lookout_graph::{graph_mailbox_id, run_graph_mail_session, GraphClient, GraphMailSessionConfig, MailClient, TokenProvider};
+use lookout_mail::body::parse_body;
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{remove_account_cache, Cache};
 use serde_json::{json, Value};
@@ -76,10 +77,24 @@ async fn mount_graph(server: &MockServer) {
             .mount(server)
             .await;
     }
-    // The Inbox's messages.
+    // The Inbox's messages. The delta link points back at this server, so the
+    // next sync proves the persisted cursor is followed rather than the whole
+    // folder being read again.
+    let mut message_delta = fixture(include_str!("../../../test-fixtures/outlook/message-summary-delta.json"));
+    message_delta["@odata.deltaLink"] = json!(format!("{}/v1.0/graph-mail-continuation", server.uri()));
     Mock::given(method("GET"))
         .and(path("/v1.0/me/mailFolders/AAMkAGINBOX%3D/messages/delta"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(fixture(include_str!("../../../test-fixtures/outlook/message-summary-delta.json"))))
+        .respond_with(ResponseTemplate::new(200).set_body_json(message_delta))
+        .mount(server)
+        .await;
+    // The incremental page the persisted cursor addresses (item 5.7.8):
+    // nothing changed, but the request itself is what the test asserts.
+    Mock::given(method("GET"))
+        .and(path("/v1.0/graph-mail-continuation"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "value": [],
+            "@odata.deltaLink": format!("{}/v1.0/graph-mail-continuation-2", server.uri()),
+        })))
         .mount(server)
         .await;
     // One message read: JSON row, attachments, then the raw MIME.
@@ -148,6 +163,23 @@ async fn the_graph_session_syncs_reads_and_writes_native_properties() {
     // resumes incrementally under the same Uids instead of re-reading the
     // whole folder.
     assert!(cache.graph_folder_cursor(&inbox).unwrap().is_some(), "the Inbox delta cursor is persisted");
+
+    // A later sync follows that cursor instead of re-reading the folder. The
+    // continuation page is empty, but reaching it is the proof.
+    commands.send(AccountCommand::SyncMailbox(inbox.clone())).await.unwrap();
+    loop {
+        // The handler emits a cached MessagesUpdated before it syncs, so wait
+        // for the Busy/…/Idle pair to know the cursor request has completed.
+        if matches!(next_event(&event_rx).await, AccountEvent::ConnectionStateChanged(ConnectionState::Idle)) {
+            break;
+        }
+    }
+    let requests = server.received_requests().await.expect("the fake server records requests");
+    assert!(
+        requests.iter().any(|request| request.url.path() == "/v1.0/graph-mail-continuation"),
+        "the second sync followed the persisted delta cursor"
+    );
+
     let report = messages.iter().find(|message| message.message_id.as_deref() == Some("<report-1@contoso.com>")).unwrap();
     assert!(report.is_unread());
     assert!(report.is_flagged_for_follow_up(), "the Graph flag rode the 5.4 overlay");
@@ -201,4 +233,36 @@ async fn the_graph_session_syncs_reads_and_writes_native_properties() {
     assert!(reopened.graph_folder_cursor(&inbox).unwrap().is_some(), "the persisted cursor survives a reopen");
     drop(reopened);
     let _ = remove_account_cache(&account_id);
+}
+
+/// The MIME path is the transport's fidelity boundary: Graph's `/$value` bytes
+/// must parse exactly like an IMAP body, keeping the iTIP invite and the
+/// Authentication-Results headers (R3 / item 5.7.1). These are the same
+/// checked-in fixtures the IMAP-side reader tests use.
+#[tokio::test]
+async fn graph_mime_fixtures_keep_invites_and_authentication_results() {
+    let server = MockServer::start().await;
+    for (id, raw) in [
+        ("invite", include_bytes!("../../../test-fixtures/outlook/invite.eml").as_slice()),
+        ("auth", include_bytes!("../../../test-fixtures/outlook/auth-results.eml").as_slice()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1.0/me/messages/{id}/$value")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(raw.to_vec()))
+            .mount(&server)
+            .await;
+    }
+
+    let client = MailClient::new(GraphClient::with_base_url(Arc::new(StubTokens), format!("{}/v1.0", server.uri())));
+
+    let invite = client.get_mime("invite").await.unwrap().expect("the invite MIME");
+    let invite = parse_body(Uid(0), &invite).expect("the Graph MIME bytes parse as a message");
+    let ics = invite.calendar_ics.as_deref().expect("the invite keeps its text/calendar part");
+    assert_eq!(parse_imip_method(ics), ImipMethod::Request);
+    assert!(ics.contains("X-MICROSOFT-CDO-BUSYSTATUS:BUSY"), "Outlook extensions survive");
+
+    let auth = client.get_mime("auth").await.unwrap().expect("the auth-results MIME");
+    let auth = parse_body(Uid(0), &auth).expect("the Graph MIME bytes parse as a message");
+    let results = auth.auth_results.as_ref().expect("Authentication-Results survives");
+    assert!(results.any_failure(), "the fixture's failing verdict is readable");
 }
