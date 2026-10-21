@@ -1,0 +1,27 @@
+{
+  "@odata.type": "#microsoft.graph.message",
+  "id": "AAMkAGMSG1=",
+  "parentFolderId": "AAMkAGINBOX=",
+  "conversationId": "AAQkAGCONV1=",
+  "internetMessageId": "<report-1@contoso.com>",
+  "subject": "Quarterly report",
+  "bodyPreview": "Hi team, the quarterly numbers are in.",
+  "from": { "emailAddress": { "name": "Adele Vance", "address": "adelev@contoso.com" } },
+  "toRecipients": [{ "emailAddress": { "name": "Megan Bowen", "address": "meganb@contoso.com" } }],
+  "receivedDateTime": "2026-10-14T09:30:00Z",
+  "isRead": false,
+  "isDraft": false,
+  "hasAttachments": true,
+  "importance": "high",
+  "inferenceClassification": "focused",
+  "body": {
+    "contentType": "html",
+    "content": "<html><body><p>Hi team, the quarterly numbers are in.</p><img src=\"cid:chart1@contoso.com\"></body></html>"
+  },
+  "internetMessageHeaders": [
+    { "name": "Received", "value": "from mx.contoso.com by mail.contoso.com" },
+    { "name": "Authentication-Results", "value": "spf=pass (sender IP is 192.0.2.1) smtp.mailfrom=contoso.com; dkim=pass (signature was verified) header.d=contoso.com; dmarc=pass action=none header.from=contoso.com" },
+    { "name": "Message-ID", "value": "<report-1@contoso.com>" },
+    { "name": "List-Id", "value": "Finance <finance.contoso.com>" }
+  ]
+}

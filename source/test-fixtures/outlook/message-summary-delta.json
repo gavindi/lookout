@@ -1,0 +1,84 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(message)",
+  "value": [
+    {
+      "@odata.type": "#microsoft.graph.message",
+      "id": "AAMkAGMSG1=",
+      "changeKey": "CQAAABYAAAA1",
+      "parentFolderId": "AAMkAGINBOX=",
+      "conversationId": "AAQkAGCONV1=",
+      "internetMessageId": "<report-1@contoso.com>",
+      "subject": "Quarterly report",
+      "bodyPreview": "Hi team, the quarterly numbers are in.",
+      "from": { "emailAddress": { "name": "Adele Vance", "address": "adelev@contoso.com" } },
+      "toRecipients": [
+        { "emailAddress": { "name": "Megan Bowen", "address": "meganb@contoso.com" } },
+        { "emailAddress": { "address": "team@contoso.com" } }
+      ],
+      "ccRecipients": [],
+      "receivedDateTime": "2026-10-14T09:30:00Z",
+      "sentDateTime": "2026-10-14T09:29:55Z",
+      "isRead": false,
+      "isDraft": false,
+      "hasAttachments": true,
+      "importance": "high",
+      "inferenceClassification": "focused",
+      "categories": ["Work"],
+      "flag": {
+        "flagStatus": "flagged",
+        "startDateTime": { "dateTime": "2026-10-16T00:00:00.0000000", "timeZone": "UTC" },
+        "dueDateTime": { "dateTime": "2026-10-16T00:00:00.0000000", "timeZone": "UTC" }
+      }
+    },
+    {
+      "@odata.type": "#microsoft.graph.message",
+      "id": "AAMkAGMSG2=",
+      "parentFolderId": "AAMkAGINBOX=",
+      "conversationId": "AAQkAGCONV1=",
+      "internetMessageId": "<reply-1@contoso.com>",
+      "subject": "RE: Quarterly report",
+      "bodyPreview": "Thanks!",
+      "from": { "emailAddress": { "name": "Megan Bowen", "address": "meganb@contoso.com" } },
+      "toRecipients": [{ "emailAddress": { "address": "adelev@contoso.com" } }],
+      "receivedDateTime": "2026-10-14T10:02:00Z",
+      "isRead": true,
+      "isDraft": false,
+      "hasAttachments": false,
+      "importance": "normal",
+      "inferenceClassification": "other",
+      "categories": [],
+      "flag": { "flagStatus": "notFlagged" }
+    },
+    {
+      "@odata.type": "#microsoft.graph.message",
+      "id": "AAMkAGDRAFT=",
+      "parentFolderId": "AAMkAGDRAFTS=",
+      "conversationId": "AAQkAGCONV2=",
+      "subject": "Unfinished thought",
+      "receivedDateTime": "2026-10-15T08:00:00Z",
+      "isRead": true,
+      "isDraft": true,
+      "hasAttachments": false
+    },
+    {
+      "@odata.type": "#microsoft.graph.eventMessage",
+      "id": "AAMkAGINVITE=",
+      "parentFolderId": "AAMkAGINBOX=",
+      "conversationId": "AAQkAGCONV3=",
+      "internetMessageId": "<invite-1@contoso.com>",
+      "subject": "Planning sync",
+      "from": { "emailAddress": { "name": "Alex Wilber", "address": "alexw@contoso.com" } },
+      "toRecipients": [{ "emailAddress": { "address": "meganb@contoso.com" } }],
+      "sentDateTime": "2026-10-15T11:00:00Z",
+      "isRead": false,
+      "isDraft": false,
+      "hasAttachments": false,
+      "meetingMessageType": "meetingRequest"
+    },
+    {
+      "id": "AAMkAGGONE=",
+      "@removed": { "reason": "deleted" }
+    }
+  ],
+  "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/AAMkAGINBOX=/messages/delta?$deltatoken=msgs-1"
+}

@@ -1,0 +1,22 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('me')/messages('AAMkAGMSG1%3D')/attachments(id,name,contentType,size,isInline)",
+  "value": [
+    {
+      "@odata.type": "#microsoft.graph.fileAttachment",
+      "id": "AAMkAGATT1=",
+      "name": "Q3-report.pdf",
+      "contentType": "application/pdf",
+      "size": 48213,
+      "isInline": false
+    },
+    {
+      "@odata.type": "#microsoft.graph.fileAttachment",
+      "id": "AAMkAGATT2=",
+      "name": "chart.png",
+      "contentType": "image/png",
+      "size": 9120,
+      "isInline": true,
+      "contentId": "chart1@contoso.com"
+    }
+  ]
+}

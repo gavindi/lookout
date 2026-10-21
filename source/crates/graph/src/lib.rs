@@ -39,9 +39,11 @@ pub use contacts::{contact_folder_from_graph, contact_from_graph, contact_to_gra
 pub use error::{GraphError, Result};
 pub use mail::client::MailClient;
 pub use mail::{
-    categories_body, classification_body, flag_body, flag_from_graph, importance_body, message_id_filter, message_properties_from_graph, outgoing_message_body, override_body,
-    override_from_graph, shared_mail_folder_from_graph, InferenceClassification, InferenceOverride, MessageDelta, MessageProperties, OutgoingAttachment, OutgoingMessage,
-    SharedMailFolder,
+    attachment_from_graph, body_part_from_attachment, categories_body, classification_body, comment_body, destination_body, draft_body, email_body_from_graph,
+    email_summary_from_graph, flag_body, flag_from_graph, folder_name_body, importance_body, mail_folder_from_graph, mailbox_from_graph, message_from_graph, message_id_filter,
+    message_properties_from_graph, outgoing_message_body, override_body, override_from_graph, search_param, shared_mail_folder_from_graph, GraphAttachment, GraphMessage,
+    InferenceClassification, InferenceOverride, MailFolder, MailFolderDelta, MessageDelta, MessagePatch, MessageProperties, MessageSummaryDelta, OutgoingAttachment,
+    OutgoingMessage, SharedMailFolder, WellKnownFolders,
 };
 pub use scopes::{
     GraphFeature, BASE_GRAPH_SCOPES, CALENDARS_READ_SHARED, CALENDARS_READ_WRITE, CALENDARS_READ_WRITE_SHARED, CONTACTS_READ_WRITE, MAILBOX_SETTINGS_READ_WRITE, MAIL_READ_WRITE,

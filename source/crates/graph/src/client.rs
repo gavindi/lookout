@@ -142,6 +142,19 @@ impl GraphClient {
         self.send_json(Method::POST, path, Some(body), &[]).await
     }
 
+    /// A `POST` carrying extra request headers - the mail transport's
+    /// `Prefer: IdType="ImmutableId"` on a move, copy or new draft, so the id
+    /// Graph returns is the stable one.
+    pub async fn post_with_headers(&self, path: &str, body: &Value, headers: &[(&str, &str)]) -> Result<Value> {
+        self.send_json(Method::POST, path, Some(body), headers).await
+    }
+
+    /// A bodiless `POST` carrying extra request headers, for actions Graph
+    /// takes no request body for (sending a draft).
+    pub async fn post_empty_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Result<Value> {
+        self.send_json(Method::POST, path, None, headers).await
+    }
+
     /// A `DELETE` (Graph returns `204 No Content`; the body surfaces as
     /// `Value::Null`). Used to remove a `masterCategory` (item 2.1).
     pub async fn delete(&self, path: &str) -> Result<Value> {

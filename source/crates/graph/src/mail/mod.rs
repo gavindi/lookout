@@ -9,7 +9,8 @@
 //! property names (§10 "Interop strings"). Like `calendar`, `contacts` and
 //! `todo`, it is deliberately pure - no HTTP, no [`GraphClient`] - so every
 //! rule is unit-testable against inline JSON. The HTTP transport lives in
-//! [`client`] (`MailClient`).
+//! [`client`] (`MailClient`). The whole-message, folder and attachment
+//! mapping for the Graph mail transport (item 5.7.2) lives in [`message`].
 //!
 //! [`GraphClient`]: crate::client::GraphClient
 //!
@@ -32,8 +33,14 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 pub mod client;
+pub mod message;
 
 pub use client::MailClient;
+pub use message::{
+    attachment_from_graph, body_part_from_attachment, comment_body, destination_body, draft_body, email_body_from_graph, email_summary_from_graph, folder_name_body,
+    mail_folder_from_graph, mailbox_from_graph, message_from_graph, search_param, GraphAttachment, GraphMessage, MailFolder, MailFolderDelta, MessagePatch, MessageSummaryDelta,
+    WellKnownFolders, ATTACHMENT_SELECT, BODY_SELECT, FOLDER_SELECT, SUMMARY_SELECT, WELL_KNOWN_FOLDER_NAMES,
+};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Offset, SecondsFormat, TimeZone, Utc};
 use lookout_core::{EmailAddress, FlagStatus, FollowUpFlag, Importance};
@@ -78,33 +85,13 @@ pub struct InferenceOverride {
     pub sender: EmailAddress,
 }
 
-/// One folder in a shared mailbox added by address (item 5.6 / M-42):
-/// `GET /users/{id}/mailFolders`, mapped to what the folder pane needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SharedMailFolder {
-    /// The folder's Graph id (`/users/{id}/mailFolders/{folder_id}/messages`).
-    pub id: String,
-    pub display_name: String,
-    /// The parent folder's Graph id, or `None` for a top-level folder.
-    pub parent_id: Option<String>,
-    /// Total and unread item counts, for the folder row's badge.
-    pub total: u32,
-    pub unread: u32,
-}
+/// A shared mailbox's folder (item 5.6 / M-42) - the same shape as the
+/// user's own, [`MailFolder`].
+pub type SharedMailFolder = MailFolder;
 
-/// Maps a Graph `mailFolder` to a [`SharedMailFolder`], or `None` when it has
-/// no id or name.
+/// Maps a shared mailbox's Graph `mailFolder`; see [`mail_folder_from_graph`].
 pub fn shared_mail_folder_from_graph(value: &Value) -> Option<SharedMailFolder> {
-    let id = value.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
-    let display_name = value.get("displayName").and_then(Value::as_str).filter(|n| !n.trim().is_empty())?.to_string();
-    let parent_id = value.get("parentFolderId").and_then(Value::as_str).filter(|p| !p.is_empty()).map(str::to_string);
-    Some(SharedMailFolder {
-        id: id.to_string(),
-        display_name,
-        parent_id,
-        total: value.get("totalItemCount").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
-        unread: value.get("unreadItemCount").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
-    })
+    mail_folder_from_graph(value)
 }
 
 /// The Graph id of a `/delta` tombstone (`{"id": "…", "@removed": {…}}`), or

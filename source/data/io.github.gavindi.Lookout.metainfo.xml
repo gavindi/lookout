@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.268" date="2026-10-21">
+      <description>
+        <p>Groundwork for an optional way to read Microsoft 365 mail directly through Microsoft Graph. Nothing changes in the app yet.</p>
+      </description>
+    </release>
     <release version="0.9.267" date="2026-10-21">
       <description>
         <p>Responsiveness fix. Dragging a large selection of messages no longer freezes the window, and messages dragged out to a file manager are kept in a private folder instead of the shared temporary folder.</p>

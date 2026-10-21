@@ -42,5 +42,14 @@ pub enum GraphError {
     UnsupportedRecurrence(String),
 }
 
+impl GraphError {
+    /// Whether a `/delta` cursor has expired (`410 Gone`,
+    /// `syncStateNotFound`): the caller must drop the cursor and resync from
+    /// scratch.
+    pub fn is_delta_reset(&self) -> bool {
+        matches!(self, GraphError::Status { status: 410, .. })
+    }
+}
+
 /// The crate's result alias.
 pub type Result<T> = std::result::Result<T, GraphError>;

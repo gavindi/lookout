@@ -1,0 +1,42 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(mailFolder)",
+  "value": [
+    {
+      "id": "AAMkAGINBOX=",
+      "displayName": "Inbox",
+      "parentFolderId": "AAMkAGROOT=",
+      "childFolderCount": 1,
+      "totalItemCount": 120,
+      "unreadItemCount": 7
+    },
+    {
+      "id": "AAMkAGPROJECTS=",
+      "displayName": "Projects",
+      "parentFolderId": "AAMkAGINBOX=",
+      "childFolderCount": 0,
+      "totalItemCount": 14,
+      "unreadItemCount": 2
+    },
+    {
+      "id": "AAMkAGSENT=",
+      "displayName": "Sent Items",
+      "parentFolderId": "AAMkAGROOT=",
+      "childFolderCount": 0,
+      "totalItemCount": 300,
+      "unreadItemCount": 0
+    },
+    {
+      "id": "AAMkAGDELETED=",
+      "displayName": "Deleted Items",
+      "parentFolderId": "AAMkAGROOT=",
+      "childFolderCount": 0,
+      "totalItemCount": 5,
+      "unreadItemCount": 0
+    },
+    {
+      "id": "AAMkAGOLDFOLDER=",
+      "@removed": { "reason": "deleted" }
+    }
+  ],
+  "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/mailFolders/delta?$deltatoken=folders-1"
+}
