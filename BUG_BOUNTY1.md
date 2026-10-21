@@ -80,6 +80,15 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
 
 13. **Drag prepare does SQLite reads and file writes per dragged message** while holding `state.borrow()`. [support.rs:458-475](source/crates/app/src/window/support.rs#L458-L475).
     - **Fix:** precompute the selection, then load and write on `spawn_blocking`. A GTK drag needs the content synchronously, so either use a `gdk::ContentProvider` with async `write_mime_type_future`, or cap the work and warn.
+    - **Correction:** there was no SQLite read; `load_raw_message` is a flat-file `std::fs::read`. The cost also landed on drags into a folder, which never use the files.
+    - **Fixed:** a new `window/drag_files.rs`.
+      - **At drag start:** `connect_prepare` only resolves each message's cache and `uidvalidity` (`drag_messages`, in-memory) and offers a `MessageFilesProvider`, a `gdk::ContentProvider` subclass, in the union beside the internal payload.
+      - **On demand:** the `.eml` files are written on `gio::spawn_blocking` only when a drop target first asks for a file format, once per drag (a `Shared` future), then serialized with `gdk::content_serialize_future`.
+      - **Formats:** the provider lists `FileList` plus its serialize MIME types, because GTK's union routes writes by `contain_mime_type`. `value()` returns `NotSupported`, so in-process drops (the composer) fall back to the stream read (confirmed in GTK 4.24's `gdk_drop_read_value_internal`).
+      - **Cleanup:** drag end removes the files after a 60 s grace period, so a file manager's async copy isn't cut short. A write that lands after the drag ended removes its own files, and the drag dir is swept at startup and shutdown.
+      - **Covers #10's drag half:** files go to `$XDG_RUNTIME_DIR/lookout/drag` (0700), each created `0600` with `create_new`. Attachments' "Open" still uses the temp dir.
+      - **Trade-off:** the file formats are always offered, so a drop onto a file manager of messages that aren't downloaded yet now fails at the drop rather than not being offered.
+      - Covered by `only_downloaded_messages_are_written_privately`, `the_provider_serves_uris_lazily_and_never_synchronously` and `a_write_landing_after_the_drag_ended_cleans_up`.
 14. **"Run rules now" does a synchronous `load_messages`** on the UI thread under a borrow. [rules.rs:188-193](source/crates/app/src/rules.rs#L188-L193).
     - **Fix:** use `spawn_cache_read` like every other caller.
     - **Fixed:** `run_rules_now` takes the `Worker` (threaded through `install_folder_menu_handler`), reads the folder with `spawn_cache_read`, and evaluates when the read lands on the GTK thread. It re-checks the master switch and re-snapshots the `RunContext` then, since the rules, folders or account may have changed during the read.

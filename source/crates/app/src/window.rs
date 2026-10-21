@@ -39,6 +39,7 @@ mod calendar_search;
 mod compose_host;
 mod connect;
 mod conversation;
+mod drag_files;
 mod flags;
 mod folders;
 mod graph_sync;
@@ -60,6 +61,7 @@ pub(crate) use calendar_search::*;
 pub(crate) use compose_host::*;
 pub(crate) use connect::*;
 pub(crate) use conversation::*;
+pub(crate) use drag_files::*;
 pub(crate) use flags::*;
 pub(crate) use folders::*;
 pub(crate) use graph_sync::*;
@@ -740,7 +742,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         for path in paths {
             let _ = std::fs::remove_file(&path);
         }
+        // Message-drag files still in their grace period.
+        sweep_drag_dir();
     });
+    // And any a previous run left behind (a crash, or an exit mid-grace).
+    gio::spawn_blocking(sweep_drag_dir);
     // A repaint hook for the folder pane, so a config change that alters it (a
     // saved search, item 2.4 / M-19) can rebuild the tree at once rather than
     // waiting for the next `FoldersUpdated`.
@@ -1214,18 +1220,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // the dragged row is part of a multi-selection, the whole selection -
         // offers two payloads in one provider union: the internal
         // `(mailbox, uid)` list for folder drops (see the folder rows' drop
-        // target), and a `text/uri-list` of temp `.eml` files (only when the
-        // raw bytes are already cached, since the drag must be synchronous)
-        // so the drag can land in a file manager too. GTK's union provider
-        // lets each drop target pick whichever format it understands.
+        // target), and the messages as `.eml` files so the drag can land in
+        // a file manager (or a composer) too. GTK's union provider lets each
+        // drop target pick whichever format it understands. The files are
+        // written lazily, off the GTK thread, only when a target asks for
+        // them (see `MessageFilesProvider`); messages whose raw bytes aren't
+        // cached yet are left out.
         {
             let drag_source = gtk::DragSource::new();
             drag_source.set_actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE);
             let bound_for_drag = bound.clone();
             let state_for_drag = state_clone.clone();
             let message_list_for_drag = message_list_for_rows.clone();
-            let drag_temp_files: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
-            let drag_temp_files_for_prepare = drag_temp_files.clone();
+            let current_drag_files: Rc<RefCell<Option<Rc<DragFiles>>>> = Rc::new(RefCell::new(None));
+            let current_drag_files_for_prepare = current_drag_files.clone();
             drag_source.connect_prepare(move |_source, _x, _y| {
                 let summaries = dragged_summaries(&message_list_for_drag, &bound_for_drag);
                 if summaries.is_empty() {
@@ -1249,18 +1257,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // straight into the drop handler on a local drop, no stream
                 // round-trip needed.
                 let internal_provider = gtk::gdk::ContentProvider::for_value(&glib::Value::from(bytes));
-                Some(match write_external_drag_files(&state_for_drag, &summaries, &drag_temp_files_for_prepare) {
-                    Some(files) => gtk::gdk::ContentProvider::new_union(&[internal_provider, files]),
-                    None => internal_provider,
-                })
+                let messages = drag_messages(&state_for_drag.borrow(), &summaries);
+                if messages.is_empty() {
+                    return Some(internal_provider);
+                }
+                let files = DragFiles::new(messages);
+                let previous = current_drag_files_for_prepare.borrow_mut().replace(files.clone());
+                if let Some(previous) = previous {
+                    previous.finish();
+                }
+                Some(gtk::gdk::ContentProvider::new_union(&[internal_provider, MessageFilesProvider::new(files).upcast()]))
             });
-            // The temp `.eml` files written for the drag-out are cleaned up
-            // once the drag finishes, whatever its outcome.
+            // The `.eml` files written for the drag-out are cleaned up once
+            // the drag finishes, whatever its outcome, after a grace period
+            // for the file manager's copy.
             {
-                let drag_temp_files = drag_temp_files.clone();
+                let current_drag_files = current_drag_files.clone();
                 drag_source.connect_drag_end(move |_source, _drag, _delete| {
-                    for path in drag_temp_files.borrow_mut().drain(..) {
-                        let _ = std::fs::remove_file(path);
+                    let files = current_drag_files.borrow_mut().take();
+                    if let Some(files) = files {
+                        files.finish();
                     }
                 });
             }

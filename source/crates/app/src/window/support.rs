@@ -4,12 +4,11 @@
 /// Software released under the GPL3 license
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 use lookout_core::{display_name, AccountId, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_mail::session::AccountCommand;
 
@@ -448,38 +447,6 @@ pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefC
     } else {
         vec![(*row_summary).clone()]
     }
-}
-
-/// Writes the dragged messages' raw bytes - when already in the flat-file
-/// cache - to temp `.eml` files and returns a `text/uri-list` content
-/// provider for them, so the drag can land in a file manager. `None` when
-/// none of the messages are cached (the internal move payload still works).
-/// The written paths are recorded in `temp_files` for cleanup on drag end.
-pub(crate) fn write_external_drag_files(state: &Rc<RefCell<UiState>>, summaries: &[EmailSummary], temp_files: &Rc<RefCell<Vec<PathBuf>>>) -> Option<gtk::gdk::ContentProvider> {
-    let state = state.borrow();
-    let mut files: Vec<gio::File> = Vec::new();
-    for summary in summaries {
-        let Some(account_id) = mailbox_account_id(&summary.mailbox) else { continue };
-        let Some(handle) = state.accounts.get(&account_id) else { continue };
-        let Some(cache) = handle.address_cache.as_ref() else { continue };
-        let Some(uidvalidity) = handle.folders.iter().find(|f| f.id == summary.mailbox).map(|f| f.uidvalidity) else {
-            continue;
-        };
-        let Ok(Some(bytes)) = cache.load_raw_message(&summary.mailbox, summary.uid, uidvalidity) else {
-            continue;
-        };
-        let path = std::env::temp_dir().join(format!("lookout-drag-{}.eml", uuid::Uuid::new_v4()));
-        if std::fs::write(&path, bytes).is_err() {
-            continue;
-        }
-        temp_files.borrow_mut().push(path.clone());
-        files.push(gio::File::for_path(path));
-    }
-    if files.is_empty() {
-        return None;
-    }
-    let file_list = gtk::gdk::FileList::from_array(&files);
-    Some(gtk::gdk::ContentProvider::for_value(&file_list.to_value()))
 }
 
 /// Handles a folder row's drop: deserializes the dragged `(mailbox, uid)`
