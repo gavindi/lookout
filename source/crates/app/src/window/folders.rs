@@ -270,12 +270,14 @@ pub(crate) fn install_folder_menu_handler(
     folder_selection: &gtk::SingleSelection,
     folder_scroller: &gtk::ScrolledWindow,
     list_header: &ListHeader,
+    worker: &Rc<Worker>,
 ) {
     use crate::folder_menu::{present_delete_dialog, present_empty_dialog, present_move_dialog, present_name_dialog, FolderMenuAction};
     let state = state.clone();
     let folder_selection = folder_selection.clone();
     let folder_scroller = folder_scroller.clone();
     let list_header = list_header.clone();
+    let worker = worker.clone();
     let handler = move |action: FolderMenuAction, mailbox: Mailbox, anchor: gtk::Widget| {
         let Some(account_id) = mailbox_account_id(&mailbox.id) else { return };
         let send: Rc<dyn Fn(AccountCommand)> = {
@@ -353,7 +355,7 @@ pub(crate) fn install_folder_menu_handler(
                 present_empty_dialog(&anchor, &mailbox, move || send(AccountCommand::EmptyMailbox { mailbox: target.clone() }));
             }
             FolderMenuAction::MarkAllRead => send(AccountCommand::MarkMailboxRead { mailbox: mailbox.id.clone() }),
-            FolderMenuAction::RunRules => crate::rules::run_rules_now(&state, &account_id, &mailbox.id),
+            FolderMenuAction::RunRules => crate::rules::run_rules_now(&state, &worker, &account_id, &mailbox.id),
             FolderMenuAction::AddFavorite | FolderMenuAction::RemoveFavorite => {
                 set_folder_favorite(&state, &mailbox.id, action == FolderMenuAction::AddFavorite);
                 // The header's star follows when this is the open folder.

@@ -2225,7 +2225,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
 
     // --- Folder rows' "⋯" menu (and Empty button) -> folder actions. ---
-    install_folder_menu_handler(&menu_handler, &state, &folder_selection, &folder_scroller, &list_header);
+    install_folder_menu_handler(&menu_handler, &state, &folder_selection, &folder_scroller, &list_header, &worker);
 
     let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
     compose_button.set_tooltip_text(Some("New Message"));
@@ -7622,8 +7622,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Config → General → "Tray icon": starts/stops the StatusNotifierItem
     // (AppIndicator) service. Enabling registers the icon with the session's
     // watcher (absent watcher = the icon simply never appears; ksni retries);
-    // disabling unregisters it, so the host drops the icon. The next
-    // `refresh_unread_indicators` paints the current count into the icon.
+    // disabling unregisters it, so the host drops the icon. Registration is
+    // awaited off the main loop; once it lands, `refresh_unread_indicators`
+    // paints the current count into the icon (a `stop` in the meantime makes
+    // `start` discard the late service and resolve to `false`).
     // Tray commands cross back from the service thread on `tray_commands`.
     let (tray_commands, tray_commands_rx) = async_channel::unbounded();
     {
@@ -7632,13 +7634,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let enabled = row.is_active();
             state.borrow().settings.set_bool(crate::settings::TRAY_ICON_ENABLED, enabled);
             if enabled {
-                if !crate::tray::start(tray_commands.clone()) {
-                    tracing::debug!("tray service did not start (no StatusNotifierWatcher on the session bus?)");
-                }
+                let state = state.clone();
+                let tray_commands = tray_commands.clone();
+                glib::spawn_future_local(async move {
+                    if crate::tray::start(tray_commands).await {
+                        refresh_unread_indicators(&state);
+                    } else {
+                        tracing::debug!("tray service did not start (no StatusNotifierWatcher on the session bus, or switched off meanwhile?)");
+                    }
+                });
             } else {
                 crate::tray::stop();
+                refresh_unread_indicators(&state);
             }
-            refresh_unread_indicators(&state);
         });
     }
 

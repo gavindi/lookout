@@ -174,27 +174,37 @@ pub(crate) fn unignore_thread(state: &Rc<RefCell<UiState>>, account: &AccountId,
 
 /// Applies the account's client rules to every cached message in `mailbox`,
 /// the folder menu's "Run rules now". Unlike automatic arrival, this runs on
-/// whatever folder the user chose, Inbox or not.
-pub(crate) fn run_rules_now(state: &Rc<RefCell<UiState>>, account_id: &AccountId, mailbox: &MailboxId) {
+/// whatever folder the user chose, Inbox or not. The folder is read off the
+/// GTK thread (`spawn_cache_read`), and the rules are re-snapshotted when the
+/// read lands, since they, the folders or the account may change meanwhile.
+pub(crate) fn run_rules_now(state: &Rc<RefCell<UiState>>, worker: &crate::worker::Worker, account_id: &AccountId, mailbox: &MailboxId) {
     if !rules_enabled(state) {
         return;
     }
-    let Some(run) = RunContext::for_account(state, account_id) else {
-        return;
-    };
-    if run.rules.is_empty() {
+    if RunContext::for_account(state, account_id).is_none_or(|run| run.rules.is_empty()) {
         return;
     }
-    let messages = {
-        let st = state.borrow();
-        match st.accounts.get(account_id).and_then(|handle| handle.address_cache.clone()) {
-            Some(cache) => cache.load_messages(mailbox).unwrap_or_default(),
-            None => Vec::new(),
+    let Some(cache) = state.borrow().accounts.get(account_id).and_then(|handle| handle.address_cache.clone()) else {
+        return;
+    };
+    let reply_rx = crate::window::spawn_cache_read(worker, cache, {
+        let mailbox = mailbox.clone();
+        move |cache| cache.load_messages(&mailbox).unwrap_or_default()
+    });
+    let state = state.clone();
+    let account_id = account_id.clone();
+    gtk::glib::spawn_future_local(async move {
+        let Ok(messages) = reply_rx.recv().await else { return };
+        if messages.is_empty() || !rules_enabled(&state) {
+            return;
         }
-    };
-    if !messages.is_empty() {
-        evaluate_batch(state, &run, &messages);
-    }
+        let Some(run) = RunContext::for_account(&state, &account_id) else {
+            return;
+        };
+        if !run.rules.is_empty() {
+            evaluate_batch(&state, &run, &messages);
+        }
+    });
 }
 
 /// Whether the rules master switch is on.

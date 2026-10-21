@@ -82,8 +82,12 @@ This document is the report plus a fix list, ordered by severity. Each tier can 
     - **Fix:** precompute the selection, then load and write on `spawn_blocking`. A GTK drag needs the content synchronously, so either use a `gdk::ContentProvider` with async `write_mime_type_future`, or cap the work and warn.
 14. **"Run rules now" does a synchronous `load_messages`** on the UI thread under a borrow. [rules.rs:188-193](source/crates/app/src/rules.rs#L188-L193).
     - **Fix:** use `spawn_cache_read` like every other caller.
+    - **Fixed:** `run_rules_now` takes the `Worker` (threaded through `install_folder_menu_handler`), reads the folder with `spawn_cache_read`, and evaluates when the read lands on the GTK thread. It re-checks the master switch and re-snapshots the `RunContext` then, since the rules, folders or account may have changed during the read.
 15. **Tray enable blocks up to 2 s.** [tray.rs:176-181](source/crates/app/src/tray.rs#L176-L181) calls `recv_timeout`.
     - **Fix:** make it async (`async_channel` and `spawn_future_local`) and update the switch state when it resolves.
+    - **Fixed:** `tray::start` is now `async`. It renders the icon before its first `.await`, runs the ksni registration under `tokio::time::timeout` on the worker, and awaits the handle over an `async_channel`, so neither the switch nor startup's seeding blocks the main loop. A stalled bus now cancels the registration instead of leaking a late handle.
+      - **Supersede guard:** a `GENERATION` counter, bumped by `start` and `stop`, makes a registration that lands after the user switched off (or on again) shut its service down and resolve to `false`.
+      - **The count:** the switch handler paints the unread count once registration succeeds. A failure is still only logged and the switch stays on, since ksni retries when a watcher appears.
 16. **File imports and exports run synchronously on the UI thread.**
     - **Where:** `std::fs::read` plus parse in [calendar_glue.rs:3055](source/crates/app/src/window/calendar_glue.rs#L3055) and [contacts_view.rs:946](source/crates/app/src/contacts_view.rs#L946); `std::fs::write` in [contacts_view.rs:1130](source/crates/app/src/contacts_view.rs#L1130).
     - **Fix:** use `gio::File::load_contents_future` and `replace_contents_future`. This also fixes portal and GVfs URIs, where `file.path()` is `None`, and the double parse on import.

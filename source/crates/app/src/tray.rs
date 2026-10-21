@@ -27,6 +27,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -152,7 +153,12 @@ static TRAY: OnceLock<Mutex<Option<ksni::Handle<LookoutTray>>>> = OnceLock::new(
 
 /// The last count sent to the tray, so consecutive identical updates skip
 /// the re-render and the D-Bus round trip.
-static LAST_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static LAST_COUNT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Bumped by every `start` and `stop`, so a `start` whose registration
+/// lands after the user switched the tray off (or on again) can tell it
+/// has been superseded.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Hands `worker`'s tokio handle to the tray machinery. Called once at
 /// startup, before any window code can start the tray; without it every
@@ -162,32 +168,45 @@ pub fn init(worker: &crate::worker::Worker) {
 }
 
 /// Starts the tray service and registers it with the session's
-/// StatusNotifierWatcher. Returns whether the service came up (a missing
+/// StatusNotifierWatcher. Resolves to whether the service came up (a missing
 /// watcher just means the icon doesn't appear yet; ksni stays offline and
-/// retries). Blocks briefly on the first registration, so callers should
-/// be on the UI thread with no locks held.
-pub fn start(commands: async_channel::Sender<TrayCommand>) -> bool {
+/// retries). The icon is rendered before the first `.await`, so call this
+/// from the UI thread; the registration itself runs on the worker and is
+/// awaited without blocking the main loop. A `stop` (or a newer `start`)
+/// made while this one is registering supersedes it: the late service is
+/// shut down instead of installed, and this resolves to `false`.
+pub async fn start(commands: async_channel::Sender<TrayCommand>) -> bool {
     let Some(tokio) = TOKIO.get() else { return false };
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let tray = LookoutTray {
         count: 0,
         icon: render_tray_icons(0),
         commands,
     };
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = async_channel::bounded(1);
     tokio.spawn(async move {
-        let _ = tx.send(tray.disable_dbus_name(true).spawn().await.ok());
+        let handle = tokio::time::timeout(START_TIMEOUT, tray.disable_dbus_name(true).spawn()).await.ok().and_then(Result::ok);
+        let _ = tx.send(handle).await;
     });
-    let Ok(Some(handle)) = rx.recv_timeout(START_TIMEOUT) else {
+    let Ok(Some(handle)) = rx.recv().await else {
         return false;
     };
+    if GENERATION.load(Ordering::Relaxed) != generation {
+        tokio.spawn(async move {
+            handle.shutdown().await;
+        });
+        return false;
+    }
     TRAY.get_or_init(|| Mutex::new(None)).lock().unwrap().replace(handle);
-    LAST_COUNT.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+    LAST_COUNT.store(u32::MAX, Ordering::Relaxed);
     true
 }
 
 /// Shuts the tray service down (unregistering the item, so the host drops
-/// the icon). No-op when the tray was never started.
+/// the icon), and supersedes any `start` still registering. No-op when the
+/// tray was never started.
 pub fn stop() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
     let Some(guard) = TRAY.get() else { return };
     let Some(handle) = guard.lock().unwrap().take() else { return };
     if let Some(tokio) = TOKIO.get() {
@@ -203,7 +222,7 @@ pub fn stop() {
 /// to the tray service via `Handle::update` on the worker's runtime.
 /// Dedupes identical consecutive counts.
 pub fn set_unread_count(count: u32) {
-    if LAST_COUNT.swap(count, std::sync::atomic::Ordering::Relaxed) == count {
+    if LAST_COUNT.swap(count, Ordering::Relaxed) == count {
         return;
     }
     let (Some(tokio), Some(handle)) = (TOKIO.get(), TRAY.get().and_then(|g| g.lock().unwrap().clone())) else {
@@ -418,6 +437,12 @@ mod tests {
         };
         assert_eq!(red_pixels(&quiet), 0, "no badge when the count is zero");
         assert!(red_pixels(&counting) > 0, "the badge disc is red");
+    }
+
+    #[test]
+    fn start_without_a_runtime_resolves_to_false() {
+        let (commands, _rx) = async_channel::unbounded();
+        assert!(!gtk::glib::MainContext::new().block_on(start(commands)));
     }
 
     #[test]
