@@ -84,6 +84,16 @@ composite string keys:
 | `EventUid(String)` | iCalendar `UID` | Unique only within a `CalendarId` |
 | `TaskUid(String)` | VTODO `UID` | Same scoping as `EventUid` |
 
+On the optional Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, library only so far) the
+same types carry Graph identities (`lookout_graph::mail::identity`):
+
+| Type | Graph shape | Notes |
+|---|---|---|
+| `MailboxId` | `"{account_id}:{graph folder id}"` | Parsed back only by stripping the known account prefix (`graph_folder_id`, `mailbox_name::mailbox_path`), never by splitting on `:` — `other:` and `shared:` account ids contain one |
+| `Uid` | Synthetic, from the cache's `graph_uids` map (Graph immutable id → u32) | Unique per **account**, so a moved message keeps its Uid; a copy gets a new one. Starts at 1, never reused |
+| `UidValidity` | One random nonzero value per account (`graph_uid_space`) | Changes only when the map is lost; an expired Graph delta cursor keeps it |
+| `BodyPart::part_number` | The Graph attachment id in base64url form (`graph_part_number`) | Filename-safe for the attachment flat files; `attachment_id_from_part` reverses it |
+
 ### 3.2 Mail types (`email.rs`, `mailbox.rs`)
 
 - **`EmailSummary`** — the list-row "weight" projection: cheap to fetch (`ENVELOPE` + `FLAGS` +
@@ -354,6 +364,11 @@ CREATE TABLE outbox (
 );
 CREATE INDEX outbox_due ON outbox (state, not_before);
 
+CREATE TABLE graph_uids (graph_id TEXT PRIMARY KEY, uid INTEGER NOT NULL UNIQUE);
+CREATE TABLE graph_uid_space (
+    id INTEGER PRIMARY KEY CHECK (id = 1), uidvalidity INTEGER NOT NULL, next_uid INTEGER NOT NULL
+);
+
 CREATE VIRTUAL TABLE search_fts USING fts5(
     mailbox_id UNINDEXED, uid UNINDEXED, subject, sender, recipients, body,
     tokenize = 'unicode61 remove_diacritics 2'
@@ -374,10 +389,16 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
 - `outbox` is the local outgoing-mail queue (§4.6, item 0.3): `payload` is an opaque JSON BLOB the
   session owns (`send::OutboxMessage`), `not_before` schedules it, and `state`/`attempts` drive the
   retry backoff. Append-only, so it needs no `user_version` wipe.
+- `graph_uids`/`graph_uid_space` are the Graph mail transport's identity map (MAIL_GRAPH_OVERVIEW.md
+  item 5.7.3): `graph_uids()` returns or allocates one account-unique `Uid` per Graph message id in
+  one `IMMEDIATE` transaction, `graph_ids_for()` reverses it, and `graph_uid_validity()` is the
+  account's single `UidValidity`. Both tables sit outside `messages`, so an envelope wipe keeps
+  every Uid; both are empty on IMAP accounts. Append-only, so no `user_version` wipe.
 - Periodic maintenance (`run_maintenance`, called once per session start on the blocking pool):
   sweeps orphaned flat files with no matching `messages` row, migrates to
   `auto_vacuum=INCREMENTAL` on first run (a one-time full `VACUUM`), and runs `PRAGMA
-  incremental_vacuum` on every run afterward to reclaim freed pages cheaply.
+  incremental_vacuum` on every run afterward to reclaim freed pages cheaply. It also prunes
+  `graph_uids` rows no `messages` row uses (`prune_graph_uids`).
 
 **Flat-file storage** (outside SQLite, under the same cache root): attachments at
 `attachments/<account>/<mailbox-hash>-<uidvalidity>-<uid>-<part>.bin`; raw `.eml` exports at

@@ -324,12 +324,14 @@ pub fn attachment_from_graph(value: &Value) -> Option<GraphAttachment> {
 }
 
 /// A [`GraphAttachment`] as a [`BodyPart`]. On the Graph transport a part's
-/// `part_number` is the **Graph attachment id**, the key its
-/// `/attachments/{id}/$value` read takes, not an IMAP body-part path. Graph
-/// hands out decoded bytes, so there is no charset or transfer encoding.
+/// `part_number` is the Graph attachment id in filename-safe form
+/// ([`super::graph_part_number`]), not an IMAP body-part path;
+/// [`super::attachment_id_from_part`] recovers the id the
+/// `/attachments/{id}/$value` read takes. Graph hands out decoded bytes, so
+/// there is no charset or transfer encoding.
 pub fn body_part_from_attachment(attachment: &GraphAttachment) -> BodyPart {
     BodyPart {
-        part_number: attachment.id.clone(),
+        part_number: super::graph_part_number(&attachment.id),
         content_type: attachment.content_type.clone(),
         charset: None,
         transfer_encoding: None,
@@ -642,6 +644,9 @@ mod tests {
 
         let pdf = body_part_from_attachment(&attachments[0]);
         assert_eq!(pdf.part_number, "AAMkAGATT1=");
+        let slashed = body_part_from_attachment(&attachment_from_graph(&json!({ "id": "AA+k/ATT3=" })).unwrap());
+        assert_eq!(slashed.part_number, "AA-k_ATT3=");
+        assert_eq!(super::super::attachment_id_from_part(&slashed.part_number).as_deref(), Some("AA+k/ATT3="));
         assert_eq!(pdf.content_type, "application/pdf");
         assert_eq!(pdf.filename.as_deref(), Some("Q3-report.pdf"));
         assert_eq!(pdf.size, 48213);

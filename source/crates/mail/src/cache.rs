@@ -769,6 +769,23 @@ impl Cache {
                 updated_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS message_graph_ids_by_graph ON message_graph_ids (graph_id);
+            -- The Graph mail transport's identity map (MAIL_GRAPH_OVERVIEW.md
+            -- item 5.7.3): one synthetic `Uid` per Graph immutable message id,
+            -- unique across the account, so a moved message keeps its Uid.
+            -- `graph_uid_space` holds the account's single `UidValidity`
+            -- (fixed when the map is created) and the next Uid to hand out.
+            -- Both are empty on IMAP accounts. Kept outside `messages`, so an
+            -- envelope wipe keeps every Uid. Append-only, so no `user_version`
+            -- wipe.
+            CREATE TABLE IF NOT EXISTS graph_uids (
+                graph_id TEXT PRIMARY KEY,
+                uid INTEGER NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS graph_uid_space (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                uidvalidity INTEGER NOT NULL,
+                next_uid INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS local_categories (
                 message_key TEXT PRIMARY KEY,
                 category_keys TEXT NOT NULL,
@@ -1575,9 +1592,11 @@ impl Cache {
     /// incremental_vacuum`, which only moves already-freed pages (from
     /// expunged messages, purged bodies, `delete_messages`' and
     /// `sweep_orphaned_files`'s flat-file purges, ...) to the end of the
-    /// file so the OS can reclaim them - no full-file rewrite.
+    /// file so the OS can reclaim them - no full-file rewrite. It also drops
+    /// Graph Uid mappings no cached message uses (`prune_graph_uids`).
     pub fn run_maintenance(&self) -> Result<()> {
         self.sweep_orphaned_files();
+        self.prune_graph_uids()?;
         let conn = self.conn.lock().unwrap();
         const INCREMENTAL: i64 = 2;
         let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
@@ -2667,6 +2686,76 @@ impl Cache {
     /// categories, importance, Focused/Other) to `messages`, for summaries that
     /// came from the server rather than from a cache read, which overlays them
     /// already.
+    /// The Graph mail transport's `UidValidity` for this account
+    /// (MAIL_GRAPH_OVERVIEW.md item 5.7.3): one value for every folder, fixed
+    /// (at random) when the Uid map is created. It changes only when the map
+    /// is lost (the cache file deleted or cleared), which is exactly when the
+    /// Uids it vouches for stop meaning anything. An expired Graph delta
+    /// cursor keeps it.
+    pub fn graph_uid_validity(&self) -> Result<UidValidity> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let validity = graph_uid_space(&tx)?.0;
+        tx.commit()?;
+        Ok(validity)
+    }
+
+    /// The synthetic `Uid` of each Graph message id in `graph_ids`, in the same
+    /// order: the existing Uid for an id seen before, otherwise a new one, handed
+    /// out in the order given (the session passes new messages oldest-first).
+    /// Uids are unique across the account, start at 1 and are never reused.
+    /// One `IMMEDIATE` transaction, so two handles on the same file can't hand
+    /// out the same Uid. Fails rather than wraps if the account ever exhausts
+    /// `u32` Uids.
+    pub fn graph_uids(&self, graph_ids: &[&str]) -> Result<Vec<Uid>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (_, mut next) = graph_uid_space(&tx)?;
+        let mut uids = Vec::with_capacity(graph_ids.len());
+        {
+            let mut find = tx.prepare_cached("SELECT uid FROM graph_uids WHERE graph_id = ?1")?;
+            let mut insert = tx.prepare_cached("INSERT INTO graph_uids (graph_id, uid) VALUES (?1, ?2)")?;
+            for graph_id in graph_ids {
+                if let Some(uid) = find.query_row([graph_id], |row| row.get::<_, u32>(0)).optional()? {
+                    uids.push(Uid(uid));
+                    continue;
+                }
+                let uid = u32::try_from(next).map_err(|_| std::io::Error::other("the account has run out of Graph message Uids"))?;
+                insert.execute(rusqlite::params![graph_id, uid])?;
+                next += 1;
+                uids.push(Uid(uid));
+            }
+        }
+        tx.execute("UPDATE graph_uid_space SET next_uid = ?1 WHERE id = 1", [next])?;
+        tx.commit()?;
+        Ok(uids)
+    }
+
+    /// The Graph message id behind each of `uids` that has one; Uids with no
+    /// mapping are left out.
+    pub fn graph_ids_for(&self, uids: &[Uid]) -> Result<HashMap<Uid, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT graph_id FROM graph_uids WHERE uid = ?1")?;
+        let mut ids = HashMap::new();
+        for uid in uids {
+            if let Some(graph_id) = stmt.query_row([uid.0], |row| row.get::<_, String>(0)).optional()? {
+                ids.insert(*uid, graph_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Drops the Graph Uid mappings no cached message uses any more, returning
+    /// how many went. Uids are account-unique on the Graph transport, so "no
+    /// `messages` row with this uid" is exact. Run from `run_maintenance`,
+    /// before any sync: a message that left one folder and hasn't been seen in
+    /// another yet simply gets a new Uid when it reappears. A no-op on IMAP
+    /// accounts, whose map is empty.
+    pub fn prune_graph_uids(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM graph_uids WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.uid = graph_uids.uid)", [])?)
+    }
+
     pub fn overlay_follow_ups(&self, messages: &mut [EmailSummary]) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         overlay_local(&conn, messages)
@@ -2948,6 +3037,26 @@ impl ContactsProvider for Cache {
     fn search_contacts(&self, prefix: &str, limit: usize) -> Vec<EmailAddress> {
         self.search_addresses(prefix, limit).unwrap_or_default()
     }
+}
+
+/// The account's Graph Uid space `(validity, next_uid)`, created on first use
+/// with a random nonzero validity and Uid 1 next. Random rather than the
+/// IMAP-style creation time: a map deleted and recreated within the same
+/// second would otherwise get the same validity, and Uids still held in memory
+/// from the old map would silently alias new messages. Runs inside the
+/// caller's transaction.
+fn graph_uid_space(tx: &rusqlite::Transaction<'_>) -> Result<(UidValidity, i64)> {
+    if let Some((validity, next)) = tx
+        .query_row("SELECT uidvalidity, next_uid FROM graph_uid_space WHERE id = 1", [], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?))
+        })
+        .optional()?
+    {
+        return Ok((UidValidity(validity), next));
+    }
+    let validity = (uuid::Uuid::new_v4().as_u128() as u32).max(1);
+    tx.execute("INSERT INTO graph_uid_space (id, uidvalidity, next_uid) VALUES (1, ?1, 1)", [validity])?;
+    Ok((UidValidity(validity), 1))
 }
 
 #[cfg(test)]
@@ -5276,5 +5385,127 @@ mod tests {
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);
+    }
+
+    // --- The Graph mail transport's identity map (item 5.7.3) ---
+
+    #[test]
+    fn graph_uids_are_stable_ordered_and_survive_a_reopen() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+
+        let first = cache.graph_uids(&["g-old", "g-new"]).unwrap();
+        assert_eq!(first, vec![Uid(1), Uid(2)], "handed out from 1, in the order given");
+        // Known ids keep their Uid; a copy (a new Graph id) gets the next one.
+        assert_eq!(cache.graph_uids(&["g-new", "g-copy", "g-old"]).unwrap(), vec![Uid(2), Uid(3), Uid(1)]);
+
+        let validity = cache.graph_uid_validity().unwrap();
+        assert_ne!(validity.0, 0);
+        let reopened = Cache::open(&account_id).unwrap();
+        assert_eq!(reopened.graph_uid_validity().unwrap(), validity);
+        assert_eq!(reopened.graph_uids(&["g-copy", "g-later"]).unwrap(), vec![Uid(3), Uid(4)]);
+
+        let ids = reopened.graph_ids_for(&[Uid(1), Uid(4), Uid(99)]).unwrap();
+        assert_eq!(ids.get(&Uid(1)).map(String::as_str), Some("g-old"));
+        assert_eq!(ids.get(&Uid(4)).map(String::as_str), Some("g-later"));
+        assert!(!ids.contains_key(&Uid(99)));
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn a_lost_graph_uid_map_starts_over_under_a_new_validity() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        cache.graph_uids(&["g1", "g2"]).unwrap();
+        let validity = cache.graph_uid_validity().unwrap();
+        drop(cache);
+
+        remove_account_cache(&account_id).unwrap();
+        let cache = Cache::open(&account_id).unwrap();
+        assert_ne!(cache.graph_uid_validity().unwrap(), validity, "a recreated map must not reuse the old validity");
+        assert_eq!(cache.graph_uids(&["g2"]).unwrap(), vec![Uid(1)]);
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn an_envelope_wipe_keeps_the_graph_uid_map() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        cache.graph_uids(&["g1", "g2"]).unwrap();
+        let validity = cache.graph_uid_validity().unwrap();
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        drop(cache);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 0).unwrap();
+        }
+        let cache = Cache::open(&account_id).unwrap();
+        assert_eq!(cache.graph_uid_validity().unwrap(), validity);
+        assert_eq!(cache.graph_uids(&["g2", "g1"]).unwrap(), vec![Uid(2), Uid(1)]);
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn pruning_drops_only_graph_uids_no_message_uses() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "AAMkAGINBOX=");
+        let uids = cache.graph_uids(&["kept", "gone"]).unwrap();
+        cache
+            .replace_messages(&mailbox_id, cache.graph_uid_validity().unwrap(), &[sample_summary(&mailbox_id, uids[0].0, None)])
+            .unwrap();
+
+        assert_eq!(cache.prune_graph_uids().unwrap(), 1);
+        let ids = cache.graph_ids_for(&uids).unwrap();
+        assert_eq!(ids.get(&uids[0]).map(String::as_str), Some("kept"));
+        assert!(!ids.contains_key(&uids[1]));
+        // Uids are never reused, even after a prune.
+        assert_eq!(cache.graph_uids(&["gone"]).unwrap(), vec![Uid(3)]);
+        cache.run_maintenance().unwrap();
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn two_handles_never_hand_out_the_same_graph_uid() {
+        let account_id = temp_account_id();
+        let a = std::sync::Arc::new(Cache::open(&account_id).unwrap());
+        let b = std::sync::Arc::new(Cache::open(&account_id).unwrap());
+        let handles: Vec<_> = [a, b]
+            .into_iter()
+            .enumerate()
+            .map(|(n, cache)| {
+                std::thread::spawn(move || {
+                    let ids: Vec<String> = (0..50).map(|i| format!("h{n}-{i}")).collect();
+                    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                    let mut uids = Vec::new();
+                    for chunk in refs.chunks(5) {
+                        uids.extend(cache.graph_uids(chunk).unwrap());
+                    }
+                    uids
+                })
+            })
+            .collect();
+        let all: Vec<Uid> = handles.into_iter().flat_map(|handle| handle.join().unwrap()).collect();
+        let distinct: HashSet<Uid> = all.iter().copied().collect();
+        assert_eq!(all.len(), 100);
+        assert_eq!(distinct.len(), 100, "every Graph id got its own Uid");
+        let _ = remove_account_cache(&account_id);
+    }
+
+    #[test]
+    fn a_graph_part_number_stays_inside_the_attachments_dir() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let mailbox_id = MailboxId::new(&account_id, "AAMkAGINBOX=");
+        // `lookout_graph::graph_part_number("AA+k/ATT3=")`.
+        let part = "AA-k_ATT3=";
+        cache.store_attachment(&mailbox_id, Uid(1), UidValidity(9), part, b"%PDF").unwrap();
+        assert_eq!(
+            cache.load_attachment(&mailbox_id, Uid(1), UidValidity(9), part).unwrap().as_deref(),
+            Some(b"%PDF".as_slice())
+        );
+        let path = cache.attachment_path(&mailbox_id, Uid(1), UidValidity(9), part);
+        assert_eq!(path.parent(), Some(cache.attachments_dir.as_path()));
+        let _ = remove_account_cache(&account_id);
     }
 }

@@ -325,7 +325,9 @@ impl MailClient {
 
     /// One attachment's raw bytes
     /// (`GET /me/messages/{id}/attachments/{attachment_id}/$value`), or `None`
-    /// when it no longer exists.
+    /// when it no longer exists. Takes the raw Graph attachment id; a cached
+    /// `BodyPart::part_number` decodes to it with
+    /// [`super::attachment_id_from_part`].
     pub async fn get_attachment_bytes(&self, graph_id: &str, attachment_id: &str) -> Result<Option<Vec<u8>>> {
         let path = format!("me/messages/{}/attachments/{}/$value", encode_segment(graph_id), encode_segment(attachment_id));
         self.graph.get_bytes_with_headers(&path, &IMMUTABLE_ID).await

@@ -10,7 +10,9 @@
 //! `todo`, it is deliberately pure - no HTTP, no [`GraphClient`] - so every
 //! rule is unit-testable against inline JSON. The HTTP transport lives in
 //! [`client`] (`MailClient`). The whole-message, folder and attachment
-//! mapping for the Graph mail transport (item 5.7.2) lives in [`message`].
+//! mapping for the Graph mail transport (item 5.7.2) lives in [`message`], and
+//! how Graph ids become `MailboxId`/`Uid`/part numbers (item 5.7.3) in
+//! [`identity`].
 //!
 //! [`GraphClient`]: crate::client::GraphClient
 //!
@@ -33,9 +35,11 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 pub mod client;
+pub mod identity;
 pub mod message;
 
 pub use client::MailClient;
+pub use identity::{allocation_order, attachment_id_from_part, graph_folder_id, graph_mailbox_id, graph_part_number};
 pub use message::{
     attachment_from_graph, body_part_from_attachment, comment_body, destination_body, draft_body, email_body_from_graph, email_summary_from_graph, folder_name_body,
     mail_folder_from_graph, mailbox_from_graph, message_from_graph, search_param, GraphAttachment, GraphMessage, MailFolder, MailFolderDelta, MessagePatch, MessageSummaryDelta,
