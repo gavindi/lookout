@@ -411,6 +411,17 @@ pub(crate) fn mailbox_account_id(mailbox: &MailboxId) -> Option<AccountId> {
     mailbox.0.split_once(':').map(|(account_id, _)| AccountId(account_id.to_string()))
 }
 
+/// Whether `mailbox` belongs to an account currently running the Graph mail
+/// transport (item 5.7.6). IMAP-only capabilities use this to hide themselves
+/// rather than failing (item 5.7.7); the account id is a GOA object path for
+/// the only accounts that can opt in, so `mailbox_account_id`'s first-`:` rule
+/// is safe here.
+pub(crate) fn mailbox_uses_graph_mail(state: &UiState, mailbox: &MailboxId) -> bool {
+    mailbox_account_id(mailbox)
+        .and_then(|account_id| state.accounts.get(&account_id))
+        .is_some_and(|handle| handle.uses_graph_mail)
+}
+
 /// The role of `mailbox` as last reported by its account's folder list, or
 /// `None` when the account isn't connected (or the mailbox isn't in its
 /// list). The app's first role lookup helper - the folder tree and search
@@ -711,10 +722,20 @@ pub(crate) fn importance_icon_and_tooltip(importance: lookout_core::Importance) 
 /// message(s) are pinned (`\Flagged`) - active only when every selected
 /// message is pinned (including nothing selected, which reads as inactive).
 /// Mirrors `apply_favorite_visual`'s icon-swap convention.
-pub(crate) fn refresh_pin_button(icon: &crate::ribbon::RibbonIcon, message_list: &MessageListModel) {
+///
+/// Pin has no Graph counterpart (item 5.7.7): when any selected message is on
+/// the Graph transport the button is disabled with a tooltip saying so, rather
+/// than offering an action the session cannot persist.
+pub(crate) fn refresh_pin_button(icon: &crate::ribbon::RibbonIcon, message_list: &MessageListModel, state: &Rc<RefCell<UiState>>) {
     let summaries = message_list.selected_summaries();
     let pinned = !summaries.is_empty() && summaries.iter().all(|s| s.is_pinned());
+    let supported = {
+        let st = state.borrow();
+        summaries.iter().all(|summary| !mailbox_uses_graph_mail(&st, &summary.mailbox))
+    };
     icon.set_icon_name(pin_icon_name(pinned));
+    icon.set_sensitive(supported);
+    icon.set_tooltip_text(Some(if supported { "Pin/Unpin" } else { "Pin isn't available on Graph mail" }));
 }
 
 /// The Mark Read/Unread icon+tooltip for what clicking would currently do -

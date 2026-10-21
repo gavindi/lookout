@@ -74,13 +74,14 @@ pub struct FolderMenuState {
 /// can't hold subfolders; Empty is the permanent Trash/Junk expunge; Move
 /// up/down reorder the Favorites section, so they need the folder to be a
 /// favourite (`favorite_pos` is its `(index, count)` there) and not already at
-/// that end.
-pub fn folder_menu_state(mailbox: &Mailbox, favorite_pos: Option<(usize, usize)>) -> FolderMenuState {
+/// that end. `folder_move_supported` is false on the Graph mail transport,
+/// which has no counterpart for a folder move (item 5.7.6).
+pub fn folder_menu_state(mailbox: &Mailbox, favorite_pos: Option<(usize, usize)>, folder_move_supported: bool) -> FolderMenuState {
     let custom = mailbox.role == MailboxRole::Custom;
     FolderMenuState {
         create: !mailbox.flags.iter().any(|flag| flag.eq_ignore_ascii_case("NoInferiors")),
         rename: custom,
-        move_folder: custom,
+        move_folder: custom && folder_move_supported,
         delete: custom,
         empty: matches!(mailbox.role, MailboxRole::Trash | MailboxRole::Junk),
         mark_read: mailbox.unread > 0,
@@ -590,20 +591,29 @@ mod tests {
 
     #[test]
     fn special_folders_lock_rename_move_and_delete() {
-        let inbox = folder_menu_state(&folder("INBOX", MailboxRole::Inbox, 0, &[]), Some((0, 3)));
+        let inbox = folder_menu_state(&folder("INBOX", MailboxRole::Inbox, 0, &[]), Some((0, 3)), true);
         assert!(inbox.create && !inbox.rename && !inbox.move_folder && !inbox.delete);
         assert!(!inbox.empty, "Empty is the Trash/Junk expunge");
         assert!(!inbox.mark_read, "nothing unread");
         assert!(inbox.is_favorite && !inbox.move_up && inbox.move_down, "first of three favourites");
 
-        let custom = folder_menu_state(&folder("Work", MailboxRole::Custom, 4, &["NoInferiors"]), None);
+        let custom = folder_menu_state(&folder("Work", MailboxRole::Custom, 4, &["NoInferiors"]), None, true);
         assert!(custom.rename && custom.move_folder && custom.delete && custom.mark_read);
         assert!(!custom.create, "\\Noinferiors can't hold subfolders");
         assert!(!custom.is_favorite && !custom.move_up && !custom.move_down);
 
-        let trash = folder_menu_state(&folder("Trash", MailboxRole::Trash, 0, &[]), Some((2, 3)));
+        let trash = folder_menu_state(&folder("Trash", MailboxRole::Trash, 0, &[]), Some((2, 3)), true);
         assert!(trash.empty && !trash.delete);
         assert!(trash.move_up && !trash.move_down, "last favourite");
+    }
+
+    /// Graph mail has no folder move, so that item is hidden while still
+    /// allowing rename and delete (item 5.7.6).
+    #[test]
+    fn graph_mail_hides_folder_move_only() {
+        let custom = folder_menu_state(&folder("Work", MailboxRole::Custom, 0, &[]), None, false);
+        assert!(!custom.move_folder);
+        assert!(custom.create && custom.rename && custom.delete);
     }
 
     #[test]
@@ -689,7 +699,7 @@ mod tests {
         let menu = build_row_menu(target, handler);
 
         let folder = folder("Work", MailboxRole::Custom, 4, &[]);
-        menu.refresh(&folder, folder_menu_state(&folder, None), Some("#3584e4"), FolderCountMode::Total);
-        menu.refresh(&folder, folder_menu_state(&folder, None), None, FolderCountMode::Unread);
+        menu.refresh(&folder, folder_menu_state(&folder, None, true), Some("#3584e4"), FolderCountMode::Total);
+        menu.refresh(&folder, folder_menu_state(&folder, None, true), None, FolderCountMode::Unread);
     }
 }

@@ -43,6 +43,37 @@ fn backend_label(backend: RuleBackend) -> &'static str {
     }
 }
 
+/// The editor's backend choices in dropdown order. Sieve is left out when no
+/// connected account's server advertises ManageSieve (item 5.7.6) - Graph
+/// mail accounts never do.
+fn backend_options(sieve_available: bool) -> &'static [&'static str] {
+    if sieve_available {
+        &["This device", "Server (Sieve)", "Microsoft 365"]
+    } else {
+        &["This device", "Microsoft 365"]
+    }
+}
+
+/// The dropdown index showing `backend` in [`backend_options`].
+fn backend_index(backend: RuleBackend, sieve_available: bool) -> u32 {
+    match backend {
+        RuleBackend::Client => 0,
+        RuleBackend::Sieve if sieve_available => 1,
+        RuleBackend::Sieve => 0,
+        RuleBackend::Graph if sieve_available => 2,
+        RuleBackend::Graph => 1,
+    }
+}
+
+/// The backend a dropdown index means, given whether Sieve is offered.
+fn backend_from_index(index: u32, sieve_available: bool) -> RuleBackend {
+    match (index, sieve_available) {
+        (1, true) => RuleBackend::Sieve,
+        (2, true) | (1, false) => RuleBackend::Graph,
+        _ => RuleBackend::Client,
+    }
+}
+
 /// A one-line human summary of a rule's conditions and actions.
 fn rule_summary(rule: &Rule) -> String {
     let conditions = if rule.conditions.is_empty() {
@@ -392,8 +423,11 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
     root.append(&labeled_row("Name", &name_entry));
 
     // Connected accounts, for the server-side backends - a Sieve or Graph rule
-    // lives on one server, so it needs an account.
-    let accounts: Vec<(lookout_core::AccountId, String)> = {
+    // lives on one server, so it needs an account. Only an account whose
+    // server advertised ManageSieve can host a Sieve rule; a Graph mail
+    // account never advertises it, so the backend hides when none can (item
+    // 5.7.6).
+    let (accounts, sieve_available): (Vec<(lookout_core::AccountId, String)>, bool) = {
         let st = state.borrow();
         let mut accounts: Vec<(lookout_core::AccountId, String)> = st
             .accounts
@@ -410,15 +444,16 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
             })
             .collect();
         accounts.sort_by_key(|(_, label)| label.to_lowercase());
-        accounts
+        let sieve_available = st.accounts.values().any(|handle| handle.sieve_advertised);
+        (accounts, sieve_available)
     };
+    // Keep the option while a Sieve rule is being edited even if its server
+    // isn't connected right now, so opening and saving can't silently change
+    // its backend.
+    let show_sieve = sieve_available || rule.borrow().backend == RuleBackend::Sieve;
 
-    let backend = gtk::DropDown::from_strings(&["This device", "Server (Sieve)", "Microsoft 365"]);
-    backend.set_selected(match rule.borrow().backend {
-        RuleBackend::Client => 0,
-        RuleBackend::Sieve => 1,
-        RuleBackend::Graph => 2,
-    });
+    let backend = gtk::DropDown::from_strings(backend_options(show_sieve));
+    backend.set_selected(backend_index(rule.borrow().backend, show_sieve));
     let account_row = if accounts.is_empty() {
         None
     } else {
@@ -447,11 +482,7 @@ pub(crate) fn show_rule_editor(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>
         let accounts = accounts.clone();
         let account_row = account_row.clone();
         move |dropdown| {
-            let selected = match dropdown.selected() {
-                1 => RuleBackend::Sieve,
-                2 => RuleBackend::Graph,
-                _ => RuleBackend::Client,
-            };
+            let selected = backend_from_index(dropdown.selected(), show_sieve);
             {
                 let mut rule = rule.borrow_mut();
                 rule.backend = selected;
@@ -970,6 +1001,22 @@ mod tests {
         assert_eq!(parse_target("Projects"), RuleTarget::Folder("Projects".into()));
         assert_eq!(target_text(&RuleTarget::Role(MailboxRole::Trash)), "Deleted Items");
         assert_eq!(target_text(&RuleTarget::Folder("Projects".into())), "Projects");
+    }
+
+    #[test]
+    fn the_sieve_backend_hides_when_no_connected_server_offers_it() {
+        // A Graph mail account never advertises ManageSieve, so the backend
+        // list collapses to the two local/Graph choices (item 5.7.6).
+        assert_eq!(backend_options(false).to_vec(), vec!["This device", "Microsoft 365"]);
+        assert_eq!(backend_options(true).to_vec(), vec!["This device", "Server (Sieve)", "Microsoft 365"]);
+        assert_eq!(backend_index(RuleBackend::Client, false), 0);
+        assert_eq!(backend_index(RuleBackend::Graph, false), 1);
+        assert_eq!(backend_index(RuleBackend::Sieve, true), 1);
+        assert_eq!(backend_index(RuleBackend::Graph, true), 2);
+        assert_eq!(backend_from_index(0, false), RuleBackend::Client);
+        assert_eq!(backend_from_index(1, false), RuleBackend::Graph);
+        assert_eq!(backend_from_index(1, true), RuleBackend::Sieve);
+        assert_eq!(backend_from_index(2, true), RuleBackend::Graph);
     }
 
     #[test]

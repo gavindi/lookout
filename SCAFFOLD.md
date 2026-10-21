@@ -84,7 +84,7 @@ composite string keys:
 | `EventUid(String)` | iCalendar `UID` | Unique only within a `CalendarId` |
 | `TaskUid(String)` | VTODO `UID` | Same scoping as `EventUid` |
 
-On the optional Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, the session actor exists but is not wired into the app until item 5.7.6) the
+On the optional Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, the session actor is wired behind a per-account opt-in since item 5.7.6) the
 same types carry Graph identities (`lookout_graph::mail::identity`):
 
 | Type | Graph shape | Notes |
@@ -390,11 +390,13 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
   session owns (`send::OutboxMessage`), `not_before` schedules it, and `state`/`attempts` drive the
   retry backoff. Append-only, so it needs no `user_version` wipe.
 - The Graph mail transport (MAIL_GRAPH_OVERVIEW.md item 5.7, session actor at
-  `lookout_graph::mail::session`, not wired until item 5.7.6) reuses this cache
-  as is: a folder delta is stored with `upsert_messages` (the incremental counterpart of
+  `lookout_graph::mail::session`, selected by an account's item 5.7.6 opt-in)
+  reuses this cache as is: a folder delta is stored with `upsert_messages` (the incremental counterpart of
   `replace_messages`) and `delete_messages`, and its Outlook properties through
   `apply_remote_mail_properties`. Its folder ids aren't paths, so the delimiter-based
-  `forget_mailbox_tree`/`rekey_snoozed` don't apply to it.
+  `forget_mailbox_tree`/`rekey_snoozed` don't apply to it. Switching an account
+  between transports clears its per-account cache: the two folder/Uid spaces
+  can't be merged.
 - `graph_uids`/`graph_uid_space` are the Graph mail transport's identity map (MAIL_GRAPH_OVERVIEW.md
   item 5.7.3): `graph_uids()` returns or allocates one account-unique `Uid` per Graph message id in
   one `IMMEDIATE` transaction, `graph_ids_for()` reverses it, and `graph_uid_validity()` is the

@@ -334,6 +334,13 @@ pub struct AppConfig {
     /// People switch is item 4.7.9.
     #[serde(default)]
     pub directory_accounts: Vec<AccountId>,
+    /// The Microsoft 365 accounts using the experimental Graph mail transport
+    /// instead of IMAP/SMTP (item 5.7.6 / A-06). Off by default: Graph has no
+    /// push (so new mail arrives by polling), no Sieve and no folder move.
+    /// This is only the stored opt-in - callers also check the account is
+    /// Microsoft 365 and has granted Graph access.
+    #[serde(default)]
+    pub graph_mail_accounts: Vec<AccountId>,
     /// The configured LDAP directories (items 4.7.4-4.7.5 / P-11). Bind
     /// passwords live in the keyring under `other_accounts::PROTOCOL_LDAP`,
     /// never here.
@@ -561,6 +568,28 @@ impl AppConfig {
         if enabled {
             self.directory_accounts.push(account_id.clone());
         }
+    }
+
+    /// Whether `account_id` has opted in to the experimental Graph mail
+    /// transport (item 5.7.6). This is just the stored opt-in - callers also
+    /// check the account is Microsoft 365 and has granted Graph access.
+    pub fn graph_mail_enabled_for(&self, account_id: &AccountId) -> bool {
+        self.graph_mail_accounts.contains(account_id)
+    }
+
+    /// Records (or clears) `account_id`'s Graph mail opt-in, returning whether
+    /// the stored state actually changed. A caller that gets `true` must
+    /// reconnect the account and drop its per-account mail cache: the IMAP and
+    /// Graph folder/Uid trees can't be merged.
+    pub fn set_graph_mail_enabled(&mut self, account_id: &AccountId, enabled: bool) -> bool {
+        if self.graph_mail_enabled_for(account_id) == enabled {
+            return false;
+        }
+        self.graph_mail_accounts.retain(|id| id != account_id);
+        if enabled {
+            self.graph_mail_accounts.push(account_id.clone());
+        }
+        true
     }
 
     /// Inserts `directory`, replacing any existing entry with the same id (the
@@ -811,6 +840,7 @@ mod tests {
                 name: "Work".into(),
             }],
             directory_accounts: vec![AccountId("account_1".into())],
+            graph_mail_accounts: vec![AccountId("account_2".into())],
             ldap_directories: vec![LdapDirectory {
                 id: format!("{LDAP_DIRECTORY_ID_PREFIX}abc"),
                 account_id: AccountId("account_1".into()),
@@ -866,6 +896,7 @@ mod tests {
             search_folders_seeded: false,
             local_task_lists: Vec::new(),
             directory_accounts: Vec::new(),
+            graph_mail_accounts: Vec::new(),
             ldap_directories: Vec::new(),
             calendar_groups: Vec::new(),
             hidden_calendars: Vec::new(),
@@ -1289,6 +1320,38 @@ mod tests {
         config.set_directory_enabled(&account, true);
         save_at(&path, &config);
         assert!(load_at(&path).directory_enabled_for(&account));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_mail_opt_in_toggles_and_tolerates_old_files() {
+        let dir = std::env::temp_dir().join(format!("lookout-graph-mail-accounts-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A file predating `graph_mail_accounts` loads as an empty list.
+        std::fs::write(&path, r#"{"identities": []}"#).unwrap();
+        let mut config = load_at(&path);
+        let account = AccountId("account_1".into());
+        assert!(!config.graph_mail_enabled_for(&account));
+
+        // Enabling reports a change exactly once; repeating it is a no-op so
+        // the caller doesn't clear and reconnect an already-Graph account.
+        assert!(config.set_graph_mail_enabled(&account, true));
+        assert!(!config.set_graph_mail_enabled(&account, true));
+        assert!(config.graph_mail_enabled_for(&account));
+        assert_eq!(config.graph_mail_accounts, vec![account.clone()]);
+
+        assert!(config.set_graph_mail_enabled(&account, false));
+        assert!(!config.graph_mail_enabled_for(&account));
+        assert!(config.graph_mail_accounts.is_empty());
+        assert!(!config.set_graph_mail_enabled(&account, false));
+
+        // An enabled opt-in round-trips.
+        config.set_graph_mail_enabled(&account, true);
+        save_at(&path, &config);
+        assert!(load_at(&path).graph_mail_enabled_for(&account));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

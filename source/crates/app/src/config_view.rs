@@ -90,6 +90,11 @@ pub type OtherAccountAction = Rc<dyn Fn(&gtk::Widget, &str)>;
 /// connect/teardown and persistence.
 pub type AccountToggle = Rc<dyn Fn(&str, bool)>;
 
+/// The caller's hook for a Microsoft 365 account's "Use Graph mail
+/// (experimental)" switch: the account id and the new state. The caller owns
+/// consent, persistence, cache clearing and the reconnect (item 5.7.6).
+pub type GraphMailToggle = Rc<dyn Fn(&str, bool)>;
+
 /// Plain display data for one GOA account in the Accounts section's
 /// enable/disable list - the union of every account the discoveries saw,
 /// disabled ones included, so a disabled account stays toggleable.
@@ -118,6 +123,18 @@ pub enum GraphPinStatus {
     NeedsConsent,
 }
 
+/// Whether a mail account can use, or already uses, the experimental Graph
+/// mail transport instead of IMAP/SMTP (item 5.7.6 / A-06).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GraphMailStatus {
+    /// Not a Microsoft 365 account (or a shared mailbox) - no switch shown.
+    NotApplicable,
+    /// Eligible but still on IMAP/SMTP.
+    Off,
+    /// Currently connected through Graph.
+    On,
+}
+
 /// Plain display data for one mail account, decoupled from window.rs's
 /// private `AccountHandle` so this module has no dependency on the session
 /// types.
@@ -140,6 +157,8 @@ pub struct MailAccountInfo {
     /// Preformatted `host:port`.
     pub smtp: String,
     pub graph_pin_status: GraphPinStatus,
+    /// The experimental Graph mail transport's availability and state.
+    pub graph_mail: GraphMailStatus,
 }
 
 /// Plain display data for one calendar account.
@@ -1336,7 +1355,9 @@ pub fn build() -> ConfigView {
 /// the actual dialog. Manual ("other") accounts additionally get Edit and
 /// Remove suffix buttons wired to `edit_other`/`remove_other`; a Microsoft
 /// 365 account with `graph_pin_status == NeedsConsent` gets a "Sync pins
-/// with Outlook" suffix button wired to `enable_graph_pin`.
+/// with Outlook" suffix button wired to `enable_graph_pin`. Every account
+/// whose `graph_mail` is not `NotApplicable` gets the experimental Graph mail
+/// switch wired to `set_graph_mail` (item 5.7.6).
 #[allow(clippy::too_many_arguments)]
 pub fn refresh(
     view: &ConfigView,
@@ -1363,6 +1384,7 @@ pub fn refresh(
     edit_other: &OtherAccountAction,
     remove_other: &OtherAccountAction,
     enable_graph_pin: &OtherAccountAction,
+    set_graph_mail: &GraphMailToggle,
     toggle_goa: &AccountToggle,
 ) {
     // No GOA daemon on the session bus at all (the normal case on KDE) -
@@ -1418,7 +1440,13 @@ pub fn refresh(
         push_row(&view.mail_group, &view.mail_rows, empty_row("No mail accounts connected"));
     } else {
         for info in mail {
-            let subtitle = format!("{} · IMAP {} · SMTP {}", info.email, info.imap, info.smtp);
+            // One line of connection detail: the Graph transport replaces
+            // IMAP/SMTP outright, so its server fields would be misleading
+            // while it's selected (item 5.7.6).
+            let subtitle = match info.graph_mail {
+                GraphMailStatus::On => format!("{} · Microsoft Graph (experimental)", info.email),
+                _ => format!("{} · IMAP {} · SMTP {}", info.email, info.imap, info.smtp),
+            };
             let row = account_row(&info.display_name, &subtitle);
             // Account name + address: blurred by privacy mode.
             crate::privacy::mark_row(&row);
@@ -1455,6 +1483,23 @@ pub fn refresh(
                 row.add_suffix(&sync_button);
             }
             push_row(&view.mail_group, &view.mail_rows, row);
+            // Per-account transport opt-in (item 5.7.6). Experimental, so the
+            // subtitle names the trade-off before the user turns it on.
+            if info.graph_mail != GraphMailStatus::NotApplicable {
+                let graph_row = adw::SwitchRow::builder()
+                    .title("Use Graph mail (experimental)")
+                    .subtitle(
+                        "Connect through Microsoft Graph instead of IMAP/SMTP. New mail may take up to a minute to arrive, and Sieve rules and folder moves aren't available.",
+                    )
+                    .active(info.graph_mail == GraphMailStatus::On)
+                    .build();
+                // Wired per refresh, after `active` is set, so rebuilding the
+                // rows never fires a reconnect.
+                let set_graph_mail = set_graph_mail.clone();
+                let account_id = info.account_id.clone();
+                graph_row.connect_active_notify(move |row| set_graph_mail(&account_id, row.is_active()));
+                push_row(&view.mail_group, &view.mail_rows, graph_row.upcast());
+            }
             let identities_subtitle = if info.identity_labels.is_empty() {
                 "Send as this account's own address".to_string()
             } else {

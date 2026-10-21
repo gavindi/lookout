@@ -31,6 +31,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -117,10 +118,15 @@ enum TokenAudience {
 }
 
 impl TokenAudience {
-    fn refresh_scopes(self) -> &'static str {
+    /// The refresh scope list for this audience. `mail_send` adds Graph's
+    /// `Mail.Send` for an account that opted into the Graph mail transport
+    /// (item 5.7.6); a token minted without it can read and write mail but
+    /// not send, which is all the other Graph features need.
+    fn refresh_scopes(self, mail_send: bool) -> Cow<'static, str> {
         match self {
-            TokenAudience::Exchange => EXCHANGE_SCOPES,
-            TokenAudience::Graph => GRAPH_SCOPES,
+            TokenAudience::Exchange => Cow::Borrowed(EXCHANGE_SCOPES),
+            TokenAudience::Graph if mail_send => Cow::Owned(format!("{GRAPH_SCOPES} https://graph.microsoft.com/{}", lookout_graph::MAIL_SEND)),
+            TokenAudience::Graph => Cow::Borrowed(GRAPH_SCOPES),
         }
     }
 }
@@ -152,6 +158,12 @@ struct StoredToken {
     /// `false`, not a parse error.
     #[serde(default)]
     graph_consented: bool,
+    /// Whether this grant also carries Graph's `Mail.Send`, requested only by
+    /// the Graph mail transport's opt-in (item 5.7.6). `#[serde(default)]` so
+    /// a token file from before the transport loads as `false` and keeps its
+    /// original, narrower Graph scope set.
+    #[serde(default)]
+    mail_send: bool,
 }
 
 /// Persists one account's refresh token. Access tokens never touch disk.
@@ -330,6 +342,7 @@ impl MicrosoftOAuth {
                 let _ = store.save(&StoredToken {
                     refresh_token: stored.refresh_token,
                     graph_consented: false,
+                    mail_send: stored.mail_send,
                 });
                 Err(GraphAuthError::ConsentRequired)
             }
@@ -341,6 +354,13 @@ impl MicrosoftOAuth {
     /// network, so it's safe to call while just building rows.
     pub fn graph_consented(&self) -> bool {
         TokenStore::for_account(&self.account_id).load().map(|s| s.graph_consented).unwrap_or(false)
+    }
+
+    /// Whether the stored grant already includes both Graph access and
+    /// `Mail.Send`, so enabling Graph mail needs no new browser prompt (item
+    /// 5.7.6). Disk-only, like [`Self::graph_consented`].
+    pub fn graph_mail_consented(&self) -> bool {
+        TokenStore::for_account(&self.account_id).load().map(|s| s.graph_consented && s.mail_send).unwrap_or(false)
     }
 
     /// Runs the interactive PKCE/loopback consent flow requesting both the
@@ -356,18 +376,44 @@ impl MicrosoftOAuth {
         self.ensure_graph_consent_for(COMBINED_SCOPES).await
     }
 
+    /// Consent for the experimental Graph mail transport (item 5.7.6): the
+    /// normal combined Outlook grant plus Graph's `Mail.Send`, which the
+    /// transport's outbox needs (`Mail.ReadWrite` alone can write a draft but
+    /// not send it). Kept out of [`Self::ensure_graph_consent`] so mail
+    /// sending stays an incremental, per-feature consent (§4.4).
+    pub async fn ensure_graph_mail_consent(&self) -> Result<(), String> {
+        self.ensure_graph_consent_scopes(COMBINED_SCOPES, true).await
+    }
+
     /// The per-feature variant of [`Self::ensure_graph_consent`]: requests
     /// exactly `scopes` (a space-separated OAuth2 scope string) rather than the
     /// fixed combined set, so consent widens incrementally as each Graph
     /// feature is first used (OUTLOOK_PARITY.md §4.4). Only ever called from a
     /// user-initiated action.
     pub async fn ensure_graph_consent_for(&self, scopes: &str) -> Result<(), String> {
+        self.ensure_graph_consent_scopes(scopes, false).await
+    }
+
+    /// [`Self::ensure_graph_consent_for`], keeping `Mail.Send` once an
+    /// account has opted into Graph mail so a later re-consent (say, for
+    /// categories) can't silently take sending away.
+    async fn ensure_graph_consent_scopes(&self, scopes: &str, mail_send: bool) -> Result<(), String> {
         let store = TokenStore::for_account(&self.account_id);
-        let resp = self.authorize_interactive(scopes).await?;
+        // Keep Mail.Send once requested, whether by the Graph mail opt-in or
+        // by a feature whose own scope set names it (e.g. schedule send).
+        let requests_mail_send = scopes.split_whitespace().any(|scope| scope.ends_with("/Mail.Send"));
+        let mail_send = mail_send || requests_mail_send || store.load().map(|stored| stored.mail_send).unwrap_or(false);
+        let scopes = if mail_send && !requests_mail_send {
+            format!("{scopes} https://graph.microsoft.com/{}", lookout_graph::MAIL_SEND)
+        } else {
+            scopes.to_string()
+        };
+        let resp = self.authorize_interactive(&scopes).await?;
         let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
         let stored = StoredToken {
             refresh_token,
             graph_consented: true,
+            mail_send,
         };
         store.save(&stored)?;
         match self.refresh(&store, &stored, TokenAudience::Graph).await {
@@ -380,6 +426,7 @@ impl MicrosoftOAuth {
                 let _ = store.save(&StoredToken {
                     refresh_token: stored.refresh_token,
                     graph_consented: false,
+                    mail_send: false,
                 });
                 Err("Microsoft granted sign-in but didn't allow the Outlook permissions requested - check your organization's app consent policy and try again".to_string())
             }
@@ -388,11 +435,12 @@ impl MicrosoftOAuth {
     }
 
     async fn refresh(&self, store: &TokenStore, current: &StoredToken, audience: TokenAudience) -> Result<RefreshOutcome, String> {
+        let scopes = audience.refresh_scopes(current.mail_send);
         let params = [
             ("client_id", CLIENT_ID),
             ("grant_type", "refresh_token"),
             ("refresh_token", current.refresh_token.as_str()),
-            ("scope", audience.refresh_scopes()),
+            ("scope", scopes.as_ref()),
         ];
         let resp = match post_token_request(&params).await {
             // A rejected grant is permanent (the token, or at least this
@@ -410,6 +458,7 @@ impl MicrosoftOAuth {
             let _ = store.save(&StoredToken {
                 refresh_token: new_refresh,
                 graph_consented: current.graph_consented,
+                mail_send: current.mail_send,
             });
         }
         let (access_token, expires_in) = (resp.access_token, resp.expires_in);
@@ -423,6 +472,7 @@ impl MicrosoftOAuth {
         store.save(&StoredToken {
             refresh_token,
             graph_consented: false,
+            mail_send: false,
         })?;
         let (access_token, expires_in) = (resp.access_token, resp.expires_in);
         self.cache(TokenAudience::Exchange, access_token.clone(), expires_in);
@@ -696,11 +746,13 @@ mod tests {
             .save(&StoredToken {
                 refresh_token: "rt-123".to_string(),
                 graph_consented: true,
+                mail_send: true,
             })
             .unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.refresh_token, "rt-123");
         assert!(loaded.graph_consented);
+        assert!(loaded.mail_send);
 
         #[cfg(unix)]
         {
@@ -724,14 +776,20 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.refresh_token, "rt-legacy");
         assert!(!loaded.graph_consented);
+        assert!(!loaded.mail_send, "a grant from before Graph mail has no Mail.Send");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn token_audience_selects_distinct_scopes() {
-        assert_eq!(TokenAudience::Exchange.refresh_scopes(), EXCHANGE_SCOPES);
-        assert_eq!(TokenAudience::Graph.refresh_scopes(), GRAPH_SCOPES);
-        assert_ne!(TokenAudience::Exchange.refresh_scopes(), TokenAudience::Graph.refresh_scopes());
+        assert_eq!(TokenAudience::Exchange.refresh_scopes(false).as_ref(), EXCHANGE_SCOPES);
+        assert_eq!(TokenAudience::Graph.refresh_scopes(false).as_ref(), GRAPH_SCOPES);
+        assert_ne!(TokenAudience::Exchange.refresh_scopes(false).as_ref(), TokenAudience::Graph.refresh_scopes(false).as_ref());
+        // The Graph mail opt-in adds Mail.Send to Graph refreshes only.
+        assert_eq!(TokenAudience::Exchange.refresh_scopes(true).as_ref(), EXCHANGE_SCOPES);
+        let mail_graph = TokenAudience::Graph.refresh_scopes(true);
+        assert!(mail_graph.contains(lookout_graph::MAIL_SEND), "Graph mail needs Mail.Send: {mail_graph}");
+        assert!(mail_graph.contains(lookout_graph::MAIL_READ_WRITE), "and the mail read/write base: {mail_graph}");
     }
 
     #[test]

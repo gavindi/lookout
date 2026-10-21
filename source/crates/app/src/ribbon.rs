@@ -86,6 +86,14 @@ impl RibbonIcon {
             button.set_tooltip_text(text);
         }
     }
+
+    /// Enable or disable the owning button - used by Pin, whose capability
+    /// depends on the selected account's mail transport (item 5.7.7).
+    pub(crate) fn set_sensitive(&self, sensitive: bool) {
+        if let Some(button) = self.button.upgrade() {
+            button.set_sensitive(sensitive);
+        }
+    }
 }
 
 type RelayoutListener = Rc<dyn Fn()>;

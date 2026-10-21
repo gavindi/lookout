@@ -102,6 +102,11 @@ pub(crate) struct AccountHandle {
     /// 2.5), from `AccountEvent::SieveAdvertised`. Gates offering the Sieve
     /// backend for the account.
     pub(crate) sieve_advertised: bool,
+    /// Whether this account's running session is the Graph mail transport
+    /// rather than IMAP/SMTP (item 5.7.6 / A-06). Set from the per-account
+    /// opt-in at connect time, so IMAP-only surfaces (folder move, Sieve) can
+    /// hide themselves while it's on.
+    pub(crate) uses_graph_mail: bool,
 }
 
 /// One GNOME Online Accounts account as discovered at startup, keeping the

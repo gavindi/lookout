@@ -471,6 +471,9 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
                 pinned: summary.is_pinned(),
                 draft: summary_is_draft(&st, summary),
                 snoozed: lookout_core::snooze_until_from_keywords(&summary.keywords).is_some(),
+                graph_mail: mailbox_account_id(&summary.mailbox)
+                    .and_then(|account_id| st.accounts.get(&account_id))
+                    .is_some_and(|handle| handle.uses_graph_mail),
             })
             .collect();
         let folders = account.as_ref().and_then(|id| st.accounts.get(id)).map(|handle| handle.folders.clone()).unwrap_or_default();
@@ -2422,6 +2425,17 @@ pub(crate) fn record_recent_folder(state: &Rc<RefCell<UiState>>, folder: &Mailbo
 /// `StoreFlagsMany` per mailbox, and one undo entry - the opposite
 /// `\Flagged` change on every affected message (item 0.4).
 pub(crate) fn set_messages_pinned(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, summaries: &[EmailSummary], pinning: bool) {
+    // Pin has no Graph counterpart (item 5.7.7), so a shortcut or a mixed
+    // selection acts only on the IMAP-transport messages; the UI hides the
+    // action when every target is on Graph.
+    let summaries: Vec<EmailSummary> = {
+        let st = state.borrow();
+        summaries.iter().filter(|summary| !mailbox_uses_graph_mail(&st, &summary.mailbox)).cloned().collect()
+    };
+    if summaries.is_empty() {
+        return;
+    }
+    let summaries = summaries.as_slice();
     let (add, remove) = if pinning {
         (vec![SystemFlagBit::Flagged], Vec::new())
     } else {

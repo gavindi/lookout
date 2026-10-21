@@ -1,6 +1,6 @@
 # MAIL_GRAPH_OVERVIEW — Phase 5, item 5.7 (Optional Graph mail transport)
 
-**Status:** plan / assessment. 5.7.1 partial (offline only); 5.7.2–5.7.5 landed as unwired library code; the rest is not implemented.
+**Status:** plan / assessment. 5.7.1 partial (offline only); 5.7.2–5.7.5 landed as library code; 5.7.6 wired it behind a per-account opt-in; 5.7.7 reconciled the transport gaps. 5.7.8–5.7.10 are not implemented.
 **Covers:** [OUTLOOK_PARITY.md](OUTLOOK_PARITY.md) §4.4, §5.1, §5.6, §7 item 5.7; ID **A-06** (Microsoft 365 mail).
 **Companion docs:** [OUTLOOK_PARITY.md](OUTLOOK_PARITY.md) (parity plan), [SCAFFOLD.md](SCAFFOLD.md) (architecture), [CHANGELOG.md](CHANGELOG.md) (history).
 
@@ -15,9 +15,11 @@
 > costly: full Graph mail sync as an alternative to IMAP for Microsoft 365
 > accounts."* Effort: **L**.
 
-Today a Microsoft 365 account is **mail over IMAP/SMTP** with Lookout's own
+By default a Microsoft 365 account is **mail over IMAP/SMTP** with Lookout's own
 XOAUTH2 (`source/crates/app/src/microsoft_oauth.rs`), and Graph is layered on top
-for the things Exchange IMAP cannot carry or expose:
+for the things Exchange IMAP cannot carry or expose. Item 5.7.6 adds an
+experimental per-account opt-in that replaces the IMAP/SMTP half with the Graph
+session; IMAP remains the default and the recommended transport.
 
 | Feature | How it works today | Where |
 |---|---|---|
@@ -38,9 +40,11 @@ marked ✅. The layered IMAP + Graph design is working.
 
 ## 2. Recommendation
 
-**Keep 5.7 deferred.** Do not implement a full Graph mail sync now.
+**Keep IMAP as the default.** Graph mail is available only behind the
+per-account, experimental switch from item 5.7.6; do not make it the transport
+of record for Microsoft 365.
 
-Reasons:
+Reasons the default stays IMAP:
 
 1. The trigger in the item's own text has not fired — 5.4 was not too costly.
 2. A Graph transport is **strictly worse for real-time delivery**: Graph change
@@ -81,11 +85,12 @@ two evidence questions remain open:
   IMAP keywords, `MOVE` or IDLE is announced. The one unverified trigger
   candidate is unchanged: the shared-mailbox IMAP login form (M-42).
 
-**Net: 5.7 stays deferred, and 5.7.1 is complete only as far as a tenant-less
-spike can take it.** Re-running (a) and (b) against a tenant is what would move
-the decision.
+**Net: IMAP stays the default, and 5.7.1 is complete only as far as a
+tenant-less spike can take it.** Item 5.7.6 exposes the Graph session behind an
+opt-in so the transport can be tried on a real mailbox; re-running (a) and (b)
+against a tenant is what would move the default.
 
-## 3. Architecture if greenlit
+## 3. Architecture (as wired by 5.7.6)
 
 Mirror the existing Graph/DAV actors: a **second account-session actor** speaking
 the **same `AccountCommand` / `AccountEvent` contract** as
@@ -96,7 +101,7 @@ are untouched.
 ```
 source/crates/app/src/window/connect.rs
   └─ if account is Microsoft 365 AND graph mail opted in
-        worker.spawn(lookout_graph::mail::run_mail_session(client, cmd_rx, interactive_cmd_rx, evt_tx))
+        worker.spawn(lookout_graph::run_graph_mail_session(mail_config, client, cmd_rx, interactive_cmd_rx, evt_tx))
      else
         worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx))
 ```
@@ -115,6 +120,70 @@ Key properties:
   `categories`, `importance`, `inferenceClassification`, `move`, `copy`,
   `delete` are all direct Graph PATCH/POST.
 
+### 3.1 Transport reconciliation (item 5.7.7)
+
+Walk of `OUTLOOK_PARITY.md` §5.1 on the Graph transport. ✅ = native,
+🟡 = degraded but working, ⛔ = unavailable and hidden, — = not implemented on
+any transport (so the transport cannot regress it). The same marks are in the
+**Graph** column of §5.1.
+
+| ID | Feature | Graph mail | Note |
+|---|---|---|---|
+| M-01 | Multi-account, IDLE push, offline cache | 🟡 | Polling every `poll_interval` (45 s default), not IDLE; the cache and multi-account handling are native (R1). |
+| M-02 | Unified inbox | ✅ | Client-side merge over the shared cache. |
+| M-03 | Focused / Other inbox | ✅ | Native `inferenceClassification` reads and writes, including sender overrides. |
+| M-04 | Conversation view | ✅ | `graph:{conversationId}` thread key; same Sent-Items-only reach as IMAP. |
+| M-05 | Reading pane right / bottom / off | ✅ | Client-side layout. |
+| M-06 | Density and preview lines | ✅ | Client-side presentation. |
+| M-07 | Sort / arrange by | ✅ | Local sort and grouping. |
+| M-08 | Filter menu | ✅ | Local filters, including Pinned (empty while Pin is unavailable). |
+| M-09 | Categories | ✅ | Native `categories` / `masterCategories`; tag keys map through the master list. |
+| M-10 | Flag for follow-up with dates | ✅ | Native Graph `flag`, with the cache overlay keeping the list in step until the next delta. |
+| M-11 | Snooze | 🟡 | Local cache snooze only; unlike the IMAP keyword + Scheduled folder, it isn't shared with Outlook or another install. |
+| M-12 | Importance display | ✅ | Native Graph `importance`. |
+| M-13 | Pin | ⛔ | Graph has no Pin counterpart. The ribbon button is disabled, the row hover action is disabled, and the context-menu entry is omitted (5.7.7). |
+| M-14 | Rules | 🟡 | Client and Graph `messageRules` backends work; the Sieve backend is hidden because the server never advertises ManageSieve. |
+| M-15 | Quick Steps | ✅ | Local chains, unchanged. |
+| M-16 | Sweep | ✅ | Reads the local cache and issues Graph moves. |
+| M-17 | Junk: safe / blocked senders | 🟡 | Moves, blocked lists and client enforcement work; `$Junk`/`$NotJunk` are local cache hints because Graph has no keyword. |
+| M-18 | Search syntax and refiners | 🟡 | Local FTS5 is the primary search; Graph `$search` is best-effort and cannot mirror every `search_query.rs` operator. |
+| M-19 | Search Folders | ✅ | Local saved searches over the FTS index. |
+| M-20 | Ignore / Clean up conversation | ✅ | Local thread-key store; the Graph thread key is stable. |
+| M-21 | Undo | 🟡 | Every available action keeps its undo; Pin has none because Pin itself is unavailable. |
+| M-22 | Mark-as-read options | ✅ | Client-side policy over native `isRead`. |
+| M-23 | Read receipts | ✅ | MIME `$value` preserves the request; the RFC 8098 reply uses the normal send path. |
+| M-24 | Automatic replies | ✅ | Native `automaticRepliesSetting`. |
+| M-25 | @mentions | ✅ | MIME/text body parsing feeds the same detector. |
+| M-26 | Message recall | — | Absent on both transports. |
+| M-27 | Delivery receipts (DSN) | — | Absent on both transports. |
+| M-28 | Print | ✅ | WebKit print of the MIME/JSON body. |
+| M-29 | Save as `.eml` / `.msg` / PDF | ✅ | `.eml` comes from the raw MIME cache; the `.msg`/PDF gap is unchanged. |
+| M-30 | View source / message headers | ✅ | `FetchRawMessage` serves the MIME source. |
+| M-31 | Open message in new window | ✅ | Raw-MIME render. |
+| M-32 | Attachment preview | ✅ | Same inline `cid:` support; the in-app preview gap is unchanged. |
+| M-33 | Download / save all attachments, zip | ✅ | Graph attachment bytes, cached like IMAP parts. |
+| M-34 | Remote content / trusted senders | ✅ | Client-side policy. |
+| M-35 | Phishing / unverified-sender banners | — | Not built yet; the MIME read now supplies the headers it needs. |
+| M-36 | Translate | — | Absent on both transports. |
+| M-37 | Immersive Reader / zoom | ✅ | Client-side zoom and theme. |
+| M-38 | Message context menu | 🟡 | The full menu works; Pin is omitted (M-13). |
+| M-39 | Notifications | ✅ | Poll-driven; new-mail latency follows M-01. |
+| M-40 | Work offline / outbox | ✅ | Cache-first reads and the local outbox are transport-neutral. |
+| M-41 | List-unsubscribe | ✅ | Headers come from the MIME read; both actions use the existing paths. |
+| M-42 | Shared mailboxes / delegate access | 🟡 | Shared mailboxes still connect over IMAP under the parent's token; the Graph shared-mailbox routes remain ready but unsurfaced. |
+| M-43 | Archive folder | ✅ | Graph folder-role move. |
+| M-44 | Drag and drop | ✅ | Graph move/copy; drag-out `.eml` uses the raw cache. |
+| M-45 | TNEF / winmail.dat | ✅ | MIME `$value` feeds the existing decoder; live-tenant fidelity is still R3's open question. |
+| M-46 | Voting buttons | — | Absent on both transports. |
+
+**§6.11 UX check:** the transport adds no new dialogs or errors. Placement
+follows Outlook except where the capability is absent (Pin is disabled/omitted,
+Move and Sieve were already hidden in 5.7.6); wording uses “Graph mail” in the
+disabled tooltip and the Config row; defaults are unchanged; the Pin shortcut
+remains bound but the disabled button makes it a no-op; all available actions
+keep their Undo; and no empty/error state changes, because a missing capability
+is hidden rather than surfaced as a failure. No screenshot changes are needed.
+
 ## 4. Task breakdown
 
 Effort: **S** ≤ 1 day · **M** ≤ 1 week · **L** multi-week.
@@ -122,12 +191,12 @@ Effort: **S** ≤ 1 day · **M** ≤ 1 week · **L** multi-week.
 | # | Task | Scope | Effort |
 |---|---|---|---|
 | 5.7.1 | **Spike + go/no-go** — 🟡 partial (offline only) | **Landed:** the harness to measure the two evidence questions — `MailClient::get_mime` (`GET /me/messages/{id}/$value`, `Prefer: IdType="ImmutableId"`), `MailClient::folder_delta` (`GET /me/mailFolders/{id}/messages/delta`) and `GraphClient::get_bytes_with_headers`, with wiremock tests and the `test-fixtures/outlook/messages-delta.json` page fixture. Question (c) is answered from Microsoft's published guidance (§2.1): Basic auth is going, IMAP is not. **Outstanding (needs a live tenant):** (a) `/$value` MIME fidelity for an iMIP invite, a TNEF message and an `Authentication-Results` message — diffed against the IMAP body; (b) delta paging cost on a large mailbox and folder. Capture those three `.eml` fixtures when a tenant is available. | S |
-| 5.7.2 | **Graph mail transport** — ✅ transport only, not wired | **Landed** in `source/crates/graph/src/mail/` as dormant library code: nothing calls it yet. **Operations** (`MailClient`): `own_mail_folders_delta` (the whole hierarchy through `/me/mailFolders/delta`, since the plain list is top-level only), `well_known_folders`, `folder_messages_delta` at row weight, `get_message` (HTML body + headers), `move_message`/`copy_message`/`delete_message`, `update_message` (one `MessagePatch` for isRead / flag / categories / importance / inferenceClassification), `list_attachments` + `get_attachment_bytes`, `create_draft`/`update_draft`/`create_reply`/`create_reply_all`/`create_forward`/`send_draft`, `create_folder`/`rename_folder`/`delete_folder`, and `search_messages` (`$search`, unordered, capped). `GraphError::is_delta_reset` flags an expired cursor (410). **Pure mappers** (`mail/message.rs`): `MailFolder` (the 5.6 `SharedMailFolder` is now an alias of it) → `Mailbox`, `GraphMessage` → `EmailSummary`, attachments → `BodyPart`, the JSON body → `EmailBody`, with the `MailboxId`/`Uid` passed in so 5.7.3 owns the identity model. **Inputs for later tasks:** a part's `part_number` is the Graph attachment id, made filename-safe by 5.7.3; the thread key is `graph:{conversationId}` because Graph summaries carry no `References` (5.7.4 must keep it); `size` is 0 and Pin has no Graph counterpart (5.7.7); `calendar_ics` needs the MIME read (R3). Covered by wiremock tests per operation and four synthetic fixtures (`mail-folders-delta.json`, `message-summary-delta.json`, `message-full.json`, `message-attachments.json`). | M |
-| 5.7.3 | **Identity model** — ✅ library only, not wired | **Landed.** `MailboxId = "{account}:{graph folder id}"`, parsed back only by stripping the account prefix (`lookout_graph::graph_folder_id`), never by splitting on `:`. A **synthetic `Uid`** per Graph immutable id comes from the cache's new `graph_uids` map (`Cache::graph_uids`, one `IMMEDIATE` transaction, reverse lookup `graph_ids_for`, pruned by `run_maintenance`). Uids are unique per **account**, so a moved message keeps its Uid and a copy gets a new one; `allocation_order` hands new ones out oldest-first. **`UidValidity` decision (changed from the original "bump on a delta reset"):** one random nonzero value per account (`graph_uid_space`), changed only when the map is lost (cache deleted or cleared). An expired delta cursor (410) resyncs the folder under the **same** Uids, because bumping would throw away cached bodies, attachments, search rows and undo references for messages that haven't changed. Random rather than time-based so a map recreated within the same second can't reuse a validity. **Fix to 5.7.2:** a part's `part_number` is now the attachment id in base64url form (`graph_part_number`), since a raw Graph id's `/` would have pointed the attachment flat file outside its directory. Documented in SCAFFOLD §3.1/§4.5. | M |
-| 5.7.4 | **Cache strategy** — ✅ decided and proven, not wired | **Decision: reuse the per-account `lookout_mail::Cache`**, no separate Graph cache file and no `user_version` migration. A Graph account keeps the same tables as an IMAP one, so FTS5 search, conversation lookups, snoozes, the outbox, the overlays and the flat files all work unchanged. **Added:** `Cache::upsert_messages`, the incremental counterpart of `replace_messages` for a delta that reports only changes (removals go through the existing `delete_messages`); it promotes `partial` rows and keeps full-body search text. **Rules for the session (5.7.5):** (1) store each folder's delta with `upsert_messages` under the 5.7.3 Uids and validity, and its tombstones with `delete_messages`; a move is a removal in one folder plus an upsert of the same Uid in the other. (2) Write each record's categories, importance, Focused/Other and flag through the existing `apply_remote_mail_properties` (categories mapped to Lookout keys, as the 5.4 sync does, `delta_cursor` = `None`), so the overlays always match Graph and a stale overlay from IMAP days is cleared; local optimistic writes keep their `updated_at` guard. A message without a Message-ID (some drafts) can't carry overlay properties. (3) The `graph:{conversationId}` thread key is stored as given; only the IMAP session calls `compute_thread_keys`. (4) Graph folder ids aren't paths: forget a deleted folder by its own id, not `forget_mailbox_tree` (whose subtree walk is delimiter-based), and a rename keeps the id, so no `rekey_snoozed`. (5) Per-folder delta cursors are 5.7.8's; the single-row `graph_delta_cursor` stays the 5.4 property sync's. Proven by `crates/graph/tests/graph_mail_cache.rs` (the synthetic fixtures through the mappers into a real cache: folders, threads, flags, search, overlays, a move, a body) and an `upsert_messages` unit test. | M |
-| 5.7.5 | **Session actor** — ✅ actor only, not wired | **Landed** as `source/crates/graph/src/mail/session.rs`: `run_graph_mail_session(config, client, cmd_rx, interactive_cmd_rx, evt_tx)` speaks the existing `AccountCommand`/`AccountEvent` contract, so nothing above the protocol seam changes. **Sync:** the folder hierarchy through `/me/mailFolders/delta` (well-known names resolved for roles), and each folder's messages delta into the shared cache - `upsert_messages` under 5.7.3's Uids, tombstones through `graph_uids_existing` + `delete_messages` (no Uid burnt for an unseen id), property records through `apply_remote_mail_properties` with a `taken_at` captured *before* the read. A read that starts from no cursor (first sync or a 410 reset) is the folder's whole snapshot and diffs with `replace_messages`, since such a page carries no tombstones; an incremental page upserts. A delta page is filtered by `parentFolderId`, and an expired cursor resyncs under the same Uids. There is no push, so the open folder is polled every `poll_interval` (default 45 s) and one other folder per tick in rotation, with the folder delta every fourth poll. **Reads:** `FetchBody` prefers `/$value` MIME (`parse_body`, so iMIP/`Authentication-Results` survive R3) and falls back to Graph's JSON body, keeping Graph attachment ids as part numbers; `FetchAttachment` and `FetchRawMessage` cache and emit the existing events. **Writes:** read state (`isRead`), follow-up flag, importance, Focused/Other (plus a native sender override for "Always move…"), categories from tag keys, move/copy/revert, snooze (local, like the IMAP fallback), junk (local keyword hint - the caller moves the folder), drafts (raw MIME, preserving the stable `Message-ID` and Bcc), folder create/rename/delete, `search_messages`, and the local outbox drained through Graph's MIME `sendMail` (Bcc header added for the wire). **Known gaps for 5.7.7:** no Pin, no Sieve (`SieveAdvertised(false)`), no folder move, remote `$search` is best-effort only, and a tag key Graph hasn't shown yet is written as its key. **Tests:** pure-helper unit tests plus `crates/graph/tests/graph_mail_session.rs`, a fake-Graph session that syncs folders/messages, reads a MIME body and performs a native `PATCH`. New plumbing: `GraphClient::post_raw`, `MailClient::{send_mime, create_draft_mime, resolve_message_id_in, get_summary}`, `Cache::graph_uids_existing`, and `lookout-mail`'s `OutboxMessage`/`OutboxState`/`build_draft_raw_message`/`outbox_items` exports. Per-folder cursor persistence is still 5.7.8. | L |
-| 5.7.6 | **App wiring + opt-in** | Per-account **"Use Graph mail (experimental)"** switch in Config → Accounts (`settings.json` list + `AppConfig` helpers, like `directory_accounts`). `connect.rs` picks the session. Disable/hide IMAP-only surfaces: Sieve rules, keyword-driven snooze/`$Junk`/`$Forwarded`, capability probes (`SieveAdvertised`), IMAP account fields. Also suppress the app's item-5.4 property mirror for that account while the Graph session is selected - the session owns reads and writes - and clear the cache on first opt-in if it has IMAP folder ids (the two trees can't be merged). | M |
-| 5.7.7 | **Feature-gap reconciliation** | Walk §5.1 row by row: native / degraded / unavailable. Update status marks and the §2.1 scorecard. Confirm each stays a §6.11 UX-checklist pass (wording, defaults, undo, empty/error states). | M |
+| 5.7.2 | **Graph mail transport** — ✅ landed (wired by 5.7.6) | **Landed** in `source/crates/graph/src/mail/`; item 5.7.6 selects it for an opted-in account. **Operations** (`MailClient`): `own_mail_folders_delta` (the whole hierarchy through `/me/mailFolders/delta`, since the plain list is top-level only), `well_known_folders`, `folder_messages_delta` at row weight, `get_message` (HTML body + headers), `move_message`/`copy_message`/`delete_message`, `update_message` (one `MessagePatch` for isRead / flag / categories / importance / inferenceClassification), `list_attachments` + `get_attachment_bytes`, `create_draft`/`update_draft`/`create_reply`/`create_reply_all`/`create_forward`/`send_draft`, `create_folder`/`rename_folder`/`delete_folder`, and `search_messages` (`$search`, unordered, capped). `GraphError::is_delta_reset` flags an expired cursor (410). **Pure mappers** (`mail/message.rs`): `MailFolder` (the 5.6 `SharedMailFolder` is now an alias of it) → `Mailbox`, `GraphMessage` → `EmailSummary`, attachments → `BodyPart`, the JSON body → `EmailBody`, with the `MailboxId`/`Uid` passed in so 5.7.3 owns the identity model. **Inputs for later tasks:** a part's `part_number` is the Graph attachment id, made filename-safe by 5.7.3; the thread key is `graph:{conversationId}` because Graph summaries carry no `References` (5.7.4 must keep it); `size` is 0 and Pin has no Graph counterpart (5.7.7); `calendar_ics` needs the MIME read (R3). Covered by wiremock tests per operation and four synthetic fixtures (`mail-folders-delta.json`, `message-summary-delta.json`, `message-full.json`, `message-attachments.json`). | M |
+| 5.7.3 | **Identity model** — ✅ landed (used by 5.7.5) | **Landed.** `MailboxId = "{account}:{graph folder id}"`, parsed back only by stripping the account prefix (`lookout_graph::graph_folder_id`), never by splitting on `:`. A **synthetic `Uid`** per Graph immutable id comes from the cache's new `graph_uids` map (`Cache::graph_uids`, one `IMMEDIATE` transaction, reverse lookup `graph_ids_for`, pruned by `run_maintenance`). Uids are unique per **account**, so a moved message keeps its Uid and a copy gets a new one; `allocation_order` hands new ones out oldest-first. **`UidValidity` decision (changed from the original "bump on a delta reset"):** one random nonzero value per account (`graph_uid_space`), changed only when the map is lost (cache deleted or cleared). An expired delta cursor (410) resyncs the folder under the **same** Uids, because bumping would throw away cached bodies, attachments, search rows and undo references for messages that haven't changed. Random rather than time-based so a map recreated within the same second can't reuse a validity. **Fix to 5.7.2:** a part's `part_number` is now the attachment id in base64url form (`graph_part_number`), since a raw Graph id's `/` would have pointed the attachment flat file outside its directory. Documented in SCAFFOLD §3.1/§4.5. | M |
+| 5.7.4 | **Cache strategy** — ✅ decided and proven (used by 5.7.5) | **Decision: reuse the per-account `lookout_mail::Cache`**, no separate Graph cache file and no `user_version` migration. A Graph account keeps the same tables as an IMAP one, so FTS5 search, conversation lookups, snoozes, the outbox, the overlays and the flat files all work unchanged. **Added:** `Cache::upsert_messages`, the incremental counterpart of `replace_messages` for a delta that reports only changes (removals go through the existing `delete_messages`); it promotes `partial` rows and keeps full-body search text. **Rules for the session (5.7.5):** (1) store each folder's delta with `upsert_messages` under the 5.7.3 Uids and validity, and its tombstones with `delete_messages`; a move is a removal in one folder plus an upsert of the same Uid in the other. (2) Write each record's categories, importance, Focused/Other and flag through the existing `apply_remote_mail_properties` (categories mapped to Lookout keys, as the 5.4 sync does, `delta_cursor` = `None`), so the overlays always match Graph and a stale overlay from IMAP days is cleared; local optimistic writes keep their `updated_at` guard. A message without a Message-ID (some drafts) can't carry overlay properties. (3) The `graph:{conversationId}` thread key is stored as given; only the IMAP session calls `compute_thread_keys`. (4) Graph folder ids aren't paths: forget a deleted folder by its own id, not `forget_mailbox_tree` (whose subtree walk is delimiter-based), and a rename keeps the id, so no `rekey_snoozed`. (5) Per-folder delta cursors are 5.7.8's; the single-row `graph_delta_cursor` stays the 5.4 property sync's. Proven by `crates/graph/tests/graph_mail_cache.rs` (the synthetic fixtures through the mappers into a real cache: folders, threads, flags, search, overlays, a move, a body) and an `upsert_messages` unit test. | M |
+| 5.7.5 | **Session actor** — ✅ landed (wired by 5.7.6) | **Landed** as `source/crates/graph/src/mail/session.rs`: `run_graph_mail_session(config, client, cmd_rx, interactive_cmd_rx, evt_tx)` speaks the existing `AccountCommand`/`AccountEvent` contract, so nothing above the protocol seam changes. **Sync:** the folder hierarchy through `/me/mailFolders/delta` (well-known names resolved for roles), and each folder's messages delta into the shared cache - `upsert_messages` under 5.7.3's Uids, tombstones through `graph_uids_existing` + `delete_messages` (no Uid burnt for an unseen id), property records through `apply_remote_mail_properties` with a `taken_at` captured *before* the read. A read that starts from no cursor (first sync or a 410 reset) is the folder's whole snapshot and diffs with `replace_messages`, since such a page carries no tombstones; an incremental page upserts. A delta page is filtered by `parentFolderId`, and an expired cursor resyncs under the same Uids. There is no push, so the open folder is polled every `poll_interval` (default 45 s) and one other folder per tick in rotation, with the folder delta every fourth poll. **Reads:** `FetchBody` prefers `/$value` MIME (`parse_body`, so iMIP/`Authentication-Results` survive R3) and falls back to Graph's JSON body, keeping Graph attachment ids as part numbers; `FetchAttachment` and `FetchRawMessage` cache and emit the existing events. **Writes:** read state (`isRead`), follow-up flag, importance, Focused/Other (plus a native sender override for "Always move…"), categories from tag keys, move/copy/revert, snooze (local, like the IMAP fallback), junk (local keyword hint - the caller moves the folder), drafts (raw MIME, preserving the stable `Message-ID` and Bcc), folder create/rename/delete, `search_messages`, and the local outbox drained through Graph's MIME `sendMail` (Bcc header added for the wire). **Known gaps for 5.7.7:** no Pin, no Sieve (`SieveAdvertised(false)`), no folder move, remote `$search` is best-effort only, and a tag key Graph hasn't shown yet is written as its key. **Tests:** pure-helper unit tests plus `crates/graph/tests/graph_mail_session.rs`, a fake-Graph session that syncs folders/messages, reads a MIME body and performs a native `PATCH`. New plumbing: `GraphClient::post_raw`, `MailClient::{send_mime, create_draft_mime, resolve_message_id_in, get_summary}`, `Cache::graph_uids_existing`, and `lookout-mail`'s `OutboxMessage`/`OutboxState`/`build_draft_raw_message`/`outbox_items` exports. Per-folder cursor persistence is still 5.7.8. | L |
+| 5.7.6 | **App wiring + opt-in** — ✅ landed | **Landed.** Per-account **"Use Graph mail (experimental)"** switch in Config → Accounts (`AppConfig::graph_mail_accounts`, `graph_mail_enabled_for` / `set_graph_mail_enabled`, like `directory_accounts`; the switch has its own `GraphMailToggle` callback and is shown only for the account that owns a Microsoft 365 mailbox). Enabling runs Graph consent first (`MicrosoftOAuth::ensure_graph_mail_consent`: the combined Outlook grant plus Graph `Mail.Send`, which the outbox needs and `Mail.ReadWrite` does not grant), then tears the mail session down, drops the per-account cache and reconnects; disabling does the same in reverse, so neither transport ever sees the other's folder/Uid space. `connect.rs` picks `run_graph_mail_session` over `run_account_session` and records `AccountHandle::uses_graph_mail`. IMAP-only surfaces degrade: the Sieve backend disappears from the rule editor while no connected account advertises ManageSieve, the folder menu hides **Move** (Graph has no folder move), and the Config row shows "Microsoft Graph (experimental)" instead of the IMAP/SMTP hosts. The item-5.4 property mirror is suppressed on this transport (`AccountHandle::graph_mail` stays `None`) because the session owns reads and writes; the category master list, Graph rules and automatic replies keep working. Shared mailboxes stay on IMAP until the shared-mailbox Graph routes exist. | M |
+| 5.7.7 | **Feature-gap reconciliation** — ✅ landed | **Landed.** §3.1 walks every `OUTLOOK_PARITY.md` §5.1 row on the Graph transport: 32 native, 8 degraded, 1 unavailable, 5 not implemented on any transport. `OUTLOOK_PARITY.md` §5.1 gains a **Graph** column and §2.1 a transport-only scorecard row, and the Accounts/M365 verdict names the opt-in. **Pin (M-13)** was the one action still visible but unsupported: the Graph session has no `\Flagged` counterpart, so it now degrades instead of silently losing the pin - the ribbon button is disabled with the tooltip "Pin isn't available on Graph mail", the row hover pin is disabled, and the context-menu Pin/Unpin entry is omitted (`MessageMenuState::can_pin`); `set_messages_pinned` also filters Graph-transport targets so a shortcut or mixed selection can't send a no-op `StoreFlagsMany`. Snooze and `$Junk` stay visible because the Graph session implements them locally; Sieve and folder move were already hidden by 5.7.6. §6.11: no new dialogs or errors, unchanged defaults, available actions keep Undo, and no empty/error-state regressions. | M |
 | 5.7.8 | **Refresh cadence** | Delta polling interval + `/me/messages/delta` cursor persisted in the cache. Document the no-IDLE latency trade-off in the doc/README. Keep the local outbox for the offline path. | S |
 | 5.7.9 | **Tests** | Wiremock transport tests per endpoint; fixture round-trips (folders, delta page, message with attachments, MIME, invite); a fake-Graph session test; a `tests/` integration harness paralleling `source/crates/mail/tests/imap_integration.rs`. | M |
 | 5.7.10 | **Close-out** | One CHANGELOG entry citing 5.7 / A-06; flip 5.7 to ✅ and update §2.1/§4.4/§5.1/§7; README; mark this file done. | S |
@@ -151,7 +220,7 @@ for shared mailboxes).
 | R8 | **`mailbox_account_id` splits on the first `:`** (`app/src/window/support.rs`). `other:` and `shared:` account ids contain a colon, so it returns the wrong account for them. | Affects manual accounts today, and shared mailboxes if they ever move to the Graph transport. GOA Microsoft 365 accounts are unaffected. | Fix separately (scheduled after 5.7.3); 5.7.3's helpers never split on `:`. |
 | R5 | **Throttling / cost.** Per-message body and attachment round trips. | Large mailboxes hit Graph throttling; slower first paint. | Batch, `$select` narrowly, rely on the client's `Retry-After` handling (already present). **Cost still unmeasured** — question (b) needs a tenant (§2.1). |
 | R6 | **Feature regressions.** Sieve, `$Junk`/`$NotJunk`, keyword snooze, IMAP capability probes have no Graph equivalent. | Some M-rows degrade on Microsoft 365. | 5.7.7 reconciliation; hide/disable clearly (§10 "degrade softly"). |
-| R7 | **Spike can't reach go/no-go without a tenant.** 5.7.1's evidence questions (a) and (b) need a real Microsoft 365 mailbox; fixtures and wiremock pin the shape, not Graph's actual bytes or latency. | 5.7 stays deferred on an assumption rather than measured evidence. | Run the landed harness (`MailClient::get_mime`/`folder_delta`) against a tenant and capture the three `.eml` fixtures before any green-light. |
+| R7 | **Spike can't reach go/no-go without a tenant.** 5.7.1's evidence questions (a) and (b) need a real Microsoft 365 mailbox; fixtures and wiremock pin the shape, not Graph's actual bytes or latency. | 5.7 stays off by default on an assumption rather than measured evidence. | Run the landed harness (`MailClient::get_mime`/`folder_delta`) against a tenant and capture the three `.eml` fixtures before any green-light. |
 
 ## 6. Non-goals
 

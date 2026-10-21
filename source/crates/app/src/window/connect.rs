@@ -253,6 +253,11 @@ pub(crate) fn connect_account(
     let shared_parent = state.borrow().app_config.borrow().shared_mailbox_parent(&account_id);
     let is_microsoft_365 = account.is_microsoft_365() || shared_parent.is_some();
     let graph_own = is_microsoft_365 && shared_parent.is_none();
+    // The experimental Graph mail transport (item 5.7.6) replaces IMAP/SMTP
+    // for an opted-in Microsoft 365 mailbox. Applies to the account's own
+    // mailbox only: the Graph transport routes through `/me`, and a shared
+    // mailbox still connects over IMAP under the parent's token (item 5.6).
+    let uses_graph_mail = graph_own && state.borrow().app_config.borrow().graph_mail_enabled_for(&account_id);
     let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if let Some(parent) = &shared_parent {
         Rc::new(MicrosoftCredentialProvider::new(parent.clone()))
     } else if is_microsoft_365 {
@@ -316,11 +321,15 @@ pub(crate) fn connect_account(
             // Independent of the `credentials` provider constructed above -
             // see the field's own doc comment on `AccountHandle`.
             graph_pin: graph_own.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
-            graph_mail: graph_own.then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
+            // The property mirror only exists for the IMAP + Graph layering
+            // (item 5.4). When the Graph session is the transport it owns
+            // both reads and writes, so the mirror must not race it.
+            graph_mail: (!uses_graph_mail && graph_own).then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
             graph_categories: graph_own.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
             graph_rules: graph_own.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
             graph_automatic_replies: graph_own.then(|| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account_id.clone()))),
             sieve_advertised: false,
+            uses_graph_mail,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -328,9 +337,12 @@ pub(crate) fn connect_account(
         // Read Outlook's per-message properties (categories, flags,
         // importance, Focused/Other) once the session has had a moment to open
         // its cache (item 5.4); `GRAPH_PROPERTY_RESYNC` and F5 keep them fresh.
-        let flags_state = state.clone();
-        let flags_account = account_id.clone();
-        glib::timeout_add_seconds_local_once(10, move || sync_mail_properties_from_graph(&flags_state, &flags_account));
+        // A Graph mail session reads and writes those natively instead.
+        if !uses_graph_mail {
+            let flags_state = state.clone();
+            let flags_account = account_id.clone();
+            glib::timeout_add_seconds_local_once(10, move || sync_mail_properties_from_graph(&flags_state, &flags_account));
+        }
         // Pull Outlook's category master list into the shared list (item 2.1),
         // a little after the flags, so the message list has rendered first.
         let categories_state = state.clone();
@@ -360,7 +372,23 @@ pub(crate) fn connect_account(
         });
     }
 
-    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx));
+    if uses_graph_mail {
+        // The same `AccountCommand`/`AccountEvent` seam, driven by Microsoft
+        // Graph instead of IMAP/SMTP (item 5.7.5), so nothing above this line
+        // changes. `MicrosoftOAuth` supplies both the Graph token and consent.
+        let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
+        let client = lookout_graph::MailClient::new(lookout_graph::GraphClient::new(oauth));
+        let session_config = lookout_graph::GraphMailSessionConfig {
+            account_id: account_id.clone(),
+            zone: crate::calendar_tz::display_zone().tz(),
+            poll_interval: lookout_graph::DEFAULT_POLL_INTERVAL,
+            mention_addresses: config.mention_addresses.clone(),
+            mention_names: config.mention_names.clone(),
+        };
+        worker.spawn(lookout_graph::run_graph_mail_session(session_config, client, cmd_rx, interactive_cmd_rx, evt_tx));
+    } else {
+        worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx));
+    }
 
     spawn_account_event_loop(
         evt_rx,
@@ -1322,7 +1350,7 @@ pub(crate) fn spawn_account_event_loop(
                         // Reverts the click handler's optimistic icon flip back
                         // to whatever the (now-restored, so correct again)
                         // selected summaries actually say.
-                        refresh_pin_button(&pin_button, &message_list);
+                        refresh_pin_button(&pin_button, &message_list, &state);
                         let title = glib::markup_escape_text(&format!("Couldn't update message flags: {message}"));
                         toast_overlay.add_toast(adw::Toast::new(&title));
                     }
@@ -1537,6 +1565,7 @@ pub(crate) fn connect_other_account(
             graph_rules: None,
             graph_automatic_replies: None,
             sieve_advertised: false,
+            uses_graph_mail: false,
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
@@ -1575,34 +1604,25 @@ pub(crate) fn connect_other_account(
     );
 }
 
-/// Tears a GOA account down after the user disables it in Config → Accounts:
-/// every running service (mail, calendar, Google Tasks, contacts) stops by
-/// dropping its handle - which closes the session's command channel, the
-/// same clean-shutdown convention the other-account Remove path relies on -
-/// per-account state is pruned, and every view is repainted so nothing from
-/// the account remains visible. The on-disk caches are deliberately kept: a
-/// re-enable reconnects to them immediately (see `connect_goa_account`).
+/// Tears one account's mail session down and prunes every per-mailbox piece of
+/// state it feeds, repainting the mail view. The account's command channel is
+/// dropped with the handle, the same clean-shutdown convention every other
+/// teardown path uses. Shared by disabling a GOA account outright and by
+/// switching an account's mail transport (item 5.7.6), which reconnects the
+/// same account immediately afterwards.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn teardown_goa_account(
+pub(crate) fn teardown_mail_account(
     state: &Rc<RefCell<UiState>>,
-    calendar_state: &Rc<RefCell<CalendarUiState>>,
     account_id: &AccountId,
-    email: Option<&str>,
     folder_selection: &gtk::SingleSelection,
     folder_scroller: &gtk::ScrolledWindow,
     message_list: &MessageListModel,
     message_list_stack: &gtk::Stack,
     list_header: &ListHeader,
-    calendar_main: &Rc<CalendarMain>,
-    calendar_list_box: &gtk::Box,
-    reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
-    tasks_view: &Rc<crate::tasks_view::TasksView>,
-    refresh_contacts_ui: &Rc<dyn Fn(Option<i32>)>,
     dashboard_refresh: &Rc<dyn Fn()>,
 ) {
-    // -- mail -- Prune every per-mailbox piece of state the account feeds so
-    // no stale data survives, and note whether the open mailbox belonged to
-    // it (the view must navigate away or the messages stay on screen).
+    // Note whether the open mailbox belonged to the account (the view must
+    // navigate away or the messages stay on screen).
     let open_mailbox_was_this_account = {
         let mut st = state.borrow_mut();
         st.accounts.remove(account_id);
@@ -1632,6 +1652,43 @@ pub(crate) fn teardown_goa_account(
     rebuild_folder_tree(state, folder_selection, folder_scroller);
     refresh_list_header(state, list_header);
     dashboard_refresh();
+}
+
+/// Tears a GOA account down after the user disables it in Config → Accounts:
+/// every running service (mail, calendar, Google Tasks, contacts) stops by
+/// dropping its handle - which closes the session's command channel, the
+/// same clean-shutdown convention the other-account Remove path relies on -
+/// per-account state is pruned, and every view is repainted so nothing from
+/// the account remains visible. The on-disk caches are deliberately kept: a
+/// re-enable reconnects to them immediately (see `connect_goa_account`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn teardown_goa_account(
+    state: &Rc<RefCell<UiState>>,
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    account_id: &AccountId,
+    email: Option<&str>,
+    folder_selection: &gtk::SingleSelection,
+    folder_scroller: &gtk::ScrolledWindow,
+    message_list: &MessageListModel,
+    message_list_stack: &gtk::Stack,
+    list_header: &ListHeader,
+    calendar_main: &Rc<CalendarMain>,
+    calendar_list_box: &gtk::Box,
+    reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+    refresh_contacts_ui: &Rc<dyn Fn(Option<i32>)>,
+    dashboard_refresh: &Rc<dyn Fn()>,
+) {
+    teardown_mail_account(
+        state,
+        account_id,
+        folder_selection,
+        folder_scroller,
+        message_list,
+        message_list_stack,
+        list_header,
+        dashboard_refresh,
+    );
 
     // -- calendar, Google Tasks, reminders --
     {

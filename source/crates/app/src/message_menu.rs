@@ -123,6 +123,10 @@ pub struct MessageMenuState {
     pub any_unread: bool,
     /// "Unpin" only when every target is pinned, as the ribbon's Pin.
     pub all_pinned: bool,
+    /// Pin has no Graph counterpart (5.7.7), so the entry is left out for
+    /// every target on the Graph mail transport - the module's "features not
+    /// available are left out" rule (degrade softly, never an error).
+    pub can_pin: bool,
     /// Snooze ▸ (not for drafts).
     pub can_snooze: bool,
     /// Some target is snoozed (waiting in Scheduled): Unsnooze replaces
@@ -145,6 +149,9 @@ pub struct TargetFacts {
     pub pinned: bool,
     pub draft: bool,
     pub snoozed: bool,
+    /// This message is on the Graph mail transport, where Pin is unavailable
+    /// (item 5.7.7).
+    pub graph_mail: bool,
 }
 
 /// The menu's state for `targets`. `single` says whether the single-message
@@ -164,6 +171,7 @@ pub fn message_menu_state(targets: &[TargetFacts], single: bool, has_archive: bo
         can_move: one_account,
         any_unread: targets.iter().any(|t| t.unread),
         all_pinned: targets.iter().all(|t| t.pinned),
+        can_pin: targets.iter().all(|t| !t.graph_mail),
         can_snooze: !any_draft,
         snoozed: targets.iter().any(|t| t.snoozed),
         can_report_junk: targets.iter().all(|t| t.role != Some(MailboxRole::Junk)),
@@ -346,11 +354,15 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
         menu.icon_action("Mark as unread", ns("mark-unread"), "mail-unread-symbolic")
     };
     menu = menu.submenu("Flag", flag);
-    menu = if state.all_pinned {
-        menu.icon_action("Unpin", ns("unpin"), "view-pin-symbolic")
-    } else {
-        menu.icon_action("Pin", ns("pin"), "view-pin-symbolic")
-    };
+    // Pin is left out on the Graph mail transport, which has no counterpart
+    // for it (item 5.7.7).
+    if state.can_pin {
+        menu = if state.all_pinned {
+            menu.icon_action("Unpin", ns("unpin"), "view-pin-symbolic")
+        } else {
+            menu.icon_action("Pin", ns("pin"), "view-pin-symbolic")
+        };
+    }
     menu = if state.snoozed {
         menu.icon_action("Unsnooze", ns("unsnooze"), "alarm-symbolic")
     } else {
@@ -512,6 +524,7 @@ mod tests {
             pinned: false,
             draft: false,
             snoozed: false,
+            graph_mail: false,
         }
     }
 
@@ -594,6 +607,25 @@ mod tests {
             ]
         );
         assert_eq!(labels(submenu(&focused_menu, "Importance")), vec![vec!["High", "Normal", "Low"]]);
+    }
+
+    #[test]
+    fn graph_mail_leaves_pin_out() {
+        // The Graph mail transport has no Pin counterpart (item 5.7.7), so
+        // the entry is absent rather than a no-op or an error.
+        let mut target = facts(Some(MailboxRole::Inbox));
+        target.graph_mail = true;
+        let state = message_menu_state(&[target], true, true);
+        assert!(!state.can_pin);
+        let menu = message_menu_description(&state, &MenuChoices::default());
+        let shown = labels(&menu);
+        assert!(
+            !shown.iter().flatten().any(|label| label == "Pin" || label == "Unpin"),
+            "Pin must be left out on Graph mail: {shown:?}"
+        );
+        // Everything else the transport supports stays in place.
+        assert!(shown.iter().flatten().any(|label| label == "Flag ▸"));
+        assert!(shown.iter().flatten().any(|label| label == "Snooze ▸"));
     }
 
     #[test]

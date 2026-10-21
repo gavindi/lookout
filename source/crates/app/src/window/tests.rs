@@ -715,6 +715,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
                     graph_rules: None,
                     graph_automatic_replies: None,
                     sieve_advertised: false,
+                    uses_graph_mail: false,
                 },
             )
         })

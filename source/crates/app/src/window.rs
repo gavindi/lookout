@@ -381,7 +381,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let prefs = st.folder_prefs.get(&node.mailbox.id).cloned().unwrap_or_default();
                     let order = &st.favorite_display_order;
                     let favorite_pos = order.iter().position(|m| m == &node.mailbox.id).map(|index| (index, order.len()));
-                    (prefs, favorite_pos)
+                    // Graph mail has no folder move (item 5.7.6).
+                    let folder_move_supported = mailbox_account_id(&node.mailbox.id)
+                        .and_then(|account_id| st.accounts.get(&account_id))
+                        .is_none_or(|handle| !handle.uses_graph_mail);
+                    (prefs, favorite_pos, folder_move_supported)
                 }),
                 _ => None,
             };
@@ -433,7 +437,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
                     label.set_label(&display_name(&node.mailbox.name));
                     label.set_css_classes(&["folder-row-label"]);
-                    let prefs = folder_view.as_ref().map(|(prefs, _)| prefs.clone()).unwrap_or_default();
+                    let prefs = folder_view.as_ref().map(|(prefs, _, _)| prefs.clone()).unwrap_or_default();
                     if let Some(color) = &prefs.color {
                         icon.add_css_class(&crate::folder_menu::color_class(color));
                     }
@@ -475,8 +479,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     _ => "Empty folder",
                 }));
                 if let Some(mailbox) = &row_mailbox {
-                    let (prefs, favorite_pos) = folder_view.clone().unwrap_or_default();
-                    let menu_state = crate::folder_menu::folder_menu_state(mailbox, favorite_pos);
+                    let (prefs, favorite_pos, folder_move_supported) = folder_view.clone().unwrap_or_default();
+                    let menu_state = crate::folder_menu::folder_menu_state(mailbox, favorite_pos, folder_move_supported);
                     widgets.menu.refresh(mailbox, menu_state, prefs.color.as_deref(), prefs.count_mode);
                 }
                 *widgets.menu_data.borrow_mut() = row_mailbox;
@@ -1364,6 +1368,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     return;
                 };
                 let Some(account_id) = mailbox_account_id(&mailbox) else { return };
+                // Pin isn't available on the Graph mail transport (5.7.7).
+                if state.borrow().accounts.get(&account_id).is_some_and(|handle| handle.uses_graph_mail) {
+                    return;
+                }
                 let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
                 let Some(cmd_tx) = cmd_tx else { return };
                 // Patches the model (and, via the Pinned group, this
@@ -1654,6 +1662,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 widgets.pin_icon.set_visible(summary.is_pinned());
                 set_pin_button_state(&widgets.pin_btn, summary.is_pinned());
+                // Pin has no Graph counterpart (item 5.7.7): disable the
+                // hover action rather than letting it appear to work.
+                let graph_mail = state_slot.borrow().as_ref().is_some_and(|state| mailbox_uses_graph_mail(&state.borrow(), &summary.mailbox));
+                widgets.pin_btn.set_sensitive(!graph_mail);
+                widgets
+                    .pin_btn
+                    .set_tooltip_text(Some(if graph_mail { "Pin isn't available on Graph mail" } else { "Pin/Unpin" }));
                 let (mr_icon, mr_tooltip) = mark_read_button_icon(unread);
                 widgets.mark_read_btn.set_icon_name(mr_icon);
                 widgets.mark_read_btn.set_tooltip_text(Some(mr_tooltip));
@@ -3663,7 +3678,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // More is not part of this band: it is the trailing, always-visible
     // overflow button shared by every module (see `RibbonOverflow`).
     // The dynamic glyphs now that every control is dressed.
-    refresh_pin_button(&pin_icon, &message_list);
+    refresh_pin_button(&pin_icon, &message_list, &state);
     refresh_flag_button(&flag_icon, &message_list);
     refresh_mark_read_button(&mark_read_icon, &message_list);
 
@@ -8624,6 +8639,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         Some(client) if client.consented() => crate::config_view::GraphPinStatus::Enabled,
                         Some(_) => crate::config_view::GraphPinStatus::NeedsConsent,
                     },
+                    // `graph_pin` is Some for exactly the accounts that own a
+                    // Microsoft 365 mailbox (never shared or manual ones), so
+                    // it doubles as the transport's eligibility marker.
+                    graph_mail: match (&h.graph_pin, h.uses_graph_mail) {
+                        (Some(_), true) => crate::config_view::GraphMailStatus::On,
+                        (Some(_), false) => crate::config_view::GraphMailStatus::Off,
+                        (None, _) => crate::config_view::GraphMailStatus::NotApplicable,
+                    },
                 })
                 .collect();
             let webcal_list = st.app_config.borrow().webcal_subscriptions.clone();
@@ -9115,6 +9138,127 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     refresh();
                 })
             };
+            // Config's per-account "Use Graph mail (experimental)" switch
+            // (item 5.7.6 / A-06). Enabling needs Graph consent first; either
+            // direction then tears the mail session down, drops the cache (the
+            // two transports' folder and Uid spaces can't be merged) and
+            // reconnects the same account so `connect_account` picks the
+            // transport anew.
+            let set_graph_mail: crate::config_view::GraphMailToggle = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let toast_overlay = toast_overlay.clone();
+                let window = window.clone();
+                let app = app.clone();
+                let folder_selection = folder_selection.clone();
+                let folder_scroller = folder_scroller.clone();
+                let message_list = message_list.clone();
+                let message_list_stack = message_list_stack.clone();
+                let message_header = message_header.clone();
+                let reading_stack = reading_stack.clone();
+                let list_header = list_header.clone();
+                let dashboard_refresh = dashboard_refresh.clone();
+                let mark_read_icon = mark_read_icon.clone();
+                let pin_icon = pin_icon.clone();
+                let refresh_hook = refresh_hook.clone();
+                Rc::new(move |account_id: &str, enabled: bool| {
+                    let id = AccountId(account_id.to_string());
+                    if state.borrow().app_config.borrow().graph_mail_enabled_for(&id) == enabled {
+                        return;
+                    }
+                    let state = state.clone();
+                    let worker = worker.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    let window = window.clone();
+                    let app = app.clone();
+                    let folder_selection = folder_selection.clone();
+                    let folder_scroller = folder_scroller.clone();
+                    let message_list = message_list.clone();
+                    let message_list_stack = message_list_stack.clone();
+                    let message_header = message_header.clone();
+                    let reading_stack = reading_stack.clone();
+                    let list_header = list_header.clone();
+                    let dashboard_refresh = dashboard_refresh.clone();
+                    let mark_read_icon = mark_read_icon.clone();
+                    let pin_icon = pin_icon.clone();
+                    let refresh_hook = refresh_hook.clone();
+                    glib::spawn_future_local(async move {
+                        if enabled {
+                            // Graph mail needs the Outlook-sync consent plus
+                            // Mail.Send for its outbox (item 5.7.6). A grant
+                            // that already carries both - a re-enable, or an
+                            // earlier schedule-send consent - skips the
+                            // browser prompt.
+                            let oauth = crate::microsoft_oauth::MicrosoftOAuth::new(id.clone());
+                            let consent = if oauth.graph_mail_consented() {
+                                Ok(())
+                            } else {
+                                oauth.ensure_graph_mail_consent().await
+                            };
+                            if let Err(e) = consent {
+                                let title = glib::markup_escape_text(&format!("Couldn't enable Graph mail: {e}"));
+                                toast_overlay.add_toast(adw::Toast::new(&title));
+                                // Put the switch back: nothing was saved.
+                                let refresh = refresh_hook.borrow().clone();
+                                refresh();
+                                return;
+                            }
+                        }
+                        {
+                            let app_config = state.borrow().app_config.clone();
+                            if !app_config.borrow_mut().set_graph_mail_enabled(&id, enabled) {
+                                return;
+                            }
+                            crate::app_config::save(&app_config.borrow());
+                        }
+                        teardown_mail_account(
+                            &state,
+                            &id,
+                            &folder_selection,
+                            &folder_scroller,
+                            &message_list,
+                            &message_list_stack,
+                            &list_header,
+                            &dashboard_refresh,
+                        );
+                        // A cache from the other transport holds folder ids and
+                        // Uids this one can't resolve; start it clean.
+                        if let Err(e) = lookout_mail::remove_account_cache(&id) {
+                            tracing::warn!(account_id = %id, "couldn't clear the mail cache for the transport switch: {e}");
+                        }
+                        let discovered = state.borrow().goa_accounts.get(&id).and_then(|account| account.mail.clone());
+                        let goa_client = state.borrow().goa_client.clone();
+                        if let (Some(mail), Some(goa_client)) = (discovered, goa_client) {
+                            connect_account(
+                                worker.clone(),
+                                state.clone(),
+                                folder_selection.clone(),
+                                folder_scroller.clone(),
+                                message_list.clone(),
+                                message_list_stack.clone(),
+                                message_header.clone(),
+                                reading_stack.clone(),
+                                toast_overlay.clone(),
+                                window.clone(),
+                                app.clone(),
+                                goa_client,
+                                list_header.clone(),
+                                mail,
+                                dashboard_refresh.clone(),
+                                mark_read_icon.clone(),
+                                pin_icon.clone(),
+                            );
+                        }
+                        toast_overlay.add_toast(adw::Toast::new(if enabled {
+                            "Graph mail enabled - new mail arrives by polling"
+                        } else {
+                            "Switched back to IMAP/SMTP"
+                        }));
+                        let refresh = refresh_hook.borrow().clone();
+                        refresh();
+                    });
+                })
+            };
             crate::config_view::refresh(
                 &config_view,
                 &goa,
@@ -9140,6 +9284,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 &edit_other,
                 &remove_other,
                 &enable_graph_pin,
+                &set_graph_mail,
                 &toggle_goa,
             );
         }
@@ -10338,7 +10483,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             };
             tracing::debug!(pos, n_items, kind, "selection-changed fired");
             refresh_mark_read_button(&mark_read_icon, &message_list_for_selection);
-            refresh_pin_button(&pin_icon, &message_list_for_selection);
+            refresh_pin_button(&pin_icon, &message_list_for_selection, &state);
             refresh_flag_button(&flag_icon, &message_list_for_selection);
             let summary = match target {
                 ReadingTarget::Single(summary) => {
@@ -10638,7 +10783,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // selection, so the aggregate state `refresh_pin_button` reads
             // off `selected_summaries()` is genuinely current - no need for
             // a separate manual icon flip first.
-            refresh_pin_button(&pin_icon_for_click, &message_list);
+            refresh_pin_button(&pin_icon_for_click, &message_list, &state);
         });
     }
     // --- Flag ▾ (item 1.16): the main part toggles the selection's flag,
