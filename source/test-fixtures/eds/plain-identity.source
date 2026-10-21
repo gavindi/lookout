@@ -1,0 +1,16 @@
+[Data Source]
+DisplayName=pat@plain.example
+Enabled=true
+Parent=plain-account
+
+[Mail Submission]
+SentFolder=folder://plain-account/Sent
+TransportUid=plain-transport
+UseSentFolder=true
+
+[Mail Identity]
+Address=pat@plain.example
+Aliases=
+Name=Pat Plain
+Organization=
+ReplyTo=

@@ -1,0 +1,17 @@
+[Data Source]
+DisplayName=gail@gmail.example
+Enabled=true
+Parent=goa-collection
+
+[Mail Account]
+BackendName=imapx
+IdentityUid=goa-identity
+
+[Authentication]
+Host=imap.gmail.example
+Method=PLAIN
+Port=993
+User=gail@gmail.example
+
+[Security]
+Method=ssl-on-alternate-port

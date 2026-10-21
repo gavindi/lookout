@@ -153,7 +153,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         move |_| worker.spawn(crate::online_accounts::open_online_accounts())
     });
-    status_page.set_child(Some(&open_settings_button));
+    // The first-run route for Evolution users (EDS_TODO.md E3.4); hidden
+    // until the background check finds an account to import.
+    let import_evolution_button = gtk::Button::builder()
+        .label("Import from Evolution…")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill"])
+        .visible(false)
+        .build();
+    let status_buttons = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).halign(gtk::Align::Center).build();
+    status_buttons.append(&open_settings_button);
+    status_buttons.append(&import_evolution_button);
+    status_page.set_child(Some(&status_buttons));
 
     // --- Folder sidebar: one expanded-by-default group per account ---
     let folder_selection = gtk::SingleSelection::new(None::<gio::ListModel>);
@@ -8767,7 +8778,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             refresh_hook();
                         })
                     };
-                    crate::other_accounts::show_add_account_dialog(anchor, worker.clone(), app_config, keyring.clone(), Some(existing), on_saved);
+                    crate::other_accounts::show_add_account_dialog(anchor, worker.clone(), app_config, keyring.clone(), Some(existing), None, on_saved);
                 })
             };
             let remove_other: crate::config_view::OtherAccountAction = {
@@ -9069,12 +9080,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Populate the placeholder rows now (both groups are empty at startup).
     refresh_config();
 
-    // Config → Accounts → "Add IMAP/SMTP account…": the app's own manual
-    // account entry point, alongside the GOA-settings "Add account…" row.
-    {
-        let add_imap_row = config_view.add_imap_row.clone();
-        let worker = worker.clone();
+    // What every new manual account does once saved - from "Add IMAP/SMTP
+    // account…" or the Evolution import: connect it, leave the first-run page
+    // for the mail view, and repaint Config.
+    let connect_new_other_account: Rc<dyn Fn(&str)> = {
         let state = state.clone();
+        let worker = worker.clone();
         let keyring = keyring.clone();
         let window = window.clone();
         let app = app.clone();
@@ -9090,54 +9101,163 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mark_read_icon = mark_read_icon.clone();
         let pin_icon = pin_icon.clone();
         let refresh_hook = refresh_hook.clone();
-        add_imap_row.connect_activated(move |row| {
-            let app_config = state.borrow().app_config.clone();
-            let on_saved = {
-                let state = state.clone();
-                let worker = worker.clone();
-                let keyring = keyring.clone();
-                let window = window.clone();
-                let app = app.clone();
-                let toast_overlay = toast_overlay.clone();
-                let folder_selection = folder_selection.clone();
-                let folder_scroller = folder_scroller.clone();
-                let message_list = message_list.clone();
-                let message_list_stack = message_list_stack.clone();
-                let message_header = message_header.clone();
-                let reading_stack = reading_stack.clone();
-                let list_header = list_header.clone();
-                let dashboard_refresh = dashboard_refresh.clone();
-                let mark_read_icon = mark_read_icon.clone();
-                let pin_icon = pin_icon.clone();
-                let refresh_hook = refresh_hook.borrow().clone();
-                Rc::new(move |account_id: &str| {
-                    let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
-                        return;
-                    };
-                    connect_other_account(
-                        worker.clone(),
-                        state.clone(),
-                        folder_selection.clone(),
-                        folder_scroller.clone(),
-                        message_list.clone(),
-                        message_list_stack.clone(),
-                        message_header.clone(),
-                        reading_stack.clone(),
-                        toast_overlay.clone(),
-                        window.clone(),
-                        app.clone(),
-                        list_header.clone(),
-                        account,
-                        keyring.clone(),
-                        dashboard_refresh.clone(),
-                        mark_read_icon.clone(),
-                        pin_icon.clone(),
-                    );
-                    refresh_hook();
-                })
+        let root_stack = root_stack.clone();
+        let current_mail_page = current_mail_page.clone();
+        let mail_view_button = mail_view_button.clone();
+        let current_lookout_page = current_lookout_page.clone();
+        let lookout_view_button = lookout_view_button.clone();
+        Rc::new(move |account_id: &str| {
+            let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
+                return;
             };
-            crate::other_accounts::show_add_account_dialog(row.upcast_ref::<gtk::Widget>(), worker.clone(), app_config, keyring.clone(), None, on_saved);
+            connect_other_account(
+                worker.clone(),
+                state.clone(),
+                folder_selection.clone(),
+                folder_scroller.clone(),
+                message_list.clone(),
+                message_list_stack.clone(),
+                message_header.clone(),
+                reading_stack.clone(),
+                toast_overlay.clone(),
+                window.clone(),
+                app.clone(),
+                list_header.clone(),
+                account,
+                keyring.clone(),
+                dashboard_refresh.clone(),
+                mark_read_icon.clone(),
+                pin_icon.clone(),
+            );
+            // The first account added from the "No Mail Accounts" page: show
+            // the mail it's about to sync rather than the empty state, as
+            // account discovery does.
+            if current_mail_page.get() == "empty" {
+                current_mail_page.set("mail");
+                if mail_view_button.is_active() {
+                    root_stack.set_visible_child_name("mail");
+                }
+            }
+            if current_lookout_page.get() == "lookout-empty" {
+                current_lookout_page.set("lookout");
+                if lookout_view_button.is_active() {
+                    root_stack.set_visible_child_name("lookout");
+                }
+            }
+            let refresh = refresh_hook.borrow().clone();
+            refresh();
+        })
+    };
+
+    // Config → Accounts → "Add IMAP/SMTP account…": the app's own manual
+    // account entry point, alongside the GOA-settings "Add account…" row.
+    {
+        let worker = worker.clone();
+        let state = state.clone();
+        let keyring = keyring.clone();
+        let connect_new_other_account = connect_new_other_account.clone();
+        config_view.add_imap_row.connect_activated(move |row| {
+            let app_config = state.borrow().app_config.clone();
+            crate::other_accounts::show_add_account_dialog(
+                row.upcast_ref::<gtk::Widget>(),
+                worker.clone(),
+                app_config,
+                keyring.clone(),
+                None,
+                None,
+                connect_new_other_account.clone(),
+            );
         });
+    }
+
+    // "Import from Evolution…" (EDS_TODO.md E3.4), in Config → Accounts and on
+    // the "No Mail Accounts" page. A background read of Evolution's accounts
+    // (which never starts EDS) shows both only when one isn't in Lookout yet;
+    // `refresh_hook` re-checks against the cached list whenever accounts are
+    // added, removed or discovered.
+    {
+        let evolution_drafts: Rc<RefCell<Vec<crate::evolution_import::OtherAccountDraft>>> = Rc::new(RefCell::new(Vec::new()));
+        // Every address Lookout already has an account for, beyond the manual
+        // accounts `is_already_present` checks itself.
+        let known_addresses = {
+            let state = state.clone();
+            move || -> Vec<String> { state.borrow().goa_accounts.values().map(|a| a.email.clone()).filter(|e| !e.is_empty()).collect() }
+        };
+        let refresh_import_visibility: Rc<dyn Fn()> = {
+            let evolution_drafts = evolution_drafts.clone();
+            let state = state.clone();
+            let known_addresses = known_addresses.clone();
+            let row = config_view.import_evolution_row.clone();
+            let button = import_evolution_button.clone();
+            Rc::new(move || {
+                let known = known_addresses();
+                let known: Vec<&str> = known.iter().map(String::as_str).collect();
+                let app_config = state.borrow().app_config.clone();
+                let visible = crate::evolution_import::any_importable(&evolution_drafts.borrow(), &app_config.borrow().other_accounts, &known);
+                row.set_visible(visible);
+                button.set_visible(visible);
+            })
+        };
+        let (drafts_tx, drafts_rx) = async_channel::bounded(1);
+        worker.spawn(async move {
+            let _ = drafts_tx.send(crate::evolution_import::evolution_account_drafts().await).await;
+        });
+        glib::spawn_future_local({
+            let evolution_drafts = evolution_drafts.clone();
+            let refresh_import_visibility = refresh_import_visibility.clone();
+            async move {
+                let Ok(drafts) = drafts_rx.recv().await else { return };
+                *evolution_drafts.borrow_mut() = drafts;
+                refresh_import_visibility();
+            }
+        });
+        // Chain onto the Config repaint every account change already runs.
+        let refresh_config_only = refresh_hook.borrow().clone();
+        *refresh_hook.borrow_mut() = {
+            let refresh_import_visibility = refresh_import_visibility.clone();
+            Rc::new(move || {
+                refresh_config_only();
+                refresh_import_visibility();
+            })
+        };
+
+        // Opening re-reads Evolution, so the list is current, then shows the
+        // dialog (or hides the entry points if nothing is left to import).
+        let open_import: Rc<dyn Fn(&gtk::Widget)> = {
+            let worker = worker.clone();
+            let state = state.clone();
+            let keyring = keyring.clone();
+            let connect_new_other_account = connect_new_other_account.clone();
+            Rc::new(move |anchor: &gtk::Widget| {
+                let (tx, rx) = async_channel::bounded(1);
+                worker.spawn(async move {
+                    let _ = tx.send(crate::evolution_import::evolution_account_drafts().await).await;
+                });
+                let anchor = anchor.clone();
+                let worker = worker.clone();
+                let state = state.clone();
+                let keyring = keyring.clone();
+                let connect_new_other_account = connect_new_other_account.clone();
+                let evolution_drafts = evolution_drafts.clone();
+                let refresh_import_visibility = refresh_import_visibility.clone();
+                let known_addresses = known_addresses.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(drafts) = rx.recv().await else { return };
+                    *evolution_drafts.borrow_mut() = drafts.clone();
+                    refresh_import_visibility();
+                    if drafts.is_empty() {
+                        return;
+                    }
+                    let app_config = state.borrow().app_config.clone();
+                    crate::evolution_import::show_import_dialog(&anchor, worker, app_config, keyring, drafts, known_addresses(), connect_new_other_account);
+                });
+            })
+        };
+        {
+            let open_import = open_import.clone();
+            config_view.import_evolution_row.connect_activated(move |row| open_import(row.upcast_ref()));
+        }
+        import_evolution_button.connect_clicked(move |button| open_import(button.upcast_ref()));
     }
 
     // Config → Accounts → "Add shared mailbox…" (item 5.6 / M-42): manage the
@@ -11189,7 +11309,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         current_mail_page,
         mail_view_button,
         list_header,
-        refresh_config.clone(),
+        // Through `refresh_hook`, so discovering GOA accounts also re-checks
+        // whether Evolution has anything left to import.
+        {
+            let refresh_hook = refresh_hook.clone();
+            Rc::new(move || {
+                let refresh = refresh_hook.borrow().clone();
+                refresh();
+            })
+        },
         current_lookout_page.clone(),
         lookout_view_button.clone(),
         dashboard_refresh.clone(),

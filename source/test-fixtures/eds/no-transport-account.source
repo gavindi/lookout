@@ -1,0 +1,17 @@
+[Data Source]
+DisplayName=Alpha first by name
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=imapx
+IdentityUid=no-transport-identity
+
+[Authentication]
+Host=imap.example.net
+Method=PLAIN
+Port=993
+User=noel
+
+[Security]
+Method=ssl-on-alternate-port

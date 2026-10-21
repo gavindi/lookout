@@ -1,0 +1,26 @@
+[Data Source]
+DisplayName=Plain mail
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=imapx
+IdentityUid=plain-identity
+ArchiveFolder=
+NeedsInitialSetup=false
+Builtin=false
+
+[Authentication]
+Host=mail.plain.example
+Method=PLAIN
+Port=143
+ProxyUid=system-proxy
+User=pat
+CredentialName=
+IsExternal=false
+
+[Security]
+Method=none
+
+[Imapx Backend]
+UseIdle=true

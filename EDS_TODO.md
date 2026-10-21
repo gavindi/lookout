@@ -599,7 +599,39 @@ Done 2026-10-21.
 
 ## Phase 3 — Import accounts from Evolution (option 3)
 
-### [ ] E3.1 — Reading `.source` files (`S`)
+### [x] E3.1 — Reading `.source` files (`S`)
+
+Done 2026-10-21. Where it differs from the plan below, following the E0.1 notes:
+
+- **Over D-Bus, not from files.** `Eds::mail_accounts()` reads every source's `Data` property
+  (E0.1 recommendation 6), so neither the Flatpak nor the Snap needs file access. The pure
+  `parse_mail_accounts(&[(uid, data)])` in `crates/eds/src/mail_accounts.rs` does the work;
+  `keyfile.rs` already existed (E0.2), and `sources.rs` now shares its key-file map, parent and
+  GOA-ancestry helpers with it.
+- **How the three sources link.** The account's `[Mail Account] IdentityUid` names the identity;
+  the identity's `[Mail Submission] TransportUid` names the transport. IMAP comes from the
+  account's `[Authentication]` (`Host`, `Port`, `User`) and `[Security] Method`, SMTP from the
+  transport's. There is no `[Network]` group in current EDS.
+- **What comes back.** `EvolutionMailAccount { account_name, name, address, imap, smtp }`, where
+  each `MailServer` carries `source_uid` (the keyring key E3.3 needs), host, port, user and
+  `MailSecurity` (`None`, `StartTls`, `Tls`). A missing or zero port takes the usual one for
+  the security method (993/143, 465/587). An unknown method counts as TLS, as ESourceSecurity's
+  `secure` does, so an import never drops encryption.
+- **Skipped, and logged:** sources that don't parse; accounts that aren't `imapx` (the built-in
+  `local`, `vfolder` and `rss` stores, POP, Exchange); accounts under a GOA collection; **accounts
+  that log in with OAuth** (`XOAUTH2`, `OAuth2`, `Google`, `Outlook`, `Yahoo`), which the plan
+  didn't mention, because a manual account logs in with a password and Evolution's keyring item
+  holds a token; and accounts with no IMAP host or user. A missing identity imports with no
+  address; a missing, non-SMTP or OAuth transport imports with SMTP left blank.
+- **Tests.** Seven unit tests read 21 fixture files in `source/test-fixtures/eds/` (named by
+  UID, as on disk): plain, STARTTLS and implicit-TLS accounts; a GOA-backed account; a missing
+  transport; a malformed file; plus POP, OAuth and the built-in stores, all skipped. Port
+  defaults and security mapping are covered too. A D-Bus wire test in `fake_eds.rs` reads a
+  linked account, identity and transport (and skips a GOA one) through the fake registry.
+- **Example:** `cargo run -p lookout-eds --example list_mail_accounts`. On this desktop it found
+  the two manual accounts and skipped the GOA ones.
+
+The original plan:
 
 In `lookout-eds`, add `keyfile.rs` with a small GKeyFile parser (pure, with no `glib`
 dependency in this crate).
@@ -621,7 +653,36 @@ dependency in this crate).
   - an account with a missing transport, imported with SMTP left blank;
   - a malformed file, which is skipped and logged.
 
-### [ ] E3.2 — Building a pre-filled account (`S`)
+### [x] E3.2 — Building a pre-filled account (`S`)
+
+Done 2026-10-21. In `source/crates/app/src/evolution_import.rs`:
+
+- **The draft.** `to_other_account_draft(&EvolutionMailAccount) -> OtherAccountDraft` fills every
+  `OtherAccount` field except the id, and also keeps Evolution's account and transport source
+  UIDs for E3.3. `into_new_account()` saves it under a fresh `other:<uuid>`, from the new
+  `other_accounts::new_other_account_id`, which the add-account dialog now uses as well.
+- **Field mapping.** The name is the identity's sender name, else the account's name in
+  Evolution; the address is the identity's, or blank. With no usable transport, SMTP is left
+  blank with the dialog's defaults (port 587, TLS on). `use_same_password` starts on, as in the
+  dialog.
+- **Security.** Each `*_use_tls` flag is true for STARTTLS and implicit TLS and false only for a
+  plain connection. Those flags are descriptive, as they already are for dialog-made accounts:
+  `lookout-mail` never reads `use_tls`. It always connects IMAP with implicit TLS and picks SMTP's
+  mode by port (465 implicit, otherwise STARTTLS). **So an imported account that Evolution
+  reaches over IMAP STARTTLS or plain IMAP (usually port 143) won't connect**, nor will SMTPS on a
+  port other than 465. E3.4 warns about these (`connection_warning`); making the engine honour
+  the flags is a separate change.
+- **Duplicates.** `is_already_present(&[OtherAccount], known_addresses)` matches the address
+  case-insensitively against manual accounts and any other addresses the caller passes (GOA and
+  Microsoft 365 accounts, for E3.4 to collect), or the same IMAP host (case-insensitively) and
+  user on a manual account. A blank address never matches.
+- **Discovery.** `evolution_account_drafts()` connects through `Eds::connect` (never starting
+  EDS) and returns the drafts, or nothing on any failure.
+- **Tests:** the field mapping, a nameless identity, a missing transport, each security method's
+  flags, a fresh id per save, and duplicate detection (address in any case, host and user, and
+  the near misses).
+
+The original plan:
 
 - `to_other_account_draft(&EvolutionMailAccount) -> OtherAccountDraft` fills the
   `OtherAccount` fields and leaves the ID unset, so a new `other:<uuid>` is generated on
@@ -631,7 +692,35 @@ dependency in this crate).
 - Unit tests cover the field mapping, how each security method maps to the `use_tls` flags,
   and duplicate detection.
 
-### [ ] E3.3 — Passwords (`S`)
+### [x] E3.3 — Passwords (`S`)
+
+Done 2026-10-21. Also in `evolution_import.rs`:
+
+- **The lookup.** `EvolutionKeyring` (behind the `EvolutionSecrets` trait, so tests need no
+  daemon) searches through the existing `secret-service` client by `e-source-uid` alone, as EDS
+  does, because EDS's schema doesn't match on its name and items from before libsecret have no
+  `xdg:schema`. It then keeps only items whose `xdg:schema` is
+  `org.gnome.Evolution.Data.Source` or absent, and secrets that are non-empty UTF-8.
+- **Never prompts.** Only the unlocked results are read; a locked item is treated as missing
+  rather than unlocked. Any failure (no keyring, which is the Flatpak today, a locked item or none
+  at all) comes back as `None` and is only logged at debug level.
+- **Which items.** `find_passwords` looks up the IMAP password under the account's UID and the
+  SMTP password under the transport's UID (only when SMTP was imported).
+- **Storing.** `store_found_passwords` writes Lookout's own copies into the account's `imap` and
+  `smtp` slots through `KeyringStore::store_password`, as the dialog does; Evolution's items are
+  only read. A missing SMTP password reuses the IMAP one, since a manual account needs both slots.
+  Without the IMAP password nothing is stored and it returns `Ok(false)`, so E3.4 asks for the
+  password as usual.
+- **The switch.** `apply_found_passwords` turns `use_same_password` off only when Evolution held
+  two different passwords, so the edit dialog later shows both fields.
+- **Confirmation** is E3.4's job: these functions only find and store.
+- **Tests:** both passwords copied into the right slots; the same password twice; a missing SMTP
+  password; no IMAP password (nothing stored); a blank transport not looked up; the item filter
+  and secret decoding. An ignored live test, `live_evolution_import`, prints whether each live
+  account's passwords were found, never the secrets. Run it with
+  `cargo test -p lookout-app live_evolution_import -- --ignored --nocapture`.
+
+The original plan:
 
 - Search the keyring through the existing `secret-service` client for items with schema
   `org.gnome.Evolution.Data.Source` and `e-source-uid = <uid>`.
@@ -642,7 +731,58 @@ dependency in this crate).
 - Never copy or move Evolution's keyring item. Lookout stores its own copy under its own
   slot, the same way `SecretServiceKeyring::store_password` does.
 
-### [ ] E3.4 — The import UI (`M`)
+### [x] E3.4 — The import UI (`M`)
+
+Done 2026-10-21. Where it differs from the plan below:
+
+- **Where it appears.** Lookout has no first-run assistant, so the two entry points are:
+  - Config → Accounts → **"Import from Evolution…"**, right under "Add IMAP/SMTP account…";
+  - an **"Import from Evolution…"** button on the "No Mail Accounts" page, under "Open Online
+    Accounts Settings".
+
+  It isn't added inside `show_add_account_dialog` itself, because that dialog is also the edit
+  dialog and the password prompt the import reuses.
+- **When it appears.** Both entry points start hidden. At startup a worker-thread read
+  (`evolution_account_drafts`, which never starts EDS) caches the drafts, and `any_importable`
+  shows both entry points only when one draft isn't already in Lookout. "Already in Lookout"
+  checks the manual accounts and every GOA account's address. `refresh_hook` now also re-runs that
+  check, and account discovery calls the hook instead of `refresh_config` directly, so adding,
+  removing or discovering accounts updates both entry points. Opening the dialog re-reads
+  Evolution first, so the list is current.
+- **The dialog** (`show_import_dialog`): one row per account with a check button, titled
+  "Name <address>":
+  - accounts already present say "Already in Lookout" and can't be ticked;
+  - the others show `connection_warning` when the engine's TLS rules don't match Evolution's
+    settings (E3.2), otherwise the IMAP server and user;
+  - the group's description says passwords are copied only when the keyring is unlocked and
+    reachable;
+  - a **"Copy saved passwords"** switch (on by default) is the confirmation E3.3 asked for, and
+    turning it off never touches Evolution's keyring;
+  - Import is sensitive only while something is ticked.
+- **Saving.** On the worker thread, `import_accounts` finds each ticked account's passwords and
+  stores them only if the account passes `other_accounts::account_problems`, the dialog's checks
+  (now shared, with SMTP included). Back on the UI thread those accounts are upserted, saved and
+  passed to `on_saved` together, in the dialog's keyring-then-`settings.json` order.
+  - Every other ticked account (no password found, copying off, SMTP missing, a failed keyring
+    write) opens `show_add_account_dialog` pre-filled through its new `prefill` argument, one
+    after another as each closes. That dialog is the existing password prompt.
+  - A keyring write that fails half-way is removed, so no orphaned item is left behind.
+- **After saving.** The add-account row and the import share `connect_new_other_account`. It
+  connects the account, repaints Config, and now also leaves the "No Mail Accounts" page (and
+  the Lookout tab's empty page) for the mail view. Before this, adding a first manual account
+  from Config left that page showing.
+- **Tests:**
+  - the planned GTK test: two found accounts, one already present, give two rows with one
+    ticked, and the present one is marked and can't be ticked. It was checked to run, not skip;
+  - `import_accounts`: complete accounts are stored, and accounts without a password or SMTP
+    are left to the dialog; with copying off, the keyring is never read;
+  - connection warnings for each TLS mismatch;
+  - `any_importable`.
+- **Not done:** a password found for an account that still has to go through the dialog (because
+  SMTP is missing, for example) isn't carried into the dialog's password field. The user types it
+  there. It is also not tested against a live Evolution setup with Lookout running.
+
+The original plan:
 
 - In the add-account entry point (`other_accounts::show_add_account_dialog` and the
   first-run assistant), show **"Import from Evolution…"** when E3.1 finds at least one
@@ -673,9 +813,9 @@ Done 2026-10-21.
   permission. It also covers `UserPrompter0`, which Lookout doesn't use.
 - **No filesystem permission.** E3 will read each source's `Data` property over D-Bus, so
   `~/.config/evolution/sources` doesn't need to be mounted. The README records this.
-- **No secrets permission yet.** E3.3 isn't implemented; without
-  `--talk-name=org.freedesktop.secrets` it will fall back to asking for the password in
-  the Flatpak build. Granting keyring access is a separate decision for that item.
+- **No secrets permission yet.** Without `--talk-name=org.freedesktop.secrets`, E3.3's
+  lookup fails soft and the Flatpak build asks for the password. Granting keyring access is
+  still a separate decision.
 - `source/flatpak/README.md` explains the new permission for reviewers.
 
 The original plan:

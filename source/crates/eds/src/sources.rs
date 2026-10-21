@@ -100,16 +100,7 @@ fn get_string(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> 
 /// source's parent only in the sense that its children then find no GOA id
 /// or `Enabled` key there.
 fn parse_sources<'a>(raw: impl IntoIterator<Item = (&'a str, &'a str)>, locales: &[String]) -> Vec<EdsSource> {
-    let mut files: HashMap<&str, KeyFile> = HashMap::new();
-    for (uid, data) in raw {
-        match KeyFile::parse(data) {
-            Ok(file) => {
-                files.insert(uid, file);
-            }
-            Err(e) => tracing::warn!("EDS: skipping source {uid}: {e}"),
-        }
-    }
-
+    let files = parse_key_files(raw);
     let mut sources: Vec<EdsSource> = files
         .iter()
         .filter_map(|(&uid, file)| {
@@ -123,7 +114,7 @@ fn parse_sources<'a>(raw: impl IntoIterator<Item = (&'a str, &'a str)>, locales:
                 // ESource defaults `Enabled` to true when the key is missing.
                 enabled: ancestry.iter().all(|f| f.get_bool("Data Source", "Enabled").unwrap_or(true)),
                 backend: file.get_non_empty(kind.group(), "BackendName").map(str::to_string),
-                goa_account_id: ancestry.iter().find_map(|f| f.get_non_empty("GNOME Online Accounts", "AccountId")).map(str::to_string),
+                goa_account_id: goa_account_id(uid, &files).map(str::to_string),
             })
         })
         .collect();
@@ -131,8 +122,28 @@ fn parse_sources<'a>(raw: impl IntoIterator<Item = (&'a str, &'a str)>, locales:
     sources
 }
 
-fn parent_of(file: &KeyFile) -> Option<&str> {
+/// Parses each source's key file, keyed by UID. A file that doesn't parse is
+/// skipped and logged.
+pub(crate) fn parse_key_files<'a>(raw: impl IntoIterator<Item = (&'a str, &'a str)>) -> HashMap<&'a str, KeyFile> {
+    let mut files = HashMap::new();
+    for (uid, data) in raw {
+        match KeyFile::parse(data) {
+            Ok(file) => {
+                files.insert(uid, file);
+            }
+            Err(e) => tracing::warn!("EDS: skipping source {uid}: {e}"),
+        }
+    }
+    files
+}
+
+pub(crate) fn parent_of(file: &KeyFile) -> Option<&str> {
     file.get_non_empty("Data Source", "Parent")
+}
+
+/// The GOA account id on the source or its nearest ancestor that has one.
+pub(crate) fn goa_account_id<'f>(uid: &str, files: &'f HashMap<&str, KeyFile>) -> Option<&'f str> {
+    ancestry(uid, files).into_iter().find_map(|f| f.get_non_empty("GNOME Online Accounts", "AccountId"))
 }
 
 /// The source's key file followed by each ancestor's, nearest first. Stops at

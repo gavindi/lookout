@@ -1,0 +1,11 @@
+[Data Source]
+DisplayName=gail@gmail.example
+Enabled=true
+Parent=goa-collection
+
+[Mail Submission]
+TransportUid=goa-transport
+
+[Mail Identity]
+Address=gail@gmail.example
+Name=Gail GOA

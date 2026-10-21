@@ -1,0 +1,16 @@
+[Data Source]
+DisplayName=gail@gmail.example
+Enabled=true
+Parent=goa-collection
+
+[Authentication]
+Host=smtp.gmail.example
+Method=PLAIN
+Port=465
+User=gail@gmail.example
+
+[Security]
+Method=ssl-on-alternate-port
+
+[Mail Transport]
+BackendName=smtp

@@ -32,6 +32,7 @@ mod eds_directory;
 mod eds_mirror;
 mod event_editor;
 mod event_menu;
+mod evolution_import;
 mod folder_menu;
 mod folder_tree;
 mod follow_up;

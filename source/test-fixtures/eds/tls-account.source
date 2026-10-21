@@ -1,0 +1,17 @@
+[Data Source]
+DisplayName=TLS mail
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=imapx
+IdentityUid=tls-identity
+
+[Authentication]
+Host=imap.tls.example
+Method=PLAIN
+Port=993
+User=taylor@tls.example
+
+[Security]
+Method=ssl-on-alternate-port

@@ -1,0 +1,16 @@
+[Data Source]
+DisplayName=pat@plain.example
+Enabled=true
+Parent=plain-account
+
+[Authentication]
+Host=mail.plain.example
+Method=PLAIN
+Port=25
+User=pat
+
+[Security]
+Method=none
+
+[Mail Transport]
+BackendName=smtp

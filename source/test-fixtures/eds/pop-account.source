@@ -1,0 +1,17 @@
+[Data Source]
+DisplayName=Old POP mail
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=pop
+IdentityUid=
+
+[Authentication]
+Host=pop.example.org
+Method=PLAIN
+Port=995
+User=polly
+
+[Security]
+Method=ssl-on-alternate-port

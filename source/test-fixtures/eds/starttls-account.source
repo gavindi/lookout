@@ -1,0 +1,17 @@
+[Data Source]
+DisplayName=StartTLS mail
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=imapx
+IdentityUid=starttls-identity
+
+[Authentication]
+Host=imap.starttls.example
+Method=PLAIN
+Port=143
+User=sam
+
+[Security]
+Method=starttls-on-standard-port

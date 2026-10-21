@@ -1,0 +1,14 @@
+# Special built-in mail store.
+
+[Data Source]
+DisplayName=On This Computer
+DisplayName[de]=Auf diesem Rechner
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=maildir
+IdentityUid=self
+
+[Maildir Backend]
+Path=/home/user/.local/share/evolution/mail/local

@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lookout_eds::{ensure_mirror_source, people_from_card, remove_mirror_source, Eds, EdsAddressBook, EdsSourceKind, MIRROR_SOURCE_UID};
+use lookout_eds::{ensure_mirror_source, people_from_card, remove_mirror_source, Eds, EdsAddressBook, EdsSourceKind, MailSecurity, MIRROR_SOURCE_UID};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{fdo, interface};
 
@@ -619,4 +619,56 @@ async fn the_mirror_needs_calendar_support() {
 
     assert!(ensure_mirror_source(&eds, &bus.dir.join("eds-mirror.ics")).await.is_err());
     assert!(log.lock().unwrap().created.is_empty());
+}
+
+#[tokio::test]
+async fn reads_evolution_mail_accounts_from_source_data() {
+    // The account, identity and transport arrive as three sources over
+    // D-Bus, linked by IdentityUid and TransportUid; a GOA-backed account
+    // beside them is left out.
+    let bus = PrivateBus::start(&[]);
+    let _service = fake_eds(
+        &bus,
+        &[SOURCES5, ADDRESS_BOOK10],
+        registry(&[
+            (
+                "acct",
+                "[Data Source]\nDisplayName=Work\nEnabled=true\nParent=\n\n[Mail Account]\nBackendName=imapx\nIdentityUid=ident\n\n[Authentication]\nHost=imap.example.org\nPort=993\nUser=wren\n\n[Security]\nMethod=ssl-on-alternate-port\n",
+            ),
+            (
+                "ident",
+                "[Data Source]\nDisplayName=wren@example.org\nParent=acct\n\n[Mail Submission]\nTransportUid=trans\n\n[Mail Identity]\nAddress=wren@example.org\nName=Wren\n",
+            ),
+            (
+                "trans",
+                "[Data Source]\nDisplayName=wren@example.org\nParent=acct\n\n[Authentication]\nHost=smtp.example.org\nPort=587\nUser=wren\n\n[Security]\nMethod=starttls-on-standard-port\n\n[Mail Transport]\nBackendName=smtp\n",
+            ),
+            (
+                "goa",
+                "[Data Source]\nDisplayName=me@example.com\nParent=\n\n[Collection]\nBackendName=google\n\n[GNOME Online Accounts]\nAccountId=account_1\n",
+            ),
+            (
+                "goa-mail",
+                "[Data Source]\nDisplayName=me@example.com\nParent=goa\n\n[Mail Account]\nBackendName=imapx\n\n[Authentication]\nHost=imap.example.com\nUser=me\n",
+            ),
+        ]),
+    )
+    .await;
+    let eds = Eds::connect_with(bus.connect().await).await.unwrap().unwrap();
+
+    let accounts = eds.mail_accounts().await.unwrap();
+    assert_eq!(accounts.len(), 1, "{accounts:#?}");
+    let account = &accounts[0];
+    assert_eq!(account.address.as_deref(), Some("wren@example.org"));
+    assert_eq!(account.name.as_deref(), Some("Wren"));
+    assert_eq!(
+        (account.imap.source_uid.as_str(), account.imap.host.as_str(), account.imap.port),
+        ("acct", "imap.example.org", 993)
+    );
+    assert_eq!(account.imap.security, MailSecurity::Tls);
+    let smtp = account.smtp.as_ref().unwrap();
+    assert_eq!(
+        (smtp.source_uid.as_str(), smtp.host.as_str(), smtp.port, smtp.security),
+        ("trans", "smtp.example.org", 587, MailSecurity::StartTls)
+    );
 }

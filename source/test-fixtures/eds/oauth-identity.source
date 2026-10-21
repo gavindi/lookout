@@ -1,0 +1,8 @@
+[Data Source]
+DisplayName=oscar@oauth.example
+Enabled=true
+Parent=oauth-account
+
+[Mail Identity]
+Address=oscar@oauth.example
+Name=Oscar OAuth

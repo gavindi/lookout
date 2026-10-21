@@ -32,8 +32,8 @@ use secret_service::{EncryptionType, SecretService};
 use crate::app_config::{AppConfig, OtherAccount, OTHER_ACCOUNT_ID_PREFIX};
 use crate::worker::Worker;
 
-const PROTOCOL_IMAP: &str = "imap";
-const PROTOCOL_SMTP: &str = "smtp";
+pub(crate) const PROTOCOL_IMAP: &str = "imap";
+pub(crate) const PROTOCOL_SMTP: &str = "smtp";
 /// The keyring slot for an LDAP directory's bind password (items 4.7.4-4.7.5 /
 /// P-11). Unlike the mail slots, its item is keyed by the `LdapDirectory.id`
 /// (e.g. `ldap:<uuid>`) through the same `KeyringStore` API - the "account"
@@ -203,17 +203,24 @@ impl CredentialProvider for OtherCredentialProvider {
 /// start blank, and blank means "keep the stored secrets", so changing
 /// server settings never requires re-typing the password.
 ///
+/// `prefill` seeds a *new* account's fields (its id is ignored and a fresh
+/// one is generated on save) - the Evolution import (EDS_TODO.md E3.4) uses it
+/// for accounts whose password it couldn't find. It's ignored when `existing`
+/// is set.
+///
 /// On a successful save (`on_saved` fires on the UI thread with the account
 /// id, after both the keyring write and the `settings.json` write have
-/// landed) the caller connects or reconnects the account.
+/// landed) the caller connects or reconnects the account. Returns the dialog,
+/// so a caller can tell when it closes.
 pub fn show_add_account_dialog(
     anchor: &gtk::Widget,
     worker: Rc<Worker>,
     app_config: Rc<RefCell<AppConfig>>,
     keyring: Arc<dyn KeyringStore>,
     existing: Option<OtherAccount>,
+    prefill: Option<OtherAccount>,
     on_saved: Rc<dyn Fn(&str)>,
-) {
+) -> gtk::Window {
     let is_edit = existing.is_some();
     let dialog = {
         let mut builder = gtk::Window::builder()
@@ -252,8 +259,9 @@ pub fn show_add_account_dialog(
     let smtp_password_entry = gtk::PasswordEntry::builder().placeholder_text("SMTP password").build();
     let smtp_password_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
 
-    // Seed an edit with the persisted values (never the passwords).
-    if let Some(account) = &existing {
+    // Seed an edit with the persisted values (never the passwords), or a new
+    // account with the prefill.
+    if let Some(account) = existing.as_ref().or(prefill.as_ref()) {
         name_entry.set_text(&account.display_name);
         email_entry.set_text(&account.email);
         imap_host_entry.set_text(&account.imap_host);
@@ -440,45 +448,7 @@ pub fn show_add_account_dialog(
                 smtp_password_entry.text().to_string()
             };
 
-            // -- validate --
-            let mut problems: Vec<String> = Vec::new();
-            if name.is_empty() {
-                problems.push("a display name is required".to_string());
-            }
-            if !crate::recipient_entry::is_plausible_address(&email) {
-                problems.push("a valid email address is required".to_string());
-            }
-            if imap_host.is_empty() {
-                problems.push("an IMAP server is required".to_string());
-            }
-            if imap_username.is_empty() {
-                problems.push("an IMAP username is required".to_string());
-            }
-            if !same_server && smtp_host.is_empty() {
-                problems.push("an SMTP server is required".to_string());
-            }
-            if !same_server && smtp_username.is_empty() {
-                problems.push("an SMTP username is required".to_string());
-            }
-            // Blank passwords are only allowed when editing (keep the stored
-            // secrets); a new account must set them.
-            if imap_password.is_empty() && existing.is_none() {
-                problems.push("a password is required".to_string());
-            }
-            if !use_same_password && smtp_password.is_empty() && existing.is_none() {
-                problems.push("an SMTP password is required".to_string());
-            }
-            if !problems.is_empty() {
-                error_label.set_label(&problems.join("\n"));
-                error_label.set_visible(true);
-                return;
-            }
-            error_label.set_visible(false);
-
-            let id = existing
-                .as_ref()
-                .map(|a| a.id.clone())
-                .unwrap_or_else(|| format!("{OTHER_ACCOUNT_ID_PREFIX}{}", uuid::Uuid::new_v4()));
+            let id = existing.as_ref().map(|a| a.id.clone()).unwrap_or_else(new_other_account_id);
             let account = OtherAccount {
                 id,
                 display_name: name,
@@ -497,6 +467,25 @@ pub fn show_add_account_dialog(
                 smtp_username,
                 use_same_password,
             };
+
+            // -- validate --
+            // With "same server" on, SMTP is a copy of IMAP, so only IMAP's
+            // problems are worth reporting.
+            let mut problems = account_problems(&account, !same_server);
+            // Blank passwords are only allowed when editing (keep the stored
+            // secrets); a new account must set them.
+            if imap_password.is_empty() && existing.is_none() {
+                problems.push("a password is required");
+            }
+            if !use_same_password && smtp_password.is_empty() && existing.is_none() {
+                problems.push("an SMTP password is required");
+            }
+            if !problems.is_empty() {
+                error_label.set_label(&problems.join("\n"));
+                error_label.set_visible(true);
+                return;
+            }
+            error_label.set_visible(false);
 
             // Keyring writes happen on the worker thread (D-Bus I/O). The
             // config mutation + save stay on the UI thread, like the
@@ -564,6 +553,39 @@ pub fn show_add_account_dialog(
     email_entry.connect_activate(move |_| save_for_activate());
 
     dialog.present();
+    dialog
+}
+
+/// What's wrong with an account's server settings, as the dialog lists it.
+/// `check_smtp` is false while the dialog's "same server" switch makes SMTP a
+/// copy of IMAP. Shared with the Evolution import, which saves accounts that
+/// pass without opening the dialog.
+pub(crate) fn account_problems(account: &OtherAccount, check_smtp: bool) -> Vec<&'static str> {
+    let mut problems = Vec::new();
+    if account.display_name.trim().is_empty() {
+        problems.push("a display name is required");
+    }
+    if !crate::recipient_entry::is_plausible_address(account.email.trim()) {
+        problems.push("a valid email address is required");
+    }
+    if account.imap_host.trim().is_empty() {
+        problems.push("an IMAP server is required");
+    }
+    if account.imap_username.trim().is_empty() {
+        problems.push("an IMAP username is required");
+    }
+    if check_smtp && account.smtp_host.trim().is_empty() {
+        problems.push("an SMTP server is required");
+    }
+    if check_smtp && account.smtp_username.trim().is_empty() {
+        problems.push("an SMTP username is required");
+    }
+    problems
+}
+
+/// A fresh, stable `other:<uuid>` id for a new manual account.
+pub(crate) fn new_other_account_id() -> String {
+    format!("{OTHER_ACCOUNT_ID_PREFIX}{}", uuid::Uuid::new_v4())
 }
 
 /// A right-aligned field label for the two-column form grid.

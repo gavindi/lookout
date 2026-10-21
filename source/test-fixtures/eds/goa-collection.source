@@ -1,0 +1,11 @@
+[Data Source]
+DisplayName=gail@gmail.example
+Enabled=true
+Parent=
+
+[Collection]
+BackendName=google
+Identity=gail@gmail.example
+
+[GNOME Online Accounts]
+AccountId=account_1676261544_5

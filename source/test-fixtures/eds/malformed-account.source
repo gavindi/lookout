@@ -1,0 +1,10 @@
+[Data Source]
+DisplayName=Broken mail
+Enabled=true
+
+[Mail Account
+BackendName=imapx
+
+[Authentication]
+Host=imap.broken.example
+User=broken

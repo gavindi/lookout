@@ -1,0 +1,17 @@
+[Data Source]
+DisplayName=Oscar OAuth
+Enabled=true
+Parent=
+
+[Mail Account]
+BackendName=imapx
+IdentityUid=oauth-identity
+
+[Authentication]
+Host=outlook.office365.example
+Method=XOAUTH2
+Port=993
+User=oscar@oauth.example
+
+[Security]
+Method=ssl-on-alternate-port

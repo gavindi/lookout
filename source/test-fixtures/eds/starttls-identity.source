@@ -1,0 +1,11 @@
+[Data Source]
+DisplayName=sam@starttls.example
+Enabled=true
+Parent=starttls-account
+
+[Mail Submission]
+TransportUid=starttls-transport
+
+[Mail Identity]
+Address=sam@starttls.example
+Name=Sam StartTLS

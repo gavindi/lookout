@@ -1,0 +1,11 @@
+[Data Source]
+DisplayName=taylor@tls.example
+Enabled=true
+Parent=tls-account
+
+[Mail Submission]
+TransportUid=tls-transport
+
+[Mail Identity]
+Address=taylor@tls.example
+Name=

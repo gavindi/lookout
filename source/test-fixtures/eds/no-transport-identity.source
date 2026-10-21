@@ -1,0 +1,11 @@
+[Data Source]
+DisplayName=noel@example.net
+Enabled=true
+Parent=no-transport-account
+
+[Mail Submission]
+TransportUid=deleted-transport
+
+[Mail Identity]
+Address=noel@example.net
+Name=Noel No-Transport

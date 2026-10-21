@@ -1,0 +1,16 @@
+[Data Source]
+DisplayName=sam@starttls.example
+Enabled=true
+Parent=starttls-account
+
+[Authentication]
+Host=smtp.starttls.example
+Method=PLAIN
+Port=587
+User=sam.submit
+
+[Security]
+Method=starttls-on-standard-port
+
+[Mail Transport]
+BackendName=smtp
