@@ -279,6 +279,22 @@ pub(crate) fn install_paned_css() {
             margin-top: 10px;
             margin-bottom: 10px;
         }
+        /* The avatar and the Select-mode checkbox sit on the sender line, so
+           they follow the same top margin the text column's density level
+           uses - otherwise the avatar would float above the sender by the
+           pane's row padding. */
+        .message-list .message-avatar,
+        .message-list .message-select-checkbox {
+            margin-top: 6px;
+        }
+        .message-list.spacing-medium .message-avatar,
+        .message-list.spacing-medium .message-select-checkbox {
+            margin-top: 7px;
+        }
+        .message-list.spacing-loose .message-avatar,
+        .message-list.spacing-loose .message-select-checkbox {
+            margin-top: 10px;
+        }
         .message-list.spacing-loose .message-section-header {
             margin-top: 7px;
             margin-bottom: 7px;
@@ -356,6 +372,24 @@ pub(crate) fn install_paned_css() {
             color: @lookout-muted;
             opacity: 0.75;
             font-size: 0.95em;
+        }
+        /* The category chip strip (UX-28), a line of its own under the
+           preview: a neutral pill with the category's preset colour as its
+           dot, so the name reads and the colour stays the identifier. */
+        .message-category-row {
+            margin-top: 2px;
+        }
+        .message-category-chip {
+            background-color: alpha(currentColor, 0.08);
+            border-radius: 9999px;
+            padding: 0 7px 0 5px;
+        }
+        .message-category-chip-label,
+        .message-category-overflow {
+            font-size: 0.82em;
+        }
+        .message-category-overflow {
+            color: @lookout-muted;
         }
         .message-section-header {
             background-color: @lookout-section-header-bg;

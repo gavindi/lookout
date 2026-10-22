@@ -118,6 +118,14 @@ pub fn categories_for_keywords<'a>(categories: &'a CategorySet, keywords: &BTree
     categories.categories.iter().filter(|c| keywords.contains(&c.keyword())).collect()
 }
 
+/// Splits the categories a message-list row must render into the chips it
+/// shows and the count it folds into a trailing "+N" (UX-28). Pure, so the
+/// cap and the overflow arithmetic are testable without a GTK widget.
+pub fn category_chip_plan<'a>(categories: &[&'a CategoryDef], max: usize) -> (Vec<&'a CategoryDef>, usize) {
+    let shown = categories.len().min(max);
+    (categories[..shown].to_vec(), categories.len() - shown)
+}
+
 /// The preset a brand-new category gets: successive adds walk the 25 presets
 /// round-robin, so a fresh list is colourful without the user choosing.
 pub fn default_preset(index: usize) -> u8 {
@@ -219,6 +227,32 @@ mod tests {
         keywords.insert("$Other-junk".into());
         let matched = categories_for_keywords(&set, &keywords);
         assert_eq!(matched.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["work", "project-xmas"]);
+    }
+
+    #[test]
+    fn chip_plan_caps_the_shown_chips_and_counts_the_rest() {
+        let set = set();
+        let defs: Vec<&CategoryDef> = set.categories.iter().collect();
+
+        // Fewer categories than the cap: all shown, nothing folded away.
+        let (shown, hidden) = category_chip_plan(&defs, 3);
+        assert_eq!(shown.len(), 2);
+        assert_eq!(hidden, 0);
+
+        // Exactly the cap.
+        let (shown, hidden) = category_chip_plan(&defs, 2);
+        assert_eq!(shown.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec!["work", "project-xmas"]);
+        assert_eq!(hidden, 0);
+
+        // Past the cap: the overflow is counted, never silently dropped.
+        let (shown, hidden) = category_chip_plan(&defs, 1);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(hidden, 1);
+
+        // No categories at all: no chip row.
+        let (shown, hidden) = category_chip_plan(&[], 3);
+        assert!(shown.is_empty());
+        assert_eq!(hidden, 0);
     }
 
     #[test]

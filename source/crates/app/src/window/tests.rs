@@ -2533,6 +2533,7 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
     let avatar = gtk::Overlay::new();
     let checkbox = gtk::CheckButton::new();
     let preview = gtk::Label::new(Some("preview"));
+    let thread_preview = gtk::Label::new(Some("thread preview"));
     let display = RowDisplay {
         select_mode: false,
         show_sender_images: true,
@@ -2548,6 +2549,7 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
         avatar: avatar.downgrade(),
         checkbox: checkbox.downgrade(),
         preview_label: preview.downgrade(),
+        thread_preview_label: thread_preview.downgrade(),
     }]));
     update_row_display(
         &registry,
@@ -2559,6 +2561,8 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
     );
     assert!(!avatar.is_visible() && checkbox.is_visible());
     assert!(!preview.is_visible());
+    // A conversation header's preview follows the same line count.
+    assert!(!thread_preview.is_visible());
 
     // Sender images off hides the avatar outside Select mode too.
     RowDisplay {

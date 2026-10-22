@@ -1598,8 +1598,9 @@ pub(crate) fn show_manage_categories_dialog(anchor: &gtk::Widget, state: Rc<RefC
 }
 
 /// A filled colour dot whose colour can change after it's built. The message
-/// list keeps `MAX_TAG_DOTS` of these per row and recolours them on bind
-/// rather than rebuilding the widgets for every row scrolled into view.
+/// list keeps `MAX_CATEGORY_CHIPS` of these per row - one per category chip -
+/// and recolours them on bind rather than rebuilding the widgets for every
+/// row scrolled into view.
 #[derive(Clone)]
 pub(crate) struct TagDot {
     pub(crate) area: gtk::DrawingArea,

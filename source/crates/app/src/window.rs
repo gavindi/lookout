@@ -845,35 +845,59 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The avatar overlay: a coloured circle with the sender's initials,
         // and on top of it (when there is one) the contact's photo. A photo
         // with no paintable leaves the initials visible underneath, so the
-        // same two children serve both cases. Fixed 32x32, centred, like the
-        // checkbox that replaces it in Select mode.
-        let avatar_label = gtk::Label::builder().css_classes(["avatar-circle"]).build();
-        let avatar_photo = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).css_classes(["avatar-photo"]).build();
-        let avatar = gtk::Overlay::builder()
+        // same two children serve both cases. Both children carry their own
+        // 32x32 square request (like the reading-pane header's avatar) so the
+        // circle stays perfectly round whatever height the row allocates the
+        // overlay in the three-line layout.
+        let avatar_label = gtk::Label::builder()
+            .css_classes(["avatar-circle"])
             .width_request(32)
             .height_request(32)
             .halign(gtk::Align::Center)
             .valign(gtk::Align::Center)
+            .build();
+        let avatar_photo = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .css_classes(["avatar-photo"])
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .can_shrink(true)
+            .build();
+        let avatar = gtk::Overlay::builder()
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            // Top-aligned with the sender line so the avatar spans the row's
+            // three (or four) lines, as Outlook's does.
+            .valign(gtk::Align::Start)
             .margin_start(8)
             .margin_end(8)
             .child(&avatar_label)
             .build();
+        avatar.add_css_class("message-avatar");
         avatar.add_overlay(&avatar_photo);
         // The avatar (initials and, when present, the contact's photo) is
         // derived from the sender's name/address, so privacy mode blurs it.
         crate::privacy::mark(&avatar);
 
-        // Fixed-width sender, expanding subject: that's what lines every
-        // row's subject up in one column, rather than letting it start
-        // wherever the sender happens to end.
-        let sender_label = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        // The message row follows Outlook's three-line layout (UX-28): the
+        // sender and the status icons on line one, the subject and received
+        // time on line two, the body preview on line three, and - only when
+        // the message is categorised - a chip strip beneath them.
+        //
+        // The sender expands rather than sitting in a fixed 180px column: the
+        // subject no longer shares its line, so there is no column to align,
+        // and a long sender should use the space the subject used to take.
+        let sender_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         // Sender name, address and (in the unified view) account name all land
         // in this one label; privacy mode blurs the lot.
         crate::privacy::mark(&sender_label);
         // The attachment and meeting-invite indicators, drawn after the
-        // sender column on rows that carry either. Same footprint as the flag
-        // icon; hidden (not just blank) when absent so a plain row takes no
-        // extra width.
+        // sender on rows that carry either. Same footprint as the flag icon;
+        // hidden (not just blank) when absent so a plain row takes no extra
+        // width.
         let attachment_icon = gtk::Image::builder()
             .icon_name("mail-attachment-symbolic")
             .pixel_size(12)
@@ -910,10 +934,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .visible(false)
             .build();
         let subject_label = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
-        let date_label = gtk::Label::builder().xalign(1.0).build();
-        // Sits between the expanding subject and the date, so a pinned row
-        // shows its marker without shifting the date column - hidden (not
-        // just blank) on unpinned rows so it takes no width at all there.
+        let date_label = gtk::Label::builder().xalign(1.0).valign(gtk::Align::Center).build();
+        // Sits in the sender line's status cluster, so a pinned row shows its
+        // marker without shifting the subject or date - hidden (not just
+        // blank) on unpinned rows so it takes no width at all there.
         let pin_icon = gtk::Image::builder()
             .icon_name(pin_icon_name(true))
             .pixel_size(12)
@@ -924,36 +948,57 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The follow-up flag's due label and icon (item 1.16), set in `bind`.
         let flag_label = gtk::Label::builder().css_classes(["caption"]).valign(gtk::Align::Center).visible(false).build();
         let flag_icon = gtk::Image::builder().pixel_size(12).valign(gtk::Align::Center).visible(false).build();
-        // One dot per configured color tag the message carries, up to
-        // `MAX_TAG_DOTS`: built once here, then recoloured and shown/hidden on
-        // `bind`. Hidden when there are none (the container takes no space
-        // when empty), so an untagged row is identical to today's.
-        let tag_dots = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).valign(gtk::Align::Center).build();
-        let tag_dot_areas: Vec<TagDot> = (0..MAX_TAG_DOTS)
+
+        // The category chip strip (UX-28): a line of its own under the
+        // preview, one dot + name pill per category. Built once per row and
+        // recoloured on bind; the whole line hides when the message has no
+        // categories, so an uncategorised row is exactly three lines.
+        let category_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .valign(gtk::Align::Center)
+            .css_classes(["message-category-row"])
+            .visible(false)
+            .build();
+        let category_chips: Vec<CategoryChip> = (0..MAX_CATEGORY_CHIPS)
             .map(|_| {
-                let dot = TagDot::new("#808080", 8);
-                dot.area.set_visible(false);
-                tag_dots.append(&dot.area);
-                dot
+                let chip = CategoryChip::new();
+                category_row.append(&chip.root);
+                chip
             })
             .collect();
-        let top_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-        top_row.append(&sender_label);
-        top_row.append(&attachment_icon);
-        top_row.append(&calendar_icon);
-        top_row.append(&mention_icon);
-        top_row.append(&importance_icon);
-        top_row.append(&subject_label);
-        top_row.append(&pin_icon);
-        top_row.append(&flag_label);
-        top_row.append(&flag_icon);
-        top_row.append(&tag_dots);
-        top_row.append(&date_label);
+        let category_overflow = gtk::Label::builder().xalign(0.0).css_classes(["message-category-overflow"]).visible(false).build();
+        category_row.append(&category_overflow);
 
-        // Spans the full row and ellipsizes, so the snippet shows as much of
-        // the body as the pane's current width fits and re-flows when the
-        // pane is resized - the cached text is deliberately longer than any
-        // width can display (see `PREVIEW_MAX_CHARS`).
+        // Line 1: sender and the status-icon cluster.
+        let sender_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .css_classes(["message-sender-line"])
+            .build();
+        sender_line.append(&sender_label);
+        sender_line.append(&attachment_icon);
+        sender_line.append(&calendar_icon);
+        sender_line.append(&mention_icon);
+        sender_line.append(&importance_icon);
+        sender_line.append(&pin_icon);
+        sender_line.append(&flag_label);
+        sender_line.append(&flag_icon);
+
+        // Line 2: subject, with the received time/date at the far right.
+        let subject_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .css_classes(["message-subject-line"])
+            .build();
+        subject_line.append(&subject_label);
+        subject_line.append(&date_label);
+
+        // Line 3: the body preview, spanning the row and ellipsizing so the
+        // snippet shows as much of the body as the pane's current width fits
+        // and re-flows when the pane is resized - the cached text is
+        // deliberately longer than any width can display (see
+        // `PREVIEW_MAX_CHARS`).
         //
         // Always present, even when there's no preview text: an empty label
         // still reserves its line, so read and unread rows stay the same
@@ -965,6 +1010,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .single_line_mode(true)
             .css_classes(["message-preview"])
             .build();
+        let preview_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["message-preview-line"])
+            .build();
+        preview_line.append(&preview_label);
 
         let text_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -973,8 +1024,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .margin_end(10)
             .css_classes(["message-text"])
             .build();
-        text_column.append(&top_row);
-        text_column.append(&preview_label);
+        text_column.append(&sender_line);
+        text_column.append(&subject_line);
+        text_column.append(&preview_line);
+        text_column.append(&category_row);
 
         // Same footprint as the avatar it replaces (32x32, centered) so
         // toggling Select mode swaps one for the other in place rather than
@@ -983,19 +1036,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .width_request(32)
             .height_request(32)
             .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
+            .valign(gtk::Align::Start)
             .visible(false)
             .build();
-        // The avatar/checkbox swap and the preview line count depend on
-        // app-wide display settings (Select mode, "Show sender images",
-        // preview lines), not on this row's message. Register weak handles so
-        // a settings change can update every live row in place; `bind` also
-        // applies them, so a freshly recycled row comes out correct.
-        row_display_registry_for_setup.borrow_mut().push(RowDisplayRefs {
-            avatar: avatar.downgrade(),
-            checkbox: checkbox.downgrade(),
-            preview_label: preview_label.downgrade(),
-        });
+        checkbox.add_css_class("message-select-checkbox");
 
         let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         message_box.add_css_class("message-row");
@@ -1005,12 +1049,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         message_box.append(&text_column);
 
         // The conversation-header row: its own expander (the section header's
-        // expander lives in `header_box`) driving a single sender/subject/date
-        // line, with the participant count as the extra column that marks a
-        // row as a thread rather than a message. Widths deliberately match
-        // the message row's (`width_request(180)` sender, hexpand subject) so
-        // threads and messages line up in the same columns.
-        let thread_sender = gtk::Label::builder().xalign(0.0).width_request(180).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        // expander lives in `header_box`) driving the same sender / subject /
+        // preview lines a message row shows, with the participant count as the
+        // extra column that marks a row as a thread rather than a message.
+        let thread_sender = gtk::Label::builder().xalign(0.0).hexpand(true).ellipsize(gtk::pango::EllipsizeMode::End).build();
         // Thread header sender (a name, or the participant list) - privacy
         // mode blurs it like the message rows' sender column.
         crate::privacy::mark(&thread_sender);
@@ -1056,38 +1098,105 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .visible(false)
             .build();
         let thread_flag_icon = gtk::Image::builder().pixel_size(12).valign(gtk::Align::Center).visible(false).build();
-        let thread_date = gtk::Label::builder().xalign(1.0).build();
-        let thread_top = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
-        thread_top.append(&thread_sender);
-        thread_top.append(&thread_attachment_icon);
-        thread_top.append(&thread_calendar_icon);
-        thread_top.append(&thread_mention_icon);
-        thread_top.append(&thread_importance_icon);
-        thread_top.append(&thread_subject);
-        thread_top.append(&thread_count);
-        thread_top.append(&thread_pin_icon);
-        thread_top.append(&thread_flag_icon);
-        thread_top.append(&thread_date);
+        let thread_date = gtk::Label::builder().xalign(1.0).valign(gtk::Align::Center).build();
+        let thread_preview_label = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .single_line_mode(true)
+            .css_classes(["message-preview"])
+            .build();
+        let thread_category_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .valign(gtk::Align::Center)
+            .css_classes(["message-category-row"])
+            .visible(false)
+            .build();
+        let thread_category_chips: Vec<CategoryChip> = (0..MAX_CATEGORY_CHIPS)
+            .map(|_| {
+                let chip = CategoryChip::new();
+                thread_category_row.append(&chip.root);
+                chip
+            })
+            .collect();
+        let thread_category_overflow = gtk::Label::builder().xalign(0.0).css_classes(["message-category-overflow"]).visible(false).build();
+        thread_category_row.append(&thread_category_overflow);
+
+        // Line 1: participants and the aggregate status icons, then the
+        // message count.
+        let thread_sender_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .css_classes(["message-sender-line"])
+            .build();
+        thread_sender_line.append(&thread_sender);
+        thread_sender_line.append(&thread_attachment_icon);
+        thread_sender_line.append(&thread_calendar_icon);
+        thread_sender_line.append(&thread_mention_icon);
+        thread_sender_line.append(&thread_importance_icon);
+        thread_sender_line.append(&thread_count);
+        thread_sender_line.append(&thread_pin_icon);
+        thread_sender_line.append(&thread_flag_icon);
+
+        // Line 2: subject and the newest message's date.
+        let thread_subject_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .css_classes(["message-subject-line"])
+            .build();
+        thread_subject_line.append(&thread_subject);
+        thread_subject_line.append(&thread_date);
+
+        // Line 3: the newest message's preview.
+        let thread_preview_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .css_classes(["message-preview-line"])
+            .build();
+        thread_preview_line.append(&thread_preview_label);
+
+        let thread_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).build();
+        thread_column.append(&thread_sender_line);
+        thread_column.append(&thread_subject_line);
+        thread_column.append(&thread_preview_line);
+        thread_column.append(&thread_category_row);
+
         let thread_expander = gtk::TreeExpander::new();
-        thread_expander.set_child(Some(&thread_top));
+        thread_expander.set_child(Some(&thread_column));
         let thread_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).margin_start(14).margin_end(10).build();
         thread_box.add_css_class("message-thread-row");
         thread_box.append(&thread_expander);
+
+        // The avatar/checkbox swap and the preview line count depend on
+        // app-wide display settings (Select mode, "Show sender images",
+        // preview lines), not on this row's message. Register weak handles so
+        // a settings change can update every live row in place; `bind` also
+        // applies them, so a freshly recycled row comes out correct. Both
+        // preview labels are registered: the same row widget renders either a
+        // message row or a conversation header.
+        row_display_registry_for_setup.borrow_mut().push(RowDisplayRefs {
+            avatar: avatar.downgrade(),
+            checkbox: checkbox.downgrade(),
+            preview_label: preview_label.downgrade(),
+            thread_preview_label: thread_preview_label.downgrade(),
+        });
 
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         row_box.append(&header_box);
         row_box.append(&message_box);
         row_box.append(&thread_box);
 
-        // Action box (initially hidden)
+        // Action box (initially hidden). Anchored to the top-right so it sits
+        // over the sender line's status icons - where Outlook's hover actions
+        // appear - rather than over the subject line.
         let action_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(0)
             .halign(gtk::Align::End)
-            .valign(gtk::Align::Center)
+            .valign(gtk::Align::Start)
             .margin_end(8)
-            .margin_top(4)
-            .margin_bottom(4)
+            .margin_top(2)
             .build();
         action_box.add_css_class("hover-quick-actions");
         // Icons/tooltips below are placeholders overwritten by `connect_bind`
@@ -1503,6 +1612,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_pin_icon,
                     thread_flag_icon,
                     thread_date,
+                    thread_preview_label,
+                    thread_category_row,
+                    thread_category_chips,
+                    thread_category_overflow,
                     checkbox,
                     checkbox_suppress,
                     accent,
@@ -1518,8 +1631,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     pin_icon,
                     flag_label,
                     flag_icon,
-                    tag_dots,
-                    tag_dot_areas,
+                    category_row,
+                    category_chips,
+                    category_overflow,
                     date_label,
                     preview_label,
                     action_box,
@@ -1547,7 +1661,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.message_box.set_visible(false);
                 widgets.thread_box.set_visible(false);
                 widgets.action_box.set_visible(false);
-                widgets.tag_dots.set_visible(false);
+                widgets.category_row.set_visible(false);
+                widgets.thread_category_row.set_visible(false);
                 // What actually draws the disclosure chevron and drives
                 // expand/collapse. The expansion *state* is applied in
                 // `MessageListModel::repopulate`, not here - bind only runs
@@ -1676,21 +1791,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 apply_flag_indicator(&widgets.flag_icon, Some(&widgets.flag_label), follow_up.as_ref());
                 set_flag_button_state(&widgets.follow_up_btn, follow_up.as_ref());
 
-                // Recolour the row's category dots, each painted directly in
-                // its category's preset colour; the unused ones are hidden.
+                // Show the row's category chips: one dot + name pill per
+                // category, with the rest folded into "+N". The strip hides
+                // itself when the message has none (UX-28).
                 let tags_borrow = tags_for_bind.borrow();
                 let shown = crate::categories::categories_for_keywords(&tags_borrow, &summary.keywords);
-                let mut tags = shown.iter().take(MAX_TAG_DOTS);
-                for dot in &widgets.tag_dot_areas {
-                    match tags.next() {
-                        Some(tag) => {
-                            dot.set_rgb(tag.color());
-                            dot.area.set_visible(true);
-                        }
-                        None => dot.area.set_visible(false),
-                    }
-                }
-                widgets.tag_dots.set_visible(!shown.is_empty());
+                bind_category_chips(&widgets.category_row, &widgets.category_chips, &widgets.category_overflow, &shown);
 
                 *widgets.bound.borrow_mut() = Some(Rc::clone(summary));
                 *widgets.bound_thread.borrow_mut() = None;
@@ -1700,7 +1806,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.message_box.set_visible(false);
                 widgets.thread_box.set_visible(true);
                 widgets.action_box.set_visible(false);
-                widgets.tag_dots.set_visible(false);
                 // A conversation header is a selection target (item 1.7):
                 // selecting it shows the whole conversation in the reading
                 // pane, and verbs act on every message in it, as in
@@ -1729,6 +1834,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     .thread_box
                     .set_tooltip_text(Some(&format!("{} messages: {}", thread.count, thread.participants.join(", "))));
                 widgets.thread_date.set_label(&format_row_date(thread.latest, chrono::Utc::now()));
+                widgets.thread_preview_label.set_label(thread.preview.as_deref().unwrap_or(""));
+                // The header's preview follows the same "Message preview"
+                // line-count setting as a message row's.
+                row_display_for_bind.get().apply(&widgets.avatar, &widgets.checkbox, &widgets.thread_preview_label);
+                // The newest message's category chips, on their own line under
+                // the preview, exactly like a message row's strip.
+                let tags_borrow = tags_for_bind.borrow();
+                let shown = crate::categories::categories_for_keywords(&tags_borrow, &thread.tags);
+                bind_category_chips(&widgets.thread_category_row, &widgets.thread_category_chips, &widgets.thread_category_overflow, &shown);
                 widgets.thread_pin_icon.set_visible(thread.has_pinned);
                 apply_flag_indicator(&widgets.thread_flag_icon, None, thread.follow_up.as_ref());
                 // Unread bolds the whole header like it bolds a message row:
@@ -2063,16 +2177,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     };
     refresh_list_header(&state, &list_header);
 
-    // Secondary header: the message list's column names, sitting directly
-    // above the rows they name. It mirrors each row's internal geometry - a
-    // gutter where the unread accent bar and avatar sit, then the fixed
-    // sender column, the expanding subject column, and the right-aligned
-    // date - so the titles line up exactly with the columns below.
+    // Secondary header: the message list's column names. Outlook shows these
+    // only in its single-line columnar layout (UX-27); the three-line message
+    // row (UX-28) has no columns to name, so the strip stays built but hidden
+    // until that layout lands. Its geometry follows the old fixed sender /
+    // subject / date columns and will need to be rebuilt on that layout's own
+    // terms rather than reused as-is.
     let column_header_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
         .margin_end(10)
         .css_classes(["message-column-header"])
+        .visible(false)
         .build();
     // Column names are chrome, not message content.
     crate::privacy::mark_ui(&column_header_row);

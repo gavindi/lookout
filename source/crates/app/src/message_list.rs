@@ -11,7 +11,7 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -619,6 +619,12 @@ pub struct ThreadRow {
     /// The newest message's subject. `None` (→ "(no subject)") matches how a
     /// plain message row renders.
     pub subject: Option<String>,
+    /// The newest message's body preview, on the conversation header's third
+    /// line (UX-28). `None` while the snippet is still being fetched.
+    pub preview: Option<String>,
+    /// The newest message's `$Lookout-tag-*` category keywords - the chip
+    /// strip the header shows under its preview.
+    pub tags: BTreeSet<String>,
     /// How many messages the conversation contains. Hidden for the
     /// count-1 case - a lone message renders as itself, not as a thread.
     pub count: usize,
@@ -827,6 +833,8 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             sender,
             participants,
             subject: latest.subject.clone(),
+            preview: latest.preview.clone(),
+            tags: latest.keywords.iter().filter(|k| lookout_core::tag_key_from_keyword(k).is_some()).cloned().collect(),
             count: emails.len(),
             latest: latest.date,
             has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
@@ -1003,6 +1011,8 @@ struct ThreadRowKey {
     sender: String,
     participants: Vec<String>,
     subject: Option<String>,
+    preview: Option<String>,
+    tags: BTreeSet<String>,
     count: usize,
     latest: DateTime<Utc>,
     has_unread: bool,
@@ -1020,6 +1030,8 @@ fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
         sender: row.sender.clone(),
         participants: row.participants.clone(),
         subject: row.subject.clone(),
+        preview: row.preview.clone(),
+        tags: row.tags.clone(),
         count: row.count,
         latest: row.latest,
         has_unread: row.has_unread,
@@ -3351,7 +3363,9 @@ mod tests {
     fn threaded_layout_buckets_by_the_newest_message_and_keeps_singletons_flat() {
         let now = local(2026, 8, 4, 8);
         let root = with_subject(from_alice(in_thread(summary(1, utc_on(now, 2026, 8, 2)), "kickoff")), "Project kickoff");
-        let reply = with_subject(from_alice(in_thread(summary(2, utc_on(now, 2026, 8, 4)), "kickoff")), "Re: Project kickoff");
+        let mut reply = with_subject(from_alice(in_thread(summary(2, utc_on(now, 2026, 8, 4)), "kickoff")), "Re: Project kickoff");
+        reply.preview = Some("Latest snippet".into());
+        reply.keywords.insert(lookout_core::tag_keyword("work"));
         let single = with_subject(summary(3, utc_on(now, 2026, 7, 15)), "Standalone");
         let messages = vec![reply.clone(), single.clone(), root.clone()];
         let ListLayout::Threaded(sections) = build_layout(messages, SortKey::Date, now, true, true) else {
@@ -3371,6 +3385,10 @@ mod tests {
             ThreadEntry::Thread(thread) => {
                 assert_eq!(thread.row.count, 2);
                 assert_eq!(thread.row.subject.as_deref(), Some("Re: Project kickoff"));
+                // The header's third line and chip strip follow the newest
+                // message, like its subject and date.
+                assert_eq!(thread.row.preview.as_deref(), Some("Latest snippet"));
+                assert!(thread.row.tags.contains(&lookout_core::tag_keyword("work")));
                 // Oldest-first reading order inside the conversation.
                 assert_eq!(thread.messages.iter().map(|m| m.uid.0).collect::<Vec<_>>(), vec![1, 2]);
                 // The sender and aggregate flags follow the newest message
@@ -3525,6 +3543,8 @@ mod tests {
             sender: "Alice".into(),
             participants: vec!["Alice".into(), "Bob".into()],
             subject: Some("Subject".into()),
+            preview: Some("Snippet".into()),
+            tags: BTreeSet::new(),
             count: 2,
             latest: Utc.with_ymd_and_hms(2024, 1, 10, 10, 0, 0).unwrap(),
             has_unread: false,
@@ -3562,6 +3582,14 @@ mod tests {
         let mut other_subject = base.clone();
         other_subject.subject = Some("Different".into());
         assert_ne!(thread_row_key(&other_subject), base_key);
+
+        let mut other_preview = base.clone();
+        other_preview.preview = Some("Different snippet".into());
+        assert_ne!(thread_row_key(&other_preview), base_key);
+
+        let mut other_tags = base.clone();
+        other_tags.tags.insert(lookout_core::tag_keyword("work"));
+        assert_ne!(thread_row_key(&other_tags), base_key);
 
         let mut other_count = base.clone();
         other_count.count = 3;

@@ -215,12 +215,24 @@ pub(crate) struct MessageRowWidgets {
     /// `pin_icon`, on rows without a flag.
     pub(crate) flag_label: gtk::Label,
     pub(crate) flag_icon: gtk::Image,
-    /// The color-tag dots' container, and its `MAX_TAG_DOTS` dots: one small
-    /// circle per configured tag the message carries, recoloured on bind.
-    pub(crate) tag_dots: gtk::Box,
-    pub(crate) tag_dot_areas: Vec<TagDot>,
+    /// The category chip strip (UX-28), a line of its own below the preview:
+    /// one preset-coloured dot plus the category's name per chip, up to
+    /// `MAX_CATEGORY_CHIPS`, then a `+N` chip for the rest. Hidden wholesale
+    /// when the message has no categories, so an uncategorised row is exactly
+    /// three lines.
+    pub(crate) category_row: gtk::Box,
+    pub(crate) category_chips: Vec<CategoryChip>,
+    pub(crate) category_overflow: gtk::Label,
     pub(crate) date_label: gtk::Label,
     pub(crate) preview_label: gtk::Label,
+    /// The conversation header's body preview (the newest message's snippet),
+    /// on the third line of its three-line row.
+    pub(crate) thread_preview_label: gtk::Label,
+    /// The conversation header's category chips, from the newest message's
+    /// keywords - the same strip a message row shows.
+    pub(crate) thread_category_row: gtk::Box,
+    pub(crate) thread_category_chips: Vec<CategoryChip>,
+    pub(crate) thread_category_overflow: gtk::Label,
     pub(crate) action_box: gtk::Box,
     /// Hover-quickmenu toggle buttons - their icon/tooltip is set in `bind`
     /// from this row's message state (unlike `delete_btn`/`reply_btn`, which
@@ -236,16 +248,89 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) bound_thread: Rc<RefCell<Option<ThreadId>>>,
 }
 
+/// One category chip on a message row (UX-28): Outlook's preset-coloured dot
+/// plus the category's name. Built once per row (up to `MAX_CATEGORY_CHIPS`)
+/// then recoloured and relabelled on `bind`, so scrolling a large mailbox
+/// never constructs widgets.
+#[derive(Clone)]
+pub(crate) struct CategoryChip {
+    pub(crate) root: gtk::Box,
+    pub(crate) dot: TagDot,
+    pub(crate) label: gtk::Label,
+}
+
+impl CategoryChip {
+    pub(crate) fn new() -> Self {
+        let dot = TagDot::new("#808080", 8);
+        let label = gtk::Label::builder()
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            // A long category name truncates inside its own chip rather than
+            // pushing the preview or the trailing "+N" out of the row.
+            .max_width_chars(16)
+            .css_classes(["message-category-chip-label"])
+            .build();
+        let root = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(4)
+            .valign(gtk::Align::Center)
+            .css_classes(["message-category-chip"])
+            .visible(false)
+            .build();
+        root.append(&dot.area);
+        root.append(&label);
+        CategoryChip { root, dot, label }
+    }
+
+    /// Shows this chip for `category`, or hides it when there is none.
+    pub(crate) fn bind(&self, category: Option<&crate::categories::CategoryDef>) {
+        match category {
+            Some(category) => {
+                self.dot.set_rgb(category.color());
+                self.label.set_label(&category.name);
+                self.root.set_tooltip_text(Some(&category.name));
+                self.root.set_visible(true);
+            }
+            None => self.root.set_visible(false),
+        }
+    }
+}
+
+/// Fills one row kind's category strip: the chips show the first
+/// `MAX_CATEGORY_CHIPS` categories, a trailing `+N` folds the rest away, and
+/// the whole row is hidden when the message has no categories. Recomputed on
+/// every bind, so a recycled row never keeps its previous occupant's chips.
+pub(crate) fn bind_category_chips(row: &gtk::Box, chips: &[CategoryChip], overflow: &gtk::Label, categories: &[&crate::categories::CategoryDef]) {
+    let (shown, hidden) = crate::categories::category_chip_plan(categories, MAX_CATEGORY_CHIPS);
+    for (chip, category) in chips.iter().zip(shown.iter()) {
+        chip.bind(Some(category));
+    }
+    for chip in chips.iter().skip(shown.len()) {
+        chip.bind(None);
+    }
+    if hidden > 0 {
+        let names: Vec<&str> = categories[shown.len()..].iter().map(|category| category.name.as_str()).collect();
+        overflow.set_label(&format!("+{hidden}"));
+        overflow.set_tooltip_text(Some(&names.join(", ")));
+        overflow.set_visible(true);
+    } else {
+        overflow.set_visible(false);
+    }
+    row.set_visible(!categories.is_empty());
+}
+
 /// Weak handles to a row's display-dependent widgets - the avatar/checkbox
-/// pair and the preview label - whose appearance follows app-wide settings
-/// (Select mode, "Show sender images", the preview line count) rather than the
-/// row's own message. The list view creates a bounded pool of row widgets and
-/// recycles them, so the registry in `build_window` holds weak references and
-/// prunes the dead ones whenever a setting changes (see `update_row_display`).
+/// pair and the two preview labels (a message row's and a conversation
+/// header's) - whose appearance follows app-wide settings (Select mode, "Show
+/// sender images", the preview line count) rather than the row's own message.
+/// The list view creates a bounded pool of row widgets and recycles them, so
+/// the registry in `build_window` holds weak references and prunes the dead
+/// ones whenever a setting changes (see `update_row_display`).
 pub(crate) struct RowDisplayRefs {
     pub(crate) avatar: glib::WeakRef<gtk::Overlay>,
     pub(crate) checkbox: glib::WeakRef<gtk::CheckButton>,
     pub(crate) preview_label: glib::WeakRef<gtk::Label>,
+    pub(crate) thread_preview_label: glib::WeakRef<gtk::Label>,
 }
 
 /// Configures a row's preview label for `lines` body-preview lines: 0 hides
@@ -297,10 +382,16 @@ impl RowDisplay {
 /// are dropped on the way.
 pub(crate) fn update_row_display(registry: &Rc<RefCell<Vec<RowDisplayRefs>>>, display: RowDisplay) {
     registry.borrow_mut().retain(|refs| {
-        let (Some(avatar), Some(checkbox), Some(preview)) = (refs.avatar.upgrade(), refs.checkbox.upgrade(), refs.preview_label.upgrade()) else {
+        let (Some(avatar), Some(checkbox), Some(preview), Some(thread_preview)) = (
+            refs.avatar.upgrade(),
+            refs.checkbox.upgrade(),
+            refs.preview_label.upgrade(),
+            refs.thread_preview_label.upgrade(),
+        ) else {
             return false;
         };
         display.apply(&avatar, &checkbox, &preview);
+        display.apply(&avatar, &checkbox, &thread_preview);
         true
     });
 }
@@ -632,10 +723,11 @@ pub(crate) const SEARCH_RESULT_LIMIT: usize = 300;
 /// history popover and persisted in the UI-state database.
 pub(crate) const SEARCH_HISTORY_LIMIT: usize = 10;
 
-/// How many color-tag dots one message row renders. A message can carry any
-/// number of tags; past this the row draws the first few and leaves the rest
-/// to the Categorize menu, so a heavily-tagged row doesn't crowd out the date.
-pub(crate) const MAX_TAG_DOTS: usize = 3;
+/// How many category chips one message row renders before folding the rest
+/// into a trailing "+N" (UX-28). Outlook's chip strip is one line under the
+/// preview; past this a heavily-categorised row would crowd out the text, so
+/// the remaining names live in the "+N" chip's tooltip.
+pub(crate) const MAX_CATEGORY_CHIPS: usize = 3;
 
 /// How long a Save-button attachment fetch may take before the UI gives up
 /// and restores the button. The session answers every `FetchAttachment`

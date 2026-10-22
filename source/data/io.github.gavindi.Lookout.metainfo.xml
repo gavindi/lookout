@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.278" date="2026-10-23">
+      <description>
+        <p>The message list now uses Outlook's three-line layout: sender with status icons, subject with the received time, and a body preview, with a category chip strip underneath when a message is categorised. Conversation headers match, the column-header strip is hidden in this layout, and sender avatars stay perfectly round.</p>
+      </description>
+    </release>
     <release version="0.9.277" date="2026-10-23">
       <description>
         <p>Row spacing is now Outlook's Density, with Full, Medium and Compact options in Settings and a Density menu on the View ribbon, so the choice sits where Outlook users expect it.</p>
