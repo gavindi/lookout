@@ -116,8 +116,8 @@
     </key>
     <key name="layout-vertical-spacing" type="s">
       <default>'medium'</default>
-      <summary>Vertical spacing in the folder and message list panes</summary>
-      <description>Vertical spacing between items in the folder and message list panes: tight (the least padding), medium (5% more padding) or loose (10% more padding). Medium is the default.</description>
+      <summary>Density of the folder and message list panes</summary>
+      <description>How much vertical space each row takes in the folder and message list panes, shown with Outlook's density names: Full (the most padding), Medium (the default) or Compact (the least). The stored values remain "loose", "medium" and "tight" so an existing setting keeps working.</description>
     </key>
     <key name="layout-message-preview-lines" type="i">
       <default>1</default>

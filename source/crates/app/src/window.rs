@@ -4019,6 +4019,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .menu_model(&reading_pane_menu)
         .build();
     let reading_pane_action = gio::SimpleAction::new_stateful("reading-pane-position", Some(glib::VariantTy::STRING), &reading_pane_action_state(&settings).to_variant());
+    // View ▸ Layout ▸ Density ▾ (UX-83, part of UX-22): Outlook's Full /
+    // Medium / Compact row spacing. It drives the stateful `win.density`
+    // action; the activation handler (which needs the two panes) is wired
+    // below, beside Settings → Appearance's "Density" row, so the two surfaces
+    // share one apply path and can never disagree. The state is normalised so
+    // an unknown stored value starts on Medium, as the panes' CSS does.
+    let initial_density = crate::settings::spacing_at(crate::settings::spacing_index(&settings.get_string(crate::settings::LAYOUT_SPACING)));
+    let density_action = gio::SimpleAction::new_stateful("density", Some(glib::VariantTy::STRING), &initial_density.to_variant());
+    let density_menu = gio::Menu::new();
+    for (value, label) in crate::settings::SPACINGS.iter().zip(crate::settings::SPACING_LABELS) {
+        density_menu.append(Some(label), Some(&format!("win.density('{value}')")));
+    }
+    let density_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["view-list-symbolic", "view-continuous-symbolic", "format-justify-fill-symbolic"]))
+        .tooltip_text(format!("Density: {}", crate::settings::spacing_label(initial_density)))
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .menu_model(&density_menu)
+        .build();
     let overview_pane_toggle = gtk::ToggleButton::builder().icon_name("x-office-calendar-symbolic").build();
     overview_pane_toggle.set_tooltip_text(Some("Calendar overview"));
     overview_pane_toggle.set_active(true);
@@ -4074,6 +4093,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             &reading_pane_button,
             themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic", "view-paged-symbolic"]),
             "Reading pane",
+        );
+        group.menu(
+            &density_button,
+            themed_icon_name(&["view-list-symbolic", "view-continuous-symbolic", "format-justify-fill-symbolic"]),
+            "Density",
         );
         group.toggle(&overview_pane_toggle, "x-office-calendar-symbolic", "Calendar overview");
     });
@@ -5396,6 +5420,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         window.add_action(action);
     }
     window.add_action(&reading_pane_action);
+    window.add_action(&density_action);
     window.add_action(&message_organization_action);
     window.add_action(&conversation_order_action);
     window.add_action(&task_sort_action);
@@ -7473,26 +7498,72 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // Config → Appearance → "Vertical spacing": swaps the `spacing-*` CSS class
-    // on the folder and message list panes, so every row in both reflows
-    // live as the choice changes (see the `.spacing-*` rules in
-    // `install_paned_css`). Written through to GSettings like the other
-    // Config rows so the choice survives restarts.
+    // View ▸ Layout ▸ Density and Config → Appearance → "Density" (UX-83)
+    // share this one apply path: it swaps the `spacing-*` CSS class on the
+    // folder and message list panes, so every row in both reflows live (see
+    // the `.spacing-*` rules in `install_paned_css`), and writes the choice
+    // through to GSettings like the other Config rows so it survives
+    // restarts. The stateful `win.density` action and the ComboRow are each
+    // written behind a suppression guard, so neither can drive the other in a
+    // loop - the same pattern as the reading-pane control above.
     {
-        let state = state.clone();
+        let density_action = density_action.clone();
+        let density_button = density_button.clone();
+        let spacing_row = config_view.spacing_row.clone();
         let folder_card = folder_card.clone().upcast::<gtk::Widget>();
         let message_list_view = message_list_view.clone().upcast::<gtk::Widget>();
         let panes = vec![folder_card, message_list_view];
-        config_view.spacing_row.connect_selected_notify(move |row| {
-            let spacing = crate::settings::spacing_at(row.selected());
-            state.borrow().settings.set_string(crate::settings::LAYOUT_SPACING, spacing);
-            for pane in &panes {
-                for class in ["spacing-tight", "spacing-medium", "spacing-loose"] {
-                    pane.remove_css_class(class);
+        let state = state.clone();
+        let suppress_row: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let apply: ApplyDensity = {
+            let density_action = density_action.clone();
+            let density_button = density_button.clone();
+            let spacing_row = spacing_row.clone();
+            let panes = panes.clone();
+            let state = state.clone();
+            let suppress_row = suppress_row.clone();
+            Rc::new(move |choice: &str, persist: bool| {
+                // Normalise first: an unknown value means Medium everywhere,
+                // as it does for the CSS class and the ComboRow index.
+                let value = crate::settings::spacing_at(crate::settings::spacing_index(choice));
+                density_action.set_state(&value.to_variant());
+                density_button.set_tooltip_text(Some(&format!("Density: {}", crate::settings::spacing_label(value))));
+                let store = state.borrow().settings.clone();
+                if persist {
+                    store.set_string(crate::settings::LAYOUT_SPACING, value);
                 }
-                pane.add_css_class(crate::settings::spacing_class(spacing));
-            }
-        });
+                for pane in &panes {
+                    for class in ["spacing-tight", "spacing-medium", "spacing-loose"] {
+                        pane.remove_css_class(class);
+                    }
+                    pane.add_css_class(crate::settings::spacing_class(value));
+                }
+                suppress_row.set(true);
+                spacing_row.set_selected(crate::settings::spacing_index(value));
+                suppress_row.set(false);
+            })
+        };
+        {
+            let apply = apply.clone();
+            density_action.connect_activate(move |_action, parameter| {
+                let Some(choice) = parameter.and_then(|p| p.str()) else { return };
+                apply(choice, true);
+            });
+        }
+        {
+            let apply = apply.clone();
+            let suppress_row = suppress_row.clone();
+            config_view.spacing_row.connect_selected_notify(move |row| {
+                if suppress_row.get() {
+                    return;
+                }
+                apply(crate::settings::spacing_at(row.selected()), true);
+            });
+        }
+        // Seed both controls from the stored value without writing anything
+        // back through.
+        let initial = state.borrow().settings.get_string(crate::settings::LAYOUT_SPACING);
+        apply(&initial, false);
     }
     // Config → Appearance → "Message preview": how many body-preview lines
     // each message-list row shows. Rewrites the live rows in place through the
@@ -8344,13 +8415,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             config_view.accent_color_button.set_rgba(&rgba);
         }
         config_view.accent_switch_row.set_active(!accent.is_empty());
-        // Appearance → "Vertical spacing": seeding fires the notify handler
-        // above, which re-swaps the panes' `spacing-*` class (a no-op for
-        // the value already applied at pane-build time). Seed separately so
-        // the ComboRow can never drift from the stored value.
-        config_view
-            .spacing_row
-            .set_selected(crate::settings::spacing_index(&persisted.get_string(crate::settings::LAYOUT_SPACING)));
+        // Appearance → "Density" needs no seed here: its shared apply path
+        // (View ▸ Layout ▸ Density and the ComboRow, wired above) seeds both
+        // controls and the panes' `spacing-*` class from the stored value when
+        // the window is built.
         // Appearance → "Message preview" and "Show sender images": seed from
         // the stored values (their notify handlers are no-ops for a value that
         // already matches, so nothing is written back on startup).

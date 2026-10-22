@@ -580,6 +580,11 @@ pub(crate) type ApplyReadingPane = Rc<dyn Fn(&str, bool)>;
 /// GSettings. Shared by View ▸ Messages and the Settings `ComboRow`.
 pub(crate) type ApplyConversationOrder = Rc<dyn Fn(&str, bool)>;
 
+/// Applies a density choice ("loose"/"medium"/"tight", UX-83) and, when the
+/// second argument is true, writes it through to GSettings. Shared by View ▸
+/// Layout ▸ Density and the Settings `ComboRow`.
+pub(crate) type ApplyDensity = Rc<dyn Fn(&str, bool)>;
+
 /// The initial state of the View ribbon's reading-pane dropdown action
 /// (`win.reading-pane-position`): "off" when the reading pane is hidden,
 /// otherwise the stored position ("right" or "bottom").

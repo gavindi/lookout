@@ -60,9 +60,10 @@ pub const LAYOUT_CALENDAR_OVERVIEW: &str = "layout-calendar-overview";
 /// How many lines of body preview each message-list row shows, 0-3 (see
 /// [`preview_lines`]); 1 is the default, matching Outlook.
 pub const LAYOUT_PREVIEW_LINES: &str = "layout-message-preview-lines";
-/// Vertical spacing between items in the folder and message list panes: one
-/// of [`SPACINGS`] ("medium" default, "tight", "loose"). Drives the
-/// `spacing-*` CSS class on both panes via [`spacing_class`].
+/// Density (row spacing) in the folder and message list panes (UX-83): one
+/// of [`SPACINGS`] ("medium" default, Outlook's Full/Medium/Compact shown via
+/// [`SPACING_LABELS`]). Drives the `spacing-*` CSS class on both panes via
+/// [`spacing_class`].
 pub const LAYOUT_SPACING: &str = "layout-vertical-spacing";
 pub const PANE_FOLDER_WIDTH_PCT: &str = "pane-folder-width-percent";
 pub const PANE_MESSAGE_LIST_WIDTH_PCT: &str = "pane-message-list-width-percent";
@@ -629,11 +630,19 @@ pub fn weekday_sun_index(day: chrono::Weekday) -> i64 {
     day.num_days_from_sunday() as i64
 }
 
-/// The `layout-vertical-spacing` setting's values, in UI (Config → Appearance
-/// → "Vertical spacing" ComboRow) order. "medium" is the default (and what an
-/// unset GSettings value resolves to); "tight" is the app's original, tightest
-/// look, and "loose" is the roomiest.
-pub const SPACINGS: [&str; 3] = ["tight", "medium", "loose"];
+/// The `layout-vertical-spacing` setting's stored values, in UI (Config →
+/// Appearance → "Density" ComboRow, and View ▸ Layout ▸ Density) order.
+/// Outlook's Full / Medium / Compact order is roomiest first, so this runs
+/// "loose", "medium", "tight"; "medium" is the default (and what an unset
+/// GSettings value resolves to). The stored identifiers deliberately keep
+/// their original tight/medium/loose spelling so an existing setting keeps
+/// working after the UI was renamed to Outlook's terms (UX-83).
+pub const SPACINGS: [&str; 3] = ["loose", "medium", "tight"];
+
+/// The Outlook label for each [`SPACINGS`] value, paired by index: "loose" is
+/// Full (the roomiest), "tight" is Compact (the tightest), matching Outlook's
+/// View ▸ Density menu (UX-83).
+pub const SPACING_LABELS: [&str; 3] = ["Full", "Medium", "Compact"];
 
 /// The CSS class each spacing value drives on the folder/message-list panes.
 /// Unknown values fall back to the default's class ("spacing-medium").
@@ -645,17 +654,24 @@ pub fn spacing_class(name: &str) -> &'static str {
     }
 }
 
-/// Index of a stored spacing value (for the config `ComboRow`); unknown
-/// values fall back to the default ("medium")'s index.
+/// Index of a stored spacing value (for the config `ComboRow` and the View
+/// ribbon's menu); unknown values fall back to the default ("medium")'s index.
 pub fn spacing_index(name: &str) -> u32 {
     let default = SPACINGS.iter().position(|s| *s == "medium").unwrap_or(1);
     SPACINGS.iter().position(|s| *s == name).unwrap_or(default) as u32
 }
 
-/// The spacing value at a [`SPACINGS`] index (from the config `ComboRow`);
-/// out-of-range indexes fall back to the default.
+/// The spacing value at a [`SPACINGS`] index (from the config `ComboRow` or the
+/// View ribbon's menu); out-of-range indexes fall back to the default.
 pub fn spacing_at(index: u32) -> &'static str {
     SPACINGS.get(index as usize).copied().unwrap_or("medium")
+}
+
+/// The Outlook label ("Full", "Medium" or "Compact") for a stored spacing
+/// value; unknown values fall back to the default's label, exactly as
+/// [`spacing_index`] and [`spacing_class`] fall back to medium.
+pub fn spacing_label(name: &str) -> &'static str {
+    SPACING_LABELS[spacing_index(name) as usize]
 }
 
 /// Where the reading pane sits, resolved from the
@@ -1071,18 +1087,31 @@ mod tests {
 
     #[test]
     fn spacing_helpers_map_values_to_css_classes_and_indexes() {
-        assert_eq!(spacing_index("tight"), 0);
+        assert_eq!(spacing_index("loose"), 0);
         assert_eq!(spacing_index("medium"), 1);
-        assert_eq!(spacing_index("loose"), 2);
+        assert_eq!(spacing_index("tight"), 2);
         assert_eq!(spacing_index("no-such-spacing"), 1, "unknown values land on the default");
-        assert_eq!(spacing_at(0), "tight");
+        assert_eq!(spacing_at(0), "loose");
         assert_eq!(spacing_at(1), "medium");
-        assert_eq!(spacing_at(2), "loose");
+        assert_eq!(spacing_at(2), "tight");
         assert_eq!(spacing_at(99), "medium", "out-of-range indexes land on the default");
         assert_eq!(spacing_class("tight"), "spacing-tight");
         assert_eq!(spacing_class("medium"), "spacing-medium");
         assert_eq!(spacing_class("loose"), "spacing-loose");
         assert_eq!(spacing_class("no-such-spacing"), "spacing-medium");
+    }
+
+    #[test]
+    fn spacing_labels_follow_outlooks_full_medium_compact_order() {
+        // UX-83: Outlook's names for the same stored values, roomiest first.
+        assert_eq!(spacing_label("loose"), "Full");
+        assert_eq!(spacing_label("medium"), "Medium");
+        assert_eq!(spacing_label("tight"), "Compact");
+        assert_eq!(spacing_label("no-such-spacing"), "Medium", "unknown values land on the default");
+        for (index, value) in SPACINGS.iter().enumerate() {
+            assert_eq!(spacing_at(index as u32), *value, "values and labels stay index-paired");
+            assert_eq!(SPACING_LABELS[index], spacing_label(value));
+        }
     }
 
     #[test]

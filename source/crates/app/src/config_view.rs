@@ -257,10 +257,11 @@ pub struct ConfigView {
     /// newly-opened HTML messages start with the header's "Switch message
     /// theme" override applied.
     pub message_theme_dark_row: adw::SwitchRow,
-    /// "Vertical spacing" dropdown (Config → Appearance), exposed so the caller
-    /// can seed it from the `layout-vertical-spacing` GSettings key and map
-    /// its selection to the `spacing-*` CSS class on the folder and message
-    /// list panes.
+    /// "Density" dropdown (Config → Appearance, UX-83): Full / Medium /
+    /// Compact, exposed so the caller can seed it from the
+    /// `layout-vertical-spacing` GSettings key and map its selection to the
+    /// `spacing-*` CSS class on the folder and message list panes. The View
+    /// ribbon's Density menu drives the same setting.
     pub spacing_row: adw::ComboRow,
     /// "Reading pane" dropdown (Config → Appearance): Right / Bottom / Off.
     /// Exposed so the caller can seed it from the `layout-reading-pane`
@@ -1011,13 +1012,15 @@ pub fn build() -> ConfigView {
         .build();
     general_group.add(&tray_icon_row);
 
-    // The "Vertical spacing" choice lives on the Appearance page rather than
-    // a separate Layout section - it's about how the panes look. Spacing
-    // between items in the folder and message list panes.
-    let spacing_model = gtk::StringList::new(&["Tight", "Medium", "Loose"]);
+    // The "Density" choice (UX-83) lives on the Appearance page rather than
+    // a separate Layout section - it's about how the panes look. Its labels
+    // come from `settings::SPACING_LABELS`, in Outlook's Full / Medium /
+    // Compact order, so this row and the View ribbon's Density menu can never
+    // drift apart.
+    let spacing_model = gtk::StringList::new(&crate::settings::SPACING_LABELS);
     let spacing_row = adw::ComboRow::builder()
-        .title("Vertical spacing")
-        .subtitle("Spacing between items in the folder and message list panes")
+        .title("Density")
+        .subtitle("Row spacing in the folder pane and message list")
         .model(&spacing_model)
         .build();
     appearance_group.add(&spacing_row);

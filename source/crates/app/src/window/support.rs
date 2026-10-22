@@ -239,17 +239,19 @@ pub(crate) fn install_paned_css() {
         .empty-state-icon {
             opacity: 0.5;
         }
-        /* The panes' vertical spacing around items (Config → Appearance →
-           'Vertical spacing'): the whole point of the setting is that every
-           row kind in a pane moves together, so all the folder rows and all
-           the message-list row kinds share one value per level. The `tight`
-           rules are the app's original look; `spacing-medium` / `spacing-
-           loose` add 5% / 20% more padding (rounded to whole pixels); in
-           `spacing-loose` the folder rows get 20% more again than the
-           message rows. The folder row's margin rides on the name label
-           (`folder-row-label`) and unread count, so `bind` must keep those
-           classes on every row (headings included) - replacing them is what
-           used to leave the folder items unspaced. */
+        /* The panes' density around items (Config → Appearance → 'Density',
+           UX-83): the whole point of the setting is that every row kind in a
+           pane moves together, so all the folder rows and all the
+           message-list row kinds share one value per level. Outlook's names
+           map on as Full = `spacing-loose` (roomiest), Medium =
+           `spacing-medium` (the default) and Compact = `spacing-tight` (the
+           app's original look). The `tight` rules therefore stay as they
+           were; `spacing-medium` / `spacing-loose` add 5% / 20% more padding
+           (rounded to whole pixels); in `spacing-loose` the folder rows get
+           20% more again than the message rows. The folder row's margin rides
+           on the name label (`folder-row-label`) and unread count, so `bind`
+           must keep those classes on every row (headings included) -
+           replacing them is what used to leave the folder items unspaced. */
         .message-list .message-text,
         .message-list .message-thread-row,
         .folder-pane .folder-row-label,
