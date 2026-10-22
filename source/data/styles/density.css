@@ -1,0 +1,65 @@
+/* The panes' density around items (Config → Appearance → 'Density',
+   UX-83): the whole point of the setting is that every row kind in a
+   pane moves together, so all the folder rows and all the
+   message-list row kinds share one value per level. Outlook's names
+   map on as Full = `spacing-loose` (roomiest), Medium =
+   `spacing-medium` (the default) and Compact = `spacing-tight` (the
+   app's original look). The `tight` rules therefore stay as they
+   were; `spacing-medium` / `spacing-loose` add 5% / 20% more padding
+   (rounded to whole pixels); in `spacing-loose` the folder rows get
+   20% more again than the message rows. The folder row's margin rides
+   on the name label (`folder-row-label`) and unread count, so `bind`
+   must keep those classes on every row (headings included) -
+   replacing them is what used to leave the folder items unspaced. */
+.message-list .message-text,
+.message-list .message-thread-row,
+.folder-pane .folder-row-label,
+.folder-pane .folder-unread-count {
+    margin-top: 6px;
+    margin-bottom: 6px;
+}
+.message-list .message-section-header {
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+.message-list.spacing-medium .message-text,
+.message-list.spacing-medium .message-thread-row,
+.folder-pane.spacing-medium .folder-row-label,
+.folder-pane.spacing-medium .folder-unread-count {
+    margin-top: 7px;
+    margin-bottom: 7px;
+}
+.message-list.spacing-medium .message-section-header {
+    margin-top: 5px;
+    margin-bottom: 5px;
+}
+.message-list.spacing-loose .message-text,
+.message-list.spacing-loose .message-thread-row {
+    margin-top: 10px;
+    margin-bottom: 10px;
+}
+/* The avatar and the Select-mode checkbox sit on the sender line, so
+   they follow the same top margin the text column's density level
+   uses - otherwise the avatar would float above the sender by the
+   pane's row padding. */
+.message-list .message-avatar,
+.message-list .message-select-checkbox {
+    margin-top: 6px;
+}
+.message-list.spacing-medium .message-avatar,
+.message-list.spacing-medium .message-select-checkbox {
+    margin-top: 7px;
+}
+.message-list.spacing-loose .message-avatar,
+.message-list.spacing-loose .message-select-checkbox {
+    margin-top: 10px;
+}
+.message-list.spacing-loose .message-section-header {
+    margin-top: 7px;
+    margin-bottom: 7px;
+}
+.folder-pane.spacing-loose .folder-row-label,
+.folder-pane.spacing-loose .folder-unread-count {
+    margin-top: 12px;
+    margin-bottom: 12px;
+}

@@ -368,7 +368,7 @@ pub(crate) type FlagOpenHandler = Rc<dyn Fn(EmailSummary) + 'static>;
 /// `categories` is the shared category master list (2.1), kept live for the
 /// rows' category chips.
 pub fn build_tasks_view(categories: Rc<RefCell<CategorySet>>) -> TasksView {
-    install_tasks_css();
+    crate::style::install();
     let list = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
@@ -764,28 +764,6 @@ pub(crate) fn flagged_mail_row(message: &EmailSummary, today: NaiveDate, complet
 /// put tasks". Has no effect while tasks exist.
 pub fn set_empty_message(view: &TasksView, message: &str) {
     *view.empty_message.borrow_mut() = message.to_string();
-}
-
-/// The tasks list's handful of display-level CSS rules, installed once per
-/// process (multiple installs are harmless, but a `Once` keeps it to one).
-fn install_tasks_css() {
-    use std::sync::Once;
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(
-            ".task-summary-done {
-                text-decoration: line-through;
-                color: alpha(currentColor, 0.6);
-            }
-            .task-due-overdue {
-                color: @lookout-task-overdue;
-            }",
-        );
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        }
-    });
 }
 
 /// Repaints the whole list from `tasks`, arranged by the view's current

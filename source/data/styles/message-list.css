@@ -1,0 +1,128 @@
+.hover-quick-actions {
+    background-color: @theme_bg_color;
+    border-radius: 8px;
+    padding: 2px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+button.hover-quick-action {
+    background-color: @theme_bg_color;
+    border-radius: 6px;
+    padding: 1px;
+    min-width: 22px;
+    min-height: 22px;
+    box-shadow: none;
+}
+button.hover-quick-action:hover {
+    background-color: @theme_selected_bg_color;
+    color: @theme_selected_fg_color;
+}
+
+button.list-header-action {
+    min-width: 24px;
+    min-height: 24px;
+    padding: 2px;
+}
+/* Zeroing the row's own padding is what lets the unread accent bar
+   sit flush against the pane's leading edge, and flattens the
+   selection highlight's inset to a full-bleed band. */
+.message-list > row {
+    padding: 0;
+}
+/* The empty-state placeholder's icon (empty mail folders, the empty
+   Favourites bucket): the artwork is drawn white, so it reads best at
+   reduced opacity against the pane in both schemes. */
+.empty-state-icon {
+    opacity: 0.5;
+}
+
+.message-row {
+    border-bottom: 1px solid @lookout-row-separator;
+}
+.attachment-row {
+    padding: 4px 6px;
+    border-radius: 6px;
+}
+.attachment-row:hover {
+    background-color: @theme_selected_bg_color;
+    color: @theme_selected_fg_color;
+}
+.message-accent-bar {
+    background-color: transparent;
+}
+.message-accent-bar.unread {
+    background-color: @lookout-unread;
+}
+/* The attachment and meeting-invite indicators, dimmed so they stay
+   secondary to the sender/subject text and the pin marker. */
+.message-row-icon {
+    color: alpha(currentColor, 0.5);
+}
+
+.message-sender-unread,
+.message-subject-unread,
+.message-date-unread {
+    color: @lookout-unread;
+    font-weight: bold;
+}
+.message-sender-read,
+.message-date-read {
+    color: @lookout-muted;
+}
+.message-subject-read {
+    color: @lookout-subject;
+}
+.message-preview {
+    color: @lookout-muted;
+    opacity: 0.75;
+    font-size: 0.95em;
+}
+/* The category chip strip (UX-28), a line of its own under the
+   preview: a neutral pill with the category's preset colour as its
+   dot, so the name reads and the colour stays the identifier. */
+.message-category-row {
+    margin-top: 2px;
+}
+.message-category-chip {
+    background-color: alpha(currentColor, 0.08);
+    border-radius: 9999px;
+    padding: 0 7px 0 5px;
+}
+.message-category-chip-label,
+.message-category-overflow {
+    font-size: 0.82em;
+}
+.message-category-overflow {
+    color: @lookout-muted;
+}
+.message-section-header {
+    background-color: @lookout-section-header-bg;
+    border-top: 1px solid @lookout-row-separator;
+    border-bottom: 1px solid @lookout-row-separator;
+}
+/* Conversation headers read as a distinct row kind from both section
+   headers (darker band) and messages (bordered): a subtle tint that
+   also backs the expander's chevron so the thread's disclosure is
+   visible against the background image. */
+.message-thread-row {
+    background-color: @lookout-thread-row-bg;
+    border-bottom: 1px solid @lookout-row-separator;
+}
+/* The participant-count badge: a pill so the number reads as a count,
+   not a fourth text column. */
+.message-thread-count {
+    font-size: 0.9em;
+    background-color: @lookout-thread-count-bg;
+    border-radius: 9999px;
+    padding: 0 7px;
+}
+.message-column-header {
+    background-color: @lookout-column-header-bg;
+    border-top: 1px solid @lookout-row-separator;
+    border-bottom: 1px solid @lookout-row-separator;
+    padding: 4px 0;
+}
+.message-column-header label {
+    color: @lookout-column-header-fg;
+    font-size: 0.85em;
+    font-weight: bold;
+}

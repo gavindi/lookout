@@ -1,0 +1,9 @@
+/* Tasks list: completed and overdue text states. */
+
+.task-summary-done {
+    text-decoration: line-through;
+    color: alpha(currentColor, 0.6);
+}
+.task-due-overdue {
+    color: @lookout-task-overdue;
+}

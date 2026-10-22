@@ -1,0 +1,100 @@
+/* Calendar chrome: flat hairline grids instead of libadwaita's rounded
+   `.card` panels, with a bordered highlight for today, matching the Outlook
+   reference. The Day/Week/Work week grids are custom-drawn (their old
+   `.calendar-hour-cell` CSS lives on as the Cairo `GRID_*_RGB` tones in
+   `paint_time_grid`). Per-calendar `.calendar-event-<hex>` chip rules and the
+   colour picker's swatch fills are generated at runtime by
+   `rebuild_calendar_checklist`. */
+
+.calendar-day-cell {
+    border: 1px solid alpha(currentColor, 0.08);
+}
+.calendar-today-cell {
+    border: 2px solid @accent_bg_color;
+}
+.calendar-selected-cell {
+    border: 2px solid alpha(currentColor, 0.35);
+}
+.calendar-drag-target {
+    border: 2px solid alpha(currentColor, 0.45);
+}
+/* The same translucent fill as every other pane (`.folder-pane`), so
+   the window background image shows through every calendar view. */
+.calendar-main-background {
+    background-color: @lookout-pane-bg;
+    border-radius: 12px;
+}
+.calendar-toggle {
+    padding: 2px 4px;
+    border-radius: 6px;
+    background: transparent;
+    box-shadow: none;
+}
+.calendar-toggle:hover,
+.calendar-toggle:active,
+.calendar-toggle:checked {
+    background: transparent;
+    box-shadow: none;
+}
+.mini-calendar-event-day,
+.mini-calendar-today {
+    font-weight: bold;
+}
+/* Half-width variant of the mini month grid, used by the Mail view's
+   right-hand overview pane. A `Gtk.Button` under Adwaita asks for
+   min-width 16px + 10px horizontal padding either side, so seven of
+   them force the grid to ~260px of natural width no matter what
+   `width_request` the surrounding box sets. Stripping the padding and
+   dropping to a caption-sized font halves each cell, which is what
+   lets the pane actually render at its requested width. */
+.mini-calendar-compact button {
+    min-width: 0;
+    min-height: 0;
+    padding: 1px 2px;
+}
+.mini-calendar-compact label {
+    font-size: 0.8em;
+}
+/* The Calendar sidebar's mini month grid keeps its normal font and
+   width, but sheds the theme's default button chrome so the cells
+   aren't bloated to ~36px each (16px min-width + 10px padding per
+   side, the same Adwaita default `.mini-calendar-compact` exists to
+   fight) - without a floor, seven cells would push the grid well past
+   the sidebar's 240px width request. */
+.mini-calendar-sidebar button {
+    min-width: 0;
+    min-height: 0;
+    padding: 4px 6px;
+}
+.mini-calendar-today {
+    color: @accent_bg_color;
+}
+.calendar-account-header {
+    font-weight: bold;
+}
+.calendar-toggle-label {
+    font-weight: normal;
+}
+/* The colour picker's swatches (the calendar row menu's Change
+   colour submenu). The background comes from a per-colour
+   `.calendar-swatch-<hex>` rule the checklist writes into
+   `check_colors`; this is the shared chrome. */
+.calendar-color-swatch {
+    min-width: 18px;
+    min-height: 18px;
+    padding: 0;
+    border-radius: 4px;
+    border: 1px solid alpha(currentColor, 0.25);
+}
+.calendar-color-swatch:hover {
+    border-color: @accent_bg_color;
+}
+/* Month-grid and Split-view event chips are plain boxes (so the grid's
+   own gesture keeps seeing clicks - see `clickable_event_label`); this
+   strips any default box chrome so the `.calendar-event-<hex>` rule
+   alone paints the tint, stripe and radius. */
+.calendar-event-chip-button {
+    padding: 0;
+    min-width: 0;
+    min-height: 0;
+}

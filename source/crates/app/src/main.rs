@@ -86,6 +86,7 @@ mod shared_mailbox;
 mod shortcuts;
 mod signatures;
 mod snooze;
+mod style;
 mod task_editor;
 mod task_lists;
 mod task_recurrence;

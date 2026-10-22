@@ -129,7 +129,7 @@ pub struct LookoutView {
 /// over outstanding-tasks over upcoming events - each card with an
 /// empty-state placeholder.
 pub fn build_lookout_view() -> LookoutView {
-    install_lookout_css();
+    crate::style::install();
 
     // --- AI Chat: a prompt field (placeholder "Summarize my inbox") with
     // a green Go button, over the assistant's reply rendered in a read-only
@@ -488,26 +488,6 @@ fn append_empty(box_: &gtk::Box, text: &str) {
         .build();
     crate::privacy::mark_ui(&placeholder);
     box_.append(&placeholder);
-}
-
-/// The dashboard's handful of display-level CSS rules, installed once per
-/// process (multiple installs are harmless, but a `Once` keeps it to one).
-fn install_lookout_css() {
-    use std::sync::Once;
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(
-            ".lookout-count {
-                color: @lookout-unread;
-                font-weight: bold;
-                font-feature-settings: 'tnum';
-            }",
-        );
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        }
-    });
 }
 
 /// One block-level unit [`parse_blocks`] recognizes: either a heading

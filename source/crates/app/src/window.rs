@@ -80,7 +80,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // reference its `lookout-*` tokens. Seeded from GSettings when the Config
     // rows are wired further down.
     let theme_manager = crate::theme::ThemeManager::install();
-    install_paned_css();
+    crate::style::install();
     // Privacy mode's blur provider (Config → Advanced → "Blur sensitive
     // information"). Installed disabled; seeded from GSettings when the
     // Advanced rows are wired further down.
@@ -2268,7 +2268,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_card.add_css_class("card-flush-start");
     message_card.set_margin_start(0);
     // Halves the gap to the reading pane: that gap is this margin plus the
-    // Paned separator (12px, see `install_paned_css`) plus the reading
+    // Paned separator (12px, see `data/styles/shell.css`) plus the reading
     // card's own start margin, so dropping both card margins to 0 takes it
     // from 24px to 12px. Zeroing the margins rather than narrowing the
     // separator keeps the whole gap draggable - the separator is
@@ -4567,7 +4567,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // mini-calendar.
     let mail_calendar_overview = calendar_view::build_mini(calendar_prefs.week_start);
     // Half-width day cells (see `.mini-calendar-compact` in
-    // `install_calendar_css`). The day buttons' own natural size is what set
+    // `data/styles/calendar.css`). The day buttons' own natural size is what set
     // the pane's real width - the `width_request` below is only a floor - so
     // narrowing the pane means narrowing the buttons.
     mail_calendar_overview.root.add_css_class("mini-calendar-compact");
@@ -7715,7 +7715,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // View ▸ Layout ▸ Density and Config → Appearance → "Density" (UX-83)
     // share this one apply path: it swaps the `spacing-*` CSS class on the
     // folder and message list panes, so every row in both reflows live (see
-    // the `.spacing-*` rules in `install_paned_css`), and writes the choice
+    // the `.spacing-*` rules in `data/styles/density.css`), and writes the choice
     // through to GSettings like the other Config rows so it survives
     // restarts. The stateful `win.density` action and the ComboRow are each
     // written behind a suppression guard, so neither can drive the other in a

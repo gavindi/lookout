@@ -1,0 +1,7 @@
+/* Lookout dashboard: the highlighted task/event count. */
+
+.lookout-count {
+    color: @lookout-unread;
+    font-weight: bold;
+    font-feature-settings: 'tnum';
+}

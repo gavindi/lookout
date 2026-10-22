@@ -1,0 +1,16 @@
+entry.header-search-entry {
+    background-color: @lookout-header-search-bg;
+}
+.search-refiner-chip {
+    background-color: @lookout-thread-count-bg;
+    border-radius: 9999px;
+    padding: 1px 4px 1px 10px;
+}
+.search-refiner-chip label {
+    font-size: 0.9em;
+}
+.search-refiner-chip button {
+    min-width: 18px;
+    min-height: 18px;
+    padding: 0;
+}

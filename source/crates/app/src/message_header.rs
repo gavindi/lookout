@@ -271,8 +271,8 @@ pub fn initials(name: Option<&str>, address: &str) -> String {
 
 /// Picks a deterministic avatar background color class from `seed` (the
 /// sender's address), so the same sender always gets the same color - a
-/// fixed palette of CSS classes registered once (see `install_paned_css`)
-/// rather than per-instance inline styling.
+/// fixed palette of CSS classes registered once (see
+/// `data/styles/message-header.css`) rather than per-instance inline styling.
 pub fn avatar_color_class(seed: &str) -> &'static str {
     let hash = seed.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     AVATAR_COLOR_CLASSES[(hash as usize) % AVATAR_COLOR_CLASSES.len()]

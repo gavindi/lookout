@@ -223,114 +223,6 @@ struct DayCell {
     events_box: gtk::Box,
 }
 
-/// Flat hairline grids (`.calendar-day-cell`) instead of libadwaita's rounded
-/// `.card` panels, and a bordered highlight for today (`.calendar-today-cell`) -
-/// matches the Outlook reference this view is styled against. The Day/Week/Work
-/// week grids are fully custom-drawn now (their old `.calendar-hour-cell` CSS
-/// lives on as the Cairo `GRID_*_RGB` tones in [`paint_time_grid`]). Registered
-/// once (from [`build_main`]) on the default display, same pattern as
-/// `window.rs`'s `install_paned_css()`.
-fn install_calendar_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(
-        ".calendar-day-cell {
-            border: 1px solid alpha(currentColor, 0.08);
-        }
-        .calendar-today-cell {
-            border: 2px solid @accent_bg_color;
-        }
-        .calendar-selected-cell {
-            border: 2px solid alpha(currentColor, 0.35);
-        }
-        .calendar-drag-target {
-            border: 2px solid alpha(currentColor, 0.45);
-        }
-        /* The same translucent fill as every other pane (`.folder-pane`), so
-           the window background image shows through every calendar view. */
-        .calendar-main-background {
-            background-color: @lookout-pane-bg;
-            border-radius: 12px;
-        }
-        .calendar-toggle {
-            padding: 2px 4px;
-            border-radius: 6px;
-            background: transparent;
-            box-shadow: none;
-        }
-        .calendar-toggle:hover,
-        .calendar-toggle:active,
-        .calendar-toggle:checked {
-            background: transparent;
-            box-shadow: none;
-        }
-        .mini-calendar-event-day,
-        .mini-calendar-today {
-            font-weight: bold;
-        }
-        /* Half-width variant of the mini month grid, used by the Mail view's
-           right-hand overview pane. A `Gtk.Button` under Adwaita asks for
-           min-width 16px + 10px horizontal padding either side, so seven of
-           them force the grid to ~260px of natural width no matter what
-           `width_request` the surrounding box sets. Stripping the padding and
-           dropping to a caption-sized font halves each cell, which is what
-           lets the pane actually render at its requested width. */
-        .mini-calendar-compact button {
-            min-width: 0;
-            min-height: 0;
-            padding: 1px 2px;
-        }
-        .mini-calendar-compact label {
-            font-size: 0.8em;
-        }
-        /* The Calendar sidebar's mini month grid keeps its normal font and
-           width, but sheds the theme's default button chrome so the cells
-           aren't bloated to ~36px each (16px min-width + 10px padding per
-           side, the same Adwaita default `.mini-calendar-compact` exists to
-           fight) - without a floor, seven cells would push the grid well past
-           the sidebar's 240px width request. */
-        .mini-calendar-sidebar button {
-            min-width: 0;
-            min-height: 0;
-            padding: 4px 6px;
-        }
-        .mini-calendar-today {
-            color: @accent_bg_color;
-        }
-        .calendar-account-header {
-            font-weight: bold;
-        }
-        .calendar-toggle-label {
-            font-weight: normal;
-        }
-        /* The colour picker's swatches (the calendar row menu's Change
-           colour submenu). The background comes from a per-colour
-           `.calendar-swatch-<hex>` rule the checklist writes into
-           `check_colors`; this is the shared chrome. */
-        .calendar-color-swatch {
-            min-width: 18px;
-            min-height: 18px;
-            padding: 0;
-            border-radius: 4px;
-            border: 1px solid alpha(currentColor, 0.25);
-        }
-        .calendar-color-swatch:hover {
-            border-color: @accent_bg_color;
-        }
-        /* Month-grid and Split-view event chips are plain boxes (so the grid's
-           own gesture keeps seeing clicks - see `clickable_event_label`); this
-           strips any default box chrome so the `.calendar-event-<hex>` rule
-           alone paints the tint, stripe and radius. */
-        .calendar-event-chip-button {
-            padding: 0;
-            min-width: 0;
-            min-height: 0;
-        }",
-    );
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    }
-}
-
 /// A single 6-week, Sunday-first month grid. Deliberately dumb and read-only:
 /// no drag/resize/creation, no per-event click handling, and no header row -
 /// the header (Today/prev/next + current-month dropdown) is owned by
@@ -3527,7 +3419,7 @@ pub struct CalendarMain {
 
 pub fn build_main(prefs: &crate::settings::CalendarPreferences) -> CalendarMain {
     let week_start = prefs.week_start;
-    install_calendar_css();
+    crate::style::install();
 
     let header_label = gtk::Label::builder().css_classes(["title-2"]).hexpand(true).xalign(0.0).build();
     let prev_button = gtk::Button::from_icon_name("go-previous-symbolic");
@@ -4547,9 +4439,9 @@ pub fn build_calendar_sections(fallbacks: &[CalendarFallbackSection], groups: &[
 /// Every calendar's row is tinted with its assigned colour from `colors` (the
 /// colour normally lives in `calendar_colors::load`, but this function only
 /// needs the map - the caller resolves/persists assignments). The same pass
-/// writes the matching `.calendar-event-<hex>` chip rules and the colour
-/// picker's swatch rules into `check_colors`, a display-level provider owned
-/// by the caller.
+/// writes one `.calendar-event-<hex>` chip rule set per distinct colour and
+/// the colour picker's (cached) swatch rules into `check_colors`, a
+/// display-level provider owned by the caller.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild_calendar_checklist(
     container: &gtk::Box,
@@ -4564,6 +4456,10 @@ pub fn rebuild_calendar_checklist(
 ) {
     clear_children(container);
     let mut css = String::new();
+    // One chip-rule set per distinct colour, not one per calendar: most
+    // calendars share a palette entry, so emitting per calendar duplicated
+    // the same six rules (and re-parsed them) on every rebuild.
+    let mut emitted_colors: HashSet<&str> = HashSet::new();
     if sections.is_empty() {
         let placeholder = gtk::Label::builder()
             .label("No calendars connected")
@@ -4600,7 +4496,9 @@ pub fn rebuild_calendar_checklist(
         }
         for calendar in &section.calendars {
             let color = colors.get(&calendar.id).map(String::as_str).unwrap_or(calendar_colors::DEFAULT_CHECK_COLOR);
-            css.push_str(&calendar_color_css(color));
+            if emitted_colors.insert(color) {
+                css.push_str(&calendar_color_css(color));
+            }
             let id = calendar.id.clone();
             let on_toggle = on_toggle.clone();
             let toggle = calendar_toggle_row(&calendar.display_name, color, checked.contains(&calendar.id), move |is_checked| {
@@ -4613,12 +4511,9 @@ pub fn rebuild_calendar_checklist(
             container.append(&row);
         }
     }
-    // The colour picker's swatch grid: one background rule per palette colour.
-    // Written into the same provider the chip rules use, so it is (re)parsed
-    // once per checklist rebuild.
-    for hex in calendar_colors::CALENDAR_PALETTE {
-        css.push_str(&format!(".calendar-swatch-{} {{ background-color: {hex}; }}\n", hex.trim_start_matches('#')));
-    }
+    // The colour picker's swatch grid: one background rule per palette colour,
+    // generated once per process and appended to the per-checklist chip rules.
+    css.push_str(calendar_swatch_css());
     append_checklist_footer(container, &on_action, hidden_count);
     check_colors.load_from_string(&css);
 }
@@ -4870,6 +4765,20 @@ fn calendar_color_css(color: &str) -> String {
          .calendar-event-{hex}.calendar-show-oof {{ background-color: alpha(#7b2cbf, 0.30); border-left: 5px solid #7b2cbf; }}\n\
          .calendar-event-{hex}.calendar-event-cancelled {{ opacity: 0.6; }}\n"
     )
+}
+
+/// The colour picker's swatch rules: one background per palette colour.
+/// Constant for the life of the process, so it is generated once and
+/// appended to each checklist rebuild's provider rather than rebuilt with it.
+fn calendar_swatch_css() -> &'static str {
+    use std::sync::OnceLock;
+    static CSS: OnceLock<String> = OnceLock::new();
+    CSS.get_or_init(|| {
+        calendar_colors::CALENDAR_PALETTE
+            .iter()
+            .map(|hex| format!(".calendar-swatch-{} {{ background-color: {hex}; }}\n", hex.trim_start_matches('#')))
+            .collect()
+    })
 }
 
 /// The calendar view's left sidebar: a mini month-picker, an "Add calendar"

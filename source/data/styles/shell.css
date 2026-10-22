@@ -1,0 +1,39 @@
+paned > separator {
+    background: none;
+    border: none;
+    box-shadow: none;
+    min-width: 12px;
+    min-height: 12px;
+}
+
+/* The black widget overlaid on the window background image while the
+   user dims it (Config → Appearance → 'Background dimming'): its
+   opacity, set from the widget, controls how much the image darkens
+   toward black. */
+.window-background-dim {
+    background-color: @lookout-dim;
+}
+
+.reading-pane-transparent {
+    background-color: transparent;
+}
+.card-flush-end {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+.card-flush-start {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+.seamless-paned > separator {
+    min-width: 6px;
+    min-height: 6px;
+}
+.window-toolbars-background {
+    background-color: @lookout-toolbar-band;
+    border-radius: 8px;
+}
+.window-icon-toolbar-background {
+    background-color: @lookout-icon-toolbar-bg;
+    border-radius: 8px;
+}

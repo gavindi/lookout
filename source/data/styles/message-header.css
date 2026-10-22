@@ -1,0 +1,32 @@
+.message-header-subject {
+    font-weight: bold;
+    font-size: 1.05em;
+}
+.message-subject-bar {
+    background-color: @lookout-subject-bar-bg;
+    border-bottom: 1px solid @lookout-subject-bar-border;
+    padding: 10px 12px;
+}
+.message-action-bar {
+    padding: 10px 12px;
+}
+.message-header-meta {
+    opacity: 0.7;
+}
+.avatar-circle {
+    border-radius: 9999px;
+    color: white;
+    font-weight: bold;
+}
+/* The contact photo layered over the initials. Clipped to the same
+   circle as the initials background so an avatar reads as one shape
+   whether it shows a photo or coloured initials. */
+.avatar-photo {
+    border-radius: 9999px;
+}
+.avatar-color-0 { background-color: @lookout-avatar-0; }
+.avatar-color-1 { background-color: @lookout-avatar-1; }
+.avatar-color-2 { background-color: @lookout-avatar-2; }
+.avatar-color-3 { background-color: @lookout-avatar-3; }
+.avatar-color-4 { background-color: @lookout-avatar-4; }
+.avatar-color-5 { background-color: @lookout-avatar-5; }

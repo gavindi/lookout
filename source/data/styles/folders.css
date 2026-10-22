@@ -1,0 +1,44 @@
+.folder-pane {
+    background-color: @lookout-pane-bg;
+}
+
+/* The folder rows' trailing unread count. Bold and accent-blue to
+   match the message list's unread rows. Tabular figures ('tnum') so
+   the digits are the same width in every row - without them the
+   counts visibly jitter as they update. */
+.folder-unread-count {
+    color: @lookout-unread;
+    font-weight: bold;
+    font-size: 0.9em;
+    font-feature-settings: 'tnum';
+    padding-right: 6px;
+}
+.folder-pane listview,
+.folder-pane list,
+.folder-pane scrolledwindow {
+    background-color: transparent;
+}
+/* A folder or tag row accepting a message drag: a rounded accent
+   outline marks the drop target while the drag hovers over it. */
+.lookout-drop-target {
+    outline: 2px solid alpha(currentColor, 0.45);
+    outline-offset: -2px;
+    border-radius: 8px;
+}
+
+/* A folder switched to its total count (Change folder count): muted
+   and regular weight, so it doesn't read as unread mail. */
+.folder-unread-count.folder-count-total {
+    color: @lookout-muted;
+    font-weight: normal;
+}
+button.folder-color-swatch {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+    border-radius: 50%;
+}
+button.folder-color-swatch.selected {
+    outline: 2px solid @theme_fg_color;
+    outline-offset: 2px;
+}
