@@ -437,6 +437,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             handle.top_row.remove(&handle.status_label);
             handle.top_row.remove(&handle.from_dropdown);
             handle.top_row.remove(&handle.read_receipt_toggle);
+            handle.top_row.remove(&handle.light_view_button);
             // A button to pop the composer back into the reading pane
             // without closing the session: it closes the window, and the
             // close handler below performs the pop-back-in (the same path
@@ -452,14 +453,15 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // (each new call lands leftmost), end-side children are appended
             // outward (each new call lands further right), so this yields,
             // left to right: [from, send | title | status, cancel, back,
-            // read receipt] - the read-receipt toggle is now the outermost
-            // widget on the right.
+            // read receipt, light view] - "View in Light Mode" is now the
+            // outermost widget on the right.
             header.pack_start(&handle.send_button);
             header.pack_start(&handle.from_dropdown);
             header.pack_end(&handle.status_label);
             header.pack_end(&handle.cancel_button);
             header.pack_end(&back_button);
             header.pack_end(&handle.read_receipt_toggle);
+            header.pack_end(&handle.light_view_button);
             let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
             content_box.append(&header);
             content_box.append(&handle.widget);
@@ -494,13 +496,16 @@ pub(crate) fn show_composer_in_reading_pane_full(
                         handle.status_label.unparent();
                         handle.from_dropdown.unparent();
                         handle.read_receipt_toggle.unparent();
+                        handle.light_view_button.unparent();
                         handle.top_row.prepend(&handle.from_dropdown);
                         handle.top_row.prepend(&handle.send_button);
                         handle.top_row.append(&handle.cancel_button);
                         handle.top_row.append(&handle.status_label);
                         handle.top_row.reorder_child_after(&handle.status_label, Some(&handle.title_label));
                         handle.top_row.append(&handle.read_receipt_toggle);
-                        handle.top_row.reorder_child_after(&handle.read_receipt_toggle, Some(&handle.status_label));
+                        handle.top_row.append(&handle.light_view_button);
+                        handle.top_row.reorder_child_after(&handle.light_view_button, Some(&handle.status_label));
+                        handle.top_row.reorder_child_after(&handle.read_receipt_toggle, Some(&handle.light_view_button));
                         if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
                             reading_stack_for_close.remove(&existing);
                         }

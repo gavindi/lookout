@@ -66,6 +66,8 @@ pub struct PopOutHandle {
     pub send_button: adw::SplitButton,
     pub from_dropdown: gtk::DropDown,
     pub read_receipt_toggle: gtk::ToggleButton,
+    /// "View in Light Mode", which rides with the read-receipt toggle.
+    pub light_view_button: gtk::ToggleButton,
     /// The composer's own header row, which the widgets above are removed
     /// from while popped out and restored to on pop-back-in.
     pub top_row: gtk::Box,
@@ -599,12 +601,43 @@ fn text_to_html(text: &str) -> String {
 
 /// Wraps the editor's body HTML in a full document for `WebView::load_html`,
 /// with a minimal stylesheet so quoted text stays visually distinct while
-/// composing.
+/// composing. The page follows the light/dark scheme (with the reading pane's
+/// dark colours) and leaves its background to the pane behind it, unless the
+/// composer's "View in Light Mode" puts [`LIGHT_VIEW_CLASS`] on the root; none
+/// of this is sent, since `read_content` reads only the body's contents.
+/// The editor page's root class while the composer is viewed in light mode.
+const LIGHT_VIEW_CLASS: &str = "lookout-light-view";
+
+/// Shows the rich editor's page in light mode (`true`: black text on a white
+/// page, as most recipients will see it) or following the app's scheme over
+/// the pane (`false`, the default). Only the view changes, never the message.
+fn set_light_view(web_view: &webkit::WebView, light: bool) {
+    let canvas = if light {
+        gtk::gdk::RGBA::new(1.0, 1.0, 1.0, 1.0)
+    } else {
+        gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)
+    };
+    web_view.set_background_color(&canvas);
+    let script = format!("document.documentElement.classList.toggle('{LIGHT_VIEW_CLASS}', {light});");
+    let web_view = web_view.clone();
+    glib::spawn_future_local(async move {
+        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+    });
+}
+
 fn html_document(body: &str) -> String {
     format!(
         r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+:root {{ color-scheme: light dark; }}
+:root.{LIGHT_VIEW_CLASS} {{ color-scheme: light; }}
+html, body {{ background: transparent; }}
 body {{ font-family: system-ui, sans-serif; font-size: 12pt; margin: 8px; }}
 blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid #999; color: #555; }}
+@media (prefers-color-scheme: dark) {{
+:root:not(.{LIGHT_VIEW_CLASS}) body {{ color: #f0f0f2; }}
+:root:not(.{LIGHT_VIEW_CLASS}) blockquote {{ color: #a0a0a8; border-left-color: #6b6b70; }}
+:root:not(.{LIGHT_VIEW_CLASS}) a {{ color: #78aeed; }}
+}}
 </style></head><body>{body}</body></html>"#
     )
 }
@@ -1180,6 +1213,9 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
         .build();
     let web_view = Rc::new(webkit::WebView::builder().editable(true).settings(&settings).web_context(&compose_web_context()).build());
+    // A transparent canvas, so the pane's own (possibly translucent)
+    // background shows through instead of WebKit's default white.
+    web_view.set_background_color(&gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
     // The draft body is editable HTML; "All text" mode blurs the whole view.
     crate::privacy::mark_blur_all(web_view.as_ref());
     // Ctrl+scroll / Ctrl+± zoom on the composer (item 1.20 / M-37).
@@ -2510,6 +2546,34 @@ pub fn build_compose_view(
     // back into the reading pane (see the `root-notify` handler below).
     let moving = Rc::new(Cell::new(false));
     let popped_out = Rc::new(Cell::new(false));
+    // "View in Light Mode", as in the reading pane: the rich body normally
+    // follows the app's scheme; this shows it as most recipients will see
+    // it. Per composer, and only for the rich editor.
+    let light_view_button = gtk::ToggleButton::builder().css_classes(["flat"]).build();
+    let sync_light_view_button = |button: &gtk::ToggleButton| {
+        // The icon and tooltip name what clicking does next, as the reading
+        // pane's do.
+        if button.is_active() {
+            button.set_icon_name(crate::window::themed_icon_name(&[
+                "weather-clear-night-symbolic",
+                "night-light-symbolic",
+                "weather-clear-symbolic",
+            ]));
+            button.set_tooltip_text(Some("View in Dark Mode"));
+        } else {
+            button.set_icon_name(crate::window::themed_icon_name(&["weather-clear-symbolic", "display-brightness-symbolic"]));
+            button.set_tooltip_text(Some("View in Light Mode"));
+        }
+    };
+    sync_light_view_button(&light_view_button);
+    {
+        let web_view = rich_web_view.clone();
+        light_view_button.connect_toggled(move |button| {
+            sync_light_view_button(button);
+            set_light_view(&web_view, button.is_active());
+        });
+    }
+    rich_toggle.bind_property("active", &light_view_button, "sensitive").sync_create().build();
     let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
     pop_out_button.set_tooltip_text(Some("Pop out compose window"));
 
@@ -2527,6 +2591,7 @@ pub fn build_compose_view(
     top_row.append(&header_spacer);
     top_row.append(&title_label);
     top_row.append(&status_label);
+    top_row.append(&light_view_button);
     top_row.append(&read_receipt_toggle);
     if on_pop_out.is_some() {
         top_row.append(&pop_out_button);
@@ -2786,6 +2851,7 @@ pub fn build_compose_view(
         let send_button = send_button.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
+        let light_view_button = light_view_button.clone();
         let editor_toolbar = editor_toolbar.clone();
         let attachment_flow = attachment_flow.clone();
         pop_out_button.connect_clicked(move |_| {
@@ -2802,6 +2868,7 @@ pub fn build_compose_view(
                 send_button: send_button.clone(),
                 from_dropdown: from_dropdown.clone(),
                 read_receipt_toggle: read_receipt_toggle.clone(),
+                light_view_button: light_view_button.clone(),
                 top_row: top_row.clone(),
                 title_label: title_label.clone(),
                 status_label: status_label.clone(),
@@ -2919,6 +2986,19 @@ mod tests {
             headers,
             auth_results: None,
         }
+    }
+
+    #[test]
+    fn the_editor_page_follows_the_scheme_and_leaves_its_background_to_the_pane() {
+        let doc = html_document("<p>Hi</p>");
+        assert!(doc.contains(":root { color-scheme: light dark; }"));
+        assert!(doc.contains("html, body { background: transparent; }"));
+        assert!(doc.contains("@media (prefers-color-scheme: dark)"));
+        // "View in Light Mode" forces the light scheme and switches the dark
+        // colours off.
+        assert!(doc.contains(&format!(":root.{LIGHT_VIEW_CLASS} {{ color-scheme: light; }}")));
+        assert!(doc.contains(&format!(":root:not(.{LIGHT_VIEW_CLASS}) body")));
+        assert!(doc.contains("<body><p>Hi</p></body>"));
     }
 
     #[test]
