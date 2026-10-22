@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.275" date="2026-10-22">
+      <description>
+        <p>The ribbon is laid out the classic Outlook way: large and small commands with each group's name underneath, and a cleaner single-row Simplified layout. The composer's formatting commands are ribbon buttons now, and new Send / Receive, Folder and Help tabs, plus extra Home, View, Calendar and People commands, put existing features one click away.</p>
+      </description>
+    </release>
     <release version="0.9.274" date="2026-10-22">
       <description>
         <p>The optional Microsoft Graph mail transport is now feature-complete, with saved per-folder change cursors, a wiremock and fixture test suite, and a read-only live-tenant harness. IMAP remains the default transport.</p>

@@ -1,12 +1,16 @@
 //! The Outlook-style ribbon: groups of icon+label controls, laid out either
-//! Simplified (one row, the label beside the icon) or Classic (the icon over
-//! the label, with larger icons).
+//! Simplified (one row of 20 px icons, the label beside each; a "plain"
+//! control shows its icon alone) or Classic (named groups in which a large
+//! control is a 32 px icon over its label and small ones, a 16 px icon beside
+//! the label, stack three to a column).
 //!
 //! The ribbon only presents widgets the caller has already built and wired.
-//! [`RibbonGroup`]'s `button`/`toggle`/`menu`/`split` swap a control's child
-//! for an icon+label box, so click handlers, shortcuts and sensitivity stay
-//! exactly where they were; switching layout re-orients that same box, so
-//! nothing is rebuilt and no handler is lost. [`RibbonIcon`] is the handle a
+//! [`RibbonGroup`]'s `button`/`toggle`/`menu`/`split` (large) and their
+//! `small_*` twins swap a control's child for an icon+label box, so click
+//! handlers, shortcuts and sensitivity stay exactly where they were;
+//! switching layout re-orients that same box and moves the same widgets into
+//! or out of their Classic columns, so nothing is rebuilt and no handler is
+//! lost. [`RibbonIcon`] is the handle a
 //! dynamic control (Pin, Flag, Read/Unread) uses to swap its glyph.
 //!
 //! [`RibbonOverflow`] makes the row adaptive: as it narrows, labels drop to
@@ -61,6 +65,26 @@ impl RibbonMode {
     pub(crate) fn index(self) -> u32 {
         RibbonMode::ALL.iter().position(|m| *m == self).unwrap_or(0) as u32
     }
+}
+
+/// How a control is drawn in the Classic layout: large (the icon over its
+/// label) or small (the icon beside its label, three to a column). The
+/// Simplified row draws both alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RibbonSize {
+    Large,
+    Small,
+}
+
+/// The shape a dressed control takes, from the layout, its size and whether
+/// it has moved into More.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    Simplified,
+    Large,
+    Small,
+    /// A row of the More popover: a menu entry, whichever layout is in force.
+    Overflow,
 }
 
 /// The handle to a dressed control's icon. A control created with a live glyph
@@ -141,14 +165,19 @@ impl RibbonStyle {
     /// (a composer that has closed) are dropped from the registry.
     pub(crate) fn set_mode(&self, mode: RibbonMode) {
         self.mode.set(mode);
-        let mut bands = self.bands.borrow_mut();
-        bands.retain(|band| {
+        self.bands.borrow_mut().retain(|band| {
             let Some(root) = band.root.upgrade() else {
                 return false;
             };
             apply_band(&root, &band.state.borrow(), mode);
             true
         });
+        // The two layouts differ in every control's size, so the overflow fit
+        // has to be redone for the new one.
+        let listeners = self.relayout_listeners.borrow().clone();
+        for listener in listeners {
+            listener();
+        }
     }
 }
 
@@ -169,6 +198,8 @@ struct BandGroup {
     container: Option<glib::WeakRef<gtk::Box>>,
     row: glib::WeakRef<gtk::Box>,
     divider: Option<glib::WeakRef<gtk::Separator>>,
+    /// The group's name under its controls, drawn in the Classic layout only.
+    title: Option<glib::WeakRef<gtk::Label>>,
     controls: Vec<usize>,
 }
 
@@ -177,6 +208,10 @@ struct ControlParts {
     image: glib::WeakRef<gtk::Image>,
     label: glib::WeakRef<gtk::Label>,
     widget: glib::WeakRef<gtk::Widget>,
+    size: RibbonSize,
+    /// Its icon says what it is, so the Simplified row shows it without its
+    /// label (Bold, Italic, the alignments).
+    plain: bool,
     /// True while the control has been moved into the More popover.
     in_overflow: Cell<bool>,
     /// Whether the "close More after activating this control" handler has
@@ -237,6 +272,9 @@ impl RibbonBand {
         let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).valign(gtk::Align::Center).build();
         row.add_css_class("ribbon-group-row");
         group_box.append(&row);
+        let title = gtk::Label::builder().label(name).css_classes(["ribbon-group-title", "dim-label"]).build();
+        title.set_visible(self.style.mode() == RibbonMode::Classic);
+        group_box.append(&title);
         let divider = gtk::Separator::new(gtk::Orientation::Vertical);
         divider.add_css_class("ribbon-divider");
         self.root.append(&group_box);
@@ -247,6 +285,7 @@ impl RibbonBand {
                 container: Some(group_box.downgrade()),
                 row: row.downgrade(),
                 divider: Some(divider.downgrade()),
+                title: Some(title.downgrade()),
                 controls: Vec::new(),
             });
             state.groups.len() - 1
@@ -256,6 +295,7 @@ impl RibbonBand {
             state: self.state.clone(),
             row,
             group_index,
+            plain: Cell::new(false),
         };
         build(&group)
     }
@@ -272,6 +312,7 @@ impl RibbonBand {
                 container: None,
                 row: row.downgrade(),
                 divider: None,
+                title: None,
                 controls: Vec::new(),
             });
             state.groups.len() - 1
@@ -281,6 +322,7 @@ impl RibbonBand {
             state: self.state.clone(),
             row,
             group_index,
+            plain: Cell::new(false),
         }
     }
 
@@ -295,49 +337,90 @@ pub(crate) struct RibbonGroup {
     state: Rc<RefCell<BandState>>,
     row: gtk::Box,
     group_index: usize,
+    /// Set by [`RibbonGroup::plain`]: the controls dressed after it drop their
+    /// labels in the Simplified row.
+    plain: Cell<bool>,
 }
 
 impl RibbonGroup {
-    /// Dress a plain button with `icon` and `label`.
+    /// Dress a plain button with `icon` and `label`, as a large control.
     pub(crate) fn button(&self, button: &gtk::Button, icon: &str, label: &str) -> RibbonIcon {
-        let (content, image, text) = build_content(icon, label);
-        button.set_child(Some(&content));
-        self.register(button.clone().upcast(), content, image, text)
+        self.dress_button(button, icon, label, RibbonSize::Large)
+    }
+
+    /// [`RibbonGroup::button`], as a small control.
+    pub(crate) fn small_button(&self, button: &gtk::Button, icon: &str, label: &str) -> RibbonIcon {
+        self.dress_button(button, icon, label, RibbonSize::Small)
     }
 
     /// Dress a toggle button (a ribbon switch such as Folder pane).
     pub(crate) fn toggle(&self, button: &gtk::ToggleButton, icon: &str, label: &str) -> RibbonIcon {
-        let (content, image, text) = build_content(icon, label);
-        button.set_child(Some(&content));
-        self.register(button.clone().upcast(), content, image, text)
+        self.dress_button(button.upcast_ref(), icon, label, RibbonSize::Large)
+    }
+
+    /// [`RibbonGroup::toggle`], as a small control.
+    pub(crate) fn small_toggle(&self, button: &gtk::ToggleButton, icon: &str, label: &str) -> RibbonIcon {
+        self.dress_button(button.upcast_ref(), icon, label, RibbonSize::Small)
     }
 
     /// Dress a menu button (a `▾` dropdown); the arrow is shown beside the
     /// content so a labelled menu button keeps its affordance.
     pub(crate) fn menu(&self, button: &gtk::MenuButton, icon: &str, label: &str) -> RibbonIcon {
-        let (content, image, text) = build_content(icon, label);
-        button.set_child(Some(&content));
-        button.set_always_show_arrow(true);
-        self.register(button.clone().upcast(), content, image, text)
+        self.dress_menu(button, icon, label, RibbonSize::Large)
+    }
+
+    /// [`RibbonGroup::menu`], as a small control.
+    pub(crate) fn small_menu(&self, button: &gtk::MenuButton, icon: &str, label: &str) -> RibbonIcon {
+        self.dress_menu(button, icon, label, RibbonSize::Small)
     }
 
     /// Dress a libadwaita split button (a main action plus its `▾` menu).
     pub(crate) fn split(&self, button: &adw::SplitButton, icon: &str, label: &str) -> RibbonIcon {
-        let (content, image, text) = build_content(icon, label);
-        button.set_child(Some(&content));
-        self.register(button.clone().upcast(), content, image, text)
+        self.dress_split(button, icon, label, RibbonSize::Large)
+    }
+
+    /// [`RibbonGroup::split`], as a small control.
+    pub(crate) fn small_split(&self, button: &adw::SplitButton, icon: &str, label: &str) -> RibbonIcon {
+        self.dress_split(button, icon, label, RibbonSize::Small)
     }
 
     /// Append a control that carries no icon+label of its own (a `DropDown`,
-    /// a colour button, a spin button) to the group's row. It still takes part
-    /// in overflow, so it moves into More when the ribbon is too narrow.
+    /// a colour button, a spin button) to the group's row. It is a small
+    /// control, so the Classic layout stacks it with its neighbours, and it
+    /// still takes part in overflow, so it moves into More when the ribbon is
+    /// too narrow.
     pub(crate) fn widget(&self, widget: &impl IsA<gtk::Widget>) {
         let widget = widget.clone().upcast::<gtk::Widget>();
         self.row.append(&widget);
-        self.register_widget(widget, glib::WeakRef::new(), glib::WeakRef::new(), glib::WeakRef::new());
+        self.register_widget(widget, glib::WeakRef::new(), glib::WeakRef::new(), glib::WeakRef::new(), RibbonSize::Small);
     }
 
-    fn register(&self, widget: gtk::Widget, content: gtk::Box, image: gtk::Image, label: gtk::Label) -> RibbonIcon {
+    /// Mark the controls dressed from here on as ones whose icon says what
+    /// they are (Bold, Italic): the Simplified row shows them without labels.
+    pub(crate) fn plain(&self) {
+        self.plain.set(true);
+    }
+
+    fn dress_button(&self, button: &gtk::Button, icon: &str, label: &str, size: RibbonSize) -> RibbonIcon {
+        let (content, image, text) = build_content(icon, label);
+        button.set_child(Some(&content));
+        self.register(button.clone().upcast(), content, image, text, size)
+    }
+
+    fn dress_menu(&self, button: &gtk::MenuButton, icon: &str, label: &str, size: RibbonSize) -> RibbonIcon {
+        let (content, image, text) = build_content(icon, label);
+        button.set_child(Some(&content));
+        button.set_always_show_arrow(true);
+        self.register(button.clone().upcast(), content, image, text, size)
+    }
+
+    fn dress_split(&self, button: &adw::SplitButton, icon: &str, label: &str, size: RibbonSize) -> RibbonIcon {
+        let (content, image, text) = build_content(icon, label);
+        button.set_child(Some(&content));
+        self.register(button.clone().upcast(), content, image, text, size)
+    }
+
+    fn register(&self, widget: gtk::Widget, content: gtk::Box, image: gtk::Image, label: gtk::Label, size: RibbonSize) -> RibbonIcon {
         // `flat` is load-bearing, not cosmetic: setting a custom child strips
         // the `.image-button`/`.text-button` class GTK derives from the
         // button's icon/label, which is exactly what Adwaita's `.toolbar`
@@ -351,29 +434,42 @@ impl RibbonGroup {
         // Keep the command's name available to assistive technology even when
         // compact mode hides the visual label.
         widget.update_property(&[gtk::accessible::Property::Label(label.text().as_str())]);
-        style_control(&content, &image, &label, self.style.mode());
         self.row.append(&widget);
-        self.register_widget(widget.clone(), content.downgrade(), image.downgrade(), label.downgrade());
+        self.register_widget(widget.clone(), content.downgrade(), image.downgrade(), label.downgrade(), size);
         RibbonIcon {
             image,
             button: widget.downgrade(),
         }
     }
 
-    /// Record a control in the band's ordered group list, for overflow. The
-    /// styled parts are empty for a plain [`RibbonGroup::widget`].
-    fn register_widget(&self, widget: gtk::Widget, content: glib::WeakRef<gtk::Box>, image: glib::WeakRef<gtk::Image>, label: glib::WeakRef<gtk::Label>) {
+    /// Record a control in the band's ordered group list, for overflow, then
+    /// style it and give it its place for the layout in force. The styled
+    /// parts are empty for a plain [`RibbonGroup::widget`].
+    fn register_widget(&self, widget: gtk::Widget, content: glib::WeakRef<gtk::Box>, image: glib::WeakRef<gtk::Image>, label: glib::WeakRef<gtk::Label>, size: RibbonSize) {
+        widget.add_css_class(match size {
+            RibbonSize::Large => "ribbon-large",
+            RibbonSize::Small => "ribbon-small",
+        });
+        let mode = self.style.mode();
         let mut state = self.state.borrow_mut();
         let index = state.controls.len();
-        state.controls.push(ControlParts {
+        let control = ControlParts {
             content,
             image,
             label,
             widget: widget.downgrade(),
+            size,
+            plain: self.plain.get(),
             in_overflow: Cell::new(false),
             closes_more_on_click: Cell::new(false),
-        });
+        };
+        style_parts(&control, state.compact.get(), mode);
+        state.controls.push(control);
         state.groups[self.group_index].controls.push(index);
+        let state = &*state;
+        if let Some(group) = state.groups.get(self.group_index) {
+            place_group(state, group, mode);
+        }
     }
 }
 
@@ -391,23 +487,141 @@ fn build_content(icon: &str, label: &str) -> (gtk::Box, gtk::Image, gtk::Label) 
     (content, image, text)
 }
 
-fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, mode: RibbonMode) {
-    match mode {
-        RibbonMode::Simplified => {
-            content.set_orientation(gtk::Orientation::Horizontal);
-            content.set_spacing(6);
-            image.set_pixel_size(16);
-            label.set_halign(gtk::Align::Start);
-            content.remove_css_class("ribbon-classic-content");
+fn style_control(content: &gtk::Box, image: &gtk::Image, label: &gtk::Label, look: Look) {
+    let (orientation, spacing, icon, halign) = match look {
+        Look::Simplified => (gtk::Orientation::Horizontal, 8, 20, gtk::Align::Fill),
+        Look::Large => (gtk::Orientation::Vertical, 2, 32, gtk::Align::Center),
+        // A column's buttons share its width; keep each icon at its leading
+        // edge so the column's icons line up, as a menu's entries do.
+        Look::Small | Look::Overflow => (gtk::Orientation::Horizontal, 6, 16, gtk::Align::Start),
+    };
+    content.set_orientation(orientation);
+    content.set_spacing(spacing);
+    content.set_halign(halign);
+    image.set_pixel_size(icon);
+    // A large button's label may take two lines ("New / Message"), centred
+    // under its icon; everywhere else it stays on one.
+    let large = look == Look::Large;
+    label.set_wrap(large);
+    label.set_max_width_chars(if large { 10 } else { -1 });
+    label.set_justify(if large { gtk::Justification::Center } else { gtk::Justification::Left });
+    label.set_halign(if large { gtk::Align::Center } else { gtk::Align::Start });
+}
+
+/// Style one control for `mode`: its shape, and whether its label shows.
+fn style_parts(control: &ControlParts, compact: bool, mode: RibbonMode) {
+    let in_overflow = control.in_overflow.get();
+    let (Some(content), Some(image), Some(label)) = (control.content.upgrade(), control.image.upgrade(), control.label.upgrade()) else {
+        return;
+    };
+    let look = match (in_overflow, mode, control.size) {
+        (true, _, _) => Look::Overflow,
+        (false, RibbonMode::Simplified, _) => Look::Simplified,
+        (false, RibbonMode::Classic, RibbonSize::Large) => Look::Large,
+        (false, RibbonMode::Classic, RibbonSize::Small) => Look::Small,
+    };
+    style_control(&content, &image, &label, look);
+    // Compact mode drops labels, and a plain control has none in the
+    // Simplified row; the More popover keeps them so its entries stay
+    // identifiable.
+    let hidden = compact || (control.plain && mode == RibbonMode::Simplified);
+    label.set_visible(in_overflow || !hidden);
+}
+
+/// One place in a group's row: a control by itself, or a column of up to
+/// three small ones (Classic only).
+enum Slot {
+    Alone(gtk::Widget),
+    Column(Vec<gtk::Widget>),
+}
+
+/// How many small controls a Classic column holds.
+const COLUMN_LEN: usize = 3;
+
+/// Give `group`'s controls (those not in More) their places in its row for
+/// `mode`: side by side in the Simplified row; in the Classic layout each
+/// large control by itself and each run of small ones stacked in columns of
+/// three. Nothing is moved when the row already has that shape, since the
+/// overflow fit calls this on every width change.
+fn place_group(state: &BandState, group: &BandGroup, mode: RibbonMode) {
+    let Some(row) = group.row.upgrade() else {
+        return;
+    };
+    let mut slots: Vec<Slot> = Vec::new();
+    for control in group.controls.iter().filter_map(|index| state.controls.get(*index)) {
+        if control.in_overflow.get() {
+            continue;
         }
-        RibbonMode::Classic => {
-            content.set_orientation(gtk::Orientation::Vertical);
-            content.set_spacing(3);
-            image.set_pixel_size(22);
-            label.set_halign(gtk::Align::Center);
-            content.add_css_class("ribbon-classic-content");
+        let Some(widget) = control.widget.upgrade() else {
+            continue;
+        };
+        if mode == RibbonMode::Classic && control.size == RibbonSize::Small {
+            match slots.last_mut() {
+                Some(Slot::Column(column)) if column.len() < COLUMN_LEN => column.push(widget),
+                _ => slots.push(Slot::Column(vec![widget])),
+            }
+        } else {
+            slots.push(Slot::Alone(widget));
         }
     }
+    if row_matches(&row, &slots) {
+        return;
+    }
+    for slot in &slots {
+        let widgets = match slot {
+            Slot::Alone(widget) => std::slice::from_ref(widget),
+            Slot::Column(column) => column.as_slice(),
+        };
+        for widget in widgets {
+            if widget.parent().is_some() {
+                widget.unparent();
+            }
+        }
+    }
+    // What is left is the old columns.
+    while let Some(child) = row.first_child() {
+        row.remove(&child);
+    }
+    for slot in slots {
+        match slot {
+            Slot::Alone(widget) => {
+                widget.set_halign(gtk::Align::Fill);
+                row.append(&widget);
+            }
+            Slot::Column(widgets) => {
+                let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(0).build();
+                column.add_css_class("ribbon-small-column");
+                for widget in widgets {
+                    widget.set_halign(gtk::Align::Fill);
+                    column.append(&widget);
+                }
+                row.append(&column);
+            }
+        }
+    }
+}
+
+/// Whether `row` already holds exactly `slots`, in order.
+fn row_matches(row: &gtk::Box, slots: &[Slot]) -> bool {
+    let mut child = row.first_child();
+    for slot in slots {
+        let Some(current) = child else {
+            return false;
+        };
+        let fits = match slot {
+            Slot::Alone(widget) => current == *widget,
+            Slot::Column(widgets) => current.has_css_class("ribbon-small-column") && children(&current) == *widgets,
+        };
+        if !fits {
+            return false;
+        }
+        child = current.next_sibling();
+    }
+    child.is_none()
+}
+
+fn children(widget: &gtk::Widget) -> Vec<gtk::Widget> {
+    std::iter::successors(widget.first_child(), |child| child.next_sibling()).collect()
 }
 
 fn apply_band(root: &gtk::Box, state: &BandState, mode: RibbonMode) {
@@ -416,20 +630,18 @@ fn apply_band(root: &gtk::Box, state: &BandState, mode: RibbonMode) {
     } else {
         root.remove_css_class("ribbon-classic");
     }
+    for group in &state.groups {
+        place_group(state, group, mode);
+        if let Some(title) = group.title.as_ref().and_then(|title| title.upgrade()) {
+            title.set_visible(mode == RibbonMode::Classic);
+        }
+    }
     apply_control_styles(state, mode);
 }
 
 fn apply_control_styles(state: &BandState, mode: RibbonMode) {
     for control in &state.controls {
-        let in_overflow = control.in_overflow.get();
-        if let (Some(content), Some(image), Some(label)) = (control.content.upgrade(), control.image.upgrade(), control.label.upgrade()) {
-            // A control living in the More popover always reads as a compact
-            // icon+label row, whichever ribbon layout is in force.
-            style_control(&content, &image, &label, if in_overflow { RibbonMode::Simplified } else { mode });
-            // Compact mode drops labels; the More popover keeps them so its
-            // entries stay identifiable.
-            label.set_visible(!state.compact.get() || in_overflow);
-        }
+        style_parts(control, state.compact.get(), mode);
     }
 }
 
@@ -744,20 +956,21 @@ impl OverflowInner {
         let Some(widget) = control.widget.upgrade() else {
             return;
         };
-        if widget.parent().is_some() {
+        if let Some(parent) = widget.parent() {
             widget.unparent();
+            // A Classic column it was the last control of would otherwise
+            // stay behind as an empty gap in the row.
+            if parent.has_css_class("ribbon-small-column") && parent.first_child().is_none() {
+                parent.unparent();
+            }
         }
         control.in_overflow.set(true);
         self.overflow_box.append(&widget);
         widget.add_css_class("ribbon-overflow-control");
         widget.set_halign(gtk::Align::Fill);
-        if let (Some(content), Some(image), Some(label)) = (control.content.upgrade(), control.image.upgrade(), control.label.upgrade()) {
-            style_control(&content, &image, &label, RibbonMode::Simplified);
-            // The popover rows are full width; keep the icon+label pair at
-            // the leading edge like a menu entry rather than centring it.
-            content.set_halign(gtk::Align::Start);
-            label.set_visible(true);
-        }
+        // The popover rows are full width; the overflow look keeps the
+        // icon+label pair at the leading edge like a menu entry.
+        style_parts(control, state.compact.get(), self.style.mode());
         // Acting on an overflowed command should dismiss More, like any menu
         // entry. Dropdowns (MenuButton) keep it open so their own menu can be
         // used; split buttons only dismiss on their main action.
@@ -819,46 +1032,23 @@ impl OverflowInner {
 }
 
 /// Restore one band's controls to their original rows, in their original
-/// order. Controls already in place stay put; only overflowed/moved ones are
-/// reparented.
+/// order. A group already in place stays put; only one with overflowed or
+/// moved controls is rebuilt (see [`place_group`]).
 fn restore_band(band: &RegisteredBand, mode: RibbonMode) {
     let Some(root) = band.root.upgrade() else {
         return;
     };
-    {
-        let state = band.state.borrow();
-        state.compact.set(false);
-        for group in &state.groups {
-            let Some(row) = group.row.upgrade() else {
-                continue;
-            };
-            let mut previous: Option<gtk::Widget> = None;
-            for index in &group.controls {
-                let Some(control) = state.controls.get(*index) else {
-                    continue;
-                };
-                let Some(widget) = control.widget.upgrade() else {
-                    continue;
-                };
-                let in_row = widget.parent().as_ref().is_some_and(|parent| parent == row.upcast_ref::<gtk::Widget>());
-                if !in_row {
-                    if widget.parent().is_some() {
-                        widget.unparent();
-                    }
-                    match &previous {
-                        Some(previous) => row.insert_child_after(&widget, Some(previous)),
-                        None => row.prepend(&widget),
-                    }
-                }
+    let state = band.state.borrow();
+    state.compact.set(false);
+    for control in &state.controls {
+        if control.in_overflow.replace(false) {
+            if let Some(widget) = control.widget.upgrade() {
                 widget.remove_css_class("ribbon-overflow-control");
-                widget.set_halign(gtk::Align::Fill);
-                control.in_overflow.set(false);
-                previous = Some(widget);
             }
         }
-        sync_group_visibility(&state);
     }
-    apply_band(&root, &band.state.borrow(), mode);
+    apply_band(&root, &state, mode);
+    sync_group_visibility(&state);
 }
 
 fn sync_group_visibility(state: &BandState) {
@@ -977,24 +1167,102 @@ mod tests {
 
         let content = button.child().and_downcast::<gtk::Box>().expect("button wears an icon+label child");
         let group_box = band.root().first_child().and_downcast::<gtk::Box>().expect("the band holds a group box");
-        // A group draws no caption in either mode: its box holds only the row.
-        let only_row = |group_box: &gtk::Box| group_box.first_child().is_some() && group_box.first_child() == group_box.last_child();
+        // The group's box holds its row and then its name.
+        let title = group_box.last_child().and_downcast::<gtk::Label>().expect("the group's name");
+        assert_eq!(title.label(), "Delete");
         let row_orientation = |button: &gtk::Button| button.child().and_downcast::<gtk::Box>().expect("content").orientation();
 
-        // Simplified: one row, label beside the icon.
+        // Simplified: one row, label beside the icon, no group names.
         assert_eq!(row_orientation(&button), gtk::Orientation::Horizontal);
-        assert!(only_row(&group_box));
+        assert!(!title.is_visible());
 
-        // Classic: icon over label, still no caption.
+        // Classic: a large control's icon over its label, and the name shows.
         style.set_mode(RibbonMode::Classic);
         assert_eq!(row_orientation(&button), gtk::Orientation::Vertical);
-        assert!(only_row(&group_box));
+        assert!(title.is_visible());
 
         // And back.
         style.set_mode(RibbonMode::Simplified);
         assert_eq!(row_orientation(&button), gtk::Orientation::Horizontal);
-        assert!(only_row(&group_box));
+        assert!(!title.is_visible());
         assert!(content.is_visible());
+    }
+
+    #[test]
+    fn classic_stacks_small_controls_in_columns_of_three() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let style = RibbonStyle::new(RibbonMode::Simplified);
+        let band = RibbonBand::new(&style, &[]);
+        let large = gtk::Button::new();
+        let small: Vec<gtk::Button> = (0..4).map(|_| gtk::Button::new()).collect();
+        band.group("Basic Text", |group| {
+            group.button(&large, "mail-attachment-symbolic", "Attach");
+            group.plain();
+            for button in &small {
+                group.small_button(button, "format-text-bold-symbolic", "Bold");
+            }
+        });
+        let group_box = band.root().first_child().and_downcast::<gtk::Box>().expect("group box");
+        let row = group_box.first_child().and_downcast::<gtk::Box>().expect("group row");
+        let row_widget = row.clone().upcast::<gtk::Widget>();
+        let label_of = |button: &gtk::Button| {
+            button
+                .child()
+                .and_downcast::<gtk::Box>()
+                .and_then(|content| content.last_child())
+                .and_downcast::<gtk::Label>()
+                .expect("label")
+        };
+
+        // Simplified: everything side by side, and a plain control's label is gone.
+        assert!(small.iter().all(|button| button.parent().as_ref() == Some(&row_widget)));
+        assert!(label_of(&large).is_visible());
+        assert!(!label_of(&small[0]).is_visible());
+
+        // Classic: the large control alone, then the small ones three to a
+        // column, each with its label beside its icon.
+        style.set_mode(RibbonMode::Classic);
+        assert_eq!(large.parent().as_ref(), Some(&row_widget));
+        let first = small[0].parent().expect("a column");
+        assert!(first.has_css_class("ribbon-small-column"));
+        assert_eq!(small[1].parent().as_ref(), Some(&first));
+        assert_eq!(small[2].parent().as_ref(), Some(&first));
+        let second = small[3].parent().expect("a second column");
+        assert_ne!(second, first);
+        assert_eq!(second.parent().as_ref(), Some(&row_widget));
+        assert_eq!(children(&row_widget).len(), 3);
+        assert!(label_of(&small[0]).is_visible());
+
+        // Placing again changes nothing.
+        apply_band(band.root(), &band.state.borrow(), RibbonMode::Classic);
+        assert_eq!(small[0].parent().as_ref(), Some(&first));
+
+        // A column emptied by overflow leaves no gap, and comes back on restore.
+        let more_band = RibbonBand::new(&style, &[]);
+        let more_button = gtk::MenuButton::new();
+        more_band.standalone().menu(&more_button, "view-more-symbolic", "More");
+        let overflow_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let extras_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+        let overflow = RibbonOverflow::new(&style, &more_button, &overflow_box, &extras_box, &separator, &more_band);
+        overflow.add_band(&band);
+        let registered = RegisteredBand {
+            root: band.root().downgrade(),
+            state: band.state.clone(),
+        };
+        overflow.inner.move_control_to_overflow(&registered, 4);
+        assert_eq!(children(&row_widget).len(), 2);
+        assert!(label_of(&small[3]).is_visible(), "a More entry keeps its label");
+        overflow.inner.restore_all();
+        assert_eq!(children(&row_widget).len(), 3);
+        assert!(small[3].parent().is_some_and(|parent| parent.has_css_class("ribbon-small-column")));
+
+        // Simplified again: back in one row.
+        style.set_mode(RibbonMode::Simplified);
+        assert!(small.iter().all(|button| button.parent().as_ref() == Some(&row_widget)));
+        assert_eq!(children(&row_widget).len(), 5);
     }
 
     #[test]

@@ -38,10 +38,10 @@ pub fn show_editor_dialog(anchor: &gtk::Widget, app_config: Rc<RefCell<AppConfig
         .placeholder_text("Name (e.g. Status update, Meeting notes)")
         .text(existing.as_ref().map(|t| t.name.as_str()).unwrap_or(""))
         .build();
-    let (web_view, format_toolbar) = crate::compose::build_rich_editor(existing.as_ref().map(|t| t.html.clone()).unwrap_or_default());
+    let (web_view, format_controls) = crate::compose::build_rich_editor(existing.as_ref().map(|t| t.html.clone()).unwrap_or_default());
 
     let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
-    toolbar.append(&format_toolbar);
+    toolbar.append(&format_controls.strip());
     let rich_scroller = gtk::ScrolledWindow::builder().child(&*web_view).hexpand(true).vexpand(true).build();
 
     let save_button = gtk::Button::with_label("Save");

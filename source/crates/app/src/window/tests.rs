@@ -2683,3 +2683,22 @@ fn sender_label_keeps_the_privacy_tag_through_read_state_changes() {
     assert!(sender_label_classes(true).contains(&"message-sender-unread"));
     assert!(sender_label_classes(false).contains(&"message-sender-read"));
 }
+
+#[test]
+fn each_mail_ribbon_tab_shows_its_own_band() {
+    for (tab, band) in [
+        ("home", "mail-home"),
+        ("send-receive", "mail-send-receive"),
+        ("folder", "mail-folder"),
+        ("view", "mail-view"),
+        ("help", "mail-help"),
+    ] {
+        assert_eq!(ribbon_stack_name("mail", tab), band);
+    }
+    // The other modules have one band each, whatever tab was last chosen.
+    for tab in ["home", "folder", "help"] {
+        assert_eq!(ribbon_stack_name("calendar", tab), "calendar");
+        assert_eq!(ribbon_stack_name("contacts", tab), "contacts");
+    }
+    assert_eq!(ribbon_stack_name("mail", "unknown"), "mail-home");
+}

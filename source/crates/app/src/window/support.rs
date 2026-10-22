@@ -155,8 +155,8 @@ pub(crate) fn install_paned_css() {
             margin-right: 6px;
         }
         /* The command ribbon's groups: a run of controls parted from its
-           neighbour by a vertical rule. The classic icon-over-label layout
-           appears only in the Classic mode (`ribbon.rs` toggles
+           neighbour by a vertical rule. The large/small layout and the
+           groups' names appear only in the Classic mode (`ribbon.rs` toggles
            `.ribbon-classic` on the band).
 
            The geometry must land on the *button* node, never the control's
@@ -177,15 +177,42 @@ pub(crate) fn install_paned_css() {
         button.ribbon-control,
         .ribbon-control > button,
         .ribbon-control > menubutton > button {
-            padding: 2px 6px;
-            min-height: 0;
+            padding: 0 8px;
+            min-height: 32px;
             min-width: 0;
         }
-        .ribbon-classic button.ribbon-control,
-        .ribbon-classic .ribbon-control > button,
-        .ribbon-classic .ribbon-control > menubutton > button {
-            padding: 4px 8px;
-            min-height: 52px;
+        /* Classic: a large control is its icon over its label, the full
+           height of the row; small ones are a third of it, stacked three to a
+           column (`ribbon.rs` sets `.ribbon-large`/`.ribbon-small`). A small
+           `DropDown` or colour button is styled through its own inner
+           `button` the same way. Commands moved into More keep the menu-row
+           geometry below, although the popover sits inside a Classic band. */
+        .ribbon-classic .ribbon-group-row {
+            min-height: 66px;
+        }
+        .ribbon-classic button.ribbon-large:not(.ribbon-overflow-control),
+        .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > button,
+        .ribbon-classic .ribbon-large:not(.ribbon-overflow-control) > menubutton > button {
+            padding: 2px 6px;
+            min-height: 62px;
+            min-width: 46px;
+        }
+        .ribbon-classic button.ribbon-small:not(.ribbon-overflow-control),
+        .ribbon-classic .ribbon-small:not(.ribbon-overflow-control) > button,
+        .ribbon-classic .ribbon-small:not(.ribbon-overflow-control) > menubutton > button {
+            padding: 0 4px;
+            min-height: 22px;
+        }
+        .ribbon-group-title {
+            font-size: 11px;
+        }
+        /* Command labels are in the regular weight, not the bold Adwaita
+           gives button text, and a little smaller in the Classic layout. */
+        .ribbon-label {
+            font-weight: normal;
+        }
+        .ribbon-classic .ribbon-control:not(.ribbon-overflow-control) .ribbon-label {
+            font-size: 11.5px;
         }
         /* Commands that overflowed from the ribbon into the More popover are
            menu rows, not the ribbon's compressed strip geometry. */

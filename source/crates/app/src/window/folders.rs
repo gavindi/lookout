@@ -496,6 +496,23 @@ pub(crate) fn forget_deleted_folder(state: &Rc<RefCell<UiState>>, root: &Mailbox
 /// section, writing the whole list through to `mail-favorites` so it survives
 /// restarts. A new favourite goes at the end. Shared by the message-list
 /// header's star and the folder rows' "⋯" menu; the caller rebuilds the tree.
+/// The open folder, as the Folder ribbon tab acts on it, and which of the
+/// folder menu's commands it allows (the same rules as its right-click menu).
+/// `None` in the unified Inbox, or before a folder is open.
+pub(crate) fn current_folder(state: &Rc<RefCell<UiState>>) -> Option<(Mailbox, crate::folder_menu::FolderMenuState)> {
+    let st = state.borrow();
+    if matches!(st.mail_view, MailView::UnifiedInbox) {
+        return None;
+    }
+    let id = st.current_mailbox.as_ref()?;
+    let handle = st.accounts.get(&mailbox_account_id(id)?)?;
+    let mailbox = handle.folders.iter().find(|m| &m.id == id)?.clone();
+    let order = &st.favorite_display_order;
+    let favorite_pos = order.iter().position(|m| m == id).map(|index| (index, order.len()));
+    let menu_state = crate::folder_menu::folder_menu_state(&mailbox, favorite_pos, !handle.uses_graph_mail);
+    Some((mailbox, menu_state))
+}
+
 pub(crate) fn set_folder_favorite(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, favorite: bool) {
     {
         let mut st = state.borrow_mut();

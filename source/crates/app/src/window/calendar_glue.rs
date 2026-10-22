@@ -89,13 +89,17 @@ pub(crate) fn last_of_month(date: chrono::NaiveDate) -> chrono::NaiveDate {
 }
 
 /// Maps a (nav-rail module, ribbon tab) pair to the `view_toolbar_stack`
-/// child to show. Mail is tabbed - Home shows the command toolbar, View the
-/// layout toggles; Calendar/Contacts each have a single non-tabbed toolbar
-/// of their own, so they ignore the tab. Unknown combos fall back to
-/// Mail-Home.
+/// child to show. Mail is tabbed - Home shows the command toolbar, Send /
+/// Receive the account sync, Folder the open folder's commands, View the
+/// layout toggles and Help the program's own; Calendar/Contacts each have a
+/// single non-tabbed toolbar of their own, so they ignore the tab. Unknown
+/// combos fall back to Mail-Home.
 pub(crate) fn ribbon_stack_name(module: &str, tab: &str) -> &'static str {
     match (module, tab) {
+        ("mail", "send-receive") => "mail-send-receive",
+        ("mail", "folder") => "mail-folder",
         ("mail", "view") => "mail-view",
+        ("mail", "help") => "mail-help",
         ("mail", _) => "mail-home",
         ("calendar", _) => "calendar",
         ("tasks", _) => "tasks",

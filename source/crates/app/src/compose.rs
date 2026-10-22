@@ -716,12 +716,87 @@ pub(crate) async fn read_content(web_view: &webkit::WebView) -> Option<EditorCon
 /// command-toolbar buttons (`gtk::Button::from_icon_name` + tooltip), so the
 /// rich-text icons carry the same background and dimensions as the ribbon
 /// bar's default icons wherever the toolbar lives.
-fn toolbar_command_button(toolbar: &gtk::Box, icon_name: &str, tooltip: &str, command: &'static str, web_view: &Rc<webkit::WebView>) {
+fn toolbar_command_button(icon_name: &str, tooltip: &str, command: &'static str, web_view: &Rc<webkit::WebView>) -> gtk::Button {
     let button = gtk::Button::from_icon_name(icon_name);
     button.set_tooltip_text(Some(tooltip));
     let web_view = web_view.clone();
     button.connect_clicked(move |_| web_view.execute_editing_command(command));
-    toolbar.append(&button);
+    button
+}
+
+/// The rich editor's formatting controls, each already wired to its WebView.
+/// The composer dresses them as ribbon buttons; the signature and template
+/// editors lay them out as one compact row ([`FormatControls::strip`]).
+pub(crate) struct FormatControls {
+    pub bold: gtk::Button,
+    pub italic: gtk::Button,
+    pub underline: gtk::Button,
+    pub strikethrough: gtk::Button,
+    pub bullets: gtk::Button,
+    pub numbering: gtk::Button,
+    pub font_size: gtk::DropDown,
+    pub color: gtk::ColorDialogButton,
+    pub link: gtk::Button,
+    pub emoji: gtk::MenuButton,
+    pub align_left: gtk::Button,
+    pub align_center: gtk::Button,
+    pub align_right: gtk::Button,
+    pub justify: gtk::Button,
+    pub indent: gtk::Button,
+    pub outdent: gtk::Button,
+    pub horizontal_rule: gtk::Button,
+    pub clear_formatting: gtk::Button,
+    pub font_family: gtk::DropDown,
+    pub table: gtk::Button,
+    pub image: gtk::Button,
+}
+
+impl FormatControls {
+    fn all(&self) -> [&gtk::Widget; 21] {
+        [
+            self.bold.upcast_ref(),
+            self.italic.upcast_ref(),
+            self.underline.upcast_ref(),
+            self.strikethrough.upcast_ref(),
+            self.bullets.upcast_ref(),
+            self.numbering.upcast_ref(),
+            self.font_size.upcast_ref(),
+            self.color.upcast_ref(),
+            self.link.upcast_ref(),
+            self.emoji.upcast_ref(),
+            self.align_left.upcast_ref(),
+            self.align_center.upcast_ref(),
+            self.align_right.upcast_ref(),
+            self.justify.upcast_ref(),
+            self.indent.upcast_ref(),
+            self.outdent.upcast_ref(),
+            self.horizontal_rule.upcast_ref(),
+            self.clear_formatting.upcast_ref(),
+            self.font_family.upcast_ref(),
+            self.table.upcast_ref(),
+            self.image.upcast_ref(),
+        ]
+    }
+
+    /// The controls as one compact row of glyphs, parted into runs.
+    pub(crate) fn strip(&self) -> gtk::Box {
+        let strip = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+        for (index, widget) in self.all().into_iter().enumerate() {
+            // Before the lists and before the alignments.
+            if index == 4 || index == 10 {
+                strip.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
+            }
+            strip.append(widget);
+        }
+        strip
+    }
+
+    /// Enable or disable every control (they only act on the rich editor).
+    pub(crate) fn set_sensitive(&self, sensitive: bool) {
+        for widget in self.all() {
+            widget.set_sensitive(sensitive);
+        }
+    }
 }
 
 /// Splits a recipient field's flattened text back into addresses.
@@ -1098,8 +1173,8 @@ fn resolved_spell_languages(configured: &[String]) -> Vec<String> {
 /// remote subresources are vetoed regardless of the reading pane's "Load
 /// images" setting - composing must never fetch remote content. Returns the
 /// WebView (which the caller keeps alive for send-time content reads) plus
-/// the toolbar.
-pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, gtk::Box) {
+/// its formatting controls.
+pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, FormatControls) {
     let settings = webkit::Settings::builder()
         .enable_javascript(true)
         .hardware_acceleration_policy(webkit::HardwareAccelerationPolicy::Never)
@@ -1188,14 +1263,12 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
         });
     }
 
-    let toolbar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
-    toolbar_command_button(&toolbar, "format-text-bold-symbolic", "Bold", "Bold", &web_view);
-    toolbar_command_button(&toolbar, "format-text-italic-symbolic", "Italic", "Italic", &web_view);
-    toolbar_command_button(&toolbar, "format-text-underline-symbolic", "Underline", "Underline", &web_view);
-    toolbar_command_button(&toolbar, "format-text-strikethrough-symbolic", "Strikethrough", "StrikeThrough", &web_view);
-    toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
-    toolbar_command_button(&toolbar, "list-bullet-symbolic", "Bulleted list", "InsertUnorderedList", &web_view);
-    toolbar_command_button(&toolbar, "list-number-symbolic", "Numbered list", "InsertOrderedList", &web_view);
+    let bold = toolbar_command_button("format-text-bold-symbolic", "Bold", "Bold", &web_view);
+    let italic = toolbar_command_button("format-text-italic-symbolic", "Italic", "Italic", &web_view);
+    let underline = toolbar_command_button("format-text-underline-symbolic", "Underline", "Underline", &web_view);
+    let strikethrough = toolbar_command_button("format-text-strikethrough-symbolic", "Strikethrough", "StrikeThrough", &web_view);
+    let bullets = toolbar_command_button("list-bullet-symbolic", "Bulleted list", "InsertUnorderedList", &web_view);
+    let numbering = toolbar_command_button("list-number-symbolic", "Numbered list", "InsertOrderedList", &web_view);
 
     let font_sizes = gtk::StringList::new(&["Small", "Normal", "Large", "Huge"]);
     let font_size_args = ["2", "3", "5", "7"];
@@ -1208,7 +1281,6 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
             }
         });
     }
-    toolbar.append(&font_size);
 
     let color_dialog = gtk::ColorDialog::new();
     let color_button = gtk::ColorDialogButton::builder().dialog(&color_dialog).tooltip_text("Text color").build();
@@ -1225,7 +1297,6 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
             web_view.execute_editing_command_with_argument("ForeColor", &hex);
         });
     }
-    toolbar.append(&color_button);
 
     let link_entry = gtk::Entry::builder().placeholder_text("https://example.com").build();
     let link_dialog = adw::AlertDialog::builder()
@@ -1253,7 +1324,6 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
     let link_button = gtk::Button::from_icon_name("insert-link-symbolic");
     link_button.set_tooltip_text(Some("Insert link"));
     link_button.connect_clicked(move |button| link_dialog.present(Some(button)));
-    toolbar.append(&link_button);
 
     // Emoji picker (item 1.20 / C-14): a MenuButton wrapping a
     // `gtk::EmojiChooser`; picking inserts the emoji at the caret.
@@ -1269,17 +1339,15 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
         });
     }
     emoji_button.set_popover(Some(&emoji_chooser));
-    toolbar.append(&emoji_button);
 
-    toolbar.append(&gtk::Separator::builder().orientation(gtk::Orientation::Vertical).build());
-    toolbar_command_button(&toolbar, "format-justify-left-symbolic", "Align left", "JustifyLeft", &web_view);
-    toolbar_command_button(&toolbar, "format-justify-center-symbolic", "Center", "JustifyCenter", &web_view);
-    toolbar_command_button(&toolbar, "format-justify-right-symbolic", "Align right", "JustifyRight", &web_view);
-    toolbar_command_button(&toolbar, "format-justify-fill-symbolic", "Justify", "JustifyFull", &web_view);
-    toolbar_command_button(&toolbar, "format-indent-more-symbolic", "Indent", "Indent", &web_view);
-    toolbar_command_button(&toolbar, "format-indent-less-symbolic", "Outdent", "Outdent", &web_view);
-    toolbar_command_button(&toolbar, "insert-hr-symbolic", "Horizontal rule", "InsertHorizontalRule", &web_view);
-    toolbar_command_button(&toolbar, "edit-clear-all-symbolic", "Remove formatting", "RemoveFormat", &web_view);
+    let align_left = toolbar_command_button("format-justify-left-symbolic", "Align left", "JustifyLeft", &web_view);
+    let align_center = toolbar_command_button("format-justify-center-symbolic", "Center", "JustifyCenter", &web_view);
+    let align_right = toolbar_command_button("format-justify-right-symbolic", "Align right", "JustifyRight", &web_view);
+    let justify = toolbar_command_button("format-justify-fill-symbolic", "Justify", "JustifyFull", &web_view);
+    let indent = toolbar_command_button("format-indent-more-symbolic", "Indent", "Indent", &web_view);
+    let outdent = toolbar_command_button("format-indent-less-symbolic", "Outdent", "Outdent", &web_view);
+    let horizontal_rule = toolbar_command_button("insert-hr-symbolic", "Horizontal rule", "InsertHorizontalRule", &web_view);
+    let clear_formatting = toolbar_command_button("edit-clear-all-symbolic", "Remove formatting", "RemoveFormat", &web_view);
 
     let font_families = gtk::StringList::new(&["Sans-serif", "Serif", "Monospace", "Cursive"]);
     let font_family_args = ["sans-serif", "serif", "monospace", "cursive"];
@@ -1292,7 +1360,6 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
             }
         });
     }
-    toolbar.append(&font_family);
 
     let table_rows = gtk::SpinButton::with_range(1.0, 20.0, 1.0);
     table_rows.set_value(2.0);
@@ -1331,7 +1398,6 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
     let table_button = gtk::Button::from_icon_name("view-grid-symbolic");
     table_button.set_tooltip_text(Some("Insert table"));
     table_button.connect_clicked(move |button| table_dialog.present(Some(button)));
-    toolbar.append(&table_button);
 
     let insert_image_button = gtk::Button::from_icon_name("insert-image-symbolic");
     insert_image_button.set_tooltip_text(Some("Insert image"));
@@ -1387,9 +1453,30 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, g
             });
         });
     }
-    toolbar.append(&insert_image_button);
-
-    (web_view, toolbar)
+    let controls = FormatControls {
+        bold,
+        italic,
+        underline,
+        strikethrough,
+        bullets,
+        numbering,
+        font_size,
+        color: color_button,
+        link: link_button,
+        emoji: emoji_button,
+        align_left,
+        align_center,
+        align_right,
+        justify,
+        indent,
+        outdent,
+        horizontal_rule,
+        clear_formatting,
+        font_family,
+        table: table_button,
+        image: insert_image_button,
+    };
+    (web_view, controls)
 }
 
 /// Rebuilds `flow`'s attachment chips from `attachments`' current contents -
@@ -1834,7 +1921,8 @@ pub fn build_compose_view(
     // rich content must not round-trip through `text_to_html`, which would
     // flatten its formatting.
     let rich_initial = prefill.html_body.clone().unwrap_or_else(|| prefill.body.as_deref().map(text_to_html).unwrap_or_default());
-    let (rich_web_view, format_toolbar) = build_rich_editor(rich_initial);
+    let (rich_web_view, format_controls) = build_rich_editor(rich_initial);
+    let format_controls = Rc::new(format_controls);
 
     let body_stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     body_stack.add_named(&text_scroller, Some("text"));
@@ -2236,38 +2324,75 @@ pub fn build_compose_view(
     }
     // --- The composer's command ribbon. The controls were built above; the
     // ribbon dresses each with an icon and a label and groups them like
-    // Outlook's Message tab. The dense inline-formatting row
-    // (`format_toolbar`) keeps its glyphs, as Outlook's does, and rides in
-    // the "Format" group as a unit.
+    // Outlook's Message tab: the text formatting as small controls (in the
+    // Simplified row, glyphs alone), then what the message includes, its
+    // tags and its format.
+    // Send and the Draft group act through the header's Send and Cancel and
+    // the autosave, which are built further down; they are wired there.
+    let ribbon_send_button = gtk::Button::from_icon_name("mail-send-symbolic");
+    ribbon_send_button.set_tooltip_text(Some("Send"));
+    let save_draft_button = gtk::Button::from_icon_name("document-save-symbolic");
+    save_draft_button.set_tooltip_text(Some("Save draft"));
+    let close_button = gtk::Button::from_icon_name("window-close-symbolic");
+    close_button.set_tooltip_text(Some("Close (the draft is kept)"));
     let editor_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
-    editor_band.group("Actions", |group| {
-        group.button(&attach_button, "mail-attachment-symbolic", "Attach files");
-        group.toggle(
-            &rich_toggle,
-            crate::window::themed_icon_name(&["document-edit-symbolic", "accessories-text-editor-symbolic"]),
-            "Rich text",
-        );
+    editor_band.group("Send", |group| {
+        group.button(&ribbon_send_button, "mail-send-symbolic", "Send");
     });
-    editor_band.group("Insert", |group| {
+    let format = &format_controls;
+    editor_band.group("Basic Text", |group| {
+        group.plain();
+        group.widget(&format.font_family);
+        group.widget(&format.font_size);
+        group.widget(&format.color);
+        group.small_button(&format.bold, "format-text-bold-symbolic", "Bold");
+        group.small_button(&format.italic, "format-text-italic-symbolic", "Italic");
+        group.small_button(&format.underline, "format-text-underline-symbolic", "Underline");
+        group.small_button(&format.strikethrough, "format-text-strikethrough-symbolic", "Strikethrough");
+        group.small_button(&format.bullets, "list-bullet-symbolic", "Bullets");
+        group.small_button(&format.numbering, "list-number-symbolic", "Numbering");
+        group.small_button(&format.outdent, "format-indent-less-symbolic", "Decrease Indent");
+        group.small_button(&format.indent, "format-indent-more-symbolic", "Increase Indent");
+        group.small_button(&format.clear_formatting, "edit-clear-all-symbolic", "Clear Formatting");
+        group.small_button(&format.align_left, "format-justify-left-symbolic", "Align Left");
+        group.small_button(&format.align_center, "format-justify-center-symbolic", "Center");
+        group.small_button(&format.align_right, "format-justify-right-symbolic", "Align Right");
+        group.small_button(&format.justify, "format-justify-fill-symbolic", "Justify");
+    });
+    editor_band.group("Include", |group| {
+        group.button(&attach_button, "mail-attachment-symbolic", "Attach Files");
         group.menu(&signature_button, "signature-1", "Signature");
         group.menu(&templates_button, "edit-copy-symbolic", "Templates");
+        group.small_button(&format.link, "insert-link-symbolic", "Link");
+        group.small_button(&format.table, "view-grid-symbolic", "Table");
+        group.small_button(&format.image, "insert-image-symbolic", "Picture");
+        group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
+        group.small_button(&format.horizontal_rule, "insert-hr-symbolic", "Horizontal Line");
+    });
+    editor_band.group("Tags", |group| {
+        group.small_toggle(&high_importance_toggle, "emblem-important-symbolic", "High Importance");
+        group.small_toggle(&low_importance_toggle, "go-down-symbolic", "Low Importance");
+        group.widget(&sensitivity_dropdown);
     });
     editor_band.group("Format", |group| {
-        group.widget(&format_toolbar);
+        group.small_toggle(
+            &rich_toggle,
+            crate::window::themed_icon_name(&["document-edit-symbolic", "accessories-text-editor-symbolic"]),
+            "Rich Text",
+        );
     });
-    editor_band.group("Options", |group| {
-        group.toggle(&high_importance_toggle, "emblem-important-symbolic", "High");
-        group.toggle(&low_importance_toggle, "go-down-symbolic", "Low");
-        group.widget(&sensitivity_dropdown);
+    editor_band.group("Draft", |group| {
+        group.button(&save_draft_button, "document-save-symbolic", "Save Draft");
+        group.button(&close_button, "window-close-symbolic", "Close");
     });
     let editor_toolbar = editor_band.root().clone();
 
     {
         let web_view = rich_web_view.clone();
         let stack_for_toggle = body_stack.clone();
-        let format_toolbar = format_toolbar.clone();
+        let format_controls = format_controls.clone();
         rich_toggle.connect_toggled(move |toggle| {
-            format_toolbar.set_sensitive(toggle.is_active());
+            format_controls.set_sensitive(toggle.is_active());
             if toggle.is_active() {
                 stack_for_toggle.set_visible_child_name("rich");
                 web_view.grab_focus();
@@ -2279,7 +2404,7 @@ pub fn build_compose_view(
     // Wire the Config → Mail preference into the composer's opening mode. The
     // toggled handler above is connected first, so `set_active` also routes
     // the stack to the right page, focuses the editor, and arms the toolbar.
-    format_toolbar.set_sensitive(rich_text_default);
+    format_controls.set_sensitive(rich_text_default);
     rich_toggle.set_active(rich_text_default);
 
     // --- Draft autosave state ---
@@ -2446,6 +2571,22 @@ pub fn build_compose_view(
             closed.set(true);
             on_done();
         });
+    }
+    // The ribbon's Send, Save Draft and Close.
+    {
+        let send_button = send_button.clone();
+        ribbon_send_button.connect_clicked(move |_| send_button.emit_by_name::<()>("clicked", &[]));
+    }
+    {
+        let autosave = autosave.clone();
+        save_draft_button.connect_clicked(move |_| {
+            let autosave = autosave.clone();
+            glib::spawn_future_local(async move { autosave.attempt().await });
+        });
+    }
+    {
+        let cancel_button = cancel_button.clone();
+        close_button.connect_clicked(move |_| cancel_button.emit_clicked());
     }
     {
         let in_reply_to = prefill.in_reply_to;

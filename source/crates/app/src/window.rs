@@ -3423,38 +3423,54 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
 
-    // --- Menu bar row (File/Home/View/Help). File (Quit) and Help (About)
-    // are `MenuButton`s with a real popover; Home/View are the ribbon's tab
-    // strip - mutually-exclusive toggle buttons that switch the ribbon
-    // content row below (see `view_toolbar_stack`). Home holds the command
-    // toolbar; View holds the pane-visibility layout toggles. Mail-only:
-    // they're disabled while another module is active (see the
-    // nav-rail handlers), matching the codebase's honest-disabled convention.
+    // --- Menu bar row (File, then the ribbon's tabs: Home, Send / Receive,
+    // Folder, View, Help). File (Quit) is a `MenuButton` with a real
+    // popover; the tabs are mutually-exclusive toggle buttons that switch
+    // the ribbon content row below (see `view_toolbar_stack`). Home holds the
+    // command toolbar, Send / Receive the account sync, Folder the open
+    // folder's commands, View the pane-visibility layout toggles and Help
+    // About. Mail-only: they're disabled while another module is active (see
+    // the nav-rail handlers), matching the codebase's honest-disabled
+    // convention.
     let file_menu = gio::Menu::new();
     file_menu.append(Some("Quit"), Some("app.quit"));
-    let help_menu = gio::Menu::new();
-    help_menu.append(Some("About Lookout"), Some("app.about"));
 
     let file_button = gtk::MenuButton::builder().label("File").css_classes(["flat"]).menu_model(&file_menu).build();
-    let home_button = gtk::ToggleButton::builder().label("Home").css_classes(["flat", "ribbon-tab"]).active(true).build();
-    let view_button = gtk::ToggleButton::builder().label("View").css_classes(["flat", "ribbon-tab"]).build();
-    view_button.set_group(Some(&home_button));
-    let help_button = gtk::MenuButton::builder().label("Help").css_classes(["flat"]).menu_model(&help_menu).build();
+    let ribbon_tab = |label: &str| gtk::ToggleButton::builder().label(label).css_classes(["flat", "ribbon-tab"]).build();
+    let home_button = ribbon_tab("Home");
+    home_button.set_active(true);
+    let send_receive_button = ribbon_tab("Send / Receive");
+    let folder_tab_button = ribbon_tab("Folder");
+    let view_button = ribbon_tab("View");
+    let help_button = ribbon_tab("Help");
+    // The tab strip, which the nav-rail handlers enable and disable as one.
+    let ribbon_tabs = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).build();
+    let ribbon_tab_buttons = [
+        (&home_button, "home"),
+        (&send_receive_button, "send-receive"),
+        (&folder_tab_button, "folder"),
+        (&view_button, "view"),
+        (&help_button, "help"),
+    ];
+    for (button, _) in ribbon_tab_buttons {
+        if button != &home_button {
+            button.set_group(Some(&home_button));
+        }
+        ribbon_tabs.append(button);
+    }
 
-    // Which ribbon tab is active ("home" | "view") and which nav-rail module
-    // is selected ("mail" | "calendar" | "tasks" | "contacts" | "lookout") -
-    // together they decide the
-    // `view_toolbar_stack`'s visible child (see `ribbon_stack_name`). The tab
-    // state persists across module switches; the nav-rail handlers re-enable
-    // Home/View on Mail and disable them elsewhere.
+    // Which ribbon tab is active (the names in `ribbon_tab_buttons`) and which
+    // nav-rail module is selected ("mail" | "calendar" | "tasks" | "contacts"
+    // | "lookout") - together they decide the `view_toolbar_stack`'s visible
+    // child (see `ribbon_stack_name`). The tab state persists across module
+    // switches; the nav-rail handlers re-enable the tabs on Mail and disable
+    // them elsewhere.
     let active_ribbon_tab: Rc<Cell<&'static str>> = Rc::new(Cell::new("home"));
     let current_module: Rc<Cell<&'static str>> = Rc::new(Cell::new("mail"));
 
     let menu_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(2).css_classes(["toolbar"]).build();
     menu_bar.append(&file_button);
-    menu_bar.append(&home_button);
-    menu_bar.append(&view_button);
-    menu_bar.append(&help_button);
+    menu_bar.append(&ribbon_tabs);
 
     // --- Command toolbar row. `compose_button`, `reply_button`,
     // `reply_all_button`, `forward_button`, `delete_button`,
@@ -3637,6 +3653,90 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     more_popover.set_child(Some(&more_scroller));
     more_button.set_popover(Some(&more_popover));
 
+    // The Mail ribbon's commands that act on the selected messages through
+    // the context menu's own dispatcher (`run_message_menu_action`), so each
+    // behaves - and undoes - exactly as its menu entry does. Nothing
+    // selected: a toast says so rather than the click doing nothing.
+    let run_on_selection: SelectionActionFn = {
+        let context = message_menu_context.clone();
+        Rc::new(move |anchor, action| {
+            let (targets, primary) = message_menu_targets(&context.message_list, MessageMenuTarget::Selection);
+            if targets.is_empty() {
+                if let Some(overlay) = &context.state.borrow().toast_overlay {
+                    overlay.add_toast(adw::Toast::new("Select a message first"));
+                }
+                return;
+            }
+            run_message_menu_action(&context, anchor, &targets, primary.as_ref(), action);
+        })
+    };
+    let selection_button = |icon: &str, tooltip: &str, action: crate::message_menu::MessageMenuAction| {
+        let button = gtk::Button::from_icon_name(icon);
+        button.set_tooltip_text(Some(tooltip));
+        let run_on_selection = run_on_selection.clone();
+        button.connect_clicked(move |button| run_on_selection(button.upcast_ref(), action.clone()));
+        button
+    };
+    // Respond ▸ Meeting: Reply with meeting (item 3.19 / C-20).
+    let meeting_button = selection_button("appointment-new-symbolic", "Reply with meeting", crate::message_menu::MessageMenuAction::ReplyWithMeeting);
+    // Respond ▸ Add Sender: wired below, once the contact editor's host exists
+    // (the profile card's "Add to contacts").
+    let add_sender_button = gtk::Button::from_icon_name("contact-new-symbolic");
+    add_sender_button.set_tooltip_text(Some("Add sender to contacts"));
+    // Move: the context menu's Move ▸ Other folder… picker.
+    let move_button = selection_button(
+        themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]),
+        "Move to folder",
+        crate::message_menu::MessageMenuAction::MoveOther,
+    );
+    // Rules ▾: create a rule from the selected message, or manage them all.
+    let rules_button = gtk::MenuButton::builder().icon_name("emblem-system-symbolic").tooltip_text("Rules").build();
+    {
+        let group = gio::SimpleActionGroup::new();
+        let create = gio::SimpleAction::new("create-rule", None);
+        {
+            let run_on_selection = run_on_selection.clone();
+            let anchor = rules_button.downgrade();
+            create.connect_activate(move |_, _| {
+                if let Some(anchor) = anchor.upgrade() {
+                    run_on_selection(anchor.upcast_ref(), crate::message_menu::MessageMenuAction::CreateRule);
+                }
+            });
+        }
+        group.add_action(&create);
+        let manage = gio::SimpleAction::new("manage-rules", None);
+        {
+            let state = state.clone();
+            let anchor = rules_button.downgrade();
+            manage.connect_activate(move |_, _| {
+                if let Some(anchor) = anchor.upgrade() {
+                    crate::rules_view::show_manage_rules_dialog(anchor.upcast_ref(), state.clone());
+                }
+            });
+        }
+        group.add_action(&manage);
+        rules_button.insert_action_group("rules", Some(&group));
+        let menu = gio::Menu::new();
+        menu.append(Some("Create rule…"), Some("rules.create-rule"));
+        menu.append(Some("Manage rules…"), Some("rules.manage-rules"));
+        rules_button.set_menu_model(Some(&menu));
+    }
+    // Find ▸ Filter Email: the message list header's own filter menu.
+    let filter_email_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["funnel-symbolic", "view-filter-symbolic", "edit-find-symbolic"]))
+        .tooltip_text("Filter email")
+        .menu_model(&list_filter_menu)
+        .build();
+    // Send/Receive All Folders, here and on the Send / Receive tab.
+    let send_receive_all_button = |state: &Rc<RefCell<UiState>>| {
+        let button = gtk::Button::from_icon_name("view-refresh-symbolic");
+        button.set_tooltip_text(Some("Send/Receive all folders"));
+        let state = state.clone();
+        button.connect_clicked(move |_| send_receive_all(&state));
+        button
+    };
+    let home_send_receive_button = send_receive_all_button(&state);
+
     // --- Command ribbon (Mail Home). Every control above was created and
     // wired already; the ribbon only dresses it with an icon and a label,
     // arranged in Outlook's groups (see `ribbon.rs`). The Simplified/Classic
@@ -3648,25 +3748,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     command_band.group("Delete", |group| {
         group.button(&delete_button, "user-trash-symbolic", "Delete");
         group.button(&archive_button, "mail-archive-symbolic", "Archive");
-        group.split(&report_button, "mail-mark-junk-symbolic", "Report");
-        group.button(&sweep_button, "edit-clear-all-symbolic", "Sweep");
+        group.small_split(&report_button, "mail-mark-junk-symbolic", "Report");
+        group.small_button(&sweep_button, "edit-clear-all-symbolic", "Sweep");
     });
     command_band.group("Respond", |group| {
         group.button(&reply_button, "mail-reply-sender-symbolic", "Reply");
         group.button(&reply_all_button, "mail-reply-all-symbolic", "Reply all");
         group.split(&forward_button, "mail-forward-symbolic", "Forward");
-    });
-    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Tags", |group| {
-        let pin = group.button(&pin_button, pin_icon_name(false), "Pin");
-        let flag = group.split(&flag_button, follow_up_icon_name(false), "Flag");
-        let read = group.button(
-            &mark_read_button,
-            themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
-            "Read",
-        );
-        group.menu(&categorize_button, themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]), "Categorize");
-        group.button(&snooze_button, "appointment-soon-symbolic", "Snooze");
-        (pin, flag, read)
+        group.small_button(&meeting_button, "appointment-new-symbolic", "Meeting");
+        group.small_button(&add_sender_button, "contact-new-symbolic", "Add Sender");
     });
     command_band.group("Quick Steps", |group| {
         group.menu(
@@ -3674,6 +3764,34 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             themed_icon_name(&["system-run-symbolic", "media-playback-start-symbolic", "go-next-symbolic"]),
             "Quick Steps",
         );
+    });
+    command_band.group("Move", |group| {
+        group.button(&move_button, themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]), "Move");
+        group.menu(&rules_button, "emblem-system-symbolic", "Rules");
+    });
+    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Tags", |group| {
+        // The large commands first, so the Classic layout stacks Pin and
+        // Snooze in a column after them.
+        let read = group.button(
+            &mark_read_button,
+            themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
+            "Read",
+        );
+        group.menu(&categorize_button, themed_icon_name(&["tag-symbolic", "mail-mark-important-symbolic"]), "Categorize");
+        let flag = group.split(&flag_button, follow_up_icon_name(false), "Flag");
+        let pin = group.small_button(&pin_button, pin_icon_name(false), "Pin");
+        group.small_button(&snooze_button, "appointment-soon-symbolic", "Snooze");
+        (pin, flag, read)
+    });
+    command_band.group("Find", |group| {
+        group.menu(
+            &filter_email_button,
+            themed_icon_name(&["funnel-symbolic", "view-filter-symbolic", "edit-find-symbolic"]),
+            "Filter Email",
+        );
+    });
+    command_band.group("Send/Receive", |group| {
+        group.button(&home_send_receive_button, "view-refresh-symbolic", "Send/Receive All Folders");
     });
     // More is not part of this band: it is the trailing, always-visible
     // overflow button shared by every module (see `RibbonOverflow`).
@@ -3748,6 +3866,45 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     calendar_band.group("New", |group| {
         group.button(&new_event_button, "appointment-new-symbolic", "New Event");
     });
+    // Go To: re-anchor every calendar view on today, step it back or
+    // forward by its own unit (a day, a week, a month), or jump to a date.
+    let calendar_today_button = gtk::Button::from_icon_name("go-home-symbolic");
+    calendar_today_button.set_tooltip_text(Some("Go to today"));
+    {
+        let calendar_main = calendar_main.clone();
+        calendar_today_button.connect_clicked(move |_| calendar_view::go_today(&calendar_main));
+    }
+    let calendar_step_button = |icon: &str, tooltip: &str, by: i64| {
+        let button = gtk::Button::from_icon_name(icon);
+        button.set_tooltip_text(Some(tooltip));
+        let calendar_main = calendar_main.clone();
+        button.connect_clicked(move |_| calendar_view::step(&calendar_main, by));
+        button
+    };
+    let calendar_back_button = calendar_step_button("go-previous-symbolic", "Back", -1);
+    let calendar_forward_button = calendar_step_button("go-next-symbolic", "Forward", 1);
+    let calendar_go_to_date_button = gtk::Button::from_icon_name("x-office-calendar-symbolic");
+    calendar_go_to_date_button.set_tooltip_text(Some("Go to date"));
+    {
+        let calendar_main = calendar_main.clone();
+        calendar_go_to_date_button.connect_clicked(move |button| {
+            let calendar_main = calendar_main.clone();
+            crate::datetime_picker::present_date_dialog(
+                Some(button.upcast_ref()),
+                "Go to date",
+                "Date",
+                "Go",
+                calendar_view::anchor(&calendar_main),
+                Rc::new(move |day| calendar_view::set_anchor(&calendar_main, day)),
+            );
+        });
+    }
+    calendar_band.group("Go To", |group| {
+        group.button(&calendar_today_button, "go-home-symbolic", "Today");
+        group.small_button(&calendar_back_button, "go-previous-symbolic", "Back");
+        group.small_button(&calendar_forward_button, "go-next-symbolic", "Forward");
+        group.small_button(&calendar_go_to_date_button, "x-office-calendar-symbolic", "Go to Date");
+    });
     calendar_band.group("View", |group| {
         group.toggle(&day_view_button, themed_icon_name(&["view-calendar-day-symbolic", "x-office-calendar-symbolic"]), "Day");
         group.toggle(
@@ -3761,9 +3918,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             themed_icon_name(&["view-calendar-month-symbolic", "x-office-calendar-symbolic"]),
             "Month",
         );
-        group.toggle(&schedule_view_button, themed_icon_name(&["view-list-symbolic", "x-office-calendar-symbolic"]), "Schedule");
-        group.toggle(&split_view_button, themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic"]), "Split view");
-        group.toggle(&list_view_button, themed_icon_name(&["view-list-symbolic"]), "List");
+        group.small_toggle(&schedule_view_button, themed_icon_name(&["view-list-symbolic", "x-office-calendar-symbolic"]), "Schedule");
+        group.small_toggle(&split_view_button, themed_icon_name(&["view-dual-symbolic", "sidebar-show-right-symbolic"]), "Split view");
+        group.small_toggle(&list_view_button, themed_icon_name(&["view-list-symbolic"]), "List");
     });
     calendar_band.group("Filter", |group| {
         group.button(&filter_button, "edit-find-symbolic", "Filter");
@@ -3897,6 +4054,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         Some(glib::VariantTy::STRING),
         &crate::settings::conversation_order_at(crate::settings::conversation_order_index(&settings.get_string(crate::settings::MAIL_CONVERSATION_ORDER))).to_variant(),
     );
+    // View ▸ Arrangement: the message list header's sort menu, and its
+    // direction toggle flipped.
+    let arrange_by_button = gtk::MenuButton::builder()
+        .icon_name("view-sort-ascending-symbolic")
+        .tooltip_text("Arrange by")
+        .menu_model(&sort_key_menu)
+        .build();
+    let reverse_sort_button = gtk::Button::from_icon_name("view-sort-descending-symbolic");
+    reverse_sort_button.set_tooltip_text(Some("Reverse sort"));
+    {
+        let sort_direction_button = sort_direction_button.clone();
+        reverse_sort_button.connect_clicked(move |_| sort_direction_button.set_active(!sort_direction_button.is_active()));
+    }
     let view_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     view_band.group("Layout", |group| {
         group.toggle(&folder_pane_toggle, "folder-symbolic", "Folder pane");
@@ -3914,11 +4084,146 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             "Messages",
         );
     });
+    view_band.group("Arrangement", |group| {
+        group.menu(&arrange_by_button, "view-sort-ascending-symbolic", "Arrange By");
+        group.button(&reverse_sort_button, "view-sort-descending-symbolic", "Reverse Sort");
+    });
     let view_toolbar = view_band.root().clone();
+
+    // --- Send / Receive tab: sync every account now, and the accounts
+    // themselves. Account Settings is wired below, once the Settings dialog
+    // exists; Add Account opens GNOME Online Accounts, where Lookout's
+    // accounts come from.
+    let add_account_button = gtk::Button::from_icon_name("list-add-symbolic");
+    add_account_button.set_tooltip_text(Some("Add account (GNOME Online Accounts)"));
+    {
+        let worker = worker.clone();
+        add_account_button.connect_clicked(move |_| worker.spawn(crate::online_accounts::open_online_accounts()));
+    }
+    let account_settings_button = gtk::Button::from_icon_name("preferences-system-symbolic");
+    account_settings_button.set_tooltip_text(Some("Account settings"));
+    let send_receive_tab_button = send_receive_all_button(&state);
+    let send_receive_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    send_receive_band.group("Send & Receive", |group| {
+        group.button(&send_receive_tab_button, "view-refresh-symbolic", "Send/Receive All Folders");
+    });
+    send_receive_band.group("Accounts", |group| {
+        group.button(&add_account_button, "list-add-symbolic", "Add Account");
+        group.button(&account_settings_button, "preferences-system-symbolic", "Account Settings");
+    });
+    let send_receive_toolbar = send_receive_band.root().clone();
+
+    // --- Folder tab: the open folder's own commands, run through the folder
+    // pane's menu handler so each asks and behaves exactly as its right-click
+    // entry does. A button is enabled as that menu would enable it for the
+    // open folder - re-read when the tab is shown and when another folder is
+    // chosen - and checks again when clicked.
+    type FolderCommand = fn(&crate::folder_menu::FolderMenuState) -> Option<crate::folder_menu::FolderMenuAction>;
+    let folder_command_button = |icon: &str, tooltip: &str| {
+        let button = gtk::Button::from_icon_name(icon);
+        button.set_tooltip_text(Some(tooltip));
+        button
+    };
+    let folder_move_icon = themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]);
+    let folder_commands: Vec<(gtk::Button, FolderCommand)> = {
+        use crate::folder_menu::FolderMenuAction as F;
+        vec![
+            (folder_command_button("folder-new-symbolic", "New folder"), |m| m.create.then_some(F::CreateSubfolder)),
+            (folder_command_button("document-edit-symbolic", "Rename folder"), |m| m.rename.then_some(F::Rename)),
+            (folder_command_button(folder_move_icon, "Move folder"), |m| m.move_folder.then_some(F::Move)),
+            (folder_command_button("user-trash-symbolic", "Delete folder"), |m| m.delete.then_some(F::Delete)),
+            (folder_command_button("mail-read-symbolic", "Mark all as read"), |m| m.mark_read.then_some(F::MarkAllRead)),
+            (folder_command_button("emblem-system-symbolic", "Run rules now"), |m| m.run_rules.then_some(F::RunRules)),
+            (folder_command_button("edit-clear-all-symbolic", "Empty folder"), |m| m.empty.then_some(F::Empty)),
+            (folder_command_button("starred-symbolic", "Show in Favorites"), |m| {
+                Some(if m.is_favorite { F::RemoveFavorite } else { F::AddFavorite })
+            }),
+        ]
+    };
+    let refresh_folder_band: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let buttons = folder_commands.clone();
+        Rc::new(move || {
+            let current = current_folder(&state);
+            for (button, command) in &buttons {
+                button.set_sensitive(current.as_ref().is_some_and(|(_, allowed)| command(allowed).is_some()));
+            }
+            // The favourites button says which way it goes.
+            if let (Some((button, _)), Some((_, allowed))) = (buttons.last(), current.as_ref()) {
+                button.set_tooltip_text(Some(if allowed.is_favorite { "Remove from Favorites" } else { "Show in Favorites" }));
+            }
+        })
+    };
+    for (button, command) in &folder_commands {
+        let state = state.clone();
+        let menu_handler = menu_handler.clone();
+        let refresh_folder_band = refresh_folder_band.clone();
+        let command = *command;
+        button.connect_clicked(move |button| {
+            let handler = menu_handler.borrow().clone();
+            let target = current_folder(&state).and_then(|(mailbox, allowed)| command(&allowed).map(|action| (action, mailbox)));
+            match (handler, target) {
+                (Some(handler), Some((action, mailbox))) => handler(action, mailbox, button.clone().upcast()),
+                _ => {
+                    if let Some(overlay) = &state.borrow().toast_overlay {
+                        overlay.add_toast(adw::Toast::new("Not available for this folder"));
+                    }
+                }
+            }
+            refresh_folder_band();
+        });
+    }
+    let folder_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    if let [(new_folder, _), (rename, _), (move_folder, _), (delete, _), (mark_read, _), (run_rules, _), (empty, _), (favorite, _)] = folder_commands.as_slice() {
+        folder_band.group("New", |group| {
+            group.button(new_folder, "folder-new-symbolic", "New Folder");
+        });
+        folder_band.group("Actions", |group| {
+            group.button(rename, "document-edit-symbolic", "Rename Folder");
+            group.button(move_folder, folder_move_icon, "Move Folder");
+            group.button(delete, "user-trash-symbolic", "Delete Folder");
+        });
+        folder_band.group("Clean Up", |group| {
+            group.button(mark_read, "mail-read-symbolic", "Mark All as Read");
+            group.button(run_rules, "emblem-system-symbolic", "Run Rules Now");
+            group.button(empty, "edit-clear-all-symbolic", "Empty Folder");
+        });
+        folder_band.group("Favorites", |group| {
+            group.button(favorite, "starred-symbolic", "Show in Favorites");
+        });
+    }
+    let folder_toolbar = folder_band.root().clone();
+    {
+        let refresh_folder_band = refresh_folder_band.clone();
+        folder_toolbar.connect_map(move |_| refresh_folder_band());
+    }
+    {
+        // After the selection's own handlers have opened the folder.
+        let refresh_folder_band = refresh_folder_band.clone();
+        folder_selection.connect_selected_notify(move |_| {
+            let refresh_folder_band = refresh_folder_band.clone();
+            glib::idle_add_local_once(move || refresh_folder_band());
+        });
+    }
+
+    // --- Help tab.
+    let about_button = gtk::Button::from_icon_name("help-about-symbolic");
+    about_button.set_tooltip_text(Some("About Lookout"));
+    about_button.connect_clicked(|button| {
+        let _ = button.activate_action("app.about", None);
+    });
+    let help_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
+    help_band.group("Help", |group| {
+        group.button(&about_button, "help-about-symbolic", "About Lookout");
+    });
+    let help_toolbar = help_band.root().clone();
 
     let view_toolbar_stack = gtk::Stack::new();
     view_toolbar_stack.add_named(&command_toolbar, Some("mail-home"));
+    view_toolbar_stack.add_named(&send_receive_toolbar, Some("mail-send-receive"));
+    view_toolbar_stack.add_named(&folder_toolbar, Some("mail-folder"));
     view_toolbar_stack.add_named(&view_toolbar, Some("mail-view"));
+    view_toolbar_stack.add_named(&help_toolbar, Some("mail-help"));
     view_toolbar_stack.add_named(&calendar_command_toolbar, Some("calendar"));
     view_toolbar_stack.add_named(&tasks_command_toolbar, Some("tasks"));
 
@@ -3955,6 +4260,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_edit_button.set_sensitive(false);
     let contacts_delete_button = gtk::Button::with_label("Delete");
     contacts_delete_button.set_sensitive(false);
+    // Communicate ▸ Email: a new message to the one selected contact, gated
+    // with Edit (and on the contact having an address).
+    let contacts_email_button = gtk::Button::with_label("Email");
+    contacts_email_button.set_sensitive(false);
     let import_contacts_button = gtk::Button::with_label("Import…");
     // Export is a split menu button (UX-16's split-button pattern): each
     // entry opens the save dialog in its format - the multi-card vCard, or
@@ -3974,6 +4283,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let contacts_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     contacts_band.group("New", |group| {
         group.button(&new_contact_button, "contact-new-symbolic", "New contact");
+    });
+    contacts_band.group("Communicate", |group| {
+        group.button(&contacts_email_button, "mail-message-new-symbolic", "Email");
     });
     contacts_band.group("Actions", |group| {
         group.button(&contacts_edit_button, "document-edit-symbolic", "Edit");
@@ -4128,25 +4440,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Config nav handlers disable them below, so the tab buttons can't be
     // clicked there (and the `if btn.is_active()` guard makes re-entrant
     // toggles no-ops anyway).
-    {
+    for (button, tab) in ribbon_tab_buttons {
         let view_toolbar_stack = view_toolbar_stack.clone();
         let active_ribbon_tab = active_ribbon_tab.clone();
         let current_module = current_module.clone();
-        home_button.connect_toggled(move |btn| {
+        button.connect_toggled(move |btn| {
             if btn.is_active() {
-                active_ribbon_tab.set("home");
-                view_toolbar_stack.set_visible_child_name(ribbon_stack_name(current_module.get(), "home"));
-            }
-        });
-    }
-    {
-        let view_toolbar_stack = view_toolbar_stack.clone();
-        let active_ribbon_tab = active_ribbon_tab.clone();
-        let current_module = current_module.clone();
-        view_button.connect_toggled(move |btn| {
-            if btn.is_active() {
-                active_ribbon_tab.set("view");
-                view_toolbar_stack.set_visible_child_name(ribbon_stack_name(current_module.get(), "view"));
+                active_ribbon_tab.set(tab);
+                view_toolbar_stack.set_visible_child_name(ribbon_stack_name(current_module.get(), tab));
             }
         });
     }
@@ -4312,8 +4613,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let current_module = current_module.clone();
         let overview_pane_toggle = overview_pane_toggle.clone();
         let overview_forced_hidden = overview_forced_hidden.clone();
-        let home_button = home_button.clone();
-        let view_button = view_button.clone();
+        let ribbon_tabs = ribbon_tabs.clone();
         let state = state.clone();
         let search_entry = search_entry.clone();
         let scope_stack = scope_stack.clone();
@@ -4341,8 +4641,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // overview pane back on after a Calendar round-trip -
                 // and the width-based auto-hide while the window is narrow.
                 mail_calendar_overview_card.set_visible(overview_pane_toggle.is_active() && !overview_forced_hidden.get());
-                home_button.set_sensitive(true);
-                view_button.set_sensitive(true);
+                ribbon_tabs.set_sensitive(true);
             }
         });
     }
@@ -4352,8 +4651,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let current_module = current_module.clone();
-        let home_button = home_button.clone();
-        let view_button = view_button.clone();
+        let ribbon_tabs = ribbon_tabs.clone();
         let search_entry = search_entry.clone();
         let scope_stack = scope_stack.clone();
         let search_refine_button = search_refine_button.clone();
@@ -4381,8 +4679,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 root_stack.set_visible_child_name(current_calendar_page.get());
                 view_toolbar_stack.set_visible_child_name("calendar");
                 mail_calendar_overview_card.set_visible(false);
-                home_button.set_sensitive(false);
-                view_button.set_sensitive(false);
+                ribbon_tabs.set_sensitive(false);
             }
         });
     }
@@ -4392,8 +4689,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let current_module = current_module.clone();
-        let home_button = home_button.clone();
-        let view_button = view_button.clone();
+        let ribbon_tabs = ribbon_tabs.clone();
         let contacts_window = contacts_window.clone();
         let search_entry = search_entry.clone();
         let scope_stack = scope_stack.clone();
@@ -4415,8 +4711,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 root_stack.set_visible_child_name(current_contacts_page.get());
                 view_toolbar_stack.set_visible_child_name("contacts");
                 mail_calendar_overview_card.set_visible(false);
-                home_button.set_sensitive(false);
-                view_button.set_sensitive(false);
+                ribbon_tabs.set_sensitive(false);
                 // People may have been popped out into their own window -
                 // bring that to the front instead of the in-stack placeholder.
                 if let Some(win) = contacts_window.borrow().as_ref() {
@@ -4441,8 +4736,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let current_module = current_module.clone();
-        let home_button = home_button.clone();
-        let view_button = view_button.clone();
+        let ribbon_tabs = ribbon_tabs.clone();
         let search_entry = search_entry.clone();
         let scope_stack = scope_stack.clone();
         let search_refine_button = search_refine_button.clone();
@@ -4459,8 +4753,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 root_stack.set_visible_child_name(current_tasks_page.get());
                 view_toolbar_stack.set_visible_child_name("tasks");
                 mail_calendar_overview_card.set_visible(false);
-                home_button.set_sensitive(false);
-                view_button.set_sensitive(false);
+                ribbon_tabs.set_sensitive(false);
             }
         });
     }
@@ -4470,8 +4763,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let view_toolbar_stack = view_toolbar_stack.clone();
         let mail_calendar_overview_card = mail_calendar_overview_card.clone();
         let current_module = current_module.clone();
-        let home_button = home_button.clone();
-        let view_button = view_button.clone();
+        let ribbon_tabs = ribbon_tabs.clone();
         let search_entry = search_entry.clone();
         let scope_stack = scope_stack.clone();
         let search_refine_button = search_refine_button.clone();
@@ -4488,8 +4780,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 root_stack.set_visible_child_name(current_lookout_page.get());
                 view_toolbar_stack.set_visible_child_name("lookout");
                 mail_calendar_overview_card.set_visible(false);
-                home_button.set_sensitive(false);
-                view_button.set_sensitive(false);
+                ribbon_tabs.set_sensitive(false);
             }
         });
     }
@@ -4941,7 +5232,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // do not fit (Layout first) into the More popover.
     let ribbon_overflow = crate::ribbon::RibbonOverflow::new(&ribbon_style, &more_button, &more_overflow_box, &more_extras_box, &more_separator, &ribbon_more_band);
     ribbon_overflow.add_band(&command_band);
+    ribbon_overflow.add_band(&send_receive_band);
+    ribbon_overflow.add_band(&folder_band);
     ribbon_overflow.add_band(&view_band);
+    ribbon_overflow.add_band(&help_band);
     ribbon_overflow.add_band(&calendar_band);
     ribbon_overflow.add_band(&tasks_band);
     ribbon_overflow.add_band(&contacts_band);
@@ -6113,6 +6407,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             })
         };
 
+        // The ribbon's Add Sender: the selected message's sender, through the
+        // card's own "Add to contacts".
+        {
+            let add_contact = add_contact.clone();
+            let message_list = message_list.clone();
+            let state = state_for_card.clone();
+            add_sender_button.connect_clicked(move |_| match message_list.selected_summary().and_then(|summary| summary.from.first().cloned()) {
+                Some(sender) => add_contact(&sender),
+                None => {
+                    if let Some(overlay) = &state.borrow().toast_overlay {
+                        overlay.add_toast(adw::Toast::new("Select a message first"));
+                    }
+                }
+            });
+        }
         let actions = crate::profile_card::ProfileCardActions {
             send_email,
             schedule_meeting,
@@ -6567,6 +6876,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_entries = contacts_entries.clone();
         let contacts_edit_button = contacts_edit_button.clone();
         let contacts_delete_button = contacts_delete_button.clone();
+        let contacts_email_button = contacts_email_button.clone();
         move || {
             let entries = contacts_entries.borrow();
             let selected_entries: Vec<ContactsListEntry> = entries
@@ -6582,6 +6892,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 _ => None,
             };
             contacts_edit_button.set_sensitive(single.is_some_and(|entry| !entry.href().is_empty()));
+            contacts_email_button.set_sensitive(single.is_some_and(|entry| !entry.card().emails.is_empty()));
             contacts_delete_button.set_sensitive(!selected_entries.is_empty() && selected_entries.iter().any(|entry| !entry.href().is_empty()));
         }
     });
@@ -6982,6 +7293,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
             popover.set_child(Some(&content));
             popover.popup();
+        });
+    }
+    {
+        let send_email = contacts_details_actions.send_email.clone();
+        let contacts_entries = contacts_entries.clone();
+        let contacts_selected = contacts_selected.clone();
+        contacts_email_button.connect_clicked(move |_| {
+            // Enabled only for exactly one selected contact with an address.
+            let address = contacts_entries
+                .borrow()
+                .iter()
+                .find(|entry| contacts_selected.borrow().contains(&(entry.account_id.clone(), contact_identity(entry.card()))))
+                .and_then(|entry| entry.card().emails.first().map(|email| email.address.clone()));
+            if let Some(address) = address {
+                send_email(&lookout_core::EmailAddress { name: None, address }, None);
+            }
         });
     }
     {
@@ -9707,6 +10034,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 crate::config_view::show_section(&config_view, "accounts");
             }
         }));
+        // The ribbon's Send / Receive ▸ Account Settings opens the same
+        // dialog on its Accounts section.
+        account_settings_button.connect_clicked({
+            let open_settings = open_settings.clone();
+            let config_view = config_view.clone();
+            move |_| {
+                open_settings();
+                crate::config_view::show_section(&config_view, "accounts");
+            }
+        });
         // The composer's "Manage Templates…" hook jumps to the Mail section,
         // where the My Templates list lives (item 2.10 / C-17).
         state.borrow_mut().manage_templates = Some(Rc::new({

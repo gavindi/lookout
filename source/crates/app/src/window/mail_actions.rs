@@ -584,6 +584,10 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
     true
 }
 
+/// A message-menu verb run on the current selection, from a ribbon control
+/// (the widget is what its dialogs present against).
+pub(crate) type SelectionActionFn = Rc<dyn Fn(&gtk::Widget, crate::message_menu::MessageMenuAction)>;
+
 /// Runs one message context-menu action on `targets` (`primary` for the
 /// single-message verbs) through the same helpers the ribbon uses, so every
 /// verb behaves - and undoes - the same wherever it's invoked.
@@ -1998,6 +2002,18 @@ pub(crate) fn resync_current_view(state: &Rc<RefCell<UiState>>) {
     };
     if let Some((account_id, mailbox_id)) = current {
         request_mailbox_sync(state, &account_id, &mailbox_id);
+        request_account_refresh(state, &account_id);
+    }
+}
+
+/// The ribbon's Send/Receive All Folders: the open folder and every
+/// account's Inbox are synced now, and each account's folder list refreshed
+/// behind them. The outbox needs nothing extra - it drains on its own clock.
+/// Both requests dedupe, so pressing it again while they run is a no-op.
+pub(crate) fn send_receive_all(state: &Rc<RefCell<UiState>>) {
+    resync_current_view(state);
+    for (account_id, inbox_id) in account_inboxes(state) {
+        request_mailbox_sync(state, &account_id, &inbox_id);
         request_account_refresh(state, &account_id);
     }
 }
