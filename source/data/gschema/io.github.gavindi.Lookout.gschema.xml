@@ -95,6 +95,11 @@
       <summary>Ribbon collapsed</summary>
       <description>Whether the command ribbon is collapsed to just its tab strip (Ctrl+F1 toggles it), as in Outlook's classic ribbon.</description>
     </key>
+    <key name="icon-style" type="s">
+      <default>'gnome'</default>
+      <summary>Icon style</summary>
+      <description>Which icon pack the app uses: 'gnome' follows the desktop's icon theme (the default), 'fluent' uses Microsoft's bundled Fluent System Icons for the action glyphs and falls back to the desktop theme for anything the pack does not cover. Switch it from the Mail View ribbon's Icons menu or Config → Appearance.</description>
+    </key>
 
     <!-- View → Layout -->
     <key name="layout-folder-pane" type="b">

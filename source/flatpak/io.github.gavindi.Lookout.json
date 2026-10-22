@@ -47,6 +47,7 @@
                 "install -Dm644 data/io.github.gavindi.Lookout.desktop /app/share/applications/io.github.gavindi.Lookout.desktop",
                 "install -Dm644 data/io.github.gavindi.Lookout.metainfo.xml /app/share/metainfo/io.github.gavindi.Lookout.metainfo.xml",
                 "install -Dm644 data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg /app/share/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg",
+                "install -Dm644 data/icons/fluent/LICENSE /app/share/doc/lookout/FLUENT-ICONS-LICENSE",
                 "install -Dm644 data/gschema/io.github.gavindi.Lookout.gschema.xml /app/share/glib-2.0/schemas/io.github.gavindi.Lookout.gschema.xml",
                 "glib-compile-schemas /app/share/glib-2.0/schemas"
             ],

@@ -81,6 +81,7 @@ assets = [
     ["../../data/io.github.gavindi.Lookout.desktop", "usr/share/applications/", "644"],
     ["../../data/io.github.gavindi.Lookout.metainfo.xml", "usr/share/metainfo/", "644"],
     ["../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["../../data/icons/fluent/LICENSE", "usr/share/doc/lookout/FLUENT-ICONS-LICENSE", "644"],
     ["../../data/gschema/io.github.gavindi.Lookout.gschema.xml", "usr/share/glib-2.0/schemas/", "644"],
 ]
 
@@ -95,6 +96,7 @@ assets = [
     { source = "../../data/io.github.gavindi.Lookout.desktop", dest = "/usr/share/applications/io.github.gavindi.Lookout.desktop", mode = "644" },
     { source = "../../data/io.github.gavindi.Lookout.metainfo.xml", dest = "/usr/share/metainfo/io.github.gavindi.Lookout.metainfo.xml", mode = "644" },
     { source = "../../data/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.gavindi.Lookout.svg", mode = "644" },
+    { source = "../../data/icons/fluent/LICENSE", dest = "/usr/share/licenses/lookout/FLUENT-ICONS-LICENSE", mode = "644" },
     { source = "../../data/gschema/io.github.gavindi.Lookout.gschema.xml", dest = "/usr/share/glib-2.0/schemas/io.github.gavindi.Lookout.gschema.xml", mode = "644" },
 ]
 

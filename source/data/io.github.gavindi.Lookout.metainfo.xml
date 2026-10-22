@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.279" date="2026-10-23">
+      <description>
+        <p>Microsoft's Fluent System Icons are now available as an optional icon pack. GNOME icons remain the default; the Mail View tab's Icons menu and Settings → Appearance → Icon style switch between the two live, and every icon the pack does not cover keeps its desktop theme glyph.</p>
+      </description>
+    </release>
     <release version="0.9.278" date="2026-10-23">
       <description>
         <p>The message list now uses Outlook's three-line layout: sender with status icons, subject with the received time, and a body preview, with a category chip strip underneath when a message is categorised. Conversation headers match, the column-header strip is hidden in this layout, and sender avatars stay perfectly round.</p>

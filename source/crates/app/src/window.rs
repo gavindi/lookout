@@ -106,6 +106,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let settings = Rc::new(crate::settings::resolve());
     crate::last_view::migrate_legacy(&settings);
     crate::background_image::migrate_legacy(&settings);
+    // The optional Fluent icon pack (UX-80): applied before any widget is
+    // built, so a window that starts in Fluent mode never flashes GNOME
+    // glyphs first. The store is shared with the View ribbon's Icons menu and
+    // Config → Appearance, both wired below.
+    let icon_style = crate::icon_style::IconStyleState::new(crate::icon_style::IconStyle::from_code(&settings.get_string(crate::settings::ICON_STYLE)));
 
     // --- Background portal approval: ask the session's portal once (the
     // shell shows a dialog the first time, then remembers) so Lookout is
@@ -733,6 +738,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // Config → Appearance's "Ribbon style" row. Its activation handler is
     // wired below, once the Config row exists.
     let ribbon_style_action = gio::SimpleAction::new_stateful("ribbon-style", Some(glib::VariantTy::STRING), &ribbon_style.mode().code().to_variant());
+    // The pack switch: a stateful `win.icon-style` action in the same shape,
+    // driven by View ▸ Icons and Config → Appearance's "Icon style" row.
+    let icon_style_action = gio::SimpleAction::new_stateful("icon-style", Some(glib::VariantTy::STRING), &icon_style.style().code().to_variant());
     // The folder rows' drop targets reach `state` through this slot (they
     // were built before it existed).
     *state_slot.borrow_mut() = Some(state.clone());
@@ -4202,6 +4210,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let sort_direction_button = sort_direction_button.clone();
         reverse_sort_button.connect_clicked(move |_| sort_direction_button.set_active(!sort_direction_button.is_active()));
     }
+    // View ▸ Icons (UX-80): the optional Fluent pack, appended as its own
+    // group. The default is the desktop's GNOME theme; the setting and the
+    // Config → Appearance row are the same stateful `win.icon-style` action.
+    let icon_style_menu = gio::Menu::new();
+    for style in crate::icon_style::IconStyle::ALL {
+        icon_style_menu.append(Some(style.label()), Some(&format!("win.icon-style('{}')", style.code())));
+    }
+    let icon_style_button = gtk::MenuButton::builder().tooltip_text("Icons").menu_model(&icon_style_menu).build();
     let view_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     view_band.group("Layout", |group| {
         group.toggle(&folder_pane_toggle, "folder-symbolic", "Folder pane");
@@ -4227,6 +4243,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     view_band.group("Arrangement", |group| {
         group.menu(&arrange_by_button, "view-sort-ascending-symbolic", "Arrange By");
         group.button(&reverse_sort_button, "view-sort-descending-symbolic", "Reverse Sort");
+    });
+    view_band.group("Appearance", |group| {
+        group.menu(
+            &icon_style_button,
+            themed_icon_name(&["applications-graphics-symbolic", "preferences-desktop-theme-symbolic", "view-grid-symbolic"]),
+            "Icons",
+        );
     });
     let view_toolbar = view_band.root().clone();
 
@@ -5543,6 +5566,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window.add_action(&task_group_action);
     window.add_action(&task_show_completed_action);
     window.add_action(&ribbon_style_action);
+    window.add_action(&icon_style_action);
 
     // --- Close-to-background: the window's close button hides the window
     // instead of exiting (Config → General → "Keep running when the window
@@ -6173,6 +6197,80 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         }
         // Seed the row from the stored mode without writing anything back.
         apply(initial_mode, false);
+    }
+    // The optional Fluent icon pack (UX-80): View ▸ Icons and Config →
+    // Appearance's "Icon style" row both drive `win.icon-style`, and one
+    // handler keeps the pack, the setting and the row in step. A failed
+    // switch (an unwritable cache, no display) leaves GNOME in force and puts
+    // both controls back where they were.
+    {
+        let icon_style = icon_style.clone();
+        let icon_style_action = icon_style_action.clone();
+        let icon_style_row = config_view.icon_style_row.clone();
+        let state = state.clone();
+        let suppress_row: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        let initial_style = icon_style.style();
+        let apply: Rc<dyn Fn(crate::icon_style::IconStyle, bool)> = {
+            let icon_style = icon_style.clone();
+            let icon_style_action = icon_style_action.clone();
+            let icon_style_row = icon_style_row.clone();
+            let state = state.clone();
+            let suppress_row = suppress_row.clone();
+            let pin_icon = pin_icon.clone();
+            let message_list = message_list.clone();
+            Rc::new(move |style, persist| {
+                let changed = icon_style.style() != style;
+                if changed {
+                    if let Err(error) = icon_style.set_style(style) {
+                        tracing::warn!(%error, "could not switch the icon style; keeping GNOME icons");
+                        let actual = icon_style.style();
+                        icon_style_action.set_state(&actual.code().to_variant());
+                        suppress_row.set(true);
+                        icon_style_row.set_selected(actual.index());
+                        suppress_row.set(false);
+                        if let Some(overlay) = state.borrow().toast_overlay.as_ref() {
+                            overlay.add_toast(adw::Toast::new("Fluent icons are unavailable; keeping GNOME icons"));
+                        }
+                        return;
+                    }
+                    // Pin is the one glyph GTK cannot recolour in the bundled
+                    // artwork (its name is not symbolic), so its ribbon button
+                    // takes the pack's symbolic pin in Fluent mode; refresh it
+                    // now rather than waiting for the next selection change.
+                    refresh_pin_button(&pin_icon, &message_list, &state);
+                }
+                icon_style_action.set_state(&style.code().to_variant());
+                if persist {
+                    state.borrow().settings.set_string(crate::settings::ICON_STYLE, style.code());
+                }
+                suppress_row.set(true);
+                icon_style_row.set_selected(style.index());
+                suppress_row.set(false);
+            })
+        };
+        {
+            let apply = apply.clone();
+            icon_style_action.connect_activate(move |_action, parameter| {
+                let style = parameter
+                    .and_then(|parameter| parameter.str())
+                    .map(crate::icon_style::IconStyle::from_code)
+                    .unwrap_or_default();
+                apply(style, true);
+            });
+        }
+        {
+            let apply = apply.clone();
+            let suppress_row = suppress_row.clone();
+            icon_style_row.connect_selected_notify(move |row| {
+                if suppress_row.get() {
+                    return;
+                }
+                let style = crate::icon_style::IconStyle::ALL.get(row.selected() as usize).copied().unwrap_or_default();
+                apply(style, true);
+            });
+        }
+        // Seed the row from the pack in force without writing anything back.
+        apply(initial_style, false);
     }
     // GTK4 only updates `default-width` when the window is resized while
     // resizable and not maximized/tiled/fullscreen (see `should_remember_size`

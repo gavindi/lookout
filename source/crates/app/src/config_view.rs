@@ -272,6 +272,10 @@ pub struct ConfigView {
     /// Exposed so the caller can seed it from the `ribbon-style` key and
     /// apply a change through the ribbon's own layout switch.
     pub ribbon_style_row: adw::ComboRow,
+    /// "Icon style" dropdown (Config → Appearance, UX-80): GNOME / Fluent.
+    /// Exposed so the caller can seed it from the `icon-style` key and apply
+    /// a change through the shared `win.icon-style` action.
+    pub icon_style_row: adw::ComboRow,
     /// "Message preview" dropdown (Config → Appearance): Off / 1 / 2 / 3
     /// lines of body preview per message-list row.
     pub preview_lines_row: adw::ComboRow,
@@ -1042,6 +1046,16 @@ pub fn build() -> ConfigView {
         .model(&gtk::StringList::new(&["Simplified", "Classic"]))
         .build();
     appearance_group.add(&ribbon_style_row);
+    // The optional Fluent icon pack (UX-80). GNOME, following the desktop's
+    // own icon theme, is the default; Fluent aliases Microsoft's icons over
+    // the names Lookout already uses. Mirrors View ▸ Icons in Mail.
+    let icon_style_labels: Vec<&str> = crate::icon_style::IconStyle::ALL.iter().map(|style| style.label()).collect();
+    let icon_style_row = adw::ComboRow::builder()
+        .title("Icon style")
+        .subtitle("Use the desktop's icons or Microsoft's Fluent System Icons")
+        .model(&gtk::StringList::new(&icon_style_labels))
+        .build();
+    appearance_group.add(&icon_style_row);
     // How many body-preview lines each message-list row shows.
     let preview_lines_model = gtk::StringList::new(&["Off", "1 line", "2 lines", "3 lines"]);
     let preview_lines_row = adw::ComboRow::builder()
@@ -1085,6 +1099,7 @@ pub fn build() -> ConfigView {
         &spacing_row,
         &reading_pane_row,
         &ribbon_style_row,
+        &icon_style_row,
         &preview_lines_row,
         &conversation_order_row,
     ] {
@@ -1270,6 +1285,7 @@ pub fn build() -> ConfigView {
         spacing_row,
         reading_pane_row,
         ribbon_style_row,
+        icon_style_row,
         preview_lines_row,
         show_sender_images_row,
         conversations_row,

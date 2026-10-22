@@ -1,0 +1,154 @@
+# Lookout's optional Fluent icon pack.
+#
+# One row per aliased icon:
+#   <GNOME icon name>  <Fluent asset name>  <regular|filled>
+#
+# The alias is the name Lookout already asks the icon theme for, so switching
+# packs needs no call-site changes: the generated theme provides the same name
+# and inherits the user's GNOME theme for everything it does not override.
+#
+# Regenerate with `python3 tools/fluent-icons.py --fetch`, then check with
+# `python3 tools/fluent-icons.py --check`.
+#
+# Upstream: https://github.com/microsoft/fluentui-system-icons (MIT)
+user-trash-symbolic	Delete	regular
+user-trash-full-symbolic	Delete	filled
+edit-delete-symbolic	Delete	regular
+x-office-calendar-symbolic	Calendar	regular
+mail-mark-important-symbolic	Important	regular
+view-list-symbolic	List	regular
+window-close-symbolic	Dismiss	regular
+document-edit-symbolic	Document Edit	regular
+weather-clear-symbolic	Weather Sunny	regular
+view-more-symbolic	More Horizontal	regular
+view-refresh-symbolic	Arrow Sync	regular
+mail-unread-symbolic	Mail Unread	regular
+mail-attachment-symbolic	Attach	regular
+go-previous-symbolic	Chevron Left	regular
+starred-symbolic	Star	filled
+mail-reply-sender-symbolic	Arrow Reply	regular
+go-next-symbolic	Chevron Right	regular
+edit-find-symbolic	Search	regular
+edit-clear-all-symbolic	Broom	regular
+weather-clear-night-symbolic	Weather Moon	regular
+view-grid-symbolic	Grid	regular
+object-select-symbolic	Checkmark Circle	regular
+night-light-symbolic	Weather Moon	regular
+mail-message-new-symbolic	Mail Add	regular
+mail-forward-symbolic	Arrow Forward	regular
+go-down-symbolic	Chevron Down	regular
+emblem-important-symbolic	Important	regular
+appointment-soon-symbolic	Calendar Clock	regular
+view-sort-ascending-symbolic	Arrow Sort Up	regular
+list-add-symbolic	Add	regular
+folder-symbolic	Folder	regular
+emblem-system-symbolic	Settings	regular
+emblem-ok-symbolic	Checkmark Circle	regular
+edit-clear-symbolic	Dismiss	regular
+contact-new-symbolic	Person Add	regular
+window-new-symbolic	Window New	regular
+view-sort-descending-symbolic	Arrow Sort Down	regular
+view-pin-symbolic	Pin	filled
+pin-off-symbolic	Pin Off	regular
+tag-symbolic	Tag	regular
+printer-symbolic	Print	regular
+mail-send-symbolic	Send	regular
+mail-reply-all-symbolic	Arrow Reply All	regular
+mail-read-symbolic	Mail Read	regular
+mail-archive-symbolic	Archive	regular
+format-justify-fill-symbolic	Text Align Justify	regular
+document-save-symbolic	Save	regular
+display-brightness-symbolic	Brightness High	regular
+avatar-default-symbolic	Person	regular
+appointment-new-symbolic	Calendar Add	regular
+alarm-symbolic	Alert	regular
+view-task-symbolic	Task List Square LTR	regular
+view-restore-symbolic	Window New	regular
+view-dual-symbolic	Panel Right	regular
+view-continuous-symbolic	List	regular
+view-conceal-symbolic	Eye Off	regular
+text-x-generic-symbolic	Document Text	regular
+sidebar-show-right-symbolic	Panel Right	regular
+preferences-system-symbolic	Settings	regular
+mail-mark-unread-symbolic	Mail Unread	regular
+mail-mark-junk-symbolic	Mail Prohibited	regular
+help-about-symbolic	Info	regular
+go-up-symbolic	Chevron Up	regular
+go-jump-symbolic	Arrow Forward	regular
+go-home-symbolic	Home	regular
+funnel-symbolic	Filter	regular
+format-text-bold-symbolic	Text Bold	regular
+folder-move-symbolic	Folder Arrow Right	regular
+edit-copy-symbolic	Copy	regular
+document-open-symbolic	Open	regular
+action-unavailable-symbolic	Prohibited	regular
+x-office-document-symbolic	Document Text	regular
+view-reveal-symbolic	Eye	regular
+view-paged-symbolic	Slide Layout	regular
+view-filter-symbolic	Filter	regular
+user-info-symbolic	Person Info	regular
+user-available-symbolic	Person Available	regular
+system-users-symbolic	People	regular
+system-search-symbolic	Search	regular
+system-run-symbolic	Run	regular
+send-to-symbolic	Share	regular
+security-high-symbolic	Shield Checkmark	regular
+open-menu-symbolic	More Vertical	regular
+non-starred-symbolic	Star	regular
+media-playlist-repeat-symbolic	Arrow Repeat All	regular
+media-playback-start-symbolic	Play	regular
+mail-mark-read-symbolic	Mail Read	regular
+mail-inbox-symbolic	Mail Inbox	regular
+mail-flag-symbolic	Flag	filled
+list-remove-symbolic	Subtract	regular
+list-number-symbolic	Text Number List LTR	regular
+list-bullet-symbolic	Text Bullet List	regular
+insert-link-symbolic	Link	regular
+insert-image-symbolic	Image	regular
+insert-hr-symbolic	Line Horizontal 1	regular
+image-x-generic-symbolic	Image	regular
+go-back-symbolic	Arrow Left	regular
+format-text-underline-symbolic	Text Underline	regular
+format-text-strikethrough-symbolic	Text Strikethrough	regular
+format-text-italic-symbolic	Text Italic	regular
+format-justify-right-symbolic	Text Align Right	regular
+format-justify-left-symbolic	Text Align Left	regular
+format-justify-center-symbolic	Text Align Center	regular
+format-indent-more-symbolic	Text Indent Increase	regular
+format-indent-less-symbolic	Text Indent Decrease	regular
+folder-new-symbolic	Folder Add	regular
+face-smile-symbolic	Emoji	regular
+dialog-warning-symbolic	Warning	regular
+chat-message-new-symbolic	Chat Add	regular
+changes-prevent-symbolic	Lock Closed	regular
+at-symbolic	Mention	regular
+x-office-address-book-symbolic	Book Contacts	regular
+web-browser-symbolic	Globe	regular
+view-calendar-workweek-symbolic	Calendar Work Week	regular
+view-calendar-week-symbolic	Calendar Week Start	regular
+view-calendar-month-symbolic	Calendar Month	regular
+view-calendar-day-symbolic	Calendar Day	regular
+video-x-generic-symbolic	Video	regular
+process-stop-symbolic	Stop	regular
+pan-end-symbolic	Chevron Right	regular
+pan-down-symbolic	Chevron Down	regular
+network-offline-symbolic	WiFi Off	regular
+mark-location-symbolic	Location	regular
+mail-spam-symbolic	Mail Prohibited	regular
+mail-sent-symbolic	Send	regular
+mail-mark-notjunk-symbolic	Mail Checkmark	regular
+mail-drafts-symbolic	Drafts	regular
+flag-outline-thin-symbolic	Flag	regular
+flag-outline-symbolic	Flag	regular
+flag-filled-symbolic	Flag	filled
+emblem-synchronizing-symbolic	Arrow Sync	regular
+edit-select-all-symbolic	Select All On	regular
+document-properties-symbolic	Info	regular
+dialog-question-symbolic	Question Circle	regular
+checkbox-checked-symbolic	Checkbox Checked	regular
+channel-secure-symbolic	Shield Lock	regular
+camera-web-symbolic	Camera	regular
+audio-x-generic-symbolic	Music Note 1	regular
+application-exit-symbolic	Sign Out	regular
+accessories-text-editor-symbolic	Document Edit	regular
+applications-graphics-symbolic	Paint Brush	regular

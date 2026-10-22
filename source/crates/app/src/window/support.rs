@@ -741,8 +741,13 @@ pub(crate) fn apply_favorite_visual(button: &gtk::ToggleButton, starred: bool) {
 /// `pinned-1`/`unpinned-1` icons (filled/outline pin shapes, `data/resources/
 /// icons/`), falling back to the generic themed pin icon (and then a
 /// universally-available one) if the resource bundle isn't compiled in (see
-/// `resources.rs`'s "best-effort" bundle doc comment).
+/// `resources.rs`'s "best-effort" bundle doc comment). In Fluent mode the
+/// pack's symbolic pins replace that full-colour artwork, because GTK only
+/// recolours names ending in `-symbolic`.
 pub(crate) fn pin_icon_name(pinned: bool) -> &'static str {
+    if crate::icon_style::is_fluent() {
+        return if pinned { "view-pin-symbolic" } else { "pin-off-symbolic" };
+    }
     if pinned {
         themed_icon_name(&["pinned-1", "view-pin-symbolic", "mail-mark-important-symbolic"])
     } else {

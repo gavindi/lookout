@@ -88,5 +88,22 @@ mod tests {
             };
             assert!(!bytes.is_empty());
         }
+        // The optional Fluent pack (UX-80) is a generated, partial icon theme:
+        // every manifest alias must be in the bundle under the theme's
+        // actions directory, or Fluent mode silently falls back to GNOME for
+        // that glyph.
+        let manifest = include_str!("../../../data/icons/fluent/manifest.tsv");
+        let expected = manifest.lines().filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#')).count();
+        let children = resource
+            .enumerate_children("/io/github/gavindi/Lookout/icons/Lookout-Fluent/scalable/actions", gio::ResourceLookupFlags::NONE)
+            .expect("the Fluent icon directory should be in the bundle");
+        assert_eq!(children.len(), expected, "every manifest alias should be bundled");
+        let bytes = resource
+            .lookup_data(
+                "/io/github/gavindi/Lookout/icons/Lookout-Fluent/scalable/actions/mail-send-symbolic.svg",
+                gio::ResourceLookupFlags::NONE,
+            )
+            .expect("the Fluent mail-send alias should be in the bundle");
+        assert!(!bytes.is_empty());
     }
 }

@@ -50,6 +50,10 @@ pub const ACCENT_COLOR: &str = "accent-color";
 pub const RIBBON_STYLE: &str = "ribbon-style";
 /// Whether the command ribbon is collapsed to its tab strip (Ctrl+F1).
 pub const RIBBON_COLLAPSED: &str = "ribbon-collapsed";
+/// Which icon pack is in force: one of the two `icon_style::IconStyle` codes
+/// ("gnome" default, "fluent"). The View ribbon's Icons menu and Config →
+/// Appearance's "Icon style" row both write it.
+pub const ICON_STYLE: &str = "icon-style";
 pub const LAYOUT_FOLDER_PANE: &str = "layout-folder-pane";
 pub const LAYOUT_READING_PANE: &str = "layout-reading-pane";
 /// Where the reading pane sits: one of [`READING_PANE_POSITIONS`] ("right"
@@ -381,6 +385,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(PRIVACY_BLUR_MODE, Value::String("off".into()));
     map.insert(RIBBON_STYLE, Value::String("simplified".into()));
     map.insert(RIBBON_COLLAPSED, Value::Bool(false));
+    map.insert(ICON_STYLE, Value::String("gnome".into()));
     map
 }
 
