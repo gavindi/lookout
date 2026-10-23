@@ -118,10 +118,13 @@ impl ContactsDetailsPane {
         let contact_info = tab_box();
         let emails = tab_box();
         let files = tab_box();
-        view_stack.add_titled(&scrolled(&overview), Some("overview"), "Overview");
-        view_stack.add_titled(&scrolled(&contact_info), Some("contact-info"), "Contact info");
-        view_stack.add_titled(&scrolled(&files), Some("files"), "Files");
-        view_stack.add_titled(&scrolled(&emails), Some("emails"), "Emails");
+        // The switcher is narrow, so libadwaita stacks each icon above its
+        // label; all four names exist in both the GNOME theme and the bundled
+        // Fluent pack, so the tabs keep their icons in either icon style.
+        view_stack.add_titled_with_icon(&scrolled(&overview), Some("overview"), "Overview", "avatar-default-symbolic");
+        view_stack.add_titled_with_icon(&scrolled(&contact_info), Some("contact-info"), "Contact info", "user-info-symbolic");
+        view_stack.add_titled_with_icon(&scrolled(&files), Some("files"), "Files", "mail-attachment-symbolic");
+        view_stack.add_titled_with_icon(&scrolled(&emails), Some("emails"), "Emails", "mail-unread-symbolic");
         let switcher = adw::ViewSwitcher::builder().policy(adw::ViewSwitcherPolicy::Narrow).build();
         switcher.set_stack(Some(&view_stack));
 
