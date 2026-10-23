@@ -16,8 +16,17 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::collections::HashMap;
+use std::time::Duration;
 
 use secret_service::{EncryptionType, SecretService};
+
+/// The per-round-trip budget for a chat request. A local model can spend a
+/// minute or more thinking once a tool result joins the prompt, so this is
+/// deliberately generous - the conversation as a whole is still bounded by
+/// `assistant_tools::MAX_TOOL_TURNS` round trips. A 30-second budget here
+/// used to cut local answers off mid-flight, and reqwest reports its own
+/// timeout as "error sending request", which read like a dead connection.
+const CHAT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The keyring item attribute identifying Lookout's own items - the same
 /// value as `other_accounts.rs`, so everything shows under one application
@@ -81,6 +90,23 @@ pub async fn delete_token() -> Result<(), String> {
     Ok(())
 }
 
+/// The user-facing message for a request that never produced a response,
+/// with reqwest's cause chain appended (a refused connection, a DNS failure,
+/// a reset mid-request, ...). `reqwest::Error`'s own display stops at
+/// "error sending request for url (...)" - identical wording for every
+/// transport failure - so a bare `{e}` leaves the user guessing. The full
+/// chain also goes to the log.
+fn transport_error(error: &reqwest::Error) -> String {
+    let mut message = format!("Connection failed: {error}");
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(&format!(" — {cause}"));
+        source = cause.source();
+    }
+    tracing::warn!("Assistant request failed: {message}");
+    message
+}
+
 /// The Settings → Assistant "Test" button's probe: `GET {base}/models` with
 /// the Bearer token. Success is a 2xx (reqwest follows the redirects some
 /// hosts answer with); a non-2xx answer or a transport failure is an error
@@ -98,7 +124,7 @@ pub async fn test_connection(base_url: &str, token: &str) -> Result<(), String> 
     let response = match request.send().await {
         Ok(response) => response,
         Err(e) if e.is_builder() => return Err(format!("Invalid API URL {url:?}: {e}")),
-        Err(e) => return Err(format!("Connection failed: {e}")),
+        Err(e) => return Err(transport_error(&e)),
     };
     let status = response.status();
     if status.is_success() {
@@ -127,7 +153,7 @@ pub async fn list_models(base_url: &str, token: &str) -> Result<Vec<String>, Str
     let response = match request.send().await {
         Ok(response) => response,
         Err(e) if e.is_builder() => return Err(format!("Invalid API URL {url:?}: {e}")),
-        Err(e) => return Err(format!("Connection failed: {e}")),
+        Err(e) => return Err(transport_error(&e)),
     };
     let status = response.status();
     if !status.is_success() {
@@ -169,28 +195,48 @@ fn endpoint_url(base_url: &str, path: &str) -> Result<String, String> {
     Ok(format!("{base}/{path}"))
 }
 
+/// The wording for a chat request that ran out its budget. A slow local
+/// model is not an unreachable server: reqwest's timeout shares the
+/// "error sending request" display with genuine transport failures, so the
+/// old fallback wording sent users looking at their URL and firewall.
+fn timed_out_error(timeout: Duration) -> String {
+    tracing::warn!("Assistant request timed out after {timeout:?}");
+    format!(
+        "The assistant took too long to answer (timed out after {timeout:?}). \
+         Local models can need several minutes for one reply - try a shorter question or a smaller model."
+    )
+}
+
 /// One raw `POST {base}/chat/completions` round trip, returning the
 /// server's parsed JSON body. The single-turn path (a bare user message,
 /// plain-text reply) is the Lookout tab's caller's job to shape from this:
 /// the tool-calling loop in `assistant_tools` POSTs the same endpoint with
-/// `tools` in the body and reads `tool_calls` back from the reply. The
-/// timeout is long because a request may itself be an LLM-internal
-/// multi-step answer (the loop's per-round-trip budget, not the whole
-/// conversation's).
+/// `tools` in the body and reads `tool_calls` back from the reply.
 pub async fn chat_completions(base_url: &str, token: &str, agent: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    chat_completions_with_timeout(base_url, token, agent, body, CHAT_TIMEOUT).await
+}
+
+/// [`chat_completions`] with an explicit per-round-trip budget. It is
+/// generous because a request may itself be an LLM-internal multi-step
+/// answer, and a local model can spend a minute or more on one once a tool
+/// result joins the prompt - but a bound still exists so a hung server
+/// can't wedge the worker forever. Tests pass a short budget to exercise
+/// the timeout wording without a five-minute wait.
+async fn chat_completions_with_timeout(base_url: &str, token: &str, agent: &str, body: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value, String> {
     if agent.is_empty() {
         return Err("No agent selected - choose one in Settings → Assistant".to_string());
     }
     let url = endpoint_url(base_url, "chat/completions")?;
     let client = crate::http::client();
-    let mut request = client.post(&url).timeout(std::time::Duration::from_secs(30)).json(body);
+    let mut request = client.post(&url).timeout(timeout).json(body);
     if !token.is_empty() {
         request = request.bearer_auth(token);
     }
     let response = match request.send().await {
         Ok(response) => response,
         Err(e) if e.is_builder() => return Err(format!("Invalid API URL {url:?}: {e}")),
-        Err(e) => return Err(format!("Connection failed: {e}")),
+        Err(e) if e.is_timeout() => return Err(timed_out_error(timeout)),
+        Err(e) => return Err(transport_error(&e)),
     };
     let status = response.status();
     if !status.is_success() {
@@ -376,5 +422,46 @@ mod tests {
 
         let (malformed, _) = block_on(serve_chat_once("200 OK", "not json"));
         assert!(malformed.unwrap_err().contains("JSON"));
+    }
+
+    /// Serves a connection that accepts the request and then never answers,
+    /// so the client can only end the call on its own budget (`timeout`).
+    async fn chat_against_a_stalled_server(timeout: Duration) -> Result<serde_json::Value, String> {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            // Outlive the client's test budget so only the timeout can end
+            // the request.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let body = serde_json::json!({"model": "gpt-4o", "messages": []});
+        chat_completions_with_timeout(&format!("http://127.0.0.1:{port}"), "sk-test", "gpt-4o", &body, timeout).await
+    }
+
+    #[test]
+    fn chat_completions_names_a_timeout_instead_of_disguising_it_as_a_connection_failure() {
+        let message = block_on(chat_against_a_stalled_server(Duration::from_millis(100))).unwrap_err();
+        assert!(message.contains("timed out after 100ms"), "the timeout must be named: {message}");
+        assert!(!message.contains("Connection failed"), "a slow model is not a connection failure: {message}");
+    }
+
+    #[test]
+    fn transport_failures_carry_the_underlying_cause() {
+        // A port that was just free: the connect is refused, and the cause
+        // must ride along with reqwest's all-purpose "error sending request".
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let body = serde_json::json!({"model": "gpt-4o", "messages": []});
+        let message = block_on(chat_completions(&format!("http://127.0.0.1:{port}"), "sk-test", "gpt-4o", &body)).unwrap_err();
+        assert!(message.starts_with("Connection failed"), "a transport failure keeps its headline: {message}");
+        assert!(
+            message.to_lowercase().contains("refused") || message.to_lowercase().contains("connect"),
+            "the cause chain must ride along: {message}"
+        );
     }
 }

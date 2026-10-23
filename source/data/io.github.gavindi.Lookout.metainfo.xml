@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.284" date="2026-10-23">
+      <description>
+        <p>Asking the assistant on the Lookout tab now works with local models. A chat round trip is allowed five minutes instead of thirty seconds, so a local model that takes longer than half a minute to answer after reading tool results is no longer cut off, and a timeout now says it timed out rather than reporting a connection failure. Unreachable hosts still fail within ten seconds, and other connection errors name their cause.</p>
+      </description>
+    </release>
     <release version="0.9.283" date="2026-10-23">
       <description>
         <p>File now opens Outlook's full-window Backstage, with Info, Open &amp; Export, Options and About pages, a Back button, the module's accent rail, and Quit Lookout. Settings is no longer a separate window: File ▸ Options shows its categories beside the selected category's settings, and the header gear, Ctrl+6, Account Settings and the composer's signature and template links open it on the right category. Opening Options is instant.</p>

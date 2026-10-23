@@ -2,12 +2,19 @@
 //! DAV: the assistant's endpoints, the Microsoft and Google OAuth token
 //! endpoints, Google Tasks and one-click unsubscribe. Sharing it keeps one
 //! connection pool and reuses TLS sessions instead of building a fresh client
-//! (and handshaking from scratch) per request.
+//! (and handshaking from scratch) per request. Connections are given ten
+//! seconds to establish, so a dead host fails promptly even on a request
+//! whose own total timeout is minutes long (the assistant's chat calls).
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 #[cfg(not(test))]
-static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(reqwest::Client::new);
+static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("the shared HTTP client's configuration is valid")
+});
 
 /// The shared client. Cloning a `reqwest::Client` only bumps a reference
 /// count, so callers take their own handle. The app runs one tokio runtime

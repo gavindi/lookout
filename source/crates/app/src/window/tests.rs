@@ -836,6 +836,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         composer_identities_refresh: None,
         manage_signatures: None,
         manage_templates: None,
+        import_evolution: None,
         create_task_from_message: None,
         reply_with_meeting: None,
         flagged_mail_refresh: None,
