@@ -50,7 +50,7 @@
     <key name="close-to-background" type="b">
       <default>true</default>
       <summary>Keep running when the window is closed</summary>
-      <description>Continue syncing and showing mail and calendar notifications after the window is closed; quit from the File menu.</description>
+      <description>Continue syncing and showing mail and calendar notifications after the window is closed; quit from the File page.</description>
     </key>
 
     <!-- Appearance -->

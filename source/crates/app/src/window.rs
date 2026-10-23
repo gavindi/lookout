@@ -40,6 +40,7 @@ mod compose_host;
 mod connect;
 mod conversation;
 mod drag_files;
+mod file_page;
 mod flags;
 mod folders;
 mod graph_sync;
@@ -708,6 +709,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         composer_identities_refresh: None,
         manage_signatures: None,
         manage_templates: None,
+        import_evolution: None,
         create_task_from_message: None,
         reply_with_meeting: None,
         flagged_mail_refresh: None,
@@ -3462,9 +3464,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     root_stack.add_named(&contacts_status_page, Some("contacts-empty"));
     root_stack.add_named(&contacts_paned, Some("contacts"));
 
-    // Built here (rather than down by the rest of the Config wiring below)
-    // so `config_view.paned` exists in time to join the shared pane-width
-    // persistence closure right below.
+    // Built here (rather than down by the rest of the Config wiring below) so
+    // every settings row exists before its handlers are attached.
     let config_view = Rc::new(crate::config_view::build());
 
     // The one real title bar for the window - owns the actual
@@ -3533,8 +3534,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // highlight shows while any blur is on; the icon and tooltip then say
     // which level is active and what the next click does (see `apply_blur_mode`
     // below). The Settings button sits to its right, directly left of the
-    // window controls, and opens the Settings window as a modal dialog (see
-    // its click handler below). `pack_end` stacks right-to-left, so the calls
+    // window controls, and opens File ▸ Options, the embedded Settings view
+    // (see its click handler below). `pack_end` stacks right-to-left, so the calls
     // are ordered rightmost first: on screen this reads open-.eml, privacy,
     // Settings.
     let header_privacy_toggle = gtk::ToggleButton::builder()
@@ -3551,18 +3552,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window_header.pack_end(&open_eml_button);
 
     // --- Menu bar row (File, then the ribbon's tabs: Home, Send / Receive,
-    // Folder, View, Help). File (Quit) is a `MenuButton` with a real
-    // popover; the tabs are mutually-exclusive toggle buttons that switch
-    // the ribbon content row below (see `view_toolbar_stack`). Home holds the
-    // command toolbar, Send / Receive the account sync, Folder the open
-    // folder's commands, View the pane-visibility layout toggles and Help
-    // About. Mail-only: they're disabled while another module is active (see
-    // the nav-rail handlers), matching the codebase's honest-disabled
-    // convention.
-    let file_menu = gio::Menu::new();
-    file_menu.append(Some("Quit"), Some("app.quit"));
-
-    let file_button = gtk::MenuButton::builder().label("File").css_classes(["flat"]).menu_model(&file_menu).build();
+    // Folder, View, Help). File is a plain button, not a menu: choosing it
+    // swaps the whole window body for the File page (Outlook's Backstage -
+    // see `window/file_page.rs`), so the row and everything under it hide
+    // until Back returns. The tabs are mutually-exclusive toggle buttons that
+    // switch the ribbon content row below (see `view_toolbar_stack`). Home
+    // holds the command toolbar, Send / Receive the account sync, Folder the
+    // open folder's commands, View the pane-visibility layout toggles and
+    // Help About. Mail-only: they're disabled while another module is active
+    // (see the nav-rail handlers), matching the codebase's honest-disabled
+    // convention. File stays enabled everywhere.
+    let file_button = gtk::Button::builder().label("File").css_classes(["flat", "ribbon-tab"]).build();
+    file_button.set_tooltip_text(Some("Open the File page"));
     let ribbon_tab = |label: &str| gtk::ToggleButton::builder().label(label).css_classes(["flat", "ribbon-tab"]).build();
     let home_button = ribbon_tab("Home");
     home_button.set_active(true);
@@ -4257,9 +4258,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let view_toolbar = view_band.root().clone();
 
     // --- Send / Receive tab: sync every account now, and the accounts
-    // themselves. Account Settings is wired below, once the Settings dialog
-    // exists; Add Account opens GNOME Online Accounts, where Lookout's
-    // accounts come from.
+    // themselves. Account Settings is wired below, once the File page's
+    // Options section exists; Add Account opens GNOME Online Accounts, where
+    // Lookout's accounts come from.
     let add_account_button = gtk::Button::from_icon_name("list-add-symbolic");
     add_account_button.set_tooltip_text(Some("Add account (GNOME Online Accounts)"));
     {
@@ -5527,9 +5528,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window_body.append(&nav_rail);
     window_body.append(&content_and_overview_paned);
 
+    // The window's two modes: the app itself, and the File page (Outlook's
+    // Backstage). The File page is built and added as "file" near the end of
+    // this function, once the Settings view it embeds exists; switching is
+    // one stack child, so the module, tab, panes and selection underneath are
+    // never rebuilt or lost.
+    let app_stack = gtk::Stack::new();
+    app_stack.set_transition_type(gtk::StackTransitionType::None);
+    // Measure only the visible mode. Homogeneous measurement (the default)
+    // would measure the File page's whole settings column while the app is
+    // showing, and the app's ribbon and panes while File is showing.
+    app_stack.set_hhomogeneous(false);
+    app_stack.set_vhomogeneous(false);
+    app_stack.add_named(&window_body, Some("app"));
+
     let outer_toolbar_view = adw::ToolbarView::new();
     outer_toolbar_view.add_top_bar(&window_header);
-    outer_toolbar_view.set_content(Some(&window_body));
+    outer_toolbar_view.set_content(Some(&app_stack));
 
     toast_overlay.set_child(Some(&outer_toolbar_view));
     toast_overlay.set_hexpand(true);
@@ -5584,7 +5599,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Close-to-background: the window's close button hides the window
     // instead of exiting (Config → General → "Keep running when the window
     // is closed"), so account sync and the notification loops keep running;
-    // File → Quit (`app.quit`) is the real exit. The portal status line
+    // File ▸ Quit Lookout (`app.quit`) is the real exit. The portal status line
     // (v2 `SetStatus`) tells the shell's background-apps list what the
     // hidden app is doing; clearing it on show keeps that list honest.
     {
@@ -5626,7 +5641,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 glib::Propagation::Stop
             }
         });
-        // The real exit paths - Ctrl+Q / File → Quit, and the tray icon's
+        // The real exit paths - File ▸ Quit Lookout, and the tray icon's
         // Quit - call `app.quit()` directly, so the close-request handler
         // (and with it the flush above) never runs for them. The `shutdown`
         // signal reaches every quit, and GTK emits it before its default
@@ -5718,7 +5733,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let calendar_paned = calendar_paned.clone();
         let contacts_paned = contacts_paned.clone();
         let contacts_content_paned = contacts_content_paned.clone();
-        let config_paned = config_view.paned.clone();
         let content_and_overview_paned = content_and_overview_paned.clone();
         let state = state.clone();
         let pane_widths_applying = pane_widths_applying.clone();
@@ -5847,7 +5861,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT), None, false);
                 restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT), None, false);
                 restore(&contacts_content_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_DETAILS_WIDTH_PCT), None, true);
-                restore(&config_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT), None, false);
             }
             // The flag is cleared from an idle, not here, so it also covers the
             // layout pass these `set_position` calls just queued. GtkPaned
@@ -6012,7 +6025,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             true,
             false,
         );
-        wire_pane_width_save(&config_view.paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT), false, false);
         wire_pane_width_save(
             &content_and_overview_paned,
             PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT),
@@ -6022,11 +6034,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     }
     // Each pane restores itself the moment it maps. This is what makes the
     // restore deterministic: every branch of `apply_stored_pane_widths` is
-    // gated on `is_mapped()`, and the six panes map at six different moments -
+    // gated on `is_mapped()`, and the five panes map at five different moments -
     // the mail split when account discovery flips `root_stack` off its empty
     // page, the calendar and people sidebars when their tab is first shown,
-    // the Config sidebar when the Settings dialog opens, the overview pane with
-    // the window itself. Before this, a pane that wasn't mapped when some
+    // the overview pane with the window itself. Before this, a pane that wasn't mapped when some
     // incidental resize happened to fire simply kept its built-in default.
     // Unmap forgets the pane was restored: mapping again puts it back through
     // GTK's allocation-time clamp, so the save suppression has to reopen.
@@ -6052,7 +6063,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         wire_pane_width_restore(&calendar_paned, PaneExtentKeys::fixed(crate::settings::PANE_CALENDAR_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&contacts_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&contacts_content_paned, PaneExtentKeys::fixed(crate::settings::PANE_CONTACTS_DETAILS_WIDTH_PCT));
-        wire_pane_width_restore(&config_view.paned, PaneExtentKeys::fixed(crate::settings::PANE_CONFIG_SIDEBAR_WIDTH_PCT));
         wire_pane_width_restore(&content_and_overview_paned, PaneExtentKeys::fixed(crate::settings::PANE_MAIL_OVERVIEW_WIDTH_PCT));
     }
     // --- Reading pane position: Right / Bottom / Off, shared by the View
@@ -9111,6 +9121,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // flow while a Config row is recording. Stop on anything handled, so a
     // matched chord never also reaches the focused widget (an entry
     // retyping "n" because Ctrl+N got through would be wrong).
+    //
+    // The File page (Backstage) gets one rule of its own: while it is open,
+    // Escape returns to the mailbox and no command chord runs - the window
+    // takes no shortcuts behind a page that is not the app, as Outlook (and
+    // MailCraft) do. `file_mode_close` is filled in once the page exists,
+    // further down this function.
+    let file_mode = Rc::new(Cell::new(false));
+    let file_mode_close: LateCallbackSlot = Rc::new(RefCell::new(None));
     let dispatch = Rc::new(RefCell::new(dispatch));
     {
         let shortcuts = shortcuts.clone();
@@ -9120,8 +9138,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let dispatch = dispatch.clone();
         let message_list = message_list.clone();
+        let file_mode = file_mode.clone();
+        let file_mode_close = file_mode_close.clone();
         let controller = gtk::EventControllerKey::new();
         controller.connect_key_pressed(move |_controller, keyval, keycode, state_modifiers| {
+            if file_mode.get() {
+                if keyval == gtk::gdk::Key::Escape && (state_modifiers & crate::shortcuts::MODIFIER_MASK).is_empty() {
+                    if let Some(close) = file_mode_close.borrow().as_ref() {
+                        close();
+                    }
+                    return glib::Propagation::Stop;
+                }
+                // Let the page's own widgets have the arrows and Enter; no
+                // command shortcut runs while File is open.
+                return glib::Propagation::Proceed;
+            }
             if shortcuts.borrow().capturing {
                 if let Some(display) = &display {
                     if let Some((modifiers, keyval)) = crate::shortcuts::chord_from_key(display, keycode, state_modifiers) {
@@ -10101,6 +10132,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     *evolution_drafts.borrow_mut() = drafts.clone();
                     refresh_import_visibility();
                     if drafts.is_empty() {
+                        // The File page offers the import even when the
+                        // Config row is hidden, so say why nothing happened.
+                        if let Some(overlay) = state.borrow().toast_overlay.clone() {
+                            overlay.add_toast(adw::Toast::new("No Evolution accounts were found to import."));
+                        }
                         return;
                     }
                     let app_config = state.borrow().app_config.clone();
@@ -10108,6 +10144,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 });
             })
         };
+        // The File page's Open & Export offers the same import. It stays on
+        // that page while the desktop can import at all; the flow reports
+        // when Evolution has nothing Lookout is missing.
+        state.borrow_mut().import_evolution = Some({
+            let open_import = open_import.clone();
+            Rc::new(move |anchor: &gtk::Widget| open_import(anchor))
+        });
         {
             let open_import = open_import.clone();
             config_view.import_evolution_row.connect_activated(move |row| open_import(row.upcast_ref()));
@@ -10243,127 +10286,181 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Settings window: the header bar's Settings button opens the Config
-    // screen (the same sidebar/stack layout that used to live in the nav
-    // rail) as a modal dialog over the main window. Single instance: while
-    // one is open, re-clicking the button (or the Ctrl+6 shortcut below)
-    // just re-presents it. The window is destroyed on close and rebuilt on
-    // the next open around the same shared `config_view.root` widget, so no
-    // per-session state is lost. The root is detached *explicitly* rather
-    // than relying on the destroy cascade to unparent it: closure reference
-    // cycles into the window's content chain (the close button's handler
-    // holds the dialog, the dialog holds the chain) can keep the chain
-    // alive after the window is destroyed, leaving the root parented to a
-    // dead window - and the next open then fails to attach it, showing an
-    // empty modal. `refresh_config` runs on every open so the account lists
-    // are current, and the discovery passes keep refreshing it while the
-    // dialog is up. ---
+    // --- Settings, embedded in the File page --------------------------------
+    // The old modal Settings window is gone. `config_view` - its category
+    // sidebar and section stack - is built once and embedded in the File
+    // page's Options section, the way Outlook's File ▸ Options works. The
+    // header's gear, Ctrl+6, the ribbon's Account Settings and the composer's
+    // signature/template hooks all open File ▸ Options and jump to the
+    // category they name; `refresh_config` repaints the view whenever it is
+    // shown so accounts, signatures and preferences are current.
+    //
+    // The File page is built below, and its Info cards need to open Settings
+    // to a category, so that hook is a slot filled once the page's own
+    // show/close closures exist.
     {
-        let window = window.clone();
-        let config_view = config_view.clone();
-        let refresh_config = refresh_config.clone();
-        let config_window: Rc<RefCell<Option<adw::Window>>> = Rc::new(RefCell::new(None));
-        let open_settings = {
-            let window = window.clone();
-            let config_view = config_view.clone();
-            let refresh_config = refresh_config.clone();
-            let config_window = config_window.clone();
-            move || {
-                if let Some(existing) = config_window.borrow().as_ref() {
-                    existing.present();
-                    return;
+        let settings_hook: OpenSettingsSlot = Rc::new(RefCell::new(None));
+        let open_settings_forward: OpenSettingsFn = {
+            let settings_hook = settings_hook.clone();
+            Rc::new(move |section: &str| {
+                if let Some(open) = settings_hook.borrow().as_ref() {
+                    open(section);
                 }
-                // Defensive: if the previous window's chain somehow still
-                // parents the root, drop that link first so the attach below
-                // can't fail. Safe no-op when the root is already detached.
-                config_view.root.unparent();
-                let dialog = adw::Window::builder()
-                    .transient_for(&window)
-                    .modal(true)
-                    .title("Settings")
-                    .default_width(1000)
-                    .default_height(720)
-                    .build();
-                let header = adw::HeaderBar::new();
-                let settings_title = adw::WindowTitle::new("Settings", "");
-                crate::privacy::mark_ui(&settings_title);
-                header.set_title_widget(Some(&settings_title));
-                let close_button = gtk::Button::from_icon_name("window-close-symbolic");
-                close_button.set_css_classes(&["flat"]);
-                close_button.set_tooltip_text(Some("Close"));
-                header.pack_end(&close_button);
-                let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
-                content.append(&header);
-                // Same card treatment the Config screen had in the main
-                // window, so the dialog shows the identical design.
-                let config_card = card_section(&config_view.root);
-                config_card.add_css_class("folder-pane");
-                config_card.set_vexpand(true);
-                content.append(&config_card);
-                dialog.set_content(Some(&content));
-                {
-                    let dialog = dialog.clone();
-                    close_button.connect_clicked(move |_| dialog.close());
-                }
-                {
-                    let config_window = config_window.clone();
-                    let config_view = config_view.clone();
-                    dialog.connect_close_request(move |_| {
-                        // Unparent the shared root now, while the window is
-                        // still alive: the destroy cascade may never reach it
-                        // if a reference cycle keeps this window's content
-                        // chain alive, and the next open then can't re-attach
-                        // it (the modal would open empty).
-                        config_view.root.unparent();
-                        *config_window.borrow_mut() = None;
-                        glib::Propagation::Proceed
-                    });
-                }
-                refresh_config();
-                *config_window.borrow_mut() = Some(dialog.clone());
-                dialog.present();
-            }
+            })
         };
-        settings_button.connect_clicked({
-            let open_settings = open_settings.clone();
-            move |_| open_settings()
-        });
-        // Ctrl+6 (shortcuts.rs ACTION_CONFIG) opens the same dialog. The
-        // rail-toggle loop above can't carry it - `refresh_config` only
-        // exists from here on - so it's dispatched here instead. The same
-        // `open_settings` rides as the composer's "Manage Signatures…"
-        // hook, which additionally jumps the settings screen to the
-        // Accounts section (where the global signature list lives).
-        let open_settings = Rc::new(open_settings);
-        dispatch.borrow_mut().insert(crate::shortcuts::ACTION_CONFIG, open_settings.clone());
-        state.borrow_mut().manage_signatures = Some(Rc::new({
-            let open_settings = open_settings.clone();
-            let config_view = config_view.clone();
-            move || {
-                open_settings();
-                crate::config_view::show_section(&config_view, "accounts");
+
+        // --- The File page (Outlook's Backstage) ---------------------------
+        // Built here because its Options section *is* the Settings view.
+        // `File` is not a menu: it swaps the window body for this page, and
+        // Back (or Escape) returns to the module, tab, panes and selection
+        // exactly as they were.
+        {
+            let hooks = crate::window::file_page::Hooks {
+                open_settings: open_settings_forward.clone(),
+                settings_page: config_view.root.clone(),
+                quit: {
+                    let app = app.clone();
+                    Rc::new(move || app.quit())
+                },
+                manage_rules: {
+                    let state = state.clone();
+                    Rc::new(move |anchor: &gtk::Widget| crate::rules_view::show_manage_rules_dialog(anchor, state.clone()))
+                },
+                manage_categories: {
+                    let state = state.clone();
+                    let tags = tags.clone();
+                    let message_list = message_list.clone();
+                    Rc::new(move |anchor: &gtk::Widget| {
+                        show_manage_categories_dialog(anchor, state.clone(), tags.clone(), message_list.clone())
+                    })
+                },
+                import_evolution: state.borrow().import_evolution.clone(),
+                import_contacts: {
+                    let window = window.clone();
+                    let state = state.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    Rc::new(move || show_contacts_import_dialog(&window, &state, &toast_overlay))
+                },
+                export_contacts: {
+                    let window = window.clone();
+                    let state = state.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    Rc::new(move |format: ContactFileFormat| {
+                        crate::contacts_view::export_all_contacts(&window, &state, format, &toast_overlay)
+                    })
+                },
+            };
+            let file_page = Rc::new(crate::window::file_page::build(state.clone(), hooks));
+            app_stack.add_named(&file_page.root, Some("file"));
+
+            // The header loses its search cluster and right-hand buttons
+            // while File is open, and shows the app's name instead; Back and
+            // Escape restore them.
+            let file_title = adw::WindowTitle::new("Lookout", "");
+            let header_controls: Rc<Vec<gtk::Widget>> = Rc::new({
+                // `mut` is only needed in debug builds, where the debug
+                // ".eml" opener joins the header controls.
+                #[allow(unused_mut)]
+                let mut controls = vec![
+                    settings_button.clone().upcast::<gtk::Widget>(),
+                    header_privacy_toggle.clone().upcast::<gtk::Widget>(),
+                ];
+                #[cfg(debug_assertions)]
+                controls.push(open_eml_button.clone().upcast::<gtk::Widget>());
+                controls
+            });
+
+            let show_file_page: Rc<dyn Fn(&str)> = {
+                let app_stack = app_stack.clone();
+                let file_page = file_page.clone();
+                let state = state.clone();
+                let window_header = window_header.clone();
+                let file_title = file_title.clone();
+                let header_controls = header_controls.clone();
+                let file_mode = file_mode.clone();
+                Rc::new(move |code: &str| {
+                    file_page.open(&state.borrow(), code);
+                    app_stack.set_visible_child_name("file");
+                    window_header.set_title_widget(Some(&file_title));
+                    for control in header_controls.iter() {
+                        control.set_visible(false);
+                    }
+                    file_mode.set(true);
+                    file_page.focus();
+                })
+            };
+            let hide_file_page: Rc<dyn Fn()> = {
+                let app_stack = app_stack.clone();
+                let window_header = window_header.clone();
+                let search_box = search_box.clone();
+                let header_controls = header_controls.clone();
+                let file_mode = file_mode.clone();
+                let file_button = file_button.clone();
+                Rc::new(move || {
+                    app_stack.set_visible_child_name("app");
+                    window_header.set_title_widget(Some(&search_box));
+                    for control in header_controls.iter() {
+                        control.set_visible(true);
+                    }
+                    file_mode.set(false);
+                    file_button.grab_focus();
+                })
+            };
+            *file_mode_close.borrow_mut() = Some(hide_file_page.clone());
+            {
+                let hide_file_page = hide_file_page.clone();
+                file_page.back.connect_clicked(move |_| hide_file_page());
             }
-        }));
-        // The ribbon's Send / Receive ▸ Account Settings opens the same
-        // dialog on its Accounts section.
-        account_settings_button.connect_clicked({
-            let open_settings = open_settings.clone();
-            let config_view = config_view.clone();
-            move |_| {
-                open_settings();
-                crate::config_view::show_section(&config_view, "accounts");
+            {
+                let show_file_page = show_file_page.clone();
+                file_button.connect_clicked(move |_| show_file_page("info"));
             }
-        });
-        // The composer's "Manage Templates…" hook jumps to the Mail section,
-        // where the My Templates list lives (item 2.10 / C-17).
-        state.borrow_mut().manage_templates = Some(Rc::new({
-            let open_settings = open_settings.clone();
-            let config_view = config_view.clone();
-            move || {
-                open_settings();
-                crate::config_view::show_section(&config_view, "mail");
-            }
-        }));
+
+            // Every Settings entry point opens File ▸ Options, optionally on
+            // a named category. An empty name keeps whichever category the
+            // reader last had open - the header gear and Ctrl+6 mean "open
+            // Settings", not "open Accounts".
+            let open_settings: Rc<dyn Fn(&str)> = {
+                let show_file_page = show_file_page.clone();
+                let config_view = config_view.clone();
+                Rc::new(move |section: &str| {
+                    show_file_page("options");
+                    if !section.is_empty() {
+                        crate::config_view::show_section(&config_view, section);
+                    }
+                })
+            };
+            *settings_hook.borrow_mut() = Some(open_settings.clone());
+
+            settings_button.connect_clicked({
+                let open_settings = open_settings.clone();
+                move |_| open_settings("")
+            });
+            // Ctrl+6 (shortcuts.rs ACTION_CONFIG) opens Options. The
+            // rail-toggle loop above can't carry it - `refresh_config` only
+            // exists from here on - so it's dispatched here instead.
+            dispatch.borrow_mut().insert(crate::shortcuts::ACTION_CONFIG, {
+                let open_settings = open_settings.clone();
+                Rc::new(move || open_settings(""))
+            });
+            // The composer's "Manage Signatures…" hook opens the Accounts
+            // category, where the global signature list lives.
+            state.borrow_mut().manage_signatures = Some({
+                let open_settings = open_settings.clone();
+                Rc::new(move || open_settings("accounts"))
+            });
+            // The ribbon's Send / Receive ▸ Account Settings opens the same.
+            account_settings_button.connect_clicked({
+                let open_settings = open_settings.clone();
+                move |_| open_settings("accounts")
+            });
+            // The composer's "Manage Templates…" hook opens the Mail
+            // category, where the My Templates list lives (item 2.10 / C-17).
+            state.borrow_mut().manage_templates = Some({
+                let open_settings = open_settings.clone();
+                Rc::new(move || open_settings("mail"))
+            });
+        }
     }
 
     // --- "Clear all caches" (Config → Advanced): deletes the on-disk mail,

@@ -31,6 +31,8 @@ const APP_CSS: &str = concat!(
     "\n",
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/styles/ribbon.css")),
     "\n",
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/styles/file-page.css")),
+    "\n",
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/styles/density.css")),
     "\n",
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/styles/search.css")),

@@ -1,0 +1,187 @@
+/* The File page - Outlook's "Backstage" (see `window/file_page.rs`).
+   Two columns: a fixed navigation rail on the left, filled with the accent
+   in the light theme and a neutral panel in the dark (see the
+   `lookout-file-nav-*` tokens in `data/themes/`), and a scrollable content
+   column on the right. Geometry and type follow Outlook's File page: a
+   210 px rail, 36 px pills, a 22 px page heading, accent section labels and
+   wide icon + title + detail tiles. */
+
+.file-page {
+    background-color: @lookout-file-page-bg;
+}
+
+/* --- Navigation rail ---------------------------------------------------- */
+
+.file-page-nav {
+    background-color: @lookout-file-nav-bg;
+    padding: 10px 8px;
+}
+
+/* Both the pinned buttons and the page rows wear the rail's ink. Symbolic
+   icons paint in the CSS `color`, so the images need it too - otherwise they
+   keep the window's foreground and vanish on the accent-filled light rail. */
+.file-page-nav label,
+.file-page-nav image {
+    color: @lookout-file-nav-fg;
+}
+
+button.file-nav-back,
+button.file-nav-quit {
+    color: @lookout-file-nav-fg;
+    border-radius: 5px;
+    min-height: 36px;
+    padding: 2px 12px;
+}
+
+button.file-nav-back:hover,
+button.file-nav-quit:hover {
+    background-color: @lookout-file-nav-hover-bg;
+}
+
+button.file-nav-back label {
+    font-weight: 600;
+    font-size: 13px;
+}
+
+button.file-nav-quit label {
+    font-size: 13px;
+}
+
+.file-page-nav-list {
+    background: none;
+}
+
+.file-page-nav-list row {
+    border-radius: 5px;
+    min-height: 36px;
+}
+
+.file-page-nav-list row:hover {
+    background-color: @lookout-file-nav-hover-bg;
+}
+
+.file-page-nav-list row:selected {
+    background-color: @lookout-file-nav-active-bg;
+}
+
+.file-page-nav-list row label {
+    font-size: 13px;
+}
+
+.file-page-nav-list row:selected label {
+    font-weight: 600;
+}
+
+/* The 3 px accent bar marking the page in view. It is transparent on the
+   accent-filled light rail, where the fill alone marks it (as in Outlook and
+   MailCraft), and accent-coloured on the neutral dark one. */
+.file-nav-marker {
+    background-color: transparent;
+    border-radius: 2px;
+}
+
+.file-page-nav-list row:selected .file-nav-marker {
+    background-color: @lookout-file-nav-marker;
+}
+
+/* --- Content pane -------------------------------------------------------- */
+
+.file-page-content {
+    background-color: @lookout-file-page-bg;
+}
+
+.file-page-heading {
+    font-size: 22px;
+    font-weight: 600;
+}
+
+.file-page-section {
+    font-size: 14px;
+    font-weight: 600;
+    color: @lookout-unread;
+}
+
+/* A wide button: icon, title and one line of explanation. The button keeps
+   the flat, borderless default inside; the tile supplies the surface. */
+button.file-page-tile {
+    background-color: @lookout-file-tile-bg;
+    border: 1px solid @lookout-file-tile-border;
+    border-radius: 6px;
+    min-height: 52px;
+    padding: 0;
+}
+
+button.file-page-tile:hover {
+    background-color: @lookout-file-tile-hover;
+}
+
+.file-page-tile-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.file-page-tile-detail {
+    font-size: 12px;
+    color: @lookout-muted;
+}
+
+/* An account on the Info page. */
+.file-page-card {
+    background-color: @lookout-file-tile-bg;
+    border: 1px solid @lookout-file-tile-border;
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+
+.file-page-card-title {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.file-page-card-detail {
+    font-size: 12px;
+    color: @lookout-muted;
+}
+
+button.file-page-card-button {
+    padding: 4px 12px;
+}
+
+/* --- Options: category pane + settings page ----------------------------- */
+
+.file-options {
+    background-color: @lookout-file-page-bg;
+}
+
+/* The second-level category list, beside the accent File rail. Neutral in
+   both themes, with a hairline separating it from the settings page. */
+.file-options-nav {
+    background-color: @lookout-file-options-nav-bg;
+    border-right: 1px solid @lookout-row-separator;
+    padding: 10px 8px;
+}
+
+.file-options-nav-list {
+    background: none;
+}
+
+.file-options-nav-list row {
+    border-radius: 5px;
+    min-height: 36px;
+}
+
+.file-options-nav-list row:hover {
+    background-color: @lookout-file-tile-hover;
+}
+
+.file-options-nav-list row:selected {
+    background-color: @lookout-file-options-nav-active-bg;
+}
+
+.file-options-nav-list row label {
+    font-size: 13px;
+}
+
+.file-options-nav-list row:selected label {
+    font-weight: 600;
+}

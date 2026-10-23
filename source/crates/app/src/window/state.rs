@@ -1093,6 +1093,18 @@ impl SieveVacationSupport {
 
 /// A late-bound action on one message (`UiState::create_task_from_message`).
 pub(crate) type MessageActionFn = Rc<dyn Fn(&EmailSummary)>;
+/// Opens the "Import from Evolution…" dialog, anchored to the widget that
+/// was clicked.
+pub(crate) type ImportEvolutionFn = Rc<dyn Fn(&gtk::Widget)>;
+/// A window-level callback installed after the widgets it needs exist.
+pub(crate) type LateCallback = Rc<dyn Fn()>;
+/// The slot one [`LateCallback`] is held in until its owner has been built.
+pub(crate) type LateCallbackSlot = Rc<RefCell<Option<LateCallback>>>;
+/// Opens File ▸ Options at a named Settings category; an empty name leaves the
+/// page's scroll position alone.
+pub(crate) type OpenSettingsFn = Rc<dyn Fn(&str)>;
+/// The slot an [`OpenSettingsFn`] is held in until the File page exists.
+pub(crate) type OpenSettingsSlot = Rc<RefCell<Option<OpenSettingsFn>>>;
 
 /// A late-bound action on a conversation's messages
 /// (`UiState::reply_with_meeting`): opens a new event prefilled with their
@@ -1708,15 +1720,20 @@ pub(crate) struct UiState {
     /// change, so an identity added/edited while a composer is open shows up
     /// in its From list immediately. `None` while no composer is open.
     pub(crate) composer_identities_refresh: Option<Rc<dyn Fn()>>,
-    /// Opens the Settings dialog to the Accounts → Signatures section - the
+    /// Opens File ▸ Options on the Accounts → Signatures section - the
     /// composer's signature menu "Manage Signatures…" item. Late-bound:
-    /// `build_window` fills it in once the settings window's open logic
-    /// exists (same pattern as `composer_identities_refresh`).
+    /// `build_window` fills it in once the File page's open logic exists
+    /// (same pattern as `composer_identities_refresh`).
     pub(crate) manage_signatures: Option<Rc<dyn Fn()>>,
-    /// Opens the Settings dialog to the Mail → My Templates section - the
+    /// Opens File ▸ Options on the Mail → My Templates section - the
     /// composer's template menu "Manage Templates…" item (item 2.10 / C-17).
     /// Late-bound, like `manage_signatures`.
     pub(crate) manage_templates: Option<Rc<dyn Fn()>>,
+    /// Opens the "Import from Evolution…" dialog (EDS_TODO.md E3.4),
+    /// anchored to the widget that was clicked. Late-bound: filled where the
+    /// Config row is wired; the File page's Open & Export offers the entry
+    /// while it is set.
+    pub(crate) import_evolution: Option<ImportEvolutionFn>,
     /// The More menu's "Create task from message…": opens the task editor
     /// seeded from a message (`show_create_task_for_email`). Late-bound: the
     /// menu is built before `calendar_state`/`tasks_view` exist, so this hook

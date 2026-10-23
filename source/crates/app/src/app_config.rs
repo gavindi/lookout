@@ -201,7 +201,7 @@ pub struct AccountSignatureDefaults {
 }
 
 /// One account's automatic replies (item 2.11 / M-24). This is the Sieve
-/// backend's source of truth: the settings dialog writes it and the Sieve push
+/// backend's source of truth: the Settings view writes it and the Sieve push
 /// path recompiles the account's script from it. Microsoft 365 accounts are
 /// configured server-side through Graph; their fetched state lives in the UI
 /// instead of here.

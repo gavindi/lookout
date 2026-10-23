@@ -602,19 +602,15 @@ pub(crate) type FolderTreeSnapshot = (bool, Vec<(AccountId, String, Vec<Mailbox>
 pub(crate) type FolderTreeSignature = Vec<(AccountId, String, Vec<FolderRowSignature>)>;
 pub(crate) type FolderRowSignature = (MailboxId, String, MailboxRole, char, u32, u32, crate::ui_state_db::FolderPrefs);
 
-/// Help → "About Lookout": everything the dialog has to say, on one page.
+/// Everything About Lookout has to say, on one column. Shared by Help →
+/// About's dialog and the File page's About page, so the two can never drift.
 ///
-/// `AdwAboutDialog` is deliberately not used here. It is a navigation widget:
-/// its main page carries only the icon, name, developer and version, and files
+/// `AdwAboutDialog` is deliberately not used: it is a navigation widget whose
+/// main page carries only the icon, name, developer and version, filing
 /// `comments` behind a "Details" row and the licence behind a "Legal" row.
 /// Those subpages are structural - no builder property flattens them - so the
-/// handful of facts below are laid out directly in a plain `AdwDialog`, which
-/// has no navigation stack at all.
-pub(crate) fn show_about_dialog() {
-    let dialog = adw::Dialog::builder().title("About Lookout").content_width(400).build();
-
-    let header = adw::HeaderBar::builder().show_title(false).build();
-
+/// handful of facts below are laid out directly.
+pub(crate) fn about_content() -> gtk::Box {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -678,11 +674,20 @@ pub(crate) fn show_about_dialog() {
     crate::privacy::mark_ui(&license);
     content.append(&license);
 
+    content
+}
+
+/// Help → "About Lookout": [`about_content`] in a small modal dialog.
+pub(crate) fn show_about_dialog() {
+    let dialog = adw::Dialog::builder().title("About Lookout").content_width(400).build();
+
+    let header = adw::HeaderBar::builder().show_title(false).build();
+
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .propagate_natural_height(true)
-        .child(&content)
+        .child(&about_content())
         .build();
 
     let toolbar_view = adw::ToolbarView::new();

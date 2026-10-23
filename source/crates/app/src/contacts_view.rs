@@ -1136,6 +1136,41 @@ pub fn export_current_contacts(window: &adw::ApplicationWindow, format: ContactF
         toast_overlay.add_toast(adw::Toast::new("Nothing to export in this category."));
         return;
     }
+    save_contact_cards(window, format, cards, toast_overlay);
+}
+
+/// "Export Contacts…" for the File page (Open & Export): saves every contact
+/// in every address book of every account, whatever the People screen's
+/// current category is - the whole address book rather than a slice of it.
+pub fn export_all_contacts(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, format: ContactFileFormat, toast_overlay: &adw::ToastOverlay) {
+    let cards: Vec<VCard> = {
+        let state = state.borrow();
+        let mut cards = Vec::new();
+        let mut seen = HashSet::new();
+        for snapshot in state.contacts_by_account.values() {
+            for record in &snapshot.contacts {
+                // A UID is unique within an account, and a server href is
+                // unique always; either keeps an account synced through more
+                // than one pass from exporting the same card twice.
+                let key = record.card.uid.clone().unwrap_or_else(|| record.href.clone());
+                if seen.insert(key) {
+                    cards.push(record.card.clone());
+                }
+            }
+        }
+        cards
+    };
+    if cards.is_empty() {
+        toast_overlay.add_toast(adw::Toast::new("No contacts to export yet."));
+        return;
+    }
+    save_contact_cards(window, format, cards, toast_overlay);
+}
+
+/// The shared save half of both contact exports: asks where to write, then
+/// writes one multi-card `.vcf` (the same shape `parse_all` imports) or an
+/// Outlook CSV file (P-08, §4.6).
+fn save_contact_cards(window: &adw::ApplicationWindow, format: ContactFileFormat, cards: Vec<VCard>, toast_overlay: &adw::ToastOverlay) {
     let window = window.clone();
     let toast_overlay = toast_overlay.clone();
     glib::spawn_future_local(async move {

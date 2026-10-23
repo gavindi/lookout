@@ -674,8 +674,8 @@ pub(crate) fn show_composer_in_reading_pane_full(
             let state = state.clone();
             Rc::new(move || state.borrow().app_config.borrow().signatures.clone())
         },
-        // "Manage Signatures…" opens Settings on the Accounts section; set
-        // by `build_window` once the settings window exists (see
+        // "Manage Signatures…" opens File ▸ Options on the Accounts section;
+        // set by `build_window` once the File page exists (see
         // `UiState::manage_signatures`).
         state.borrow().manage_signatures.clone(),
         // The composer's My Templates menu re-reads the global template list
@@ -684,8 +684,8 @@ pub(crate) fn show_composer_in_reading_pane_full(
             let state = state.clone();
             Rc::new(move || state.borrow().app_config.borrow().templates.clone())
         },
-        // "Manage Templates…" opens Settings on the Mail section; set by
-        // `build_window` once the settings window exists (see
+        // "Manage Templates…" opens File ▸ Options on the Mail section; set
+        // by `build_window` once the File page exists (see
         // `UiState::manage_templates`).
         state.borrow().manage_templates.clone(),
         // The account's default signature for this compose kind, resolved

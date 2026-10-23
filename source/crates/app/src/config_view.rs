@@ -21,8 +21,6 @@ use adw::prelude::*;
 use gtk::glib;
 use lookout_core::AccountId;
 
-use crate::util::card_section;
-
 /// The caller's hook for opening the manage-identities dialog: takes the
 /// anchoring widget and the account id (opaque string).
 pub type ManageIdentities = Rc<dyn Fn(&gtk::Widget, &str)>;
@@ -194,32 +192,27 @@ pub struct ShortcutRow {
     pub action: &'static str,
 }
 
-/// Shows the given section page in the settings screen, syncing the
-/// sidebar's selection to it - e.g. the composer's "Manage Signatures…"
-/// jumps to the Accounts section where the signature list lives.
+/// Selects one category in the Options page - the composer's "Manage
+/// Signatures…", an account card's Settings button, and the rest of the deep
+/// links - by selecting its row in the category pane, which switches the
+/// content pane to it.
 pub fn show_section(view: &ConfigView, name: &str) {
-    view.section_stack.set_visible_child_name(name);
-    if let Some(index) = view.section_names.iter().position(|n| *n == name) {
+    if let Some(index) = view.section_names.iter().position(|candidate| *candidate == name) {
         if let Some(row) = view.section_list.row_at_index(index as i32) {
             view.section_list.select_row(Some(&row));
         }
     }
 }
 
-/// The config screen's widget tree. `root` goes into the Settings dialog
-/// (a modal window opened from the header bar's Settings button);
-/// the account groups are kept here so `refresh` can repopulate them in
-/// place without rebuilding the whole page.
+/// The config screen's widget tree. `root` is the whole File page's Options
+/// section (Outlook's File ▸ Options): a File-style category pane on the left
+/// and the selected category's settings on the right. The account groups are
+/// kept here so `refresh` can repopulate them in place without rebuilding the
+/// whole page.
 pub struct ConfigView {
     pub root: gtk::Widget,
-    /// The sidebar/content split itself, exposed so the caller can wire its
-    /// `position` to the same persist-width-as-a-percentage mechanism used
-    /// by the Mail/Calendar/Contacts panes.
-    pub paned: gtk::Paned,
-    /// The section stack and sidebar list (and the section names in order),
-    /// kept so `show_section` can jump to a named section - e.g. the
-    /// composer's "Manage Signatures…" lands on the Accounts section.
-    section_stack: gtk::Stack,
+    /// The category pane's list and the names in page order, so
+    /// `show_section` can select a category.
     section_list: gtk::ListBox,
     section_names: Rc<Vec<&'static str>>,
     /// "Add account…" entry row, exposed so the caller can wire its
@@ -530,24 +523,50 @@ pub struct ConfigView {
     contacts_cache_rows: RefCell<Vec<adw::ActionRow>>,
 }
 
-/// Builds a section's screen: a scrolling `adw::PreferencesPage` holding
-/// `groups` (in order), registered on `stack` under `name`. `sections`
-/// collects the `(label, name)` pair so the sidebar list can be built once
-/// every section has been registered.
-fn add_section(stack: &gtk::Stack, sections: &mut Vec<(&'static str, &'static str)>, label: &'static str, name: &'static str, groups: &[&adw::PreferencesGroup]) {
-    let section_page = adw::PreferencesPage::new();
-    section_page.set_vexpand(true);
+/// Adds one category page to the Options stack: a File-style heading naming
+/// the category, then its groups in a clamped, scrollable column. `sections`
+/// collects the `(label, code)` pairs so the category pane can be built once
+/// every page exists.
+fn add_section(
+    stack: &gtk::Stack,
+    sections: &mut Vec<(&'static str, &'static str)>,
+    label: &'static str,
+    name: &'static str,
+    groups: &[&adw::PreferencesGroup],
+) {
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(32)
+        .margin_end(32)
+        .build();
+    let heading = gtk::Label::builder().label(label).css_classes(["file-page-heading"]).halign(gtk::Align::Start).xalign(0.0).build();
+    body.append(&heading);
     for group in groups {
-        section_page.add(*group);
+        // The page heading names the category. A group whose own title only
+        // repeats it (Accounts under Accounts, Appearance under Appearance)
+        // would print it twice; clear that one title and let the heading carry
+        // it. Groups with their own names - Signatures, My Templates, Keyboard
+        // shortcuts - keep theirs as sub-headings.
+        if group.title() == label {
+            group.set_title("");
+        }
+        body.append(*group);
     }
-    stack.add_named(&section_page, Some(name));
+    let clamp = adw::Clamp::builder().maximum_size(720).child(&body).build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&clamp)
+        .build();
+    stack.add_named(&scroller, Some(name));
     sections.push((label, name));
 }
 
-/// Wraps `content` in the app's rounded/bordered ".card" treatment (mirrors
-/// window.rs's private `card_section` helper - duplicated here rather than
-/// shared so this module stays decoupled from window.rs, per its own
-/// data-in/widget-out convention).
 /// The "Include desktop address books" row's subtitle while the desktop's
 /// address books are reachable (and before that's known).
 pub const EDS_ADDRESS_BOOKS_SUBTITLE: &str = "Show people from GNOME Contacts and Evolution in People, read-only, and suggest them when choosing recipients";
@@ -1006,7 +1025,7 @@ pub fn build() -> ConfigView {
     general_group.add(&start_at_login_row);
     let close_to_background_row = adw::SwitchRow::builder()
         .title("Keep running when the window is closed")
-        .subtitle("Continue syncing and notifying in the background; quit from the File menu")
+        .subtitle("Continue syncing and notifying in the background; quit from the File page")
         .active(true)
         .build();
     general_group.add(&close_to_background_row);
@@ -1183,12 +1202,17 @@ pub fn build() -> ConfigView {
         .build();
     advanced_group.add(&clear_cache_row);
 
-    // -- assemble the sidebar (section list) + content (stack of per-section
-    // pages) layout --
+    // -- assemble the Options page, in the File page's own style: a category
+    // pane on the left and the selected category's settings on the right.
+    // Every page is a File-style heading over grouped rows, and only the
+    // visible page is measured (non-homogeneous stack), so opening Options
+    // costs a single page's layout. --
 
     let section_stack = gtk::Stack::new();
-    section_stack.set_vexpand(true);
     section_stack.set_hexpand(true);
+    section_stack.set_vexpand(true);
+    section_stack.set_hhomogeneous(false);
+    section_stack.set_vhomogeneous(false);
 
     let mut sections: Vec<(&'static str, &'static str)> = Vec::new();
     add_section(
@@ -1210,9 +1234,12 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "Assistant", "assistant", &[&assistant_group]);
     add_section(&section_stack, &mut sections, "Advanced", "advanced", &[&advanced_group]);
 
+    // The category pane: the same compact row list as the File rail, in a
+    // neutral panel so it reads as a second level beside the accent rail.
     let section_list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
-        .css_classes(["navigation-sidebar"])
+        .activate_on_single_click(true)
+        .css_classes(["file-options-nav-list"])
         .build();
     for (label, _) in &sections {
         let row_label = gtk::Label::builder().label(*label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
@@ -1222,7 +1249,10 @@ pub fn build() -> ConfigView {
         row_label.set_margin_top(8);
         row_label.set_margin_bottom(8);
         let row = gtk::ListBoxRow::new();
+        row.set_activatable(true);
+        row.set_selectable(true);
         row.set_child(Some(&row_label));
+        row.update_property(&[gtk::accessible::Property::Label(label)]);
         section_list.append(&row);
     }
 
@@ -1240,29 +1270,23 @@ pub fn build() -> ConfigView {
         section_list.select_row(Some(&first_row));
     }
 
-    let section_scroller = gtk::ScrolledWindow::builder()
+    let category_scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
         .vexpand(true)
         .child(&section_list)
         .build();
+    let category_pane = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["file-options-nav"]).build();
+    category_pane.set_width_request(200);
+    category_pane.set_vexpand(true);
+    category_pane.append(&category_scroller);
 
-    let paned = gtk::Paned::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .start_child(&card_section(&section_scroller))
-        .end_child(&card_section(&section_stack))
-        .resize_start_child(false)
-        .resize_end_child(true)
-        .shrink_start_child(false)
-        .shrink_end_child(false)
-        .position(200)
-        .vexpand(true)
-        .build();
-    paned.add_css_class("seamless-paned");
+    let panes = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["file-options"]).build();
+    panes.append(&category_pane);
+    panes.append(&section_stack);
 
     ConfigView {
-        root: paned.clone().upcast(),
-        paned,
-        section_stack,
+        root: panes.clone().upcast(),
         section_list,
         section_names,
         add_account_row,
@@ -1909,69 +1933,11 @@ mod tests {
         assert_eq!(time_zone_at(u32::MAX), "", "out of range reads as unset");
     }
 
-    fn card_section(content: &gtk::Widget) -> gtk::Box {
-        let card = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .css_classes(["card"])
-            .overflow(gtk::Overflow::Hidden)
-            .build();
-        card.append(content);
-        card
-    }
-
-    /// The Settings window's close/reopen contract from window.rs, guarded
-    /// without mapping real windows (GTK may only be initialized on one
-    /// thread, and libtest gives each test its own - the repo's other
-    /// GTK-touching tests race to `gtk::init()` the same way). Closing the
-    /// settings dialog must leave the shared `config_view.root` detached so
-    /// the next open can re-attach it: the window's close handler unparents
-    /// it explicitly because reference cycles into the window's content
-    /// chain (the close button's handler holds the dialog, the dialog holds
-    /// the chain) can otherwise leave the root parented to a destroyed
-    /// window, and the reopen's attach then fails - the empty modal bug.
-    /// Ignored by default: it needs a real display, and GTK is not
-    /// thread-safe while libtest spreads tests across threads, so it only
-    /// runs on demand - `cargo test -p lookout-app -- --ignored
-    /// --test-threads=1 config_view::tests`. Same self-skipping convention
-    /// as the window.rs GTK tests when run among them.
-    #[ignore = "needs a display and a single test thread; run with --ignored --test-threads=1"]
-    #[test]
-    fn settings_window_reopen_reparents_the_config_root() {
-        // Same convention as the window.rs GTK tests: libtest gives each
-        // test its own thread, GTK may only be initialized on one - if
-        // another test thread got there first, skip rather than panic. The
-        // shared `gtk_test::gtk_ready` lock also serializes the init itself.
-        // Headless environments (CI) can't initialize GTK at all; the
-        // lifecycle is exercised where a display exists.
-        if !crate::gtk_test::gtk_ready() {
-            eprintln!("skipping: no display available, or GTK initialized on another test thread");
-            return;
-        }
-        let config_view = Rc::new(build());
-
-        // First open: the root attaches to the window's content chain.
-        let card = card_section(&config_view.root);
-        assert!(config_view.root.parent().is_some(), "root must attach to the window's chain");
-
-        // Close: the window.rs close handler unparents the root explicitly
-        // before the window is destroyed.
-        config_view.root.unparent();
-        assert!(config_view.root.parent().is_none(), "close-path unparent must detach the root");
-
-        // Second open: the defensive unparent is a no-op, and the root
-        // re-attaches to the fresh window's chain.
-        config_view.root.unparent();
-        let card2 = card_section(&config_view.root);
-        assert!(config_view.root.parent().is_some(), "root must re-attach to the second window");
-        let _ = (card, card2);
-    }
-
     /// `AdwPreferencesRow::title`/`subtitle` are rendered as Pango markup, so
     /// a literal "&" (as "Default for replies & forwards" used to be) fails
     /// to parse and GTK logs a "Gtk-WARNING **: Failed to set text ... from
     /// markup" instead of showing the row's title at all. Same
-    /// display/single-thread convention as `settings_window_reopen_...`
-    /// above.
+    /// display/single-thread convention as the other GTK tests.
     #[ignore = "needs a display and a single test thread; run with --ignored --test-threads=1"]
     #[test]
     fn signature_default_dropdown_title_survives_markup_parsing() {

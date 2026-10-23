@@ -16,3 +16,12 @@
 @define-color lookout-subject-bar-border alpha(@theme_fg_color, 0.08);
 @define-color lookout-thread-row-bg alpha(@theme_fg_color, 0.04);
 @define-color lookout-thread-count-bg alpha(@theme_fg_color, 0.08);
+
+/* File (Backstage): the navigation rail is the accent, with on-accent ink and
+   no separate marker - the filled rail itself marks the page in view, as in
+   Outlook's light theme. */
+@define-color lookout-file-nav-bg @accent_bg_color;
+@define-color lookout-file-nav-fg @accent_fg_color;
+@define-color lookout-file-nav-hover-bg alpha(@accent_fg_color, 0.12);
+@define-color lookout-file-nav-active-bg alpha(@accent_fg_color, 0.22);
+@define-color lookout-file-nav-marker transparent;
