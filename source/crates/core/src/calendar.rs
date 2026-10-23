@@ -1,5 +1,6 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 
 use crate::email::EmailAddress;
@@ -172,6 +173,99 @@ pub struct CalendarInfo {
     pub owner: Option<String>,
 }
 
+/// One attachment on an event (OUTLOOK_PARITY.md item 3.16 / CAL-21). Models
+/// the three forms an RFC 5545 `ATTACH` takes:
+///
+/// - a server-managed CalDAV attachment (RFC 8607): a `url` plus a
+///   `managed_id` (the `MANAGED-ID` parameter the server generated);
+/// - a plain URI attachment: only `url`;
+/// - an inline attachment (`VALUE=BINARY` / `ENCODING=BASE64`): `data` holds
+///   the base64 payload, which is what iMIP invitations carry and what a
+///   CalDAV server without RFC 8607 stores in the calendar object.
+///
+/// `name`, `mime_type` and `size` come from the RFC 8607 `FILENAME`/`FMTTYPE`/
+/// `SIZE` parameters (with sensible fallbacks derived from the URI or the
+/// decoded bytes).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct EventAttachment {
+    /// The display file name. RFC 8607 deliberately does not call it a path -
+    /// it is untrusted input, so callers sanitize it before writing to disk.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// The `ATTACH` value when it is a URI (or, on the Graph backend, the
+    /// attachment's server id - see [`EventAttachment::graph_id`]).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// RFC 8607 `MANAGED-ID`, present only on a server-managed CalDAV
+    /// attachment. Written back so the server can match the property, and
+    /// stripped from the iMIP form (RFC 8607 §3.12.7: the id is meaningless
+    /// outside the server that issued it).
+    #[serde(default)]
+    pub managed_id: Option<String>,
+    /// Base64-encoded inline contents (`ATTACH;VALUE=BINARY`). Kept encoded
+    /// in the model so it round-trips through the JSON cache and `settings`
+    /// without a byte-array encoder; use [`Self::bytes`] to decode.
+    #[serde(default)]
+    pub data: Option<String>,
+}
+
+/// The largest inline attachment Lookout will carry in a calendar object or
+/// an iMIP invitation. The iCalendar form is base64, so a document with this
+/// much data is roughly a third larger on the wire; bigger files are refused
+/// by the editor with an explanatory message rather than silently dropped.
+pub const MAX_INLINE_EVENT_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+impl EventAttachment {
+    /// An inline attachment from raw bytes (what the editor's file chooser
+    /// produces). Returns `None` for a file over
+    /// [`MAX_INLINE_EVENT_ATTACHMENT_BYTES`].
+    pub fn from_bytes(name: impl Into<String>, mime_type: Option<String>, data: &[u8]) -> Option<Self> {
+        if data.len() > MAX_INLINE_EVENT_ATTACHMENT_BYTES {
+            return None;
+        }
+        Some(Self {
+            name: name.into(),
+            mime_type,
+            size: Some(data.len() as u64),
+            url: None,
+            managed_id: None,
+            data: Some(base64::engine::general_purpose::STANDARD.encode(data)),
+        })
+    }
+
+    /// The decoded inline contents, or `None` for a URI-only attachment (or a
+    /// payload that isn't valid base64).
+    pub fn bytes(&self) -> Option<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD.decode(self.data.as_deref()?).ok()
+    }
+
+    /// Whether this attachment's contents travel inside the calendar object.
+    pub fn is_inline(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// The size to display: the declared `SIZE`, else the decoded inline
+    /// length.
+    pub fn byte_size(&self) -> Option<u64> {
+        self.size.or_else(|| self.bytes().map(|bytes| bytes.len() as u64))
+    }
+
+    /// The Graph attachment id, when this came from the Microsoft Graph
+    /// backend (Graph's attachment list has no URI; the id is the handle a
+    /// `GET /me/events/{id}/attachments/{id}` uses). A CalDAV `ATTACH` URI -
+    /// absolute (`scheme://`), collection-relative (`/…`) or dot-relative -
+    /// is distinguishable from Graph's base64 id, so the two can share `url`.
+    pub fn graph_id(&self) -> Option<&str> {
+        self.url.as_deref().filter(|url| {
+            !url.contains("://") && !url.starts_with('/') && !url.starts_with("./") && !url.starts_with("../") && !url.contains([':', '?', '#']) && self.managed_id.is_none()
+        })
+    }
+}
+
 /// One VEVENT as it exists on the server: for a recurring event this is the
 /// *master* instance (`DTSTART`/`DTEND` + `RRULE`), not an individual
 /// occurrence - see [`EventOccurrence`] for the expanded/rendered form.
@@ -277,6 +371,11 @@ pub struct CalendarEvent {
     /// provider-specific "Teams meeting" integration this app doesn't have.
     #[serde(default)]
     pub conference_url: Option<String>,
+    /// The event's attachments (CAL-21): RFC 8607 managed attachments, plain
+    /// URIs, or inline `ATTACH;VALUE=BINARY` payloads. Empty for an event
+    /// with none.
+    #[serde(default)]
+    pub attachments: Vec<EventAttachment>,
     /// Whether this is an online meeting hosted by Microsoft Teams (Graph
     /// `isOnlineMeeting`). When set, the Graph writer asks Microsoft to
     /// create the meeting link (`onlineMeetingProvider: teamsForBusiness`) and
@@ -380,6 +479,9 @@ pub struct EventOccurrence {
     pub reminder_minutes_before: Option<i64>,
     #[serde(default)]
     pub conference_url: Option<String>,
+    /// The event's attachments (see [`CalendarEvent::attachments`]).
+    #[serde(default)]
+    pub attachments: Vec<EventAttachment>,
 }
 
 /// RFC 5545 §3.8.1.11 `STATUS` on a VTODO.
@@ -464,4 +566,44 @@ pub struct CalendarTask {
     /// The calendar object's `getetag` as reported by the server, if known.
     #[serde(default)]
     pub etag: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_inline_attachment_round_trips_its_bytes() {
+        let attachment = EventAttachment::from_bytes("notes.txt", Some("text/plain".to_string()), b"Hello agenda!").unwrap();
+        assert_eq!(attachment.name, "notes.txt");
+        assert_eq!(attachment.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(attachment.byte_size(), Some(13));
+        assert_eq!(attachment.bytes().as_deref(), Some(b"Hello agenda!".as_slice()));
+        assert!(attachment.is_inline());
+        assert!(attachment.graph_id().is_none());
+    }
+
+    #[test]
+    fn an_oversized_inline_attachment_is_refused() {
+        let oversized = vec![0u8; MAX_INLINE_EVENT_ATTACHMENT_BYTES + 1];
+        assert!(EventAttachment::from_bytes("huge.bin", None, &oversized).is_none());
+    }
+
+    #[test]
+    fn graph_ids_are_distinguished_from_caldav_uris() {
+        let graph = EventAttachment {
+            url: Some("AAMkAGI1AAAt9AHjAAABEgAQAEdBogju-MJEu6Ngg-1_W0g=".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(graph.graph_id(), Some("AAMkAGI1AAAt9AHjAAABEgAQAEdBogju-MJEu6Ngg-1_W0g="));
+
+        for url in ["https://cal.example.com/attach/64/34X22R", "/attach/64/34X22R"] {
+            let managed = EventAttachment {
+                url: Some(url.to_string()),
+                managed_id: Some("97S".to_string()),
+                ..Default::default()
+            };
+            assert!(managed.graph_id().is_none(), "{url} is a CalDAV attachment");
+        }
+    }
 }

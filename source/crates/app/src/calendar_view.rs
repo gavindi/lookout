@@ -5188,6 +5188,7 @@ mod tests {
             status: lookout_core::EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -6227,6 +6228,7 @@ mod tests {
             status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         };
         set_search_results(
             &main,

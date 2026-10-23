@@ -602,6 +602,7 @@ mod tests {
             status: Default::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 

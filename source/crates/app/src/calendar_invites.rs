@@ -412,6 +412,7 @@ pub fn cancellation_event(occ: &EventOccurrence, organizer: Option<EmailAddress>
         reminder_minutes_before: None,
         conference_url: occ.conference_url.clone(),
         is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
+        attachments: occ.attachments.clone(),
     }
 }
 
@@ -449,6 +450,7 @@ pub fn stored_event_from_occurrence(occ: &EventOccurrence) -> CalendarEvent {
         reminder_minutes_before: occ.reminder_minutes_before,
         conference_url: occ.conference_url.clone(),
         is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
+        attachments: occ.attachments.clone(),
     }
 }
 
@@ -517,6 +519,7 @@ mod tests {
             reminder_minutes_before: None,
             conference_url: None,
             is_online_meeting: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -550,6 +553,7 @@ mod tests {
             status: lookout_core::EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 

@@ -193,6 +193,9 @@ fn stripped_event(occurrence: &EventOccurrence, time_zone: Option<String>, inclu
         reminder_minutes_before: None,
         conference_url: None,
         is_online_meeting: false,
+        // The desktop mirror is a "what's on today" summary; files stay with
+        // the original event and aren't copied into the system calendar.
+        attachments: Vec::new(),
     }
 }
 
@@ -815,6 +818,7 @@ mod tests {
             status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 

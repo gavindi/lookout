@@ -885,6 +885,7 @@ mod tests {
             status: lookout_core::EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 

@@ -180,6 +180,7 @@ fn expand_set(set: RRuleSet, event: &CalendarEvent, window_start: DateTime<Utc>,
                 status: event.status,
                 reminder_minutes_before: event.reminder_minutes_before,
                 conference_url: event.conference_url.clone(),
+                attachments: event.attachments.clone(),
             }
         })
         .collect()
@@ -243,6 +244,7 @@ fn single_occurrence_if_overlapping(event: &CalendarEvent, window_start: DateTim
             status: event.status,
             reminder_minutes_before: event.reminder_minutes_before,
             conference_url: event.conference_url.clone(),
+            attachments: event.attachments.clone(),
         }]
     } else {
         Vec::new()
@@ -283,6 +285,7 @@ mod tests {
             reminder_minutes_before: None,
             conference_url: None,
             is_online_meeting: false,
+            attachments: Vec::new(),
         }
     }
 

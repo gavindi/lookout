@@ -1208,6 +1208,74 @@ pub(crate) fn invite_detail_row(row_name: &str, value_name: &str, caption: &str)
     row
 }
 
+/// A compact MIME/size line for an invite-card attachment.
+fn invite_attachment_summary(attachment: &lookout_core::EventAttachment) -> String {
+    let mut parts = Vec::new();
+    if let Some(mime_type) = attachment.mime_type.as_deref().filter(|mime| !mime.trim().is_empty()) {
+        parts.push(mime_type.to_string());
+    }
+    if let Some(size) = attachment.byte_size() {
+        parts.push(lookout_core::text::human_size(size));
+    }
+    if parts.is_empty() {
+        "Attachment".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Fills the invite card's Attachments section (CAL-21). Each attachment is a
+/// name/size line plus either a Save button (inline contents, which iMIP
+/// invitations carry) or an Open link (a URI attachment). The whole section
+/// hides for an invitation with no files.
+fn render_invite_attachments(card: &gtk::Box, invitation: &lookout_core::ImipInvitation) {
+    let Some(container) = named_child_of(card, "imip-attachments").and_then(|child| child.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    let Some(rows) = named_child_of(&container, "imip-attachment-rows").and_then(|child| child.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    while let Some(child) = rows.first_child() {
+        rows.remove(&child);
+    }
+    let attachments = imip_event(invitation).map(|event| event.attachments).unwrap_or_default();
+    if attachments.is_empty() {
+        container.set_visible(false);
+        return;
+    }
+    for attachment in attachments {
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).halign(gtk::Align::Start).build();
+        let label = gtk::Label::builder()
+            .label(format!("{} · {}", attachment.name, invite_attachment_summary(&attachment)))
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .hexpand(true)
+            .build();
+        crate::privacy::mark(&label);
+        row.append(&label);
+        if let Some(bytes) = attachment.bytes() {
+            let name = attachment.name.clone();
+            let save = gtk::Button::from_icon_name("document-save-symbolic");
+            save.add_css_class("flat");
+            save.set_tooltip_text(Some("Save attachment"));
+            save.set_valign(gtk::Align::Center);
+            save.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                crate::event_editor::save_event_attachment(&window, &name, bytes.clone());
+            });
+            row.append(&save);
+        } else if let Some(url) = attachment.url.as_deref().filter(|url| url.starts_with("http://") || url.starts_with("https://")) {
+            let open = gtk::LinkButton::with_label(url, "Open");
+            open.add_css_class("flat");
+            open.set_tooltip_text(Some("Open attachment"));
+            row.append(&open);
+        }
+        rows.append(&row);
+    }
+    container.set_visible(true);
+}
+
 /// Sets one invite-card row's value label, hiding the row when the invitation
 /// has nothing for it. `text == None` hides the row; `Some("")` is not
 /// expected but would show an empty value (callers only pass `Some` for
@@ -1331,6 +1399,10 @@ pub(crate) fn render_invite_card(reading_stack: &gtk::Stack, invitation: Option<
     set_invite_row(&card, "imip-where-row", "imip-where", invitation.location.clone());
     set_invite_row(&card, "imip-organizer-row", "imip-organizer", invitation.organizer.as_ref().map(format_imip_organizer));
     set_invite_row(&card, "imip-description-row", "imip-description", invitation.description.clone());
+    // CAL-21: the invitation's files. An inline attachment (which is how an
+    // iMIP REQUEST carries an agenda) saves straight from the message; a URI
+    // attachment opens in the browser.
+    render_invite_attachments(&card, invitation);
     // CAL-35 / 3.18: the conflict line ("Conflicts with Standup, 1:1") and the
     // mini day timeline, both from `invite_card_extras`.
     set_invite_row(&card, "imip-conflict-row", "imip-conflict", conflict_summary(conflicts));

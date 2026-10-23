@@ -107,6 +107,14 @@ pub async fn run_calendar_session(
                 Ok(CalendarCommand::DeleteEvent { .. }) => {
                     let _ = events.send(CalendarSessionEvent::Error("not connected - the event was not deleted".to_string())).await;
                 }
+                Ok(CalendarCommand::FetchEventAttachment { request_id, .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                            request_id,
+                            message: "not connected - the attachment could not be downloaded".to_string(),
+                        })
+                        .await;
+                }
                 Ok(_) => {}
                 Err(_) => {}
             }
@@ -296,6 +304,15 @@ async fn connect_and_run(
                             .await;
                     }
                 },
+                CalendarCommand::FetchEventAttachment {
+                    calendar_id,
+                    event_href,
+                    attachment,
+                    request_id,
+                } => {
+                    let owner = owner_of(&calendars, &calendar_id);
+                    fetch_event_attachment(client, owner.as_deref(), event_href.as_deref(), &attachment, request_id, events).await;
+                }
             }
         }
     }
@@ -375,10 +392,17 @@ async fn sync_month(client: &CalendarClient, calendars: &[CalendarInfo], month: 
 /// Creates or updates `event`, sharing one path: a fresh event (no Graph id)
 /// is created, an existing one (`href` set) is updated. Resyncs the on-screen
 /// month on success, or emits `EventSaveFailed`.
+///
+/// Attachments (CAL-21) are Graph child resources, not part of the event
+/// body: after the event has an id, each newly attached file is POSTed to
+/// `/me/events/{id}/attachments`, and an update removes the child resources
+/// the user deleted from the form. A failure is reported after the event
+/// itself was saved, so the meeting is never rolled back over a file.
 async fn write_event(client: &CalendarClient, calendars: &[CalendarInfo], event: &CalendarEvent, current_month: NaiveDate, events: &async_channel::Sender<CalendarSessionEvent>) {
+    let owner = owner_of(calendars, &event.calendar_id);
     let result = if event.href.is_none() {
         match calendars.iter().find(|calendar| calendar.id == event.calendar_id) {
-            Some(calendar) => client.create_event(calendar, event).await.map(|_| ()),
+            Some(calendar) => client.create_event(calendar, event).await,
             None => {
                 let _ = events
                     .send(CalendarSessionEvent::EventSaveFailed {
@@ -391,12 +415,14 @@ async fn write_event(client: &CalendarClient, calendars: &[CalendarInfo], event:
             }
         }
     } else {
-        let owner = owner_of(calendars, &event.calendar_id);
-        client.update_event(event, owner.as_deref()).await.map(|_| ())
+        client.update_event(event, owner.as_deref()).await
     };
 
     match result {
-        Ok(()) => {
+        Ok(saved) => {
+            if let Some(event_id) = saved.href.as_deref() {
+                sync_attachments(client, owner.as_deref(), event_id, event, events).await;
+            }
             let mut months = vec![current_month];
             let event_month = first_of_month(event.start.date_naive());
             if event_month != current_month {
@@ -412,6 +438,84 @@ async fn write_event(client: &CalendarClient, calendars: &[CalendarInfo], event:
                     uid: event.uid.clone(),
                     recurrence_id: event.recurrence_id,
                     message: format!("failed to save event \"{}\": {e}", event.uid),
+                })
+                .await;
+        }
+    }
+}
+
+/// Reconciles an event's Graph attachment children with the form's list
+/// (CAL-21): delete every server attachment the form dropped, then upload
+/// every inline attachment that has no server id yet. Failures are reported
+/// as toasts; the event write itself has already succeeded.
+async fn sync_attachments(client: &CalendarClient, owner: Option<&str>, event_id: &str, event: &CalendarEvent, events: &async_channel::Sender<CalendarSessionEvent>) {
+    let wanted: std::collections::HashSet<&str> = event.attachments.iter().filter_map(|attachment| attachment.graph_id()).collect();
+    match client.list_attachments(event_id, owner).await {
+        Ok(existing) => {
+            for attachment in existing {
+                let Some(id) = attachment.graph_id() else { continue };
+                if !wanted.contains(id) {
+                    if let Err(e) = client.delete_attachment(event_id, owner, id).await {
+                        tracing::warn!("failed to remove Graph event attachment {id}: {e}");
+                    }
+                }
+            }
+        }
+        Err(e) => tracing::warn!("couldn't list Graph event attachments for reconciliation: {e}"),
+    }
+    for attachment in event.attachments.iter().filter(|attachment| attachment.is_inline() && attachment.graph_id().is_none()) {
+        if let Err(e) = client.add_attachment(event_id, owner, attachment).await {
+            let _ = events
+                .send(CalendarSessionEvent::Error(format!(
+                    "event \"{}\" was saved, but \"{}\" couldn't be attached: {e}",
+                    event.uid, attachment.name
+                )))
+                .await;
+        }
+    }
+}
+
+/// Answers a `FetchEventAttachment` (CAL-21): inline contents decode straight
+/// from the document; a Graph attachment id is read through
+/// `GET /me/events/{id}/attachments/{id}`.
+async fn fetch_event_attachment(
+    client: &CalendarClient,
+    owner: Option<&str>,
+    event_id: Option<&str>,
+    attachment: &lookout_core::EventAttachment,
+    request_id: u64,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+) {
+    let fetched = if let Some(data) = attachment.bytes() {
+        Some(Ok(data))
+    } else if let (Some(event_id), Some(attachment_id)) = (event_id, attachment.graph_id()) {
+        Some(client.fetch_attachment(event_id, owner, attachment_id).await)
+    } else {
+        None
+    };
+    match fetched {
+        Some(Ok(data)) => {
+            let _ = events
+                .send(CalendarSessionEvent::EventAttachmentFetched {
+                    request_id,
+                    name: attachment.name.clone(),
+                    data,
+                })
+                .await;
+        }
+        Some(Err(e)) => {
+            let _ = events
+                .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                    request_id,
+                    message: format!("couldn't download \"{}\": {e}", attachment.name),
+                })
+                .await;
+        }
+        None => {
+            let _ = events
+                .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                    request_id,
+                    message: format!("attachment \"{}\" has no location", attachment.name),
                 })
                 .await;
         }
@@ -599,6 +703,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_event_uploads_its_attachments() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/calendars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": "cal1", "name": "Work" }] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/calendars/cal1/events"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "ev-new",
+                "iCalUId": "new@example.com",
+                "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" },
+                "end": { "dateTime": "2026-10-15T09:30:00", "timeZone": "UTC" }
+            })))
+            .mount(&server)
+            .await;
+        // No existing children, then the upload.
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/events/ev-new/attachments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/events/ev-new/attachments"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": "att-1", "name": "notes.txt" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/calendars/cal1/calendarView"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+            .mount(&server)
+            .await;
+
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx));
+
+        let calendar_id = lookout_core::CalendarId("acct:cal1".to_string());
+        let mut event = crate::calendar::event_from_graph(
+            &json!({ "id": "x", "subject": "New", "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" }, "end": { "dateTime": "2026-10-15T09:30:00", "timeZone": "UTC" } }),
+            &calendar_id,
+        )
+        .unwrap();
+        event.href = None;
+        event.etag = None;
+        event.attachments = vec![lookout_core::EventAttachment::from_bytes("notes.txt", Some("text/plain".to_string()), b"Hello agenda!").unwrap()];
+        cmd_tx.send(CalendarCommand::CreateEvent { event: Box::new(event) }).await.unwrap();
+
+        let mut failed = None;
+        for _ in 0..40 {
+            let event = match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(event)) => event,
+                _ => break,
+            };
+            match event {
+                CalendarSessionEvent::EventSaveFailed { message, .. } => {
+                    failed = Some(message);
+                    break;
+                }
+                CalendarSessionEvent::OccurrencesUpdated { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(failed.is_none(), "create should not fail: {failed:?}");
+
+        cmd_tx.send(CalendarCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
     async fn a_consent_error_stops_with_a_non_retryable_state() {
         struct NoConsent;
 
@@ -743,6 +919,7 @@ mod tests {
             status: Default::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         };
         assert!(overlaps(&occ, "2026-10-01T00:00:00Z".parse().unwrap(), "2026-11-01T00:00:00Z".parse().unwrap()));
         assert!(!overlaps(&occ, "2026-11-01T00:00:00Z".parse().unwrap(), "2026-12-01T00:00:00Z".parse().unwrap()));

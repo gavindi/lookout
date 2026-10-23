@@ -2227,4 +2227,19 @@ pub(crate) struct CalendarUiState {
     /// `refresh_calendar_checklist` can hand it to every rebuild from the many
     /// call sites that have no window reference.
     pub(crate) calendar_sidebar_action: Option<calendar_view::CalendarSidebarActionHandler>,
+    /// In-flight event-attachment downloads (item 3.16 / CAL-21), keyed by a
+    /// window-unique request id: the save callback the calendar event loop
+    /// hands the decoded bytes (or the failure message) when the owning
+    /// account answers a `FetchEventAttachment`.
+    pub(crate) attachment_requests: HashMap<u64, AttachmentRequest>,
+    /// Monotonic id source for [`Self::attachment_requests`].
+    pub(crate) attachment_next_id: u64,
+}
+
+/// One pending `FetchEventAttachment` answer (item 3.16 / CAL-21): the save
+/// dialog's success/failure callbacks, captured by the request site and run on
+/// the main loop when the calendar session replies.
+pub(crate) struct AttachmentRequest {
+    pub(crate) on_success: Box<dyn Fn(String, Vec<u8>)>,
+    pub(crate) on_error: Box<dyn Fn(String)>,
 }

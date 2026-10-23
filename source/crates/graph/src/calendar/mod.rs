@@ -98,6 +98,7 @@ pub fn event_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<Calen
         reminder_minutes_before: reminder_minutes(value),
         conference_url: conference_url(value),
         is_online_meeting: is_online_meeting(value),
+        attachments: attachments_from_graph(value),
     })
 }
 
@@ -141,6 +142,7 @@ pub fn occurrence_from_graph(value: &Value, calendar_id: &CalendarId) -> Option<
         status: event_status_from_graph(value),
         reminder_minutes_before: reminder_minutes(value),
         conference_url: conference_url(value),
+        attachments: attachments_from_graph(value),
     })
 }
 
@@ -478,6 +480,53 @@ fn conference_url(value: &Value) -> Option<String> {
         .filter(|u| !u.is_empty())
         .or_else(|| value.get("onlineMeetingUrl").and_then(Value::as_str).filter(|u| !u.is_empty()))
         .map(str::to_string)
+}
+
+/// The event's `attachments` (CAL-21), when the read expanded them
+/// (`$expand=attachments`). Graph returns metadata for the list - `id`,
+/// `name`, `contentType`, `size` - and `contentBytes` only when a single
+/// attachment is fetched, so the id doubles as the handle for
+/// `GET /me/events/{id}/attachments/{attachmentId}`; the app's
+/// `FetchEventAttachment` command performs that read on demand.
+fn attachments_from_graph(value: &Value) -> Vec<lookout_core::EventAttachment> {
+    value
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(attachment_from_graph)
+        .collect()
+}
+
+/// One Graph attachment as [`lookout_core::EventAttachment`]; `None` for an
+/// item/reference attachment (no file contents to show or save) or one with no
+/// id to fetch it by.
+fn attachment_from_graph(attachment: &Value) -> Option<lookout_core::EventAttachment> {
+    let id = attachment.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())?;
+    // An item/reference attachment has no file contents to show or save; only
+    // file attachments are carried into the model.
+    if let Some(kind) = attachment.get("@odata.type").and_then(Value::as_str) {
+        if !kind.to_ascii_lowercase().contains("fileattachment") {
+            return None;
+        }
+    }
+    let name = attachment
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("attachment")
+        .to_string();
+    let mime_type = attachment.get("contentType").and_then(Value::as_str).map(str::to_string);
+    let size = attachment.get("size").and_then(Value::as_u64);
+    let data = attachment.get("contentBytes").and_then(Value::as_str).map(str::to_string);
+    Some(lookout_core::EventAttachment {
+        name,
+        mime_type,
+        size,
+        url: Some(id.to_string()),
+        managed_id: None,
+        data,
+    })
 }
 
 /// The access level a calendar permission grants (Graph `calendarRole`),
@@ -898,5 +947,37 @@ mod tests {
         .unwrap();
         assert_eq!(attendee.role, AttendeeRole::Required);
         assert_eq!(attendee.status, AttendeeStatus::NeedsAction);
+    }
+
+    #[test]
+    fn expanded_graph_attachments_map_into_the_event() {
+        let mut value = sample_event();
+        value["attachments"] = json!([{
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "id": "att-1",
+            "name": "agenda.pdf",
+            "contentType": "application/pdf",
+            "size": 1024
+        }, {
+            "@odata.type": "#microsoft.graph.itemAttachment",
+            "id": "att-2",
+            "name": "Forwarded meeting"
+        }]);
+        let event = event_from_graph(&value, &calendar_id()).unwrap();
+        assert_eq!(event.attachments.len(), 1, "an item attachment has no file to show");
+        assert_eq!(event.attachments[0].name, "agenda.pdf");
+        assert_eq!(event.attachments[0].graph_id(), Some("att-1"));
+        assert_eq!(event.attachments[0].mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(event.attachments[0].byte_size(), Some(1024));
+
+        // The occurrence mapper carries the same files into the editor.
+        let occurrence = occurrence_from_graph(&value, &calendar_id()).unwrap();
+        assert_eq!(occurrence.attachments.len(), 1);
+        assert_eq!(occurrence.attachments[0].graph_id(), Some("att-1"));
+    }
+
+    #[test]
+    fn an_event_with_no_attachments_maps_to_an_empty_list() {
+        assert!(event_from_graph(&sample_event(), &calendar_id()).unwrap().attachments.is_empty());
     }
 }

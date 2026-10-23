@@ -27,6 +27,46 @@ pub const MAX_FEED_BYTES: usize = 5 * 1024 * 1024;
 /// toast.
 const MAX_ERROR_SNIPPET_CHARS: usize = 300;
 
+/// The largest attachment [DavClient::download_attachment] will buffer. The
+/// URI comes from a server document, so an absurd `Content-Length` is refused
+/// before allocating.
+pub const MAX_ATTACHMENT_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// A file name safe to put in a `Content-Disposition` header: quotes,
+/// backslashes and control characters can break the header (or smuggle a
+/// second one), and a path separator would be meaningless to the server.
+fn sanitize_filename(name: &str) -> String {
+    // Non-ASCII is folded to `_` rather than emitted as raw bytes: an HTTP
+    // header value isn't UTF-8 text, and RFC 5987's `filename*` form is more
+    // than this upload needs.
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '_' })
+        .filter(|c| !matches!(c, '"' | '\\' | '/' | '?' | '#'))
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "attachment".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// A MIME type safe to use as an HTTP `Content-Type` header value. A
+/// `FMTTYPE` can come from another client's calendar document, so an embedded
+/// control character or CR/LF must not reach the header builder; an empty or
+/// unusable value falls back to `application/octet-stream`.
+fn sanitize_content_type(mime_type: Option<&str>) -> String {
+    let cleaned: String = mime_type.unwrap_or_default().chars().filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\').collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() || !cleaned.contains('/') {
+        "application/octet-stream".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
 /// Reduces a server response body to a display-safe snippet for an error
 /// message. Server error pages are HTML (`<title>`s, tags, `\r\n` line
 /// endings) and GTK widgets reject control characters outright - a raw body
@@ -153,6 +193,13 @@ pub struct CalendarDiscovery {
     pub schedule_outbox_href: Option<String>,
     /// `CALDAV:schedule-inbox-URL` from the principal, when supported.
     pub schedule_inbox_href: Option<String>,
+    /// Whether the calendar home advertises RFC 8607 managed attachments
+    /// (`DAV: calendar-managed-attachments` on `OPTIONS`). When `true`, a
+    /// saved event's file attachments are uploaded to the calendar object
+    /// (`POST ?action=attachment-add`) instead of being carried inline in the
+    /// `.ics`; when `false` the inline `ATTACH;VALUE=BINARY` fallback applies
+    /// (CAL-21).
+    pub managed_attachments: bool,
 }
 
 impl DavClient {
@@ -171,10 +218,13 @@ impl DavClient {
 
         let Some(principal_href) = principal else {
             tracing::warn!("server didn't answer current-user-principal; treating the configured URL as the calendar-home-set directly");
+            let home_set_href = self.base_url.to_string();
+            let managed_attachments = self.managed_attachments_supported(&home_set_href, credential).await;
             return Ok(CalendarDiscovery {
-                home_set_href: self.base_url.to_string(),
+                home_set_href,
                 schedule_outbox_href: None,
                 schedule_inbox_href: None,
+                managed_attachments,
             });
         };
         let principal_url = self.resolve(&principal_href)?;
@@ -188,17 +238,18 @@ impl DavClient {
         if schedule_outbox_href.is_some() {
             tracing::debug!("server advertises RFC 6638 scheduling (schedule-outbox-URL); client-side iMIP will stand down");
         }
+        let home_set_missing = home_set.is_none();
+        let home_set_href = home_set.unwrap_or_else(|| self.base_url.to_string());
+        if home_set_missing {
+            tracing::warn!("server didn't answer calendar-home-set; treating the configured URL as the calendar-home-set directly");
+        }
+        let managed_attachments = self.managed_attachments_supported(&home_set_href, credential).await;
 
         Ok(CalendarDiscovery {
-            home_set_href: match home_set {
-                Some(href) => href,
-                None => {
-                    tracing::warn!("server didn't answer calendar-home-set; treating the configured URL as the calendar-home-set directly");
-                    self.base_url.to_string()
-                }
-            },
+            home_set_href,
             schedule_outbox_href,
             schedule_inbox_href,
+            managed_attachments,
         })
     }
 }
@@ -560,6 +611,73 @@ impl DavClient {
         self.delete_object(href, credential, None).await
     }
 
+    /// Whether the calendar home advertises RFC 8607 managed attachments
+    /// (`DAV: calendar-managed-attachments` on an `OPTIONS` request, §3.2).
+    /// A server that doesn't answer `OPTIONS` - or fails it - simply gets the
+    /// inline `ATTACH;VALUE=BINARY` fallback; this never fails the account
+    /// (§10, degrade softly).
+    pub async fn managed_attachments_supported(&self, home_set_href: &str, credential: &Credential) -> bool {
+        let Ok(url) = self.resolve(home_set_href) else { return false };
+        let supported = match self.send_request("OPTIONS", url, credential, None, &[]).await {
+            Ok(response) => response.headers().get("DAV").and_then(|value| value.to_str().ok()).is_some_and(|value| {
+                value.split(',').any(|token| {
+                    let token = token.trim();
+                    token.eq_ignore_ascii_case("calendar-managed-attachments") || token.eq_ignore_ascii_case("calendar-managed-attachments-no-recurrence")
+                })
+            }),
+            Err(e) => {
+                tracing::debug!("OPTIONS for managed attachments failed; using inline attachments: {e}");
+                false
+            }
+        };
+        if supported {
+            tracing::debug!("calendar home advertises RFC 8607 managed attachments");
+        }
+        supported
+    }
+
+    /// Uploads one file as an RFC 8607 managed attachment on the calendar
+    /// object at `resource_href` (`POST ?action=attachment-add`, §3.4). The
+    /// server adds the `ATTACH;MANAGED-ID=…` property to the object itself; the
+    /// returned id (from the `Cal-Managed-ID` header) is informational - the
+    /// session resyncs the month, which re-reads the server's property.
+    pub async fn upload_managed_attachment(&self, resource_href: &str, attachment: &lookout_core::EventAttachment, credential: &Credential) -> Result<Option<String>> {
+        let bytes = attachment
+            .bytes()
+            .ok_or_else(|| Error::Discovery(format!("attachment \"{}\" has no readable contents", attachment.name)))?;
+        let separator = if resource_href.contains('?') { '&' } else { '?' };
+        let url = self.resolve(&format!("{resource_href}{separator}action=attachment-add"))?;
+        let mime_type = sanitize_content_type(attachment.mime_type.as_deref());
+        let filename = sanitize_filename(&attachment.name);
+        let headers = vec![
+            ("Content-Type", mime_type),
+            ("Content-Disposition", format!("attachment; filename=\"{filename}\"")),
+            ("Prefer", "return=representation".to_string()),
+        ];
+        let response = self.send_body_request("POST", url, credential, Some(bytes), &headers).await?;
+        let managed_id = response.headers().get("Cal-Managed-ID").and_then(|value| value.to_str().ok()).map(str::to_string);
+        // Drain the (usually the updated calendar object) body so the
+        // connection can be reused.
+        drop(response.bytes().await?);
+        Ok(managed_id)
+    }
+
+    /// Downloads one attachment (`GET` on the `ATTACH` URI, RFC 8607 §3.10).
+    /// A body over [`MAX_ATTACHMENT_DOWNLOAD_BYTES`] is refused rather than
+    /// buffered - the URI ultimately comes from a server document.
+    pub async fn download_attachment(&self, href: &str, credential: &Credential) -> Result<Vec<u8>> {
+        let url = self.resolve(href)?;
+        let response = self.send_request("GET", url.clone(), credential, None, &[]).await?;
+        if response.content_length().is_some_and(|len| len > MAX_ATTACHMENT_DOWNLOAD_BYTES as u64) {
+            return Err(Error::Discovery(format!("attachment {url} exceeds the {MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte limit")));
+        }
+        let body = response.bytes().await?;
+        if body.len() > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+            return Err(Error::Discovery(format!("attachment {url} exceeds the {MAX_ATTACHMENT_DOWNLOAD_BYTES}-byte limit")));
+        }
+        Ok(body.to_vec())
+    }
+
     /// POSTs a `VFREEBUSY` request (built by
     /// [`crate::freebusy::build_vfreebusy_request`]) to the schedule-outbox at
     /// `outbox_href` and parses the `CALDAV:schedule-response` into one
@@ -670,9 +788,26 @@ impl DavClient {
         body: Option<String>,
         extra_headers: &[(&str, String)],
     ) -> Result<reqwest::Response> {
+        self.send_body_request(method_name, url, credential, body.map(String::into_bytes), extra_headers).await
+    }
+
+    /// The byte-body form of [`Self::send_request`] - the attachment upload
+    /// (`POST ?action=attachment-add`) sends the file itself, not a string
+    /// (RFC 8607, CAL-21). Identical auth/error convention.
+    async fn send_body_request(
+        &self,
+        method_name: &str,
+        url: reqwest::Url,
+        credential: &Credential,
+        body: Option<Vec<u8>>,
+        extra_headers: &[(&str, String)],
+    ) -> Result<reqwest::Response> {
         let method = Method::from_bytes(method_name.as_bytes()).expect("method name is a valid HTTP token");
         let request_url = url.clone();
-        tracing::debug!("DAV {method_name} {request_url} body:\n{:?}", body);
+        match &body {
+            Some(body) => tracing::debug!("DAV {method_name} {request_url} body: {} bytes", body.len()),
+            None => tracing::debug!("DAV {method_name} {request_url}"),
+        }
         let mut req = self.http.request(method, url);
         for (name, value) in extra_headers {
             req = req.header(*name, value);
@@ -991,6 +1126,109 @@ END:VCALENDAR
         let credential = Credential::Password("secret".to_string());
 
         assert!(client.set_calendar_color("/dav/calendars/user/abc/", "#3584e4", &credential).await.is_err());
+    }
+
+    // --- CAL-21: RFC 8607 managed attachments -------------------------
+
+    #[tokio::test]
+    async fn managed_attachments_supported_reads_the_dav_options_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("OPTIONS"))
+            .and(path("/dav/calendars/alice/"))
+            .respond_with(ResponseTemplate::new(200).insert_header("DAV", "1, 2, 3, calendar-access, calendar-managed-attachments, calendar-managed-attachments-no-recurrence"))
+            .mount(&server)
+            .await;
+
+        let client = DavClient::new(&format!("{}/", server.uri()), false, "alice".to_string()).unwrap();
+        assert!(
+            client
+                .managed_attachments_supported("/dav/calendars/alice/", &Credential::Password("secret".to_string()))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_attachments_supported_degrades_to_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("OPTIONS"))
+            .and(path("/dav/calendars/alice/"))
+            .respond_with(ResponseTemplate::new(200).insert_header("DAV", "1, 3, calendar-access"))
+            .mount(&server)
+            .await;
+        let client = DavClient::new(&format!("{}/", server.uri()), false, "alice".to_string()).unwrap();
+        assert!(
+            !client
+                .managed_attachments_supported("/dav/calendars/alice/", &Credential::Password("secret".to_string()))
+                .await
+        );
+
+        // A server that rejects OPTIONS is just as soft a no.
+        let rejecting = MockServer::start().await;
+        Mock::given(method("OPTIONS"))
+            .and(path("/dav/calendars/alice/"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&rejecting)
+            .await;
+        let client = DavClient::new(&format!("{}/", rejecting.uri()), false, "alice".to_string()).unwrap();
+        assert!(
+            !client
+                .managed_attachments_supported("/dav/calendars/alice/", &Credential::Password("secret".to_string()))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_managed_attachment_posts_the_file_and_reads_the_id() {
+        use wiremock::matchers::{body_bytes, header, query_param};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dav/calendars/alice/work/evt-1.ics"))
+            .and(query_param("action", "attachment-add"))
+            .and(header("Content-Type", "text/plain"))
+            .and(header("Content-Disposition", "attachment; filename=\"notes.txt\""))
+            .and(header("Prefer", "return=representation"))
+            .and(body_bytes(b"Hello agenda!".to_vec()))
+            .respond_with(ResponseTemplate::new(201).insert_header("Cal-Managed-ID", "97S"))
+            .mount(&server)
+            .await;
+
+        let client = DavClient::new(&format!("{}/", server.uri()), false, "alice".to_string()).unwrap();
+        let attachment = lookout_core::EventAttachment::from_bytes("notes.txt", Some("text/plain".to_string()), b"Hello agenda!").unwrap();
+        let managed_id = client
+            .upload_managed_attachment("/dav/calendars/alice/work/evt-1.ics", &attachment, &Credential::Password("secret".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(managed_id.as_deref(), Some("97S"));
+    }
+
+    #[tokio::test]
+    async fn download_attachment_returns_the_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/64/34X22R"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"agenda".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = DavClient::new(&format!("{}/", server.uri()), false, "alice".to_string()).unwrap();
+        let bytes = client
+            .download_attachment("/attachments/64/34X22R", &Credential::Password("secret".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"agenda");
+    }
+
+    #[tokio::test]
+    async fn download_attachment_surfaces_http_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/gone"))
+            .respond_with(ResponseTemplate::new(410).set_body_string("gone"))
+            .mount(&server)
+            .await;
+        let client = DavClient::new(&format!("{}/", server.uri()), false, "alice".to_string()).unwrap();
+        assert!(client.download_attachment("/attachments/gone", &Credential::Password("secret".to_string())).await.is_err());
     }
 
     #[tokio::test]

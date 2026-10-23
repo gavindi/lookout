@@ -16,7 +16,7 @@
 /// Software released under the GPL3 license
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::calendar::{CalendarEvent, CalendarInfo, CalendarTask, EventOccurrence, SchedulingInfo};
+use crate::calendar::{CalendarEvent, CalendarInfo, CalendarTask, EventAttachment, EventOccurrence, SchedulingInfo};
 use crate::email::EmailAddress;
 use crate::freebusy::AttendeeAvailability;
 use crate::ids::{CalendarId, EventUid};
@@ -174,6 +174,20 @@ pub enum CalendarCommand {
     SetSharedCalendars {
         owners: Vec<String>,
     },
+    /// Fetch one event attachment's bytes (item 3.16 / CAL-21). The UI never
+    /// talks to the server, so saving an attachment from the editor or the
+    /// invitation card goes through the owning calendar session: CalDAV reads
+    /// the `ATTACH` URI (an RFC 8607 managed attachment included), Graph reads
+    /// `GET /me/events/{id}/attachments/{id}`. `event_href` is the Graph event
+    /// id where the backend needs one; `attachment` carries the URI/id and the
+    /// inline contents when the document already had them. `request_id` is
+    /// echoed on the answer so a stale reply can be dropped.
+    FetchEventAttachment {
+        calendar_id: CalendarId,
+        event_href: Option<String>,
+        attachment: EventAttachment,
+        request_id: u64,
+    },
     Shutdown,
 }
 
@@ -216,6 +230,19 @@ pub enum CalendarSessionEvent {
     EventSaveFailed {
         uid: EventUid,
         recurrence_id: Option<DateTime<Utc>>,
+        message: String,
+    },
+    /// A `FetchEventAttachment` answer: the decoded file contents, plus the
+    /// display name the caller can offer in its save dialog.
+    EventAttachmentFetched {
+        request_id: u64,
+        name: String,
+        data: Vec<u8>,
+    },
+    /// A `FetchEventAttachment` request failed (no URI/inline data, an HTTP
+    /// error, or an attachment the server no longer has).
+    EventAttachmentFetchFailed {
+        request_id: u64,
         message: String,
     },
 }

@@ -34,6 +34,7 @@ behaviour rather than an interpretation of the specs.
 | `message-full.json` | A Graph `GET /me/messages/{id}` read with `body` and `internetMessageHeaders`, including `Authentication-Results` and `List-Id` — pins the reading-pane body mapping (A-06, item 5.7.2). Synthetic. |
 | `message-attachments.json` | A Graph `GET /me/messages/{id}/attachments` page: a file attachment and an inline image with a `contentId` (A-06, item 5.7.2). Synthetic; whether Graph returns `contentId` under the transport's `$select` still needs checking against a tenant. |
 | `recurrence-rules.ics` | The six recurrence shapes Outlook writes: monthly day-of-month, monthly "second Tuesday" (`BYDAY=2TU`), monthly last weekday (`BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1`), yearly month/day, yearly fourth Thursday, and the Graph round-trip form with `WKST` — pins the Series builder (CAL-13, item 3.10). |
+| `event-attachments.ics` | The three `ATTACH` forms an event can carry: an RFC 8607 managed attachment (`MANAGED-ID`/`FILENAME`/`FMTTYPE`/`SIZE` + URI), an inline `VALUE=BINARY;ENCODING=BASE64` file folded across lines, and a plain URI attachment — pins the parser, the stored round trip and the iMIP managed-id strip (CAL-21, item 3.16). Authored to RFC 5545/8607. |
 
 These are authored to the documented wire formats (`[MS-OXCICAL]`, `[MS-OXOMSG]`,
 `[MS-OXTNEF]`, RFC 6047, the Microsoft Graph reference) and verified by

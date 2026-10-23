@@ -1474,6 +1474,7 @@ pub(crate) fn open_event_editor_for(
             categories: &categories,
             suggested_attendees: &[],
             scheduling: Some(&scheduling),
+            attachment_fetch: Some(attachment_fetch_callback(calendar_state)),
         },
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
@@ -1980,6 +1981,7 @@ pub(crate) fn show_new_event_editor(
             categories: &categories,
             suggested_attendees: attendees,
             scheduling: Some(&scheduling),
+            attachment_fetch: Some(attachment_fetch_callback(calendar_state)),
         },
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
@@ -2015,6 +2017,60 @@ pub(crate) fn calendar_handle_for_id(calendar_state: &Rc<RefCell<CalendarUiState
         .values()
         .find(|handle| handle.calendars.iter().any(|c| c.id == *calendar_id))
         .map(|handle| handle.cmd_tx.clone())
+}
+
+/// Asks the owning calendar session for one event attachment's bytes (item
+/// 3.16 / CAL-21), running `on_success`/`on_error` when the answer arrives on
+/// the calendar event loop. The UI never fetches a server URL itself: a CalDAV
+/// managed attachment may need the account's credentials and a Graph child
+/// resource is only reachable through the Graph actor.
+pub(crate) fn request_event_attachment(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    calendar_id: CalendarId,
+    event_href: Option<String>,
+    attachment: lookout_core::EventAttachment,
+    on_success: impl Fn(String, Vec<u8>) + 'static,
+    on_error: impl Fn(String) + 'static,
+) {
+    let Some(handle) = calendar_handle_for_id(calendar_state, &calendar_id) else {
+        on_error(format!("the calendar holding \"{}\" isn't connected", attachment.name));
+        return;
+    };
+    let request_id = {
+        let mut state = calendar_state.borrow_mut();
+        let request_id = state.attachment_next_id;
+        state.attachment_next_id = state.attachment_next_id.wrapping_add(1);
+        state.attachment_requests.insert(
+            request_id,
+            super::state::AttachmentRequest {
+                on_success: Box::new(on_success),
+                on_error: Box::new(on_error),
+            },
+        );
+        request_id
+    };
+    let _ = handle.send_blocking(CalendarCommand::FetchEventAttachment {
+        calendar_id,
+        event_href,
+        attachment,
+        request_id,
+    });
+}
+
+/// The event editor's attachment-save bridge (CAL-21), backed by
+/// [`request_event_attachment`] over the window's calendar state.
+pub(crate) fn attachment_fetch_callback(calendar_state: &Rc<RefCell<CalendarUiState>>) -> crate::event_editor::AttachmentFetchCallback {
+    let calendar_state = calendar_state.clone();
+    Rc::new(move |calendar_id, event_href, attachment, on_success, on_error| {
+        request_event_attachment(
+            &calendar_state,
+            calendar_id,
+            event_href,
+            attachment,
+            move |name, data| on_success(name, data),
+            move |message| on_error(message),
+        );
+    })
 }
 
 /// Whether the calendar account owning `calendar_id` is served by the
@@ -2118,6 +2174,7 @@ pub(crate) fn route_calendar_delete(calendar_state: &Rc<RefCell<CalendarUiState>
             reminder_minutes_before: occ.reminder_minutes_before,
             conference_url: occ.conference_url.clone(),
             is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
+            attachments: occ.attachments.clone(),
         };
         master.exdates.push(occ.start);
         let _ = handle.send_blocking(CalendarCommand::UpdateEvent { event: Box::new(master) });

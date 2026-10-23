@@ -96,6 +96,7 @@ pub fn birthday_occurrences(account_id: &AccountId, calendar_id: &CalendarId, co
                 // local time, so 0 = local midnight).
                 reminder_minutes_before: Some(0),
                 conference_url: None,
+                attachments: Vec::new(),
             });
         }
     }

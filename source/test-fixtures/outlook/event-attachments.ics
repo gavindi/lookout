@@ -1,0 +1,18 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Microsoft Corporation//Outlook 16.0 MIMEDIR//EN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:attachment-demo@example.com
+DTSTAMP:20261015T090000Z
+DTSTART:20261020T140000Z
+DTEND:20261020T150000Z
+SUMMARY:Quarterly review
+ORGANIZER;CN=Ada Lovelace:mailto:ada@example.com
+ATTENDEE;ROLE=REQ-PARTICIPANT;RSVP=TRUE;CN=Grace Hopper:mailto:grace@example.com
+ATTACH;MANAGED-ID=97S;FMTTYPE=text/html;SIZE=59;FILENAME=agenda.html:https://cal.example.com/attach/64/34X22R
+ATTACH;FMTTYPE=text/plain;ENCODING=BASE64;VALUE=BINARY;SIZE=17;FILENAME=notes.txt:
+ SGVsbG8gYWdlbmRhIQ==
+ATTACH;FMTTYPE=application/pdf;FILENAME=deck.pdf:https://files.example.com/deck.pdf
+END:VEVENT
+END:VCALENDAR

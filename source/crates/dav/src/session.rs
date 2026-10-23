@@ -136,6 +136,14 @@ pub async fn run_calendar_session(
                     Ok(CalendarCommand::DeleteCalendar { .. }) => {
                         let _ = events.send(CalendarSessionEvent::Error("not connected - the list was not deleted".to_string())).await;
                     }
+                    Ok(CalendarCommand::FetchEventAttachment { request_id, .. }) => {
+                        let _ = events
+                            .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                                request_id,
+                                message: "not connected - the attachment could not be downloaded".to_string(),
+                            })
+                            .await;
+                    }
                     Ok(_) => {}
                     Err(_) => {}
                 }
@@ -165,6 +173,7 @@ async fn connect_and_run(
     // re-listed after any create/rename/delete so the app's sidebar reflects
     // the server's own view.
     let home_set_href = discovery.home_set_href.clone();
+    let managed_attachments = discovery.managed_attachments;
     let mut calendars = client.list_calendars(&home_set_href, &config.account_id, &credential).await?;
     let _ = events.send(CalendarSessionEvent::CalendarsUpdated(calendars.clone())).await;
     let _ = events
@@ -228,10 +237,10 @@ async fn connect_and_run(
                     sync_month(&client, &calendars, &credential, first_of_month(date), events, cache).await?;
                 }
                 CalendarCommand::CreateEvent { event } => {
-                    write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;
+                    write_event(&client, &calendars, &credential, &event, current_month, managed_attachments, events, cache).await;
                 }
                 CalendarCommand::UpdateEvent { event } => {
-                    write_event(&client, &calendars, &credential, &event, current_month, events, cache).await;
+                    write_event(&client, &calendars, &credential, &event, current_month, managed_attachments, events, cache).await;
                 }
                 CalendarCommand::DeleteEvent { calendar_id: _, href, etag } => match client.delete_calendar_object(&href, &credential, etag.as_deref()).await {
                     Ok(()) => sync_month(&client, &calendars, &credential, current_month, events, cache).await?,
@@ -255,6 +264,9 @@ async fn connect_and_run(
                     request_id,
                 } => {
                     fetch_free_busy(&client, schedule_outbox.as_deref(), &credential, &organizer, &attendees, start, end, request_id, events).await;
+                }
+                CalendarCommand::FetchEventAttachment { attachment, request_id, .. } => {
+                    fetch_event_attachment(&client, &credential, &attachment, request_id, events).await;
                 }
                 CalendarCommand::SyncTasks => sync_tasks(&client, &calendars, &credential, events, cache).await?,
                 CalendarCommand::CreateTask { task } => {
@@ -503,15 +515,25 @@ async fn sync_month(
 /// `<uid>.ics` href under the collection and `If-None-Match: *`), an edit
 /// keeps its `href`/`etag` (so `If-Match` guards against clobbering).
 ///
+/// Attachments (CAL-21): on an RFC 8607 server (`managed_attachments`) the
+/// newly added inline files are uploaded to the saved calendar object one by
+/// one - the server then owns the bytes and writes `ATTACH;MANAGED-ID=…` into
+/// the object. The PUT body omits those inline payloads so a 10 MB meeting
+/// agenda isn't re-uploaded on every save. A server without the extension (or
+/// an upload that fails) keeps the inline `ATTACH;VALUE=BINARY` form, so the
+/// file is never silently lost.
+///
 /// Any failure (calendar not found, HTTP 412 on a stale etag, auth, ...) is
 /// reported via `CalendarSessionEvent::Error` rather than aborting the session;
 /// the caller's toast shows it.
+#[allow(clippy::too_many_arguments)]
 async fn write_event(
     client: &DavClient,
     calendars: &[CalendarInfo],
     credential: &Credential,
     event: &CalendarEvent,
     current_month: NaiveDate,
+    managed_attachments: bool,
     events: &async_channel::Sender<CalendarSessionEvent>,
     cache: Option<&CalendarCache>,
 ) {
@@ -526,14 +548,68 @@ async fn write_event(
         return;
     };
 
-    let ics = crate::ical::build_vcalendar(event);
+    // New inline files that this save should hand to the server. Attachments
+    // with a MANAGED-ID already live on the server and stay in the PUT body;
+    // URI-only ones are part of the document as-is.
+    let pending: Vec<lookout_core::EventAttachment> = if managed_attachments {
+        event
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.is_inline() && attachment.managed_id.is_none())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut put_event = event.clone();
+    if !pending.is_empty() {
+        put_event.attachments.retain(|attachment| !(attachment.is_inline() && attachment.managed_id.is_none()));
+    }
     let href = match &event.href {
         Some(href) => href.clone(),
         None => format!("{}{}.ics", calendar.href, url_safe_uid(&event.uid.0)),
     };
+    let ics = crate::ical::build_vcalendar(&put_event);
 
     match client.put_calendar_object(&href, &ics, credential, event.etag.as_deref()).await {
-        Ok(_new_etag) => {
+        Ok(new_etag) => {
+            if !pending.is_empty() {
+                let mut uploaded = true;
+                for attachment in &pending {
+                    if let Err(e) = client.upload_managed_attachment(&href, attachment, credential).await {
+                        tracing::warn!("managed attachment upload failed, falling back to inline: {e}");
+                        uploaded = false;
+                        break;
+                    }
+                }
+                if !uploaded {
+                    // Keep the file: rewrite the object with the inline form.
+                    // The second PUT needs the etag the first one returned; a
+                    // server that omitted it gets an explicit failure instead
+                    // of a blind overwrite.
+                    match new_etag {
+                        Some(etag) => {
+                            let inline = crate::ical::build_vcalendar(event);
+                            if let Err(e) = client.put_calendar_object(&href, &inline, credential, Some(&etag)).await {
+                                let _ = events
+                                    .send(CalendarSessionEvent::Error(format!(
+                                        "event \"{}\" was saved, but its attachment couldn't be stored: {e}",
+                                        event.uid
+                                    )))
+                                    .await;
+                            }
+                        }
+                        None => {
+                            let _ = events
+                                .send(CalendarSessionEvent::Error(format!(
+                                    "event \"{}\" was saved, but its attachment couldn't be stored",
+                                    event.uid
+                                )))
+                                .await;
+                        }
+                    }
+                }
+            }
             let mut months = vec![current_month];
             let event_month = first_of_month(event.start.date_naive());
             if event_month != current_month {
@@ -552,6 +628,57 @@ async fn write_event(
                     uid: event.uid.clone(),
                     recurrence_id: event.recurrence_id,
                     message: format!("failed to save event \"{}\": {e}", event.uid),
+                })
+                .await;
+        }
+    }
+}
+
+/// Answers a `FetchEventAttachment` (CAL-21): inline contents decode straight
+/// from the document; a URI attachment is fetched from the server with the
+/// account's credentials. A failure is a soft `EventAttachmentFetchFailed`
+/// (the save dialog/toast names it), never a session abort.
+async fn fetch_event_attachment(
+    client: &DavClient,
+    credential: &Credential,
+    attachment: &lookout_core::EventAttachment,
+    request_id: u64,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+) {
+    if let Some(data) = attachment.bytes() {
+        let _ = events
+            .send(CalendarSessionEvent::EventAttachmentFetched {
+                request_id,
+                name: attachment.name.clone(),
+                data,
+            })
+            .await;
+        return;
+    }
+    let Some(url) = attachment.url.as_deref().filter(|url| !url.trim().is_empty()) else {
+        let _ = events
+            .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                request_id,
+                message: format!("attachment \"{}\" has no location", attachment.name),
+            })
+            .await;
+        return;
+    };
+    match client.download_attachment(url, credential).await {
+        Ok(data) => {
+            let _ = events
+                .send(CalendarSessionEvent::EventAttachmentFetched {
+                    request_id,
+                    name: attachment.name.clone(),
+                    data,
+                })
+                .await;
+        }
+        Err(e) => {
+            let _ = events
+                .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                    request_id,
+                    message: format!("couldn't download \"{}\": {e}", attachment.name),
                 })
                 .await;
         }

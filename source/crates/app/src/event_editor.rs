@@ -21,9 +21,10 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike, Utc};
+use gtk::{gio, glib};
 use lookout_core::{
-    Attendee, AttendeeAvailability, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventOccurrence, EventSensitivity, EventStatus, EventUid,
-    FreeBusyInterval, RecurrenceRange,
+    Attendee, AttendeeAvailability, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, EmailAddress, EventAttachment, EventOccurrence, EventSensitivity,
+    EventStatus, EventUid, FreeBusyInterval, RecurrenceRange, MAX_INLINE_EVENT_ATTACHMENT_BYTES,
 };
 
 use crate::calendar_colors::CalendarColorMap;
@@ -44,6 +45,12 @@ const SHOW_AS_CHOICES: [(BusyStatus, &str); 5] = [
     (BusyStatus::Busy, "Busy"),
     (BusyStatus::Oof, "Away"),
 ];
+
+/// Microsoft Graph's per-attachment limit for an event attachment
+/// (`POST /me/events/{id}/attachments`). Larger files need an upload session,
+/// which isn't implemented, so the editor refuses them up front instead of
+/// letting the server reject the meeting's file.
+const GRAPH_ATTACHMENT_LIMIT_BYTES: u64 = 3 * 1024 * 1024;
 
 /// The dropdown index showing `show_as` (unknown states fall back to Busy).
 fn show_as_index(show_as: BusyStatus) -> u32 {
@@ -141,6 +148,12 @@ impl SchedulingHandle {
     }
 }
 
+/// Fetches one non-inline (server-managed or URI) attachment through the
+/// owning calendar session (CAL-21). The editor's rows call this when the user
+/// clicks Save on an attachment whose bytes aren't in the event document; the
+/// window supplies an implementation backed by `request_event_attachment`.
+pub type AttachmentFetchCallback = Rc<dyn Fn(CalendarId, Option<String>, EventAttachment, Rc<dyn Fn(String, Vec<u8>)>, Rc<dyn Fn(String)>)>;
+
 /// What to prefill the editor with: the pickable calendars (label + id), which
 /// calendar is selected by default, the event being edited (if any), and a
 /// read-only snapshot for the right-hand mini-calendar/day-strip preview.
@@ -212,6 +225,10 @@ pub struct EventEditorPrefill<'a> {
     /// toolbar offers a Scheduling tab that asks the caller for attendees'
     /// free/busy. `None` (no calendar account able to answer) hides the tab.
     pub scheduling: Option<&'a SchedulingContext>,
+    /// The attachment download bridge (item 3.16 / CAL-21): when present, a
+    /// listed attachment that isn't inline can be saved through the owning
+    /// calendar session. `None` leaves such rows display-only.
+    pub attachment_fetch: Option<AttachmentFetchCallback>,
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -468,6 +485,20 @@ pub fn show_event_editor(
     fields_group.add(&location_row);
     fields_group.add(&video_toggle);
     fields_group.add(&video_url_row);
+    // CAL-21: the event's files - managed/URI attachments already on the
+    // event, plus anything the user attaches here. A read-only (webcal) event
+    // still lists and saves what it carries, but offers no add/remove; a
+    // server-held file there has no calendar session to download it from, so
+    // only inline contents get a Save button.
+    let attachment_fetch = if read_only { None } else { prefill.attachment_fetch.clone() };
+    let attachment_calendar = existing.as_ref().map(|occ| occ.calendar_id.clone()).unwrap_or_else(|| prefill.default_calendar.clone());
+    let (attachments_group, attachments) = build_event_attachments_group(
+        existing.as_ref().map(|occ| occ.attachments.clone()).unwrap_or_default(),
+        read_only,
+        attachment_calendar,
+        existing.as_ref().and_then(|occ| occ.href.clone()),
+        attachment_fetch,
+    );
 
     let recurring_note = gtk::Label::builder()
         .label("This event repeats - changes apply to the whole series.")
@@ -514,6 +545,7 @@ pub fn show_event_editor(
         .margin_end(12)
         .build();
     form_box.append(&fields_group);
+    form_box.append(&attachments_group);
     form_box.append(&datetime_row);
     form_box.append(&read_only_note);
     form_box.append(&recurring_note);
@@ -1195,6 +1227,7 @@ pub fn show_event_editor(
         let busy_dropdown = busy_dropdown.clone();
         let sensitivity_dropdown = sensitivity_dropdown.clone();
         let reminder_dropdown = reminder_dropdown.clone();
+        let attachments = attachments.clone();
         let series = series.clone();
         let existing_meta = existing_meta.clone();
         let existing_attendees = existing_attendees.clone();
@@ -1228,6 +1261,20 @@ pub fn show_event_editor(
                     return;
                 }
             }
+            // Graph attaches a file after the event is saved and caps one at
+            // 3 MB (no upload session yet); refuse here rather than leaving the
+            // meeting saved without its file (CAL-21).
+            if graph_calendars.contains(&calendar_id) {
+                if let Some(attachment) = attachments
+                    .borrow()
+                    .iter()
+                    .find(|attachment| attachment.byte_size().is_some_and(|size| size > GRAPH_ATTACHMENT_LIMIT_BYTES))
+                {
+                    error_label.set_label(&format!("\"{}\" is larger than Microsoft 365's 3 MB attachment limit.", attachment.name));
+                    error_label.set_visible(true);
+                    return;
+                }
+            }
             let input = FormInput {
                 title: title_row.text().to_string(),
                 location: location_row.text().to_string(),
@@ -1255,6 +1302,7 @@ pub fn show_event_editor(
                 exdates: existing.as_ref().map(|occ| occ.exdates.clone()).unwrap_or_default(),
                 owner_email: owner_email.clone(),
                 existing_meta: existing_meta.clone(),
+                attachments: attachments.borrow().clone(),
             };
             match build_event_from_input(input) {
                 Ok(mut event) => {
@@ -1388,6 +1436,211 @@ pub fn show_event_editor(
     }
 
     dialog.present();
+}
+
+/// Builds the event editor's Attachments group (CAL-21) and returns its shared
+/// list. Rows are rebuilt in place after every add/remove; an attachment that
+/// already carries inline contents gets a Save button, and a writable event
+/// also gets Add and Remove. A file over
+/// [`MAX_INLINE_EVENT_ATTACHMENT_BYTES`] is refused with an explanation rather
+/// than being silently dropped.
+fn build_event_attachments_group(
+    initial: Vec<EventAttachment>,
+    read_only: bool,
+    calendar_id: CalendarId,
+    event_href: Option<String>,
+    attachment_fetch: Option<AttachmentFetchCallback>,
+) -> (adw::PreferencesGroup, Rc<RefCell<Vec<EventAttachment>>>) {
+    let attachments = Rc::new(RefCell::new(initial));
+    let rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let group = adw::PreferencesGroup::builder().title("Attachments").build();
+
+    if !read_only {
+        let add_row = adw::ActionRow::builder()
+            .title("Add attachment")
+            .subtitle(format!("Files up to {} MB", MAX_INLINE_EVENT_ATTACHMENT_BYTES / (1024 * 1024)))
+            .build();
+        let add_button = gtk::Button::with_label("Add");
+        add_button.set_valign(gtk::Align::Center);
+        add_button.set_tooltip_text(Some("Attach a file to this event"));
+        add_row.add_suffix(&add_button);
+        group.add(&add_row);
+
+        let group_for_add = group.clone();
+        let attachments_for_add = attachments.clone();
+        let rows_for_add = rows.clone();
+        let calendar_id_for_add = calendar_id.clone();
+        let event_href_for_add = event_href.clone();
+        let attachment_fetch_for_add = attachment_fetch.clone();
+        add_button.connect_clicked(move |button| {
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+            let group = group_for_add.clone();
+            let attachments = attachments_for_add.clone();
+            let rows = rows_for_add.clone();
+            let calendar_id = calendar_id_for_add.clone();
+            let event_href = event_href_for_add.clone();
+            let attachment_fetch = attachment_fetch_for_add.clone();
+            glib::spawn_future_local(async move {
+                let dialog = gtk::FileDialog::builder().title("Attach files").build();
+                let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
+                let mut too_large = Vec::new();
+                for i in 0..files.n_items() {
+                    let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
+                    let Ok(info) = file
+                        .query_info_future("standard::display-name,standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
+                        .await
+                    else {
+                        continue;
+                    };
+                    let display_name = info.display_name().to_string();
+                    let mime_type = info
+                        .content_type()
+                        .and_then(|content_type| gio::functions::content_type_get_mime_type(&content_type))
+                        .map(|mime| mime.to_string());
+                    let Ok((bytes, _etag)) = file.load_contents_future().await else { continue };
+                    match EventAttachment::from_bytes(display_name.clone(), mime_type, &bytes) {
+                        Some(attachment) => attachments.borrow_mut().push(attachment),
+                        None => too_large.push(display_name),
+                    }
+                }
+                rebuild_attachment_rows(&group, &attachments, &rows, false, &calendar_id, &event_href, &attachment_fetch);
+                if !too_large.is_empty() {
+                    group.set_description(Some(&format!(
+                        "{} couldn't be attached: the limit is {} MB per file.",
+                        too_large.join(", "),
+                        MAX_INLINE_EVENT_ATTACHMENT_BYTES / (1024 * 1024)
+                    )));
+                }
+            });
+        });
+    }
+
+    rebuild_attachment_rows(&group, &attachments, &rows, read_only, &calendar_id, &event_href, &attachment_fetch);
+    (group, attachments)
+}
+
+/// Recreates the per-attachment rows under the group. The "Add attachment"
+/// row (when writable) stays first; everything after it is rebuilt from
+/// `attachments`, so indexes in the Remove handlers always match the list.
+fn rebuild_attachment_rows(
+    group: &adw::PreferencesGroup,
+    attachments: &Rc<RefCell<Vec<EventAttachment>>>,
+    rows: &Rc<RefCell<Vec<adw::ActionRow>>>,
+    read_only: bool,
+    calendar_id: &CalendarId,
+    event_href: &Option<String>,
+    attachment_fetch: &Option<AttachmentFetchCallback>,
+) {
+    let existing_rows = std::mem::take(&mut *rows.borrow_mut());
+    for row in existing_rows {
+        group.remove(&row);
+    }
+    let items = attachments.borrow().clone();
+    for (index, attachment) in items.iter().enumerate() {
+        let row = adw::ActionRow::builder().title(&attachment.name).subtitle(attachment_subtitle(attachment)).build();
+        if let Some(bytes) = attachment.bytes() {
+            let save = gtk::Button::from_icon_name("document-save-symbolic");
+            save.add_css_class("flat");
+            save.set_tooltip_text(Some("Save attachment"));
+            save.set_valign(gtk::Align::Center);
+            let name = attachment.name.clone();
+            save.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                save_event_attachment(&window, &name, bytes.clone());
+            });
+            row.add_suffix(&save);
+        } else if let (Some(fetch), Some(_)) = (attachment_fetch, attachment.url.as_deref()) {
+            // A server-managed CalDAV attachment or a Graph child resource:
+            // its bytes live on the server, so save goes through the owning
+            // calendar session (CAL-21).
+            let save = gtk::Button::from_icon_name("document-save-symbolic");
+            save.add_css_class("flat");
+            save.set_tooltip_text(Some("Save attachment"));
+            save.set_valign(gtk::Align::Center);
+            let fetch = fetch.clone();
+            let attachment = attachment.clone();
+            let calendar_id = calendar_id.clone();
+            let event_href = event_href.clone();
+            let error_group = group.clone();
+            save.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                let window = std::rc::Rc::new(window);
+                let success_window = window.clone();
+                let on_success: Rc<dyn Fn(String, Vec<u8>)> = Rc::new(move |name, data| {
+                    save_event_attachment(&success_window, &name, data);
+                });
+                let on_error: Rc<dyn Fn(String)> = {
+                    let error_group = error_group.clone();
+                    Rc::new(move |message| {
+                        error_group.set_description(Some(&message));
+                    })
+                };
+                fetch(calendar_id.clone(), event_href.clone(), attachment.clone(), on_success, on_error);
+            });
+            row.add_suffix(&save);
+        }
+        if !read_only {
+            let remove = gtk::Button::from_icon_name("window-close-symbolic");
+            remove.add_css_class("flat");
+            remove.set_tooltip_text(Some("Remove attachment"));
+            remove.set_valign(gtk::Align::Center);
+            let group = group.clone();
+            let attachments = attachments.clone();
+            let rows = rows.clone();
+            let calendar_id = calendar_id.clone();
+            let event_href = event_href.clone();
+            let attachment_fetch = attachment_fetch.clone();
+            remove.connect_clicked(move |_| {
+                if index < attachments.borrow().len() {
+                    attachments.borrow_mut().remove(index);
+                }
+                rebuild_attachment_rows(&group, &attachments, &rows, false, &calendar_id, &event_href, &attachment_fetch);
+            });
+            row.add_suffix(&remove);
+        }
+        group.add(&row);
+        rows.borrow_mut().push(row);
+    }
+    if read_only && items.is_empty() {
+        group.set_visible(false);
+    } else {
+        group.set_visible(true);
+    }
+}
+
+/// A row's subtitle: the MIME type and size, whichever are known.
+fn attachment_subtitle(attachment: &EventAttachment) -> String {
+    let mut parts = Vec::new();
+    if let Some(mime_type) = attachment.mime_type.as_deref().filter(|mime| !mime.trim().is_empty()) {
+        parts.push(mime_type.to_string());
+    }
+    if let Some(size) = attachment.byte_size() {
+        parts.push(lookout_core::text::human_size(size));
+    }
+    if parts.is_empty() {
+        "Attachment".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// Writes inline attachment bytes to a user-chosen file - the row's Save
+/// button. The suggested name is reduced to its final path component: RFC 8607
+/// `FILENAME` is untrusted, so it must never select a directory.
+pub(crate) fn save_event_attachment(window: &gtk::Window, name: &str, bytes: Vec<u8>) {
+    let file_name = std::path::Path::new(name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "attachment".to_string());
+    let window = window.clone();
+    glib::spawn_future_local(async move {
+        let dialog = gtk::FileDialog::builder().title("Save attachment").initial_name(&file_name).build();
+        let Ok(file) = dialog.save_future(Some(&window)).await else { return };
+        let _ = file
+            .replace_contents_bytes_future(&glib::Bytes::from(bytes.as_slice()), None, false, gio::FileCreateFlags::REPLACE_DESTINATION)
+            .await;
+    });
 }
 
 /// Picks the first icon name present in the current icon theme, matching the
@@ -1645,6 +1898,7 @@ fn synthetic_occurrence(calendar_id: CalendarId, title: &str, start: DateTime<Ut
         status: EventStatus::default(),
         reminder_minutes_before: None,
         conference_url: None,
+        attachments: Vec::new(),
     }
 }
 
@@ -1975,6 +2229,8 @@ struct FormInput {
     exdates: Vec<DateTime<Utc>>,
     owner_email: Option<String>,
     existing_meta: Option<EventMeta>,
+    /// The event's files (CAL-21), carried from the editor's attachment list.
+    attachments: Vec<EventAttachment>,
 }
 
 /// Builds a [`CalendarEvent`] from already-extracted form values. `Err` on an
@@ -2088,6 +2344,7 @@ pub fn calendar_event_from_occurrence(occ: &EventOccurrence, start_local: NaiveD
         reminder_minutes_before: occ.reminder_minutes_before,
         conference_url: occ.conference_url.clone(),
         is_online_meeting: lookout_core::interop::is_teams_meeting(occ.conference_url.as_deref()),
+        attachments: occ.attachments.clone(),
     }
 }
 
@@ -2167,6 +2424,7 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         // dedicated Teams toggle lands with the Microsoft calendar wiring.
         is_online_meeting: lookout_core::interop::is_teams_meeting(conference_url.as_deref()),
         conference_url,
+        attachments: input.attachments,
     })
 }
 
@@ -2199,7 +2457,18 @@ mod tests {
             exdates: Vec::new(),
             owner_email: None,
             existing_meta: None,
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_event_from_input_keeps_the_attachment_list() {
+        let mut input = base_input();
+        input.attachments = vec![lookout_core::EventAttachment::from_bytes("notes.txt", Some("text/plain".to_string()), b"Hello agenda!").unwrap()];
+        let event = build_event_from_input(input).expect("valid range");
+        assert_eq!(event.attachments.len(), 1);
+        assert_eq!(event.attachments[0].name, "notes.txt");
+        assert_eq!(event.attachments[0].bytes().as_deref(), Some(b"Hello agenda!".as_slice()));
     }
 
     /// An all-day event chosen for 13 Oct is written as `DTSTART;VALUE=DATE:
@@ -2284,6 +2553,7 @@ mod tests {
             status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -2483,6 +2753,7 @@ mod tests {
             status: EventStatus::default(),
             reminder_minutes_before: Some(10),
             conference_url: Some("https://meet.example.com/x".to_string()),
+            attachments: Vec::new(),
         };
         let moved = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(), chrono::NaiveTime::from_hms_opt(14, 0, 0).unwrap());
         let event = calendar_event_from_occurrence(&occ, moved, moved + chrono::Duration::hours(2));
@@ -2584,6 +2855,7 @@ mod tests {
             status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         };
         let moved = NaiveDateTime::new(NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(), chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
         // The drag reports the last *day* (inclusive); the model stores the
@@ -2629,6 +2901,7 @@ mod tests {
             status: EventStatus::default(),
             reminder_minutes_before: None,
             conference_url: None,
+            attachments: Vec::new(),
         };
         // The form's times are the *edited* times - the override anchors the
         // original series instance.

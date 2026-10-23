@@ -103,9 +103,15 @@ impl FilePage {
     /// Shows `code` and refreshes the parts that change while the page is
     /// closed. An unknown code falls back to Info, the default page.
     pub(crate) fn open(&self, state: &UiState, code: &str) {
-        let code = PAGES.iter().find(|(candidate, _, _)| *candidate == code).map(|(candidate, _, _)| *candidate).unwrap_or("info");
+        let code = PAGES
+            .iter()
+            .find(|(candidate, _, _)| *candidate == code)
+            .map(|(candidate, _, _)| *candidate)
+            .unwrap_or("info");
         self.stack.set_visible_child_name(code);
-        let Some(index) = PAGES.iter().position(|(candidate, _, _)| *candidate == code) else { return };
+        let Some(index) = PAGES.iter().position(|(candidate, _, _)| *candidate == code) else {
+            return;
+        };
         let Some(row) = self.nav.row_at_index(index as i32) else {
             if code == "info" {
                 self.refresh_info(state);
@@ -148,7 +154,11 @@ fn fill_info(accounts_box: &gtk::Box, summary: &gtk::Label, state: &UiState, ope
     }
     let mut accounts: Vec<&AccountHandle> = state.accounts.values().collect();
     accounts.sort_by_key(|account| {
-        let name = if account.display_name.trim().is_empty() { &account.email } else { &account.display_name };
+        let name = if account.display_name.trim().is_empty() {
+            &account.email
+        } else {
+            &account.display_name
+        };
         name.to_lowercase()
     });
 
@@ -173,7 +183,12 @@ fn fill_info(accounts_box: &gtk::Box, summary: &gtk::Label, state: &UiState, ope
 /// Builds the page. The shell adds [`FilePage::root`] to its stack, wires
 /// [`FilePage::back`], and calls [`FilePage::open`] whenever File is chosen.
 pub(crate) fn build(state: Rc<RefCell<UiState>>, hooks: Hooks) -> FilePage {
-    let root = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).css_classes(["file-page"]).hexpand(true).vexpand(true).build();
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["file-page"])
+        .hexpand(true)
+        .vexpand(true)
+        .build();
 
     // --- The navigation rail -------------------------------------------------
     let rail = gtk::Box::builder().orientation(gtk::Orientation::Vertical).css_classes(["file-page-nav"]).build();
@@ -257,7 +272,12 @@ pub(crate) fn build(state: Rc<RefCell<UiState>>, hooks: Hooks) -> FilePage {
     root.append(&rail);
 
     // --- The content pane ----------------------------------------------------
-    let stack = gtk::Stack::builder().transition_type(gtk::StackTransitionType::None).hexpand(true).vexpand(true).css_classes(["file-page-content"]).build();
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::None)
+        .hexpand(true)
+        .vexpand(true)
+        .css_classes(["file-page-content"])
+        .build();
     // Each page is measured only while it is the visible one: the Options
     // page's settings column is large, and homogeneous measurement (the
     // default) would measure it on every Info/About allocation too.
@@ -271,12 +291,9 @@ pub(crate) fn build(state: Rc<RefCell<UiState>>, hooks: Hooks) -> FilePage {
     info_body.append(&accounts);
     {
         let open_settings = hooks.open_settings.clone();
-        let add = tile(
-            "list-add-symbolic",
-            "Add Account",
-            "Connect a GNOME Online Account or an IMAP/SMTP mailbox",
-            move |_| open_settings("accounts"),
-        );
+        let add = tile("list-add-symbolic", "Add Account", "Connect a GNOME Online Account or an IMAP/SMTP mailbox", move |_| {
+            open_settings("accounts")
+        });
         info_body.append(&add);
     }
     info_body.append(&section("Mailbox"));
@@ -293,9 +310,12 @@ pub(crate) fn build(state: Rc<RefCell<UiState>>, hooks: Hooks) -> FilePage {
     }
     {
         let manage = hooks.manage_categories.clone();
-        info_body.append(&tile("view-list-symbolic", "Categories", "Names and colours for sorting mail, events, people and tasks", move |button| {
-            manage(button.upcast_ref())
-        }));
+        info_body.append(&tile(
+            "view-list-symbolic",
+            "Categories",
+            "Names and colours for sorting mail, events, people and tasks",
+            move |button| manage(button.upcast_ref()),
+        ));
     }
     add_page(&stack, "info", &info_body);
 
@@ -373,7 +393,15 @@ pub(crate) fn build(state: Rc<RefCell<UiState>>, hooks: Hooks) -> FilePage {
         });
     }
 
-    let page = FilePage { root, back, nav, stack, accounts, summary, open_settings: hooks.open_settings.clone() };
+    let page = FilePage {
+        root,
+        back,
+        nav,
+        stack,
+        accounts,
+        summary,
+        open_settings: hooks.open_settings.clone(),
+    };
     page.refresh_info(&state.borrow());
     page
 }
@@ -383,7 +411,14 @@ pub(crate) fn build(state: Rc<RefCell<UiState>>, hooks: Hooks) -> FilePage {
 /// out. Returns the page's body - append the heading, sections and tiles to
 /// it - and the caller wraps it with [`add_page`].
 fn page_body() -> gtk::Box {
-    gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).margin_top(24).margin_bottom(24).margin_start(36).margin_end(36).build()
+    gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(36)
+        .margin_end(36)
+        .build()
 }
 
 /// Puts `body` in the scrollable, width-clamped content column and adds it to
@@ -400,17 +435,34 @@ fn add_page(stack: &gtk::Stack, code: &str, body: &gtk::Box) {
 
 /// A page heading, 22 px semibold (the size is in `file-page.css`).
 fn heading(text: &str) -> gtk::Label {
-    gtk::Label::builder().label(text).css_classes(["file-page-heading"]).halign(gtk::Align::Start).xalign(0.0).build()
+    gtk::Label::builder()
+        .label(text)
+        .css_classes(["file-page-heading"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .build()
 }
 
 /// A section label above a run of tiles: semibold, in the accent colour.
 fn section(text: &str) -> gtk::Label {
-    gtk::Label::builder().label(text).css_classes(["file-page-section"]).halign(gtk::Align::Start).xalign(0.0).margin_top(10).build()
+    gtk::Label::builder()
+        .label(text)
+        .css_classes(["file-page-section"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .margin_top(10)
+        .build()
 }
 
 /// A dim, wrapping line of explanatory text.
 fn dim_label(text: &str) -> gtk::Label {
-    gtk::Label::builder().label(text).css_classes(["dim-label"]).halign(gtk::Align::Start).xalign(0.0).wrap(true).build()
+    gtk::Label::builder()
+        .label(text)
+        .css_classes(["dim-label"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .build()
 }
 
 /// A wide button with an icon, a title and a line of explanation - the tile
@@ -437,7 +489,12 @@ where
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
-    let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).valign(gtk::Align::Center).build();
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
     text.append(&title_label);
     text.append(&detail_label);
     let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(14).build();
@@ -447,7 +504,11 @@ where
     content.set_margin_bottom(6);
     content.append(&image);
     content.append(&text);
-    let button = gtk::Button::builder().child(&content).css_classes(["flat", "file-page-tile"]).halign(gtk::Align::Fill).build();
+    let button = gtk::Button::builder()
+        .child(&content)
+        .css_classes(["flat", "file-page-tile"])
+        .halign(gtk::Align::Fill)
+        .build();
     button.update_property(&[gtk::accessible::Property::Label(&format!("{title}. {detail}"))]);
     button.connect_clicked(move |button| on_click(button));
     button
@@ -456,9 +517,17 @@ where
 /// One account on the Info page: initials, name and address, the servers it
 /// talks to, and a Settings button that opens Settings → Accounts.
 fn account_card(account: &AccountHandle, open_settings: Rc<dyn Fn(&str)>) -> gtk::Box {
-    let (name, address) = if account.display_name.trim().is_empty() { (account.email.clone(), account.email.clone()) } else { (account.display_name.clone(), account.email.clone()) };
+    let (name, address) = if account.display_name.trim().is_empty() {
+        (account.email.clone(), account.email.clone())
+    } else {
+        (account.display_name.clone(), account.email.clone())
+    };
 
-    let card = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).css_classes(["file-page-card"]).build();
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .css_classes(["file-page-card"])
+        .build();
 
     let avatar = gtk::Label::builder()
         .label(initials(Some(&name), &address))
@@ -472,7 +541,12 @@ fn account_card(account: &AccountHandle, open_settings: Rc<dyn Fn(&str)>) -> gtk
     privacy::mark(&avatar);
     card.append(&avatar);
 
-    let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).hexpand(true).valign(gtk::Align::Center).build();
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(1)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
     let name_label = gtk::Label::builder()
         .label(name)
         .css_classes(["file-page-card-title"])

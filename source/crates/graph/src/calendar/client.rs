@@ -11,6 +11,7 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use lookout_core::calendar_protocol::{InvitationResponse, ProposedTime};
 use lookout_core::{AccountId, AttendeeAvailability, BusyStatus, CalendarEvent, CalendarInfo, EmailAddress, EventOccurrence, FreeBusyInterval};
@@ -20,7 +21,8 @@ use crate::client::{DeltaPage, GraphClient};
 use crate::error::{GraphError, Result};
 
 use super::{
-    calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph, parse_graph_date_time, CalendarPermission, CalendarRole,
+    attachment_from_graph, calendar_from_graph, event_create_body, event_from_graph, event_patch_body, graph_date_time, occurrence_from_graph, parse_graph_date_time,
+    CalendarPermission, CalendarRole,
 };
 
 /// One room from the tenant directory (`/places/microsoft.graph.room`,
@@ -46,10 +48,16 @@ const MAX_ROOMS: usize = 1000;
 /// Most calendar-permission grants read for one calendar (`calendarPermissions`
 /// is small in practice). Item 5.6 / CAL-24.
 const MAX_PERMISSIONS: usize = 500;
+/// Most attachments read for one event (Graph caps an event below this in
+/// practice; a guard against an unexpected page loop). Item 3.16 / CAL-21.
+const MAX_EVENT_ATTACHMENTS: usize = 500;
 
 /// The `$select` fields the calendar-view read needs (exactly what the mapper
 /// consumes, so full bodies aren't fetched).
 const EVENT_SELECT: &str = "$select=id,changeKey,iCalUId,subject,body,start,end,isAllDay,location,showAs,sensitivity,categories,isCancelled,isReminderOn,reminderMinutesBeforeStart,organizer,attendees,onlineMeeting,onlineMeetingUrl";
+/// Attachment metadata (never `contentBytes`, which only a single-attachment
+/// read returns) expanded onto every calendar-view event (CAL-21).
+const EVENT_EXPAND: &str = "&$expand=attachments($select=id,name,contentType,size,isInline)";
 
 /// The calendar HTTP operations, over a shared [`GraphClient`].
 pub struct CalendarClient {
@@ -134,6 +142,63 @@ impl CalendarClient {
         let headers: Vec<(&str, &str)> = etag.map(|etag| vec![("If-Match", etag)]).unwrap_or_default();
         self.graph.delete_with_headers(&path, &headers).await?;
         Ok(())
+    }
+
+    /// The event's attachments (`GET /me/events/{id}/attachments`, CAL-21).
+    /// Metadata only - Graph returns `contentBytes` only from
+    /// [`Self::fetch_attachment`].
+    pub async fn list_attachments(&self, event_id: &str, owner: Option<&str>) -> Result<Vec<lookout_core::EventAttachment>> {
+        let path = format!(
+            "{}/{}/attachments?$select=id,name,contentType,size,isInline",
+            self.events_root(owner),
+            encode_segment(event_id)
+        );
+        let items = self.graph.get_all(&path, MAX_EVENT_ATTACHMENTS).await?;
+        Ok(items.iter().filter_map(attachment_from_graph).collect())
+    }
+
+    /// Adds one file attachment to an existing event (`POST /me/events/{id}/
+    /// attachments`, CAL-21). Graph caps a single file attachment at 3 MB;
+    /// larger files surface Graph's own error (degrade softly, §10).
+    pub async fn add_attachment(&self, event_id: &str, owner: Option<&str>, attachment: &lookout_core::EventAttachment) -> Result<()> {
+        let bytes = attachment.bytes().ok_or_else(|| GraphError::Status {
+            status: 0,
+            message: format!("attachment \"{}\" has no readable contents", attachment.name),
+            request_id: None,
+        })?;
+        let path = format!("{}/{}/attachments", self.events_root(owner), encode_segment(event_id));
+        let body = json!({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": attachment.name,
+            "contentType": attachment.mime_type.clone().unwrap_or_else(|| "application/octet-stream".to_string()),
+            "contentBytes": base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
+        self.graph.post(&path, &body).await?;
+        Ok(())
+    }
+
+    /// Removes an attachment (`DELETE /me/events/{id}/attachments/{id}`).
+    pub async fn delete_attachment(&self, event_id: &str, owner: Option<&str>, attachment_id: &str) -> Result<()> {
+        let path = format!("{}/{}/attachments/{}", self.events_root(owner), encode_segment(event_id), encode_segment(attachment_id));
+        self.graph.delete(&path).await.map(|_| ())
+    }
+
+    /// Downloads one attachment's bytes (`GET /me/events/{id}/attachments/
+    /// {id}` → `contentBytes`). Used by `CalendarCommand::FetchEventAttachment`
+    /// when the editor or the invitation card saves a file.
+    pub async fn fetch_attachment(&self, event_id: &str, owner: Option<&str>, attachment_id: &str) -> Result<Vec<u8>> {
+        let path = format!("{}/{}/attachments/{}", self.events_root(owner), encode_segment(event_id), encode_segment(attachment_id));
+        let value = self.graph.get(&path).await?;
+        let encoded = value.get("contentBytes").and_then(Value::as_str).ok_or_else(|| GraphError::Status {
+            status: 0,
+            message: format!("Graph returned attachment {attachment_id} without contents"),
+            request_id: None,
+        })?;
+        base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|e| GraphError::Status {
+            status: 0,
+            message: format!("attachment {attachment_id} isn't valid base64: {e}"),
+            request_id: None,
+        })
     }
 
     /// Responds to a meeting invitation through Graph's own RSVP action
@@ -248,7 +313,7 @@ impl CalendarClient {
     /// `/calendars/{id}/calendarView?startDateTime=…`, encoded and windowed.
     fn view_path(&self, calendar: &CalendarInfo, start: DateTime<Utc>, end: DateTime<Utc>) -> String {
         format!(
-            "{}/{}/calendarView?startDateTime={}&endDateTime={}&{EVENT_SELECT}&$top=100",
+            "{}/{}/calendarView?startDateTime={}&endDateTime={}&{EVENT_SELECT}&$top=100{EVENT_EXPAND}",
             self.calendars_root(calendar.owner.as_deref()),
             encode_segment(&calendar.href),
             iso8601(start),
@@ -642,6 +707,83 @@ mod tests {
             .await;
 
         client(&server).delete_event("ev1", None, Some("owner@example.com")).await.unwrap();
+    }
+
+    // --- CAL-21: Graph event attachments ------------------------------
+
+    #[tokio::test]
+    async fn list_attachments_reads_the_event_children() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/events/ev1/attachments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "id": "att-1",
+                    "name": "agenda.pdf",
+                    "contentType": "application/pdf",
+                    "size": 1024
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let attachments = client(&server).list_attachments("ev1", None).await.unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "agenda.pdf");
+        assert_eq!(attachments[0].graph_id(), Some("att-1"));
+    }
+
+    #[tokio::test]
+    async fn add_attachment_posts_a_file_attachment() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1.0/me/events/ev1/attachments"))
+            .and(body_partial_json(json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": "notes.txt",
+                "contentType": "text/plain",
+                "contentBytes": "SGVsbG8gYWdlbmRhIQ=="
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "id": "att-2",
+                "name": "notes.txt"
+            })))
+            .mount(&server)
+            .await;
+
+        let attachment = lookout_core::EventAttachment::from_bytes("notes.txt", Some("text/plain".to_string()), b"Hello agenda!").unwrap();
+        client(&server).add_attachment("ev1", None, &attachment).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_decodes_content_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/events/ev1/attachments/att-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "id": "att-2",
+                "name": "notes.txt",
+                "contentBytes": "SGVsbG8gYWdlbmRhIQ=="
+            })))
+            .mount(&server)
+            .await;
+
+        let bytes = client(&server).fetch_attachment("ev1", None, "att-2").await.unwrap();
+        assert_eq!(bytes, b"Hello agenda!");
+    }
+
+    #[tokio::test]
+    async fn delete_attachment_removes_the_child() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1.0/me/events/ev1/attachments/att-2"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        client(&server).delete_attachment("ev1", None, "att-2").await.unwrap();
     }
 
     #[tokio::test]

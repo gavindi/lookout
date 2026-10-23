@@ -2713,6 +2713,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_invite_card.append(&invite_detail_row("imip-where-row", "imip-where", "Where"));
     imip_invite_card.append(&invite_detail_row("imip-organizer-row", "imip-organizer", "Organizer"));
     imip_invite_card.append(&invite_detail_row("imip-description-row", "imip-description", "Description"));
+    // CAL-21: files the invitation carries (an inline `ATTACH;VALUE=BINARY`
+    // from an iMIP sender, or a URI/managed attachment), each row a name plus
+    // a Save/link action. Filled per message by `render_invite_card`.
+    let imip_attachments = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    imip_attachments.set_widget_name("imip-attachments");
+    imip_attachments.set_visible(false);
+    let imip_attachments_caption = gtk::Label::builder().label("Attachments").css_classes(["dim-label", "caption"]).xalign(0.0).build();
+    crate::privacy::mark_ui(&imip_attachments_caption);
+    imip_attachments.append(&imip_attachments_caption);
+    let imip_attachment_rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    imip_attachment_rows.set_widget_name("imip-attachment-rows");
+    imip_attachments.append(&imip_attachment_rows);
+    imip_invite_card.append(&imip_attachments);
     // CAL-35 / 3.18: a "Conflicts with …" row and a mini day timeline, both
     // filled by `render_invite_card` from the cached calendar and hidden when
     // the invite's day clashes with nothing (or isn't loaded).
@@ -6476,6 +6489,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         calendar_groups: state.borrow().app_config.borrow().calendar_groups.clone(),
         hidden_calendars: state.borrow().app_config.borrow().hidden_calendars.clone(),
         calendar_sidebar_action: None,
+        attachment_requests: HashMap::new(),
+        attachment_next_id: 0,
         eds_mirror: Default::default(),
     }));
     // The calendar handle `render_body` reaches for when an incoming iMIP
@@ -10330,9 +10345,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let state = state.clone();
                     let tags = tags.clone();
                     let message_list = message_list.clone();
-                    Rc::new(move |anchor: &gtk::Widget| {
-                        show_manage_categories_dialog(anchor, state.clone(), tags.clone(), message_list.clone())
-                    })
+                    Rc::new(move |anchor: &gtk::Widget| show_manage_categories_dialog(anchor, state.clone(), tags.clone(), message_list.clone()))
                 },
                 import_evolution: state.borrow().import_evolution.clone(),
                 import_contacts: {
@@ -10345,9 +10358,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let window = window.clone();
                     let state = state.clone();
                     let toast_overlay = toast_overlay.clone();
-                    Rc::new(move |format: ContactFileFormat| {
-                        crate::contacts_view::export_all_contacts(&window, &state, format, &toast_overlay)
-                    })
+                    Rc::new(move |format: ContactFileFormat| crate::contacts_view::export_all_contacts(&window, &state, format, &toast_overlay))
                 },
             };
             let file_page = Rc::new(crate::window::file_page::build(state.clone(), hooks));
@@ -10361,10 +10372,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // `mut` is only needed in debug builds, where the debug
                 // ".eml" opener joins the header controls.
                 #[allow(unused_mut)]
-                let mut controls = vec![
-                    settings_button.clone().upcast::<gtk::Widget>(),
-                    header_privacy_toggle.clone().upcast::<gtk::Widget>(),
-                ];
+                let mut controls = vec![settings_button.clone().upcast::<gtk::Widget>(), header_privacy_toggle.clone().upcast::<gtk::Widget>()];
                 #[cfg(debug_assertions)]
                 controls.push(open_eml_button.clone().upcast::<gtk::Widget>());
                 controls

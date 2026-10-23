@@ -670,6 +670,7 @@ mod tests {
             status: Default::default(),
             reminder_minutes_before: minutes,
             conference_url: None,
+            attachments: Vec::new(),
         }
     }
 

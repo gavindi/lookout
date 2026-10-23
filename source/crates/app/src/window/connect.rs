@@ -2651,6 +2651,18 @@ pub(crate) fn connect_calendar_account(
                             handle.fail(generation, message);
                         }
                     }
+                    CalendarSessionEvent::EventAttachmentFetched { request_id, name, data } => {
+                        let request = calendar_state.borrow_mut().attachment_requests.remove(&request_id);
+                        if let Some(request) = request {
+                            (request.on_success)(name, data);
+                        }
+                    }
+                    CalendarSessionEvent::EventAttachmentFetchFailed { request_id, message } => {
+                        let request = calendar_state.borrow_mut().attachment_requests.remove(&request_id);
+                        if let Some(request) = request {
+                            (request.on_error)(message);
+                        }
+                    }
                 }
             }
         }

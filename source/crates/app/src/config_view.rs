@@ -527,13 +527,7 @@ pub struct ConfigView {
 /// the category, then its groups in a clamped, scrollable column. `sections`
 /// collects the `(label, code)` pairs so the category pane can be built once
 /// every page exists.
-fn add_section(
-    stack: &gtk::Stack,
-    sections: &mut Vec<(&'static str, &'static str)>,
-    label: &'static str,
-    name: &'static str,
-    groups: &[&adw::PreferencesGroup],
-) {
+fn add_section(stack: &gtk::Stack, sections: &mut Vec<(&'static str, &'static str)>, label: &'static str, name: &'static str, groups: &[&adw::PreferencesGroup]) {
     let body = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
@@ -542,7 +536,12 @@ fn add_section(
         .margin_start(32)
         .margin_end(32)
         .build();
-    let heading = gtk::Label::builder().label(label).css_classes(["file-page-heading"]).halign(gtk::Align::Start).xalign(0.0).build();
+    let heading = gtk::Label::builder()
+        .label(label)
+        .css_classes(["file-page-heading"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .build();
     body.append(&heading);
     for group in groups {
         // The page heading names the category. A group whose own title only

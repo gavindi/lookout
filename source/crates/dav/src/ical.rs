@@ -1,5 +1,6 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+use base64::Engine as _;
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use icalendar::{
     Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, EventStatus as IcalEventStatus, PartStat,
@@ -7,8 +8,8 @@ use icalendar::{
 };
 use lookout_core::interop::{cdo, onlinemeeting};
 use lookout_core::{
-    Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventSensitivity, EventStatus, EventUid, ImipInvitation, ImipMethod,
-    RecurrenceRange, ScheduleAgent, TaskPriority, TaskStatus, TaskUid,
+    Attendee, AttendeeRole, AttendeeStatus, BusyStatus, CalendarEvent, CalendarId, CalendarTask, EmailAddress, EventAttachment, EventSensitivity, EventStatus, EventUid,
+    ImipInvitation, ImipMethod, RecurrenceRange, ScheduleAgent, TaskPriority, TaskStatus, TaskUid,
 };
 
 /// Parses every VEVENT out of a raw iCalendar document (as returned by a
@@ -114,6 +115,7 @@ fn convert_event(calendar_id: &CalendarId, event: &icalendar::Event) -> Option<C
         // URL (parsed above) is the only online-meeting signal.
         is_online_meeting: false,
         reminder_minutes_before: parse_reminder(event),
+        attachments: parse_attachments(event),
     })
 }
 
@@ -130,6 +132,79 @@ fn online_meeting_url(event: &icalendar::Event) -> Option<String> {
         .or_else(|| event.property_value(onlinemeeting::X_MICROSOFT_SKYPETEAMSMEETINGURL))
         .or_else(|| event.property_value(onlinemeeting::X_MICROSOFT_ONLINEMEETINGCONFLINK));
     onlinemeeting::detect(explicit, event.get_location(), event.get_description()).map(|meeting| meeting.url)
+}
+
+/// The event's `ATTACH` properties (CAL-21), in document order. Handles every
+/// form RFC 5545/8607 define:
+///
+/// - `ATTACH;MANAGED-ID=…;FILENAME=…;FMTTYPE=…;SIZE=…:https://…` - an RFC 8607
+///   server-managed attachment;
+/// - `ATTACH;FILENAME=…:https://…` (or any bare URI) - an unmanaged link;
+/// - `ATTACH;VALUE=BINARY;ENCODING=BASE64;FILENAME=…:…` - inline contents,
+///   which is how iMIP invitations carry files.
+///
+/// A `VALUE=BINARY` payload that isn't valid base64 is dropped with a warning
+/// rather than rendered as garbled bytes.
+fn parse_attachments(event: &icalendar::Event) -> Vec<EventAttachment> {
+    property_refs(event, "ATTACH").into_iter().filter_map(parse_attachment).collect()
+}
+
+fn parse_attachment(property: &Property) -> Option<lookout_core::EventAttachment> {
+    let param = |name: &str| -> Option<String> {
+        property
+            .params()
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.value().to_string())
+    };
+    let raw = property.value().trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value_type = param("VALUE").unwrap_or_default().to_ascii_uppercase();
+    let encoding = param("ENCODING").unwrap_or_default().to_ascii_uppercase();
+    let binary = value_type == "BINARY" || encoding == "BASE64";
+    let filename = param("FILENAME").or_else(|| param("X-FILENAME"));
+    let mime_type = param("FMTTYPE");
+    let declared_size = param("SIZE").and_then(|size| size.trim().parse::<u64>().ok());
+
+    if binary {
+        let payload: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        let Some(decoded) = base64::engine::general_purpose::STANDARD.decode(payload.as_bytes()).ok() else {
+            tracing::warn!("dropping an ATTACH whose VALUE=BINARY payload isn't valid base64");
+            return None;
+        };
+        return Some(lookout_core::EventAttachment {
+            name: filename.filter(|name| !name.trim().is_empty()).unwrap_or_else(|| "attachment".to_string()),
+            mime_type,
+            size: declared_size.or(Some(decoded.len() as u64)),
+            url: None,
+            managed_id: None,
+            data: Some(payload),
+        });
+    }
+
+    Some(lookout_core::EventAttachment {
+        name: filename
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| attachment_name_from_url(raw))
+            .unwrap_or_else(|| "attachment".to_string()),
+        mime_type,
+        size: declared_size,
+        url: Some(raw.to_string()),
+        managed_id: param("MANAGED-ID"),
+        data: None,
+    })
+}
+
+/// A display name for a URI attachment with no `FILENAME`: the last path
+/// segment, or the host when the URI has no path.
+fn attachment_name_from_url(url: &str) -> Option<String> {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    let trimmed = without_query.trim_end_matches('/');
+    let candidate = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let candidate = candidate.trim();
+    (!candidate.is_empty() && !candidate.contains(':') && candidate != "http" && candidate != "https").then(|| candidate.to_string())
 }
 
 /// Every parsed `Property` under `key`, in multi-property order then
@@ -863,6 +938,16 @@ fn build_vevent_form(event: &CalendarEvent, form: Option<ImipMethod>) -> icalend
     if !event.categories.is_empty() {
         vevent.append_property(Property::new("CATEGORIES", event.categories.join(",")));
     }
+    // CAL-21: the event's attachments. The stored (CalDAV) form keeps an
+    // RFC 8607 MANAGED-ID so the server can match its attachment resource; an
+    // iMIP REQUEST (the invitation/update) strips it (RFC 8607 §3.12.7 - the
+    // id is server-local) and carries inline data where this client has it,
+    // so attendees receive the file with the invitation. A REPLY/COUNTER/
+    // DECLINECOUNTER/CANCEL carries no attachments - the meeting's files
+    // belong to the REQUEST, not to an answer.
+    if form.is_none() || form == Some(ImipMethod::Request) {
+        append_attachments(&mut vevent, &event.attachments, form.is_some());
+    }
     // `Class::Public` is the RFC default - omit it so a plain event's
     // serialized ICS doesn't grow noise it didn't have before this field
     // existed.
@@ -929,6 +1014,59 @@ fn recurrence_property(key: &str, dt: DateTime<Utc>, all_day: bool, zone: Option
         prop.add_parameter("VALUE", "DATE");
     }
     prop
+}
+
+/// Appends every attachment as an `ATTACH` property. Inline contents take the
+/// RFC 5545 binary form (`VALUE=BINARY;ENCODING=BASE64`); a URI attachment
+/// carries RFC 8607's `MANAGED-ID` on the stored form only. An attachment with
+/// neither data nor a URI is skipped.
+fn append_attachments(vevent: &mut icalendar::Event, attachments: &[lookout_core::EventAttachment], imip: bool) {
+    for attachment in attachments {
+        // A Microsoft Graph child attachment is addressed by its Graph id,
+        // which means nothing in an iCalendar document (and isn't a URI).
+        // Graph reads/writes its own attachment resources, so skip it here.
+        if attachment.graph_id().is_some() {
+            continue;
+        }
+        let mut property = if let Some(data) = attachment.data.as_deref().filter(|data| !data.is_empty()) {
+            let mut property = Property::new("ATTACH", data);
+            // RFC 5545 §3.2.7: inline binary values are base64-encoded. Both
+            // parameters are written because Outlook reads either as the
+            // signal.
+            property.add_parameter("ENCODING", "BASE64");
+            property.add_parameter("VALUE", "BINARY");
+            property
+        } else if let Some(url) = attachment.url.as_deref().filter(|url| !url.is_empty()) {
+            let mut property = Property::new("ATTACH", url);
+            if let Some(managed_id) = attachment.managed_id.as_deref().filter(|id| !id.is_empty()) {
+                if !imip {
+                    property.add_parameter("MANAGED-ID", &ical_param(managed_id));
+                }
+            }
+            property
+        } else {
+            continue;
+        };
+        if let Some(mime_type) = attachment.mime_type.as_deref().filter(|mime| !mime.trim().is_empty()) {
+            property.add_parameter("FMTTYPE", &ical_param(mime_type));
+        }
+        if let Some(size) = attachment.byte_size() {
+            property.add_parameter("SIZE", &size.to_string());
+        }
+        if let Some(name) = Some(attachment.name.trim()).filter(|name| !name.is_empty()) {
+            property.add_parameter("FILENAME", &ical_param(name));
+        }
+        vevent.append_multi_property(property.done());
+    }
+}
+
+/// One RFC 5545 parameter value, made safe: `"` `;` `,` and `\` delimit or
+/// escape parameters, and a control character can break the line. A file name
+/// arrives from a file chooser or another client's document, so it is never
+/// interpolated raw into the property (a `;` would otherwise start a second
+/// parameter, and a newline a second property).
+fn ical_param(value: &str) -> String {
+    value.chars().map(|c| if c.is_control() || matches!(c, '"' | ';' | ',' | '\\') { '_' } else { c }).collect()
 }
 
 fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee], rsvp: bool) {
@@ -1154,6 +1292,7 @@ mod tests {
             reminder_minutes_before: None,
             conference_url: None,
             is_online_meeting: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -2018,5 +2157,99 @@ END:VCALENDAR\r\n";
         assert_eq!(tasks[0].summary.as_deref(), Some("Ignored todo"));
         assert_eq!(tasks[0].due, None);
         assert!(tasks[0].href.is_none() && tasks[0].etag.is_none());
+    }
+
+    // --- CAL-21: event attachments -------------------------------------
+
+    const OUTLOOK_ATTACHMENT_FIXTURE: &str = include_str!("../../../test-fixtures/outlook/event-attachments.ics");
+
+    #[test]
+    fn parses_managed_inline_and_uri_attachments_from_the_outlook_fixture() {
+        let events = parse_vevents(&cal_id(), OUTLOOK_ATTACHMENT_FIXTURE);
+        assert_eq!(events.len(), 1);
+        let attachments = &events[0].attachments;
+        assert_eq!(attachments.len(), 3);
+
+        // RFC 8607 managed attachment: URI + MANAGED-ID + FILENAME/FMTTYPE/SIZE.
+        assert_eq!(attachments[0].name, "agenda.html");
+        assert_eq!(attachments[0].managed_id.as_deref(), Some("97S"));
+        assert_eq!(attachments[0].mime_type.as_deref(), Some("text/html"));
+        assert_eq!(attachments[0].size, Some(59));
+        assert_eq!(attachments[0].url.as_deref(), Some("https://cal.example.com/attach/64/34X22R"));
+        assert!(!attachments[0].is_inline());
+
+        // Inline base64 (folded across lines in the document).
+        assert_eq!(attachments[1].name, "notes.txt");
+        assert!(attachments[1].is_inline());
+        assert_eq!(attachments[1].bytes().as_deref(), Some(b"Hello agenda!".as_slice()));
+        assert_eq!(attachments[1].size, Some(17));
+        assert!(attachments[1].url.is_none());
+
+        // A plain URI attachment with no MANAGED-ID.
+        assert_eq!(attachments[2].name, "deck.pdf");
+        assert!(attachments[2].managed_id.is_none());
+        assert_eq!(attachments[2].url.as_deref(), Some("https://files.example.com/deck.pdf"));
+    }
+
+    #[test]
+    fn attachments_round_trip_through_a_stored_vcalendar() {
+        let event = parse_vevents(&cal_id(), OUTLOOK_ATTACHMENT_FIXTURE).remove(0);
+        let ics = build_vcalendar(&event);
+        let round = parse_vevents(&cal_id(), &ics).remove(0);
+        assert_eq!(round.attachments.len(), 3);
+        assert_eq!(round.attachments[0].managed_id.as_deref(), Some("97S"));
+        assert_eq!(round.attachments[0].name, "agenda.html");
+        assert_eq!(round.attachments[1].bytes().as_deref(), Some(b"Hello agenda!".as_slice()));
+        assert!(
+            ics.lines().all(|line| line.trim_end_matches('\r').len() <= 75),
+            "the inline payload must be folded to the RFC 5545 line limit: {ics}"
+        );
+    }
+
+    #[test]
+    fn the_imip_form_strips_managed_ids_and_keeps_inline_data() {
+        let event = parse_vevents(&cal_id(), OUTLOOK_ATTACHMENT_FIXTURE).remove(0);
+        let ics = build_imip_vcalendar(&event, ImipMethod::Request);
+        assert!(!ics.contains("MANAGED-ID"), "RFC 8607 §3.12.7: an id is server-local: {ics}");
+        assert!(ics.contains("FILENAME=agenda.html"), "{ics}");
+        assert!(ics.contains("ENCODING=BASE64"), "inline contents ride with the invitation: {ics}");
+        assert!(ics.contains("SGVsbG8gYWdlbmRhIQ=="), "{ics}");
+        let round = parse_vevents(&cal_id(), &ics).remove(0);
+        assert_eq!(round.attachments.len(), 3);
+        assert!(round.attachments[0].managed_id.is_none());
+        assert_eq!(round.attachments[1].bytes().as_deref(), Some(b"Hello agenda!".as_slice()));
+    }
+
+    #[test]
+    fn an_imip_answer_carries_no_attachments() {
+        let event = parse_vevents(&cal_id(), OUTLOOK_ATTACHMENT_FIXTURE).remove(0);
+        for method in [ImipMethod::Reply, ImipMethod::Counter, ImipMethod::DeclineCounter, ImipMethod::Cancel] {
+            let ics = build_imip_vcalendar(&event, method);
+            assert!(!ics.contains("ATTACH"), "{method:?} must not re-send the meeting's files: {ics}");
+        }
+    }
+
+    #[test]
+    fn a_graph_attachment_id_is_not_written_as_an_icalendar_uri() {
+        let mut event = full_event();
+        event.attachments.push(lookout_core::EventAttachment {
+            name: "agenda.pdf".to_string(),
+            url: Some("AAMkAGI1AAAt9AHjAAABEgAQAEdBogju-MJEu6Ngg-1_W0g=".to_string()),
+            ..Default::default()
+        });
+        let ics = build_vcalendar(&event);
+        assert!(!ics.contains("ATTACH"), "a Graph child id isn't an iCalendar URI: {ics}");
+    }
+
+    #[test]
+    fn attachment_file_names_cannot_inject_icalendar_parameters() {
+        let mut event = full_event();
+        event
+            .attachments
+            .push(lookout_core::EventAttachment::from_bytes("a;b,c\"d\ne.txt", Some("text/plain".to_string()), b"x").unwrap());
+        let ics = build_vcalendar(&event);
+        assert!(!ics.contains("a;b"), "a semicolon would start a second parameter: {ics}");
+        let round = parse_vevents(&cal_id(), &ics).remove(0);
+        assert_eq!(round.attachments[0].name, "a_b_c_d_e.txt");
     }
 }
