@@ -368,6 +368,17 @@ pub fn format_accel(modifiers: gdk::ModifierType, key: gdk::Key) -> String {
     out
 }
 
+/// The human-readable form of a stored accelerator, for tooltips and labels
+/// (`<Primary>1` → `Ctrl+1`, `<Primary><Shift>r` → `Ctrl+Shift+R`). GTK does
+/// the key-name and modifier translation, so the result matches the platform
+/// and locale. An unparseable accelerator is returned unchanged.
+pub fn display_accel(accel: &str) -> String {
+    match parse_accel(accel) {
+        Some((modifiers, keyval)) => gtk::accelerator_get_label(keyval, modifiers).to_string(),
+        None => accel.to_string(),
+    }
+}
+
 /// Resolves a logical keyval to the physical keycode that produces it in
 /// the current keymap, preferring the primary group/level pair.
 pub fn keycode_for(display: &gdk::Display, keyval: gdk::Key) -> Option<u32> {
@@ -493,6 +504,19 @@ impl ShortcutState {
         self.accels.get(action).cloned().unwrap_or_default()
     }
 
+    /// A control's tooltip: its name plus the action's current binding, e.g.
+    /// `Calendar (Ctrl+2)`. Falls back to the bare name when the action has
+    /// no usable accelerator. Used by the nav rail (UX-14) so a remapped
+    /// chord shows up there without a restart.
+    pub fn tooltip_for(&self, label: &str, action: &'static str) -> String {
+        let accel = display_accel(&self.accel_for(action));
+        if accel.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} ({accel})")
+        }
+    }
+
     /// Rebinds an action to the chord the user just pressed: validates it,
     /// refuses conflicts, persists the logical accelerator to GSettings and
     /// re-resolves the table. Returns the canonical string on success.
@@ -587,6 +611,15 @@ mod tests {
     #[test]
     fn format_lowercases_letters_under_shift() {
         assert_eq!(format_accel(CONTROL | SHIFT, gdk::Key::from_name("R").unwrap()), "<Primary><Shift>r");
+    }
+
+    #[test]
+    fn display_accel_is_human_readable() {
+        assert_eq!(display_accel("F5"), "F5");
+        let mail = display_accel("<Primary>1");
+        assert!(mail.ends_with('1'), "{mail}");
+        assert!(!mail.contains("Primary"), "{mail}");
+        assert_eq!(display_accel("not a chord"), "not a chord");
     }
 
     #[test]

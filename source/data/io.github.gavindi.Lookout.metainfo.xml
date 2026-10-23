@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.282" date="2026-10-23">
+      <description>
+        <p>The app rail now lists the Lookout dashboard below Mail, Calendar, People and Tasks, shows each module's shortcut in its tooltip, and marks the selected app with an accent pill and full-colour icon.</p>
+      </description>
+    </release>
     <release version="0.9.281" date="2026-10-23">
       <description>
         <p>The People screen's contact details pane now shows an icon above each tab — Overview, Contact info, Files and Emails — and the icons follow the selected GNOME or Fluent icon style.</p>

@@ -37,3 +37,25 @@ paned > separator {
     background-color: @lookout-icon-toolbar-bg;
     border-radius: 8px;
 }
+
+/* The module buttons in the app rail (UX-14): a rounded pill, muted until
+   selected. The selected app wears an accent-tinted pill and its bundled
+   full-colour artwork at full opacity - the filled form of its icon. */
+.nav-rail-button {
+    border-radius: 14px;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 6px;
+}
+.nav-rail-button image {
+    opacity: 0.6;
+}
+.nav-rail-button:hover image {
+    opacity: 0.85;
+}
+.nav-rail-button:checked {
+    background-color: alpha(@accent_bg_color, 0.22);
+}
+.nav-rail-button:checked image {
+    opacity: 1;
+}

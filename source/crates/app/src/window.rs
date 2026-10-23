@@ -3472,6 +3472,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `root_stack` are explicitly told not to show these (see
     // `card_section`), so there's exactly one set, not four.
     let window_header = adw::HeaderBar::new();
+    // With the Lookout button moved to the nav rail (UX-14), the header's
+    // start side is empty. Strict centring keeps the search cluster in the
+    // true middle of the bar instead of letting the asymmetric end-side
+    // controls pull it toward the start.
+    window_header.set_centering_policy(adw::CenteringPolicy::Strict);
     // The centred search cluster (UX-11): a scope dropdown, the search entry,
     // and a "Refine" button that opens the advanced-search form. The title
     // widget is the header bar's centre slot, so this replaces the redundant
@@ -3505,21 +3510,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     search_box.append(&search_entry);
     search_box.append(&search_refine_button);
     window_header.set_title_widget(Some(&search_box));
-    // The Lookout tab lives in the header's top-left corner rather than the
-    // nav rail (it's the app's own dashboard, and its Observatorium icon
-    // reads like a logo), with the permanent mail-search entry to its
-    // right. Still a toggle button in the rail's group, so the tab switch
-    // stays mutually exclusive with the other views.
+    // The Lookout dashboard's button joins the nav rail below the core apps
+    // (UX-14), where Outlook puts More apps. It stays in the rail buttons'
+    // toggle group, so the module switch remains mutually exclusive, and gets
+    // the same selected-pill and shortcut-tooltip treatment.
     let lookout_icon_image = nav_rail_image(
         "/io/github/gavindi/Lookout/icons/observatorium-1.svg",
         include_bytes!("../../../data/resources/icons/observatorium-1.svg"),
     );
     let lookout_view_button = gtk::ToggleButton::builder()
         .child(&lookout_icon_image)
-        .css_classes(["flat"])
+        .css_classes(["flat", "nav-rail-button"])
         .tooltip_text("Lookout")
         .build();
-    window_header.pack_start(&lookout_view_button);
     // The search cluster is the header's centred title widget (built above);
     // nothing to pack here.
     // The privacy toggle: cycles the tri-state privacy blur (Config →
@@ -4495,13 +4498,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- View-switcher rail: a narrow, deliberately unstyled (no `.card`,
     // no background) strip along the window's left edge so the background
-    // image shows straight through it. Five views today (Mail/Calendar/
-    // People/Tasks/Config - the Lookout tab lives in the header instead),
-    // joined into one toggle group for mutual-exclusive selection.
+    // image shows straight through it. The app's five modules -
+    // Mail/Calendar/People/Tasks, then the Lookout dashboard where Outlook
+    // puts More apps - share one toggle group for mutual-exclusive selection
+    // and the `nav-rail-button` accent-pill styling (UX-14).
     let mail_icon_image = nav_rail_image("/io/github/gavindi/Lookout/icons/email-1.svg", include_bytes!("../../../data/resources/icons/email-1.svg"));
     let mail_view_button = gtk::ToggleButton::builder()
         .child(&mail_icon_image)
-        .css_classes(["flat"])
+        .css_classes(["flat", "nav-rail-button"])
         .tooltip_text("Mail")
         .active(true)
         .build();
@@ -4511,7 +4515,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     );
     let calendar_view_button = gtk::ToggleButton::builder()
         .child(&calendar_icon_image)
-        .css_classes(["flat"])
+        .css_classes(["flat", "nav-rail-button"])
         .tooltip_text("Calendar")
         .build();
     calendar_view_button.set_group(Some(&mail_view_button));
@@ -4521,15 +4525,20 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     );
     let contacts_view_button = gtk::ToggleButton::builder()
         .child(&contacts_icon_image)
-        .css_classes(["flat"])
+        .css_classes(["flat", "nav-rail-button"])
         .tooltip_text("People")
         .build();
     contacts_view_button.set_group(Some(&calendar_view_button));
     let tasks_icon_image = nav_rail_image("/io/github/gavindi/Lookout/icons/task-1.svg", include_bytes!("../../../data/resources/icons/task-1.svg"));
-    let tasks_view_button = gtk::ToggleButton::builder().child(&tasks_icon_image).css_classes(["flat"]).tooltip_text("Tasks").build();
+    let tasks_view_button = gtk::ToggleButton::builder()
+        .child(&tasks_icon_image)
+        .css_classes(["flat", "nav-rail-button"])
+        .tooltip_text("Tasks")
+        .build();
     tasks_view_button.set_group(Some(&contacts_view_button));
-    // The Lookout button was built up in the header section; joining it to
-    // the rail buttons' toggle group keeps the tab switching exclusive.
+    // The Lookout button was built above (next to the header's search
+    // cluster); joining it to the rail buttons' toggle group keeps the tab
+    // switching exclusive.
     lookout_view_button.set_group(Some(&mail_view_button));
 
     // `vexpand(true)` so the rail stretches the window's full height (it
@@ -4550,6 +4559,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     nav_rail_content.append(&calendar_view_button);
     nav_rail_content.append(&contacts_view_button);
     nav_rail_content.append(&tasks_view_button);
+    // A little separation from the core apps, like Outlook's More apps
+    // section (UX-14).
+    lookout_view_button.set_margin_top(6);
+    nav_rail_content.append(&lookout_view_button);
     let nav_rail = gtk::ScrolledWindow::builder()
         .child(&nav_rail_content)
         .has_frame(false)
@@ -9024,13 +9037,28 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // The Config keyboard rows refresh through this closure: it repaints
     // every row's accelerator label from the live table.
+    // UX-14: the rail's tooltips name each module's current shortcut, e.g.
+    // "Calendar (Ctrl+2)". They refresh from the same closure as the Config
+    // keyboard rows, so a rebound chord shows up there immediately.
+    let nav_rail_tooltips: Vec<(&'static str, &'static str, gtk::ToggleButton)> = vec![
+        (crate::shortcuts::ACTION_MAIL, "Mail", mail_view_button.clone()),
+        (crate::shortcuts::ACTION_CALENDAR, "Calendar", calendar_view_button.clone()),
+        (crate::shortcuts::ACTION_CONTACTS, "People", contacts_view_button.clone()),
+        (crate::shortcuts::ACTION_TASKS, "Tasks", tasks_view_button.clone()),
+        (crate::shortcuts::ACTION_LOOKOUT, "Lookout", lookout_view_button.clone()),
+    ];
+
     let refresh_shortcut_rows: Rc<dyn Fn()> = Rc::new({
         let shortcuts = shortcuts.clone();
         let config_view = config_view.clone();
+        let nav_rail_tooltips = nav_rail_tooltips.clone();
         move || {
             let table = shortcuts.borrow();
             for row in config_view.keyboard_rows.borrow().iter() {
                 row.label.set_label(&table.accel_for(row.action));
+            }
+            for (action, label, button) in &nav_rail_tooltips {
+                button.set_tooltip_text(Some(&table.tooltip_for(label, action)));
             }
         }
     });
