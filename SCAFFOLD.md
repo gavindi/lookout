@@ -852,6 +852,13 @@ starts from a clone of the existing card and only rewrites exposed fields, so un
 properties (`X-` extensions, `KIND:group`, etc.) ride along untouched. Graph v1.0 has no
 contact-group endpoint, so `KIND:group` lists remain a CardDAV-only feature.
 
+**`contact_merge.rs`** in `lookout-core` is the pure duplicate matcher and field-aware merge
+model (shared email/phone/UID, plus a name-only rule for cards with no email or phone); the
+app's `contact_merge_view.rs` scans each account's snapshot, renders the two-page review dialog
+and writes the keeper through the ordinary `ContactCommand` channel before deleting the other
+copies. Matching is deliberately per account: a merge never deletes a copy from another
+provider's address book.
+
 **`event_editor.rs`** — the calendar's counterpart to `compose.rs` (a modal form, since Calendar
 has no reading-pane slot). Recurrence UI lives in a separate `recurrence.rs` module
 (`RecurrenceRule`/`Frequency`/`RecurrenceEnd`, with `parse_rrule_string`/`to_rrule_string`/

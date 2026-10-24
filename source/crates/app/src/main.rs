@@ -19,6 +19,7 @@ mod categories;
 mod chat_links;
 mod compose;
 mod config_view;
+mod contact_merge_view;
 mod contact_picker;
 mod contacts_details;
 mod contacts_editor;

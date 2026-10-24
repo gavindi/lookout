@@ -4455,6 +4455,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let contacts_email_button = gtk::Button::with_label("Email");
     contacts_email_button.set_sensitive(false);
     let import_contacts_button = gtk::Button::with_label("Import…");
+    // Merge duplicates (P-09, roadmap 4.6): scans the People screen's current
+    // contacts for copies within one account and opens the field-level review
+    // dialog.
+    let merge_duplicates_button = gtk::Button::with_label("Merge duplicates…");
     // Export is a split menu button (UX-16's split-button pattern): each
     // entry opens the save dialog in its format - the multi-card vCard, or
     // Outlook's CSV columns (P-08, §4.6).
@@ -4480,6 +4484,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_band.group("Actions", |group| {
         group.button(&contacts_edit_button, "document-edit-symbolic", "Edit");
         group.button(&contacts_delete_button, "user-trash-symbolic", "Delete");
+        group.button(&merge_duplicates_button, "edit-find-symbolic", "Merge duplicates…");
     });
     contacts_band.group("Transfer", |group| {
         group.button(&import_contacts_button, "document-open-symbolic", "Import…");
@@ -7677,6 +7682,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let toast_overlay = toast_overlay.clone();
         manage_groups_button.connect_clicked(move |_| {
             show_manage_groups_dialog(&window, &state, &toast_overlay);
+        });
+    }
+    {
+        let window = window.clone();
+        let state = state.clone();
+        let toast_overlay = toast_overlay.clone();
+        merge_duplicates_button.connect_clicked(move |_| {
+            crate::contact_merge_view::show_merge_duplicates_dialog(&window, &state, &toast_overlay);
         });
     }
     {

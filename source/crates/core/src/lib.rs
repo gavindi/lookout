@@ -8,6 +8,7 @@
 pub mod automatic_replies;
 pub mod calendar;
 pub mod calendar_protocol;
+pub mod contact_merge;
 pub mod email;
 pub mod freebusy;
 pub mod holidays;

@@ -88,6 +88,12 @@ pub(crate) fn resolve_contact_lists(contacts: &[lookout_dav::ContactRecord]) -> 
 }
 
 impl ContactsAccountSnapshot {
+    /// The account label shown in the People screen. Read by the contact-merge
+    /// dialog so its duplicate groups can name the account they belong to.
+    pub(crate) fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
     /// Whether `other` would show the same People screen: the same name,
     /// books and records. `suggestions` and `contact_lists` are derived from
     /// the records, so they aren't compared. A poll that finds nothing new
@@ -498,7 +504,7 @@ pub fn show_contact_details_dialog(window: &adw::ApplicationWindow, entry: &Cont
 /// the one-shot reply channel the outcome arrives on. `None` when the
 /// account has no session (or it's dead) - the caller decides how to
 /// surface that (a toast, or a silent skip in a batched write).
-fn dispatch_contact_command(
+pub(crate) fn dispatch_contact_command(
     state: &Rc<RefCell<UiState>>,
     account_id: &AccountId,
     build: impl FnOnce(async_channel::Sender<Result<(), String>>) -> ContactCommand,
