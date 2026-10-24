@@ -5111,36 +5111,98 @@ async fn move_message_to_role(
 /// `\Deleted` + EXPUNGE. `has_move`/`has_uidplus` come from the single
 /// post-login `CAPABILITY` fetch, never a per-batch round trip.
 ///
+/// A server's `OK` is not proof the source lost the messages. Gmail accepts
+/// `UID MOVE`/`STORE`+`EXPUNGE` while treating both as label changes, and has
+/// been seen to return success without removing the source label (INBOX in
+/// particular). Trusting that OK is what left a dragged message in both
+/// folders: the app dropped it from its cache, then its own post-move resync
+/// read it straight back from the server. Every move is therefore verified
+/// with a `UID SEARCH` in the source; any survivors are copied to the target
+/// (so a source deletion can never lose a message a partially-failed MOVE
+/// left behind) and then explicitly deleted, and only a genuinely clean
+/// source counts as a move - a source that still holds them is an error, so
+/// the caller reports failure instead of lying about it.
+///
 /// Returns the `(source UID, destination UID)` pairs the server reported in
 /// its `COPYUID` response codes (RFC 4315) - what lets `RevertMove` find the
 /// messages again for undo. Empty when the server doesn't send them.
 async fn move_uids_to_path(session: &mut Session<SessionStream>, uids: &[Uid], path: &str, has_move: bool, has_uidplus: bool) -> Result<Vec<(Uid, Uid)>> {
-    let uid_chunks = uid_set_chunks(uids);
     let mut moved = Vec::new();
     if has_move {
-        for uid_set in &uid_chunks {
+        for uid_set in &uid_set_chunks(uids) {
             if let Some(copy_uid) = session.uid_mv_mapped(uid_set, path).await? {
                 moved.extend(copy_uid.pairs.into_iter().map(|(from, to)| (Uid(from), Uid(to))));
             }
         }
     } else {
         moved = copy_uids_to_path(session, uids, path).await?;
-        for uid_set in &uid_chunks {
-            let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
+        delete_uids_from_selected(session, uids, has_uidplus).await?;
+    }
+    let remaining = uids_still_present(session, uids).await?;
+    if !remaining.is_empty() {
+        tracing::warn!(
+            count = remaining.len(),
+            "server accepted the move but left messages in the source; removing them explicitly"
+        );
+        if has_move {
+            // The server acknowledged `MOVE` without removing the source.
+            // Copy first: RFC 6851 lets a partially failed message be
+            // "unaffected" (not copied at all), so deleting blind could lose
+            // it. On Gmail, whose label model is why this path exists, a copy
+            // to a label the message already carries is a no-op.
+            moved.extend(copy_uids_to_path(session, &remaining, path).await?);
         }
-        if has_uidplus {
-            for uid_set in &uid_chunks {
-                let _: Vec<_> = session.uid_expunge(uid_set).await?.try_collect().await?;
-            }
-        } else {
-            // NB: expunges every \Deleted-flagged message in the currently
-            // selected mailbox, not just this batch - a documented, accepted
-            // simplification since nothing else in this crate ever sets
-            // \Deleted, used only when the server lacks UIDPLUS.
-            let _: Vec<_> = session.expunge().await?.try_collect().await?;
+        delete_uids_from_selected(session, &remaining, has_uidplus).await?;
+        let still = uids_still_present(session, &remaining).await?;
+        if !still.is_empty() {
+            return Err(Error::Imap(async_imap::error::Error::No(format!(
+                "{} message(s) are still in the source folder after the move",
+                still.len()
+            ))));
         }
     }
     Ok(moved)
+}
+
+/// Marks `uids` `\Deleted` in the currently selected mailbox and expunges
+/// them - the source half of a move, used by the COPY fallback (servers
+/// without RFC 6851 MOVE) and to retry a `MOVE` the server acknowledged but
+/// didn't apply. One transaction per UID set: a large sparse batch is several
+/// STORE/EXPUNGE pairs rather than one oversized command line.
+async fn delete_uids_from_selected(session: &mut Session<SessionStream>, uids: &[Uid], has_uidplus: bool) -> Result<()> {
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let uid_chunks = uid_set_chunks(uids);
+    for uid_set in &uid_chunks {
+        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS (\\Deleted)").await?.try_collect().await?;
+    }
+    if has_uidplus {
+        for uid_set in &uid_chunks {
+            let _: Vec<_> = session.uid_expunge(uid_set).await?.try_collect().await?;
+        }
+    } else {
+        // NB: expunges every \Deleted-flagged message in the currently
+        // selected mailbox, not just this batch - a documented, accepted
+        // simplification since nothing else in this crate ever sets
+        // \Deleted, used only when the server lacks UIDPLUS.
+        let _: Vec<_> = session.expunge().await?.try_collect().await?;
+    }
+    Ok(())
+}
+
+/// Which of `uids` the currently selected mailbox still contains, ascending.
+/// One `UID SEARCH UID` per set chunk; the post-move check for servers whose
+/// `OK` didn't mean what it said.
+async fn uids_still_present(session: &mut Session<SessionStream>, uids: &[Uid]) -> Result<Vec<Uid>> {
+    let mut present: HashSet<u32> = HashSet::new();
+    for uid_set in &uid_set_chunks(uids) {
+        present.extend(session.uid_search(format!("UID {uid_set}")).await?);
+    }
+    let mut found: Vec<Uid> = uids.iter().copied().filter(|uid| present.contains(&uid.0)).collect();
+    found.sort_by_key(|uid| uid.0);
+    found.dedup();
+    Ok(found)
 }
 
 /// `UID COPY` of `uids` from the *currently selected* mailbox into `path`,

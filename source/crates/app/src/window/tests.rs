@@ -1852,7 +1852,7 @@ fn folder_drop_moves_payload_messages_to_the_target_folder() {
     let value = glib::Value::from(glib::Bytes::from(payload.as_slice()));
     let target = test_mailbox(&acc, "Archive", 0);
 
-    let handled = handle_message_drag_drop(&state, &target, &value);
+    let handled = handle_message_drag_drop(&state, None, &target, &value);
     assert!(handled, "a well-formed payload must be claimed by the folder's drop target");
     match cmd_rx.try_recv() {
         Ok(AccountCommand::MoveMessagesTo {
@@ -1892,10 +1892,100 @@ fn folder_drop_rejects_foreign_payloads() {
     let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 0)])]);
     let target = test_mailbox(&acc, "Archive", 0);
 
-    assert!(!handle_message_drag_drop(&state, &target, &glib::Value::from("hello")), "a text drop is not our payload");
     assert!(
-        !handle_message_drag_drop(&state, &target, &glib::Value::from(glib::Bytes::from_static(b"not json"))),
+        !handle_message_drag_drop(&state, None, &target, &glib::Value::from("hello")),
+        "a text drop is not our payload"
+    );
+    assert!(
+        !handle_message_drag_drop(&state, None, &target, &glib::Value::from(glib::Bytes::from_static(b"not json"))),
         "junk bytes are not our payload"
+    );
+}
+
+/// A drag can carry messages from more than one source folder (a search, a
+/// saved search). Each source needs its own `MoveMessagesTo`, and anything
+/// already in the target folder isn't a move at all. Grouping by account
+/// alone moved only the first folder's UIDs and silently dropped the rest.
+#[test]
+fn folder_drop_groups_by_source_mailbox_and_skips_the_target() {
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(
+        acc.clone(),
+        vec![test_mailbox(&acc, "INBOX", 3), test_mailbox(&acc, "Sent", 0), test_mailbox(&acc, "Archive", 0)],
+    )]);
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+
+    let payload = serde_json::to_vec(&vec![
+        ("acc:INBOX".to_string(), 7u32),
+        ("acc:Sent".to_string(), 8u32),
+        ("acc:INBOX".to_string(), 9u32),
+        ("acc:Archive".to_string(), 99u32),
+    ])
+    .unwrap();
+    let value = glib::Value::from(glib::Bytes::from(payload.as_slice()));
+    let target = test_mailbox(&acc, "Archive", 0);
+
+    assert!(handle_message_drag_drop(&state, None, &target, &value));
+    let mut got: Vec<(String, Vec<u32>)> = Vec::new();
+    while let Ok(command) = cmd_rx.try_recv() {
+        match command {
+            AccountCommand::MoveMessagesTo {
+                mailbox,
+                uids,
+                target: got_target,
+            } => {
+                assert_eq!(got_target, MailboxId("acc:Archive".into()));
+                got.push((mailbox.0, uids.into_iter().map(|uid| uid.0).collect()));
+            }
+            other => panic!("expected MoveMessagesTo, got {other:?}"),
+        }
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("acc:INBOX".to_string(), vec![7, 9]), ("acc:Sent".to_string(), vec![8])],
+        "one move per source folder, and the target folder's own message is skipped"
+    );
+}
+
+/// The dragged rows leave the list as the drop is handled, not when the
+/// server answers - and they are stashed for `MoveFailed` to restore. The
+/// drag path used to be the only move that skipped this, so a slow move (or
+/// a sync racing it) left a row that looked like a copy behind.
+#[test]
+fn folder_drop_hides_the_dragged_rows_before_the_move() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 2), test_mailbox(&acc, "Archive", 0)])]);
+    let (cmd_tx, _cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+
+    let message_list = MessageListModel::build();
+    message_list.repopulate(
+        vec![summary(Uid(7), "acc:INBOX", 2026, 10, 20, 9), summary(Uid(9), "acc:INBOX", 2026, 10, 21, 9)],
+        SortKey::Date,
+        true,
+    );
+    assert_eq!(message_list.all_messages().len(), 2);
+
+    let payload = serde_json::to_vec(&vec![("acc:INBOX".to_string(), 7u32)]).unwrap();
+    let value = glib::Value::from(glib::Bytes::from(payload.as_slice()));
+    let target = test_mailbox(&acc, "Archive", 0);
+
+    assert!(handle_message_drag_drop(&state, Some(&message_list), &target, &value));
+    let remaining = message_list.all_messages();
+    assert_eq!(remaining.len(), 1, "the dragged row must leave the list at once");
+    assert_eq!(remaining[0].uid, Uid(9), "only the dragged message is hidden");
+    assert!(
+        state
+            .borrow()
+            .pending_optimistic_removals
+            .get(&MailboxId("acc:INBOX".into()))
+            .is_some_and(|rows| rows.iter().any(|m| m.uid == Uid(7))),
+        "the hidden row must be stashed so MoveFailed can restore it"
     );
 }
 

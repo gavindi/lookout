@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.286" date="2026-10-24">
+      <description>
+        <p>Dragging a message onto a folder no longer leaves a copy behind. Every move is now verified against the server after it is accepted, and a message the server left in the source folder (Gmail's label-based IMAP has been seen to do this) is copied to the target and then explicitly removed, so it no longer reappears in the Inbox after a refresh or a restart. Dragged rows also leave the list immediately, and a drag that spans folders is grouped per source folder.</p>
+      </description>
+    </release>
     <release version="0.9.285" date="2026-10-23">
       <description>
         <p>Calendar events can now carry attachments. The event editor adds, saves and removes files, and invitations show theirs with Save and Open actions. Servers that support CalDAV managed attachments store the file for the event; other CalDAV servers keep it in the event itself, Microsoft 365 uses Graph event attachments, and meeting invitations carry the files inline so attendees receive them.</p>

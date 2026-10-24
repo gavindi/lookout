@@ -76,10 +76,21 @@ pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefC
 /// `G_TYPE_BYTES` value - a JSON list, so a drop from any other source fails
 /// the parse and reads as "not ours" rather than a bogus move), keeps only
 /// the messages belonging to the target folder's own account (messages can't
-/// move across accounts), and issues one `MoveMessagesTo` per source mailbox.
+/// move across accounts), and issues one `MoveMessagesTo` per source
+/// mailbox - grouped by `(account, mailbox)`, because a selection can span
+/// folders (search results, a saved search) and each source needs its own
+/// command.
+///
+/// The rows leave the list here, before the server round trip, exactly as
+/// every other move path does: `optimistic_remove_messages` hides them and
+/// stashes them for `MoveFailed`/the next sync to reconcile, so a racing
+/// `MessagesUpdated` can't resurrect a message the user already moved. A
+/// search keeps its own results list instead, which `MessagesUpdated`
+/// deliberately never touches.
+///
 /// `false` when the payload isn't ours (or empty), which lets GTK try other
 /// drop targets.
-pub(crate) fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Mailbox, value: &glib::Value) -> bool {
+pub(crate) fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, message_list: Option<&MessageListModel>, target: &Mailbox, value: &glib::Value) -> bool {
     let Ok(bytes) = value.get::<glib::Bytes>() else {
         return false;
     };
@@ -93,40 +104,80 @@ pub(crate) fn handle_message_drag_drop(state: &Rc<RefCell<UiState>>, target: &Ma
     if payload.is_empty() {
         return false;
     }
-    let mut groups: HashMap<AccountId, (MailboxId, Vec<Uid>)> = HashMap::new();
+    let mut groups: HashMap<(AccountId, MailboxId), Vec<Uid>> = HashMap::new();
     for (mailbox, uid) in payload {
-        let Some(account_id) = mailbox_account_id(&MailboxId(mailbox.clone())) else { continue };
-        if account_id != target.account_id {
+        let mailbox = MailboxId(mailbox);
+        let Some(account_id) = mailbox_account_id(&mailbox) else { continue };
+        // Cross-account moves aren't possible over one account's session;
+        // a drop on the message's own folder is a no-op the session would
+        // skip anyway, so it never earns an undo entry or a toast.
+        if account_id != target.account_id || mailbox == target.id {
             continue;
         }
-        let entry = groups.entry(account_id).or_insert_with(|| (MailboxId(mailbox), Vec::new()));
-        entry.1.push(Uid(uid));
+        groups.entry((account_id, mailbox)).or_default().push(Uid(uid));
     }
     if groups.is_empty() {
         return false;
     }
-    for (account_id, (source, uids)) in groups {
+    let mut inverse = Vec::new();
+    let mut count = 0usize;
+    for ((account_id, source), mut uids) in groups {
+        uids.sort_by_key(|uid| uid.0);
+        uids.dedup();
         let cmd_tx = state.borrow().accounts.get(&account_id).map(|handle| handle.cmd_tx.clone());
         let Some(cmd_tx) = cmd_tx else { continue };
-        // Undo: move them back from the target folder to their source.
-        record_undo(
-            state,
-            &undo_move_description(MailboxRole::Custom, uids.len()),
-            vec![AccountCommand::RevertMove {
-                moved_from: source.clone(),
-                moved_to: target.id.clone(),
+        // Send first: a command that never reaches the account must not leave
+        // the rows hidden with no `MoveFailed` to restore them.
+        if cmd_tx
+            .send_blocking(AccountCommand::MoveMessagesTo {
+                mailbox: source.clone(),
                 uids: uids.clone(),
-            }],
-        );
-        let _ = cmd_tx.send_blocking(AccountCommand::MoveMessagesTo {
-            mailbox: source,
+                target: target.id.clone(),
+            })
+            .is_err()
+        {
+            continue;
+        }
+        remove_dragged_rows(state, message_list, &source, &uids);
+        count += uids.len();
+        inverse.push(AccountCommand::RevertMove {
+            moved_from: source,
+            moved_to: target.id.clone(),
             uids,
-            target: target.id.clone(),
         });
     }
-    // The drop target is now a recent folder for Move ▸ / Copy ▸ (item 1.17).
-    record_recent_folder(state, &target.id);
+    if count > 0 {
+        record_undo(state, &undo_move_description(MailboxRole::Custom, count), inverse);
+        // The drop target is now a recent folder for Move ▸ / Copy ▸ (item 1.17).
+        record_recent_folder(state, &target.id);
+    }
     true
+}
+
+/// Applies a drop's local removal before its command is sent. The ordinary
+/// list uses the shared optimistic-removal stash (`optimistic.rs`), which
+/// both hides the rows now and keeps a racing `MessagesUpdated` from
+/// repainting them until the server confirms. The search view is different:
+/// `MessagesUpdated` is ignored there, and the list renders `search_results`
+/// rather than a mailbox snapshot, so the matching hits are removed from
+/// that result set and the list re-derived from it.
+fn remove_dragged_rows(state: &Rc<RefCell<UiState>>, message_list: Option<&MessageListModel>, mailbox: &MailboxId, uids: &[Uid]) {
+    let Some(message_list) = message_list else { return };
+    if !state.borrow().search_active {
+        optimistic_remove_messages(state, message_list, mailbox, uids);
+        return;
+    }
+    {
+        let mut st = state.borrow_mut();
+        st.search_results.retain(|m| !(m.mailbox == *mailbox && uids.contains(&m.uid)));
+        // The unified snapshot backs the "All Inboxes" view the user returns
+        // to when the search ends; drop the hits there too so leaving search
+        // doesn't briefly show a moved message again before its resync.
+        if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
+            snapshot.retain(|m| !uids.contains(&m.uid));
+        }
+    }
+    repopulate_search_results(state, message_list);
 }
 
 /// The message-list header's mutable parts: the two title lines and the

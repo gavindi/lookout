@@ -181,11 +181,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // down, once the mail accounts are wired up), so the drop target reaches
     // it through this slot, filled right after `state` is created.
     let state_slot: Rc<RefCell<Option<Rc<RefCell<UiState>>>>> = Rc::new(RefCell::new(None));
+    // The message list the drop target removes the dragged rows from, before
+    // the move reaches the server. Built later than the folder rows, for the
+    // same reason as `state_slot`.
+    let message_list_slot: Rc<RefCell<Option<MessageListModel>>> = Rc::new(RefCell::new(None));
     // What the rows' "⋯" menu (and Empty button) actions do - installed by
     // `install_folder_menu_handler` once `state` and the list header exist.
     let menu_handler: crate::folder_menu::FolderMenuHandler = Rc::new(RefCell::new(None));
     {
         let state_slot = state_slot.clone();
+        let message_list_slot = message_list_slot.clone();
         let menu_handler = menu_handler.clone();
         folder_factory.connect_setup(move |_, list_item| {
             let expander = gtk::TreeExpander::new();
@@ -229,6 +234,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             {
                 let drop_data = drop_data.clone();
                 let state_slot = state_slot.clone();
+                let message_list_slot = message_list_slot.clone();
                 drop_target.connect_drop(move |_target, value, _x, _y| {
                     let Some(mailbox) = drop_data.borrow().clone() else {
                         return false;
@@ -236,7 +242,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let Some(state) = state_slot.borrow().clone() else {
                         return false;
                     };
-                    handle_message_drag_drop(&state, &mailbox, value)
+                    let message_list = message_list_slot.borrow().clone();
+                    handle_message_drag_drop(&state, message_list.as_ref(), &mailbox, value)
                 });
             }
             {
@@ -542,6 +549,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Message list ---
     let message_list = MessageListModel::build_with_worker(worker.clone());
+    // The folder rows' drop targets were built before this model existed;
+    // hand it over now so a drop can hide its rows before the move is sent.
+    *message_list_slot.borrow_mut() = Some(message_list.clone());
     let last_selection = last_view::load(&settings);
     // Phase 5: the scalars that used to be hardcoded here now come from the
     // GSettings-backed store (see `settings`), so the session starts where
