@@ -42,15 +42,15 @@ Counts are tallied from the §5 tables.
 
 | Area (§) | ✅ | 🟡 | ❌ | ⛔ | Verdict |
 |---|---|---|---|---|---|
-| Mail (5.1) | 36 | 5 | 3 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, `@mentions` detection with a filter, rules across client, Graph and Sieve backends, automatic replies across Graph and Sieve, Focused Inbox with Outlook's Move to / Always / Stop over Graph and the opt-in local classifier on every other account (M-03, 2.12), Quick Steps in the ribbon and the `Ctrl+Shift+1`…`9` slots, Outlook's single-line columnar list with sortable, configurable headers (M-07), and the organising layer — **Sweep**, Search Folders and Ignore / Clean up conversation). No `.msg`; no delivery receipts. |
-| Compose (5.2) | 15 | 3 | 4 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
+| Mail (5.1) | 37 | 5 | 2 | 2 | Solid IMAP core (sync, IDLE, FTS search, unified inbox, pin, the shared category master list with Outlook's 25 presets, drag-and-drop, undo, snooze synced across installs, follow-up flags with due dates, Outlook's right-click menu, stacked conversations in the reading pane, save-all/zip, RFC 5788 junk keywords, TNEF decode, `@mentions` detection with a filter, rules across client, Graph and Sieve backends, automatic replies across Graph and Sieve, Focused Inbox with Outlook's Move to / Always / Stop over Graph and the opt-in local classifier on every other account (M-03, 2.12), Quick Steps in the ribbon and the `Ctrl+Shift+1`…`9` slots, Outlook's single-line columnar list with sortable, configurable headers (M-07), and the organising layer — **Sweep**, Search Folders and Ignore / Clean up conversation). No `.msg`; no delivery receipts. |
+| Compose (5.2) | 16 | 3 | 3 | 1 | Good rich editor and identities, with undo send, schedule send, emoji, file drop, an attachment reminder, sensitivity, and forwarding with attachments or forward-as-attachment. |
 | Calendar (5.3) | 30 | 4 | 1 | 0 | Views and drag-to-edit are good, and week start, working hours, a second time zone, the full five-state show-as and per-event time zones apply live. The view switcher carries Day/Work week/Week/Month, the horizontal **Schedule** view and the **List** view (3.11). Events share the category master list (2.1), the Series builder edits monthly day-of-month / Nth-or-last-weekday / first-or-last-weekday (`BYSETPOS`) and yearly month-day or month/Nth-weekday patterns with a live preview (3.10), and a right-click offers Outlook's event menu with Ctrl-drag to copy (3.12). Organizer invitations send as iMIP (or defer to an RFC 6638 server): REQUEST on save, update with `SEQUENCE++`, CANCEL on delete; attendees answer from the invite card's split buttons (comment, edit the reply in the composer, or don't send), incoming replies update the organizer's event, with a Tracking view in the editor, and time proposals round-trip (COUNTER/DECLINECOUNTER, with meeting forward). The event editor's **Scheduling Assistant** tab shows attendee availability (RFC 6638 `VFREEBUSY`, the organizer's own cache as a fallback, or Graph `getSchedule` for Microsoft 365, 5.1) with Suggested times; the editor's room suggestions from Graph `places` remain to be wired. Events carry **attachments** (3.16): the editor adds/saves/removes files, a CalDAV server advertising RFC 8607 stores them as managed resources (`ATTACH;MANAGED-ID`), other CalDAV servers keep the inline `ATTACH;VALUE=BINARY` form, Microsoft 365 uses Graph event attachments, and the iMIP invitation carries the inline files so attendees receive them. Calendars carry a per-row ⋯ menu (colour picker with CalDAV write-back, Rename, Share, Remove, Move to group) and user-defined groups (3.13). The title-bar search is module-aware: in Calendar it searches the cached event index (title, location, notes, attendees) and shows a results list, with the ribbon's **Filter** action focusing it (3.14 / CAL-22). |
 | People (5.4) | 11 | 1 | 0 | 0 | CRUD, groups and full field editing (anniversary, IM, URL, custom fields, photo) are fine, and the profile card opens on hover/click of any person reference (4.2). Contact lists (`KIND:group` cards) are offered in compose (4.3). CSV import/export matches Outlook's format (4.5). **Merge duplicates** groups a contact's copies within an account by shared email, phone or name and merges them field by field (4.6). The Graph GAL reaches `/me/people` and `/users` (5.2), the directory merge seam plus the shared debounced `DirectorySource` landed (4.7.1–4.7.2), the Graph backend and LDAP config model followed (4.7.3–4.7.4), the LDAP backend landed (4.7.5) and the composer, attendee field and recipient picker are wired (4.7.6–4.7.7); the People search group and the Settings opt-in/LDAP dialogs remain (4.7.8–4.7.9). |
 | Tasks (5.5) | 10 | 0 | 1 | 1 | VTODO, Google Tasks and Microsoft To Do (Graph) CRUD, sharing the category master list (2.1), with a navigation pane of smart lists and per-source lists (**My Day**, **Flagged email**, **Tasks**), list create/rename/delete across every backend, My Day's per-day pin set with due-today/overdue suggestions, and task reminders plus recurrence (4.8, 4.9, 4.10). No subtasks. |
 | Accounts / Microsoft 365 (5.6) | 6 | 0 | 2 | 0 | Microsoft 365 is mail over IMAP/SMTP by default, and its **calendar** (5.1), **contacts** (5.2) and **To Do** (5.3) are now native via Graph. Focused Inbox, per-message categories, importance and follow-up flags now sync with Outlook (5.4). An account can optionally use the experimental **Graph mail** transport instead (5.7.2–5.7.10), now complete with wiremock/fixture coverage and a read-only live-tenant harness; the resulting parity is graded in the transport row above. |
 | Security (5.7) | 6 | 0 | 2 | 1 | Remote-image blocking, a sandbox, sender-authentication banners, the external-sender tag, link safety and report phishing exist. No S/MIME/PGP. |
 | Desktop / extras (5.8) | 4 | 4 | 4 | 0 | Themes, tray and remappable shortcuts are good. No Outlook keymap preset, PST import or Copilot-style actions. |
-| **Total** | **118** | **17** | **17** | **5** | ~75% at parity, ~11% partial |
+| **Total** | **120** | **17** | **15** | **5** | ~76% at parity, ~11% partial |
 
 **Optional Graph mail transport (5.1 / 5.7, item 5.7.10).** Transport parity only, counted from the §5.1 **Graph** column; these rows are not added to the totals above because an account uses one transport at a time. The implementation is complete (5.7.2–5.7.10), with wiremock endpoint tests, fixture round-trips, a fake-Graph session test and a read-only live-tenant harness; live MIME fidelity and delta cost remain R7.
 
@@ -60,16 +60,20 @@ Counts are tallied from the §5 tables.
 
 ### 2.2 Top 10 gaps (ranked by user impact)
 
-1. ✅ ~~**Microsoft 365 To Do** (A-05) - done: `/me/todo/lists` and per-list tasks sync through `lookout_graph::todo` into the Tasks view as synthetic `todo:<list id>` sources, sharing the account's "Sync with Outlook" Graph consent (5.3).~~
-2. ✅ ~~**Sending meeting invitations as organizer** (CAL-14) - done: client iMIP REQUEST/update/CANCEL, or RFC 6638 server scheduling.~~
-3. ✅ ~~**Rules** (M-14) — done across client, Microsoft 365 (Graph) and Sieve backends (2.5).~~
-4. **Undo send and undo actions** (M-21, C-09).
-5. **Spell check** (C-02). WebKit can do this; it's switched off.
-6. **Flags with due dates / follow-up**, and **importance** (M-10, M-12, C-05).
-7. **Calendar preferences**: week start, working hours, time zones (CAL-08…CAL-11).
-8. **Scheduling Assistant / free/busy** (CAL-19) — CalDAV RFC 6638 and a local fallback landed with 3.8, and Graph `getSchedule` with 5.1; room suggestions from Graph `places` remain to be wired into the editor.
-9. **Reopen drafts; forward with attachments** (C-12, C-13).
-10. ✅ ~~**Automatic replies (Out of Office)** (M-24) - done: a per-account Settings page (on/off, optional time range, messages) backed by Graph `automaticRepliesSetting` on Microsoft 365 or an RFC 5230 Sieve `vacation` block elsewhere, with an "Automatic replies are on" banner in Mail and a Turn off action.~~
+Refreshed for 0.9.291. Nine of the previous ten items shipped — To Do, organizer invitations, rules, undo send, spell check, follow-up flags and importance, calendar preferences, reopen drafts/forward with attachments, and automatic replies — so completed items are removed rather than struck; the list below is the current set.
+
+1. **Outlook keyboard preset** (UI-04, 1.18) — remapping exists, but Outlook's chords (Ctrl+E/F, Backspace, Ctrl+Shift+V/Y, F7, F9, Ctrl+Alt+1…5) are not a selectable preset.
+2. **Ribbon consistency and compose tabs** (UX-16, UX-21, UX-40, UX-50, UX-66; U.1) — Mail, Calendar, People and Tasks still use three different command-bar styles, and the composer has no Message / Insert / Format text / Options tabs.
+3. **Calendar quick create and event peek** (UX-55, UX-56; U.7) — clicking a slot or event opens the full editor; Outlook opens a quick-create popover or a peek card first.
+4. **Scheduling Assistant / room finder** (CAL-19, 3.8) — attendee free/busy, Suggested times and Graph `getSchedule` are in; Graph `places` room suggestions are not wired into the editor.
+5. **Reminders window** (CAL-12, 3.9) — due events and tasks raise desktop notifications, but there is no always-on-top list with Dismiss all / Snooze / Join.
+6. **Folder pane and message-list chrome** (UX-23, UX-24, UX-26, UX-29, UX-31; U.4) — Outlook's folder order and Drafts total count, one Filter menu merging filter and sort, the avatar-to-checkbox hover, and the `[Draft]` prefix remain.
+7. **Attachment preview** (M-32, X-03; 7.3) — attachments open or save, but there is no in-app PDF/image/text preview or Outlook's tile menu with Preview as the default click.
+8. **Directory completion** (P-11; 4.7.8–4.7.10) — the composer and recipient picker query Graph/LDAP; the People screen's Directory group and the Settings opt-in/LDAP dialogs are still missing.
+9. **Task steps / subtasks** (T-07; 4.11) — tasks have no `RELATED-TO` children and Graph `checklistItems` are not read.
+10. **Settings regroup** (UX-20; U.10) — File ▸ Options works, but Calendar accounts, Webcal, Appearance, Apps, Assistant and Advanced are still top-level, and Mail/Calendar lack Outlook's sub-pages.
+
+Beyond the top ten: S/MIME and OpenPGP (S-04/S-05, 6.4), PST import (X-02), mail merge (C-23), delivery receipts (M-27), `.msg`/PDF save (M-29), Translate/Immersive Reader (M-36/M-37), weather (CAL-29) and Copilot-style actions (X-05).
 
 ### 2.3 UI/UX at a glance
 
@@ -282,7 +286,7 @@ On the optional Graph mail transport (items 5.7.2–5.7.10; close-out 5.7.10), t
 | M-32 | Attachment preview | Inline `cid:` images; Open / Open with / Save | 🟡 | In-app preview for PDF, images, text (Office via LibreOffice conversion, optional) | ✅ |
 | M-33 | Download / save all attachments, zip | Per-attachment save; "Save all" (folder) and "Download as zip" on the strip header and the conversation card menu (1.23) | ✅ | — | ✅ |
 | M-34 | Remote content / trusted senders | `core/src/trust.rs`, `app/src/trusted_senders.rs` | ✅ | — | ✅ |
-| M-35 | Phishing / unverified-sender / external banners | `EmailBody.auth_results` exists, never filled | ❌ | §4.1 | — |
+| M-35 | Phishing / unverified-sender / external banners | `EmailBody.auth_results` (RFC 8601) drives the reading-pane and popped-out failure/unverified banner, the `From` display-name ↔ address mismatch banner, and `is_external_sender` adds the external-sender tag (S-03, S-06) | ✅ | — | ✅ |
 | M-36 | Translate | — | ❌ | Pluggable provider (LibreTranslate, or the assistant endpoint) | — |
 | M-37 | Immersive Reader / zoom | Dark message theme toggle; Ctrl+scroll and Ctrl+± zoom on the reading pane, popped-out message window and composer (1.20) | 🟡 | Reader mode (7.5) | ✅ |
 | M-38 | Message context menu | Right-click (or Shift+F10 / Menu) on a row or conversation header: Reply, Reply all, Forward · Delete, Archive, Move ▸, Copy ▸ (recent folders, Other folder…) · Mark as read/unread, Flag ▸, Pin, Snooze ▸, Categorize ▸ · Report ▸ · View ▸ details / source · Open in new window, Print (`message_menu.rs`, 1.17) | ✅ | Ignore (2.8), Block ▸ (2.9), Rules ▸ Create rule (2.5) and Report phishing / Not junk (1.24) join it as those land | 🟡 |
@@ -304,7 +308,7 @@ On the optional Graph mail transport (items 5.7.2–5.7.10; close-out 5.7.10), t
 | C-03 | Plain text vs HTML | Rich-text toggle; `multipart/alternative` | ✅ | — |
 | C-04 | From / Bcc / identities | `app/src/identities.rs`, From dropdown | ✅ | "Send as" for Microsoft 365 shared mailboxes (Phase 5) |
 | C-05 | Importance (High/Low) | `ComposedMessage.importance`; High/Low toggles; three headers written | ✅ | — |
-| C-06 | Sensitivity | — | ❌ | §4.1 |
+| C-06 | Sensitivity | The composer's Options group carries Normal / Personal / Private / Company-Confidential, round-tripped through the `Sensitivity` header; the reading pane and popped-out window show a banner (§4.1) | ✅ | — |
 | C-07 | Request read / delivery receipt | Read only | 🟡 | DSN (M-27) |
 | C-08 | Schedule send / delay delivery | Send ▾ → Tomorrow morning / Tomorrow afternoon / Monday morning / Custom time…; outbox `not_before`; the message waits in Drafts with a "Scheduled to send …" bar (Cancel send); "N scheduled messages" banner and dialog. On Microsoft 365 with Graph access the send is scheduled server-side through Exchange (`sendMail` + `PidTagDeferredSendTime`), so it goes out even with Lookout closed; the local outbox is the fallback elsewhere | ✅ | — |
 | C-09 | Undo send | Outbox `not_before` delay (Settings → Mail → "Undo send": Off / 5 s / 10 s, default 5); Undo on the "Sending" toast cancels and reopens the composer | ✅ | — |
@@ -420,7 +424,7 @@ On the optional Graph mail transport (items 5.7.2–5.7.10; close-out 5.7.10), t
 | S-04 | S/MIME sign/encrypt/verify | — | ❌ | GPGME (gpgsm) |
 | S-05 | OpenPGP | — | ❌ | GPGME (gpg) |
 | S-06 | External-sender tag | `is_external_sender` plus a `mail-internal-domains` list; the reading pane and popped-out window tag an outside sender as external (6.2) | ✅ | — |
-| S-07 | Sensitivity labels (Purview) | ⛔ | Tenant-specific; show the header-based sensitivity only |
+| S-07 | Sensitivity labels (Purview) | — | ⛔ | Tenant-specific; show the header-based sensitivity only |
 | S-08 | Link safety (hover shows real URL, warn on mismatch) | Hover status strip with the real URL; a pure scanner warns (and confirms before opening) when an anchor's text names a different host (6.3) | ✅ | — |
 | S-09 | Report phishing | Report phishing in the Report menu and split button: forwards the message as a `message/rfc822` attachment to a configured address, then moves it to Junk (6.7) | ✅ | — |
 
