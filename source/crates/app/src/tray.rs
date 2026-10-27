@@ -3,7 +3,7 @@
 //! Shows the app in the notification area - Ubuntu's AppIndicator extension,
 //! KDE Plasma's system tray, and other SNI hosts - with the summed Inbox
 //! unread count baked into the icon, a tooltip naming the count, and a
-//! right-click menu (Open Lookout / Compose… / Quit). Left-click toggles
+//! right-click menu (Open Lookout / New mail / Quit). Left-click toggles
 //! the main window's visibility (the "show/hide" this feature exists for).
 //!
 //! Everything is opt-in via the Config → General → "Tray icon" toggle
@@ -54,7 +54,7 @@ pub enum TrayCommand {
     ToggleWindow,
     /// "Open Lookout" menu item: present the window.
     OpenWindow,
-    /// "Compose…" menu item: open a new-message composer.
+    /// "New mail" menu item: open a new-message composer.
     Compose,
     /// "Quit" menu item.
     Quit,
@@ -108,7 +108,7 @@ impl ksni::Tray for LookoutTray {
         let mut menu = Vec::new();
         for (label, icon, command) in [
             ("Open Lookout", "go-home-symbolic", TrayCommand::OpenWindow),
-            ("Compose…", "mail-message-new-symbolic", TrayCommand::Compose),
+            ("New mail", "mail-message-new-symbolic", TrayCommand::Compose),
         ] {
             let commands = self.commands.clone();
             menu.push(
@@ -461,7 +461,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(labels, ["Open Lookout", "Compose…", "Quit"]);
+        assert_eq!(labels, ["Open Lookout", "New mail", "Quit"]);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use super::*;
 /// placeholder). Removes any leftover `"compose"` page first so repeated
 /// clicks don't accumulate stale pages, and restores whatever page was
 /// visible beforehand once `on_done` fires (Cancel or Send) - so Reply's
-/// Cancel lands back on the same message, and New Message's Cancel lands
+/// Discard lands back on the same message, and New mail's Discard lands
 /// back on the empty placeholder. Arms the composer's header pop-out button:
 /// clicking it moves the still-alive composer into its own window (see the
 /// `on_pop_out` closure below), and closing that window pops the composer

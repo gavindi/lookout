@@ -391,6 +391,9 @@ pub struct ConfigView {
     /// "Internal domains" entry (Config → Mail): a comma-separated list of
     /// domains the reading pane treats as internal (item 6.2 / S-06).
     pub internal_domains_entry: gtk::Entry,
+    /// "Use server folder names" switch (Config → Mail): shows the server's
+    /// own folder names instead of Outlook's well-known role names (UX-03).
+    pub server_folder_names_row: adw::SwitchRow,
     /// "Report phishing address" entry (Config → Mail): where Report phishing
     /// forwards a message as an attachment (item 6.7 / S-09).
     pub report_phishing_entry: gtk::Entry,
@@ -733,6 +736,11 @@ pub fn build() -> ConfigView {
         .subtitle("Display images hosted on remote servers in messages")
         .build();
     mail_settings_group.add(&remote_images_row);
+    let server_folder_names_row = adw::SwitchRow::builder()
+        .title("Use server folder names")
+        .subtitle("Show folders under the server's own names instead of Outlook's well-known names")
+        .build();
+    mail_settings_group.add(&server_folder_names_row);
     // The "Junk email" group (item 2.9 / M-17): the safe senders (the same
     // list the external-content trust flow uses, S-01) and the blocked
     // senders, mirroring Outlook's Mail → Junk email page.
@@ -774,7 +782,7 @@ pub fn build() -> ConfigView {
         .build();
     mail_settings_group.add(&rules_row);
     let quick_steps_row = adw::ActionRow::builder()
-        .title("Quick Steps…")
+        .title("Quick steps…")
         .subtitle("Chains of actions you run on the selected messages")
         .activatable(true)
         .build();
@@ -1332,6 +1340,7 @@ pub fn build() -> ConfigView {
         background_brightness_scale,
         restore_background_row,
         remote_images_row,
+        server_folder_names_row,
         trusted_senders_row,
         blocked_senders_row,
         ignored_conversations_row,

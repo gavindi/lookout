@@ -116,7 +116,7 @@ pub struct DefaultShortcut {
 pub const DEFAULT_SHORTCUTS: &[DefaultShortcut] = &[
     DefaultShortcut {
         action: ACTION_COMPOSE,
-        title: "New message",
+        title: "New mail",
         keyval: gdk::Key::n,
         modifiers: CONTROL,
     },

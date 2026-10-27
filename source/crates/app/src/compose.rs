@@ -1120,7 +1120,7 @@ impl AutosaveCtx {
 }
 
 /// A draft with no recipients, no subject and no body content is not worth
-/// storing - an untouched "New Message" composer must not litter the Drafts
+/// storing - an untouched "New mail" composer must not litter the Drafts
 /// folder with empty messages. Whitespace-only counts as empty; the rich
 /// editor's blank document (`<p><br></p>`) renders to whitespace-only text,
 /// so it's caught by the same check.
@@ -2405,7 +2405,7 @@ pub fn build_compose_view(
         group.small_menu(&format.emoji, "face-smile-symbolic", "Emoji");
         group.small_button(&format.horizontal_rule, "insert-hr-symbolic", "Horizontal Line");
     });
-    editor_band.group("Tags", |group| {
+    editor_band.group("Options", |group| {
         group.small_toggle(&high_importance_toggle, "emblem-important-symbolic", "High Importance");
         group.small_toggle(&low_importance_toggle, "go-down-symbolic", "Low Importance");
         group.widget(&sensitivity_dropdown);
@@ -2523,7 +2523,8 @@ pub fn build_compose_view(
 
     let cancel_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["user-trash-symbolic", "edit-delete-symbolic"]));
     cancel_button.add_css_class("destructive-action");
-    cancel_button.set_tooltip_text(Some("Cancel"));
+    cancel_button.set_tooltip_text(Some("Discard"));
+    cancel_button.update_property(&[gtk::accessible::Property::Label("Discard")]);
     // Send is a split button, as in Outlook: the main part sends now, the
     // arrow opens the "Schedule send" menu (item 1.14), wired below.
     let send_button = adw::SplitButton::builder()
@@ -2621,19 +2622,19 @@ pub fn build_compose_view(
 
     {
         let on_done = on_done.clone();
-        let autosave = autosave.clone();
         let closed = closed.clone();
+        let cmd_tx = cmd_tx.clone();
+        let draft_message_id = draft_message_id.clone();
         cancel_button.connect_clicked(move |_| {
-            // One final save before teardown, so closing the composer never
-            // loses work (the draft stays in Drafts; there's no "discard"
-            // affordance yet). The save runs on its own task and outlives
-            // the widget - `AutosaveCtx` holds the editor by `Rc`, so the
-            // read still resolves after the pane has closed, and the task
-            // never consults `closed` (which is set right below, and would
-            // otherwise veto the very save this exists to perform).
-            let autosave = autosave.clone();
-            glib::spawn_future_local(async move { autosave.attempt().await });
+            // Discard (UX-08): remove any autosaved copy from Drafts, then
+            // close without the final save the old "Cancel" action performed.
+            // Setting `closed` first stops the autosave tick; a save already
+            // queued ahead of this delete stays ahead of it on the account's
+            // command channel, so the delete still wins.
             closed.set(true);
+            let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
+                message_id: (*draft_message_id).clone(),
+            });
             on_done();
         });
     }
@@ -2650,8 +2651,17 @@ pub fn build_compose_view(
         });
     }
     {
-        let cancel_button = cancel_button.clone();
-        close_button.connect_clicked(move |_| cancel_button.emit_clicked());
+        // Close keeps the draft (its tooltip says so): one last save, then
+        // teardown. Distinct from Discard, which deletes the autosaved copy.
+        let on_done = on_done.clone();
+        let autosave = autosave.clone();
+        let closed = closed.clone();
+        close_button.connect_clicked(move |_| {
+            let autosave = autosave.clone();
+            glib::spawn_future_local(async move { autosave.attempt().await });
+            closed.set(true);
+            on_done();
+        });
     }
     {
         let in_reply_to = prefill.in_reply_to;

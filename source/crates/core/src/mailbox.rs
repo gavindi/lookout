@@ -49,6 +49,31 @@ pub fn display_name(name: &str) -> String {
     }
 }
 
+/// Outlook's spelling for a well-known folder role, used when the user hasn't
+/// asked to see the server's own folder names (UX-03). `None` for a custom
+/// folder, which always keeps its own name.
+pub fn role_display_name(role: MailboxRole) -> Option<&'static str> {
+    match role {
+        MailboxRole::Inbox => Some("Inbox"),
+        MailboxRole::Sent => Some("Sent Items"),
+        MailboxRole::Drafts => Some("Drafts"),
+        MailboxRole::Trash => Some("Deleted Items"),
+        MailboxRole::Junk => Some("Junk Email"),
+        MailboxRole::Archive => Some("Archive"),
+        MailboxRole::Custom => None,
+    }
+}
+
+/// The name to show for a mailbox: its role's well-known spelling unless
+/// `use_server_names` is set, in which case the server's own name is shown
+/// (with `INBOX` still title-cased). Custom folders always keep their name.
+pub fn display_name_for(name: &str, role: MailboxRole, use_server_names: bool) -> String {
+    if use_server_names {
+        return display_name(name);
+    }
+    role_display_name(role).map(str::to_string).unwrap_or_else(|| display_name(name))
+}
+
 /// Guesses a [`MailboxRole`] from a folder's display name when the server
 /// doesn't advertise `SPECIAL-USE` attributes. Case-insensitive, matches the
 /// common names used by Gmail, Outlook/Exchange, Dovecot, and other major
@@ -107,6 +132,22 @@ mod tests {
         assert_eq!(display_name("Inbox"), "Inbox");
         assert_eq!(display_name("Archive"), "Archive");
         assert_eq!(display_name("Projects"), "Projects");
+    }
+
+    #[test]
+    fn roles_get_outlooks_names_unless_server_names_are_requested() {
+        assert_eq!(display_name_for("Junk Mail", MailboxRole::Junk, false), "Junk Email");
+        assert_eq!(display_name_for("Bin", MailboxRole::Trash, false), "Deleted Items");
+        assert_eq!(display_name_for("Sent", MailboxRole::Sent, false), "Sent Items");
+        assert_eq!(display_name_for("INBOX", MailboxRole::Inbox, false), "Inbox");
+        assert_eq!(display_name_for("My Projects", MailboxRole::Custom, false), "My Projects");
+    }
+
+    #[test]
+    fn server_folder_names_keep_the_providers_spelling() {
+        assert_eq!(display_name_for("Junk Mail", MailboxRole::Junk, true), "Junk Mail");
+        assert_eq!(display_name_for("Bin", MailboxRole::Trash, true), "Bin");
+        assert_eq!(display_name_for("INBOX", MailboxRole::Inbox, true), "Inbox");
     }
 
     #[test]

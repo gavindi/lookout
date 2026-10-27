@@ -9,7 +9,7 @@ use adw::prelude::*;
 use chrono::Timelike;
 use gtk::{gio, glib};
 use lookout_core::calendar_protocol::CalendarCommand;
-use lookout_core::{display_name, AccountId, CalendarTask, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
+use lookout_core::{AccountId, CalendarTask, EmailSummary, EventOccurrence, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_dav::subscription::SubscriptionCommand;
 use lookout_mail::session::AccountCommand;
 use lookout_mail::SearchScope;
@@ -105,6 +105,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `UiState` exists. One-time imports of the pre-GSettings plain files
     // run before the first reads below.
     let settings = Rc::new(crate::settings::resolve());
+    // Mirror the folder-name preference before the folder pane is built
+    // (UX-03); the Config switch keeps the mirror in step afterwards.
+    crate::settings::set_use_server_folder_names(settings.get_bool(crate::settings::MAIL_USE_SERVER_FOLDER_NAMES));
     crate::last_view::migrate_legacy(&settings);
     crate::background_image::migrate_legacy(&settings);
     // The optional Fluent icon pack (UX-80): applied before any widget is
@@ -448,7 +451,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 TreeItem::Folder(node) | TreeItem::Favorite(node) => {
                     icon.set_visible(true);
                     icon.set_icon_name(Some(folder_icon_name(node.mailbox.role)));
-                    label.set_label(&display_name(&node.mailbox.name));
+                    label.set_label(&crate::settings::folder_display_name(&node.mailbox));
                     label.set_css_classes(&["folder-row-label"]);
                     let prefs = folder_view.as_ref().map(|(prefs, _, _)| prefs.clone()).unwrap_or_default();
                     if let Some(color) = &prefs.color {
@@ -2396,7 +2399,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     install_folder_menu_handler(&menu_handler, &state, &folder_selection, &folder_scroller, &list_header, &worker);
 
     let compose_button = gtk::Button::from_icon_name("mail-message-new-symbolic");
-    compose_button.set_tooltip_text(Some("New Message"));
+    compose_button.set_tooltip_text(Some("New mail"));
 
     // Dev-only: load a raw .eml fixture straight into the reading pane,
     // bypassing IMAP entirely - for manually exercising render_body()
@@ -3834,12 +3837,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (the profile card's "Add to contacts").
     let add_sender_button = gtk::Button::from_icon_name("contact-new-symbolic");
     add_sender_button.set_tooltip_text(Some("Add sender to contacts"));
-    // Move: the context menu's Move ▸ Other folder… picker.
-    let move_button = selection_button(
-        themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]),
-        "Move to folder",
-        crate::message_menu::MessageMenuAction::MoveOther,
-    );
+    // Move to ▾ (UX-06): the account's recent folders plus "Other folder…",
+    // rebuilt on every `show` so the list tracks the live selection, like the
+    // Categorize and Quick steps menus.
+    let move_button = gtk::MenuButton::builder()
+        .icon_name(themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]))
+        .tooltip_text("Move to")
+        .build();
+    let move_popover = gtk::Popover::new();
+    move_button.set_popover(Some(&move_popover));
+    {
+        let context = message_menu_context.clone();
+        let anchor = move_button.clone();
+        move_popover.connect_show(move |popover| {
+            let menu = build_move_to_menu(&context, anchor.upcast_ref(), popover);
+            popover.set_child(Some(&menu));
+        });
+    }
     // Rules ▾: create a rule from the selected message, or manage them all.
     let rules_button = gtk::MenuButton::builder().icon_name("emblem-system-symbolic").tooltip_text("Rules").build();
     {
@@ -3894,7 +3908,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // layout is shared app-wide via `ribbon_style`.
     let command_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     command_band.group("New", |group| {
-        group.button(&compose_button, "mail-message-new-symbolic", "New Message");
+        group.button(&compose_button, "mail-message-new-symbolic", "New mail");
     });
     command_band.group("Delete", |group| {
         group.button(&delete_button, "user-trash-symbolic", "Delete");
@@ -3909,18 +3923,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         group.small_button(&meeting_button, "appointment-new-symbolic", "Meeting");
         group.small_button(&add_sender_button, "contact-new-symbolic", "Add Sender");
     });
-    command_band.group("Quick Steps", |group| {
+    command_band.group("Quick steps", |group| {
         group.menu(
             &quick_steps_button,
             themed_icon_name(&["system-run-symbolic", "media-playback-start-symbolic", "go-next-symbolic"]),
-            "Quick Steps",
+            "Quick steps",
         );
     });
     command_band.group("Move", |group| {
-        group.button(&move_button, themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]), "Move");
+        group.menu(&move_button, themed_icon_name(&["folder-move-symbolic", "go-jump-symbolic"]), "Move to");
         group.menu(&rules_button, "emblem-system-symbolic", "Rules");
     });
-    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Tags", |group| {
+    let (pin_icon, flag_icon, mark_read_icon) = command_band.group("Categories", |group| {
         // The large commands first, so the Classic layout stacks Pin and
         // Snooze in a column after them.
         let read = group.button(
@@ -3955,13 +3969,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     // --- Calendar's own command toolbar row, swapped in for the Mail one
     // (see `view_toolbar_stack` below) when the Calendar nav-rail button is
-    // active. New Event opens the event editor (wired later, once
+    // active. New event opens the event editor (wired later, once
     // `calendar_state` exists); the segmented options (Day/Work
     // week/Week/Month/Schedule/Split/List) switch the main panel's stack;
     // Filter/Share remain disabled placeholders. Print is live (prints the displayed
     // range through WebKit's print pipeline).
     let new_event_button = gtk::Button::from_icon_name("appointment-new-symbolic");
-    new_event_button.set_tooltip_text(Some("New Event"));
+    new_event_button.set_tooltip_text(Some("New event"));
 
     let day_view_button = gtk::ToggleButton::builder().label("Day").build();
     let work_week_view_button = gtk::ToggleButton::builder().label("Work week").build();
@@ -4015,7 +4029,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     print_button.set_tooltip_text(Some("Print"));
     let calendar_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     calendar_band.group("New", |group| {
-        group.button(&new_event_button, "appointment-new-symbolic", "New Event");
+        group.button(&new_event_button, "appointment-new-symbolic", "New event");
     });
     // Go To: re-anchor every calendar view on today, step it back or
     // forward by its own unit (a day, a week, a month), or jump to a date.
@@ -4089,7 +4103,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // `calendar_state` exists); Connect Google Tasks runs the interactive
     // OAuth flow for the account's Google GOA account.
     let new_task_button = gtk::Button::from_icon_name(themed_icon_name(&["view-task-symbolic", "appointment-soon-symbolic"]));
-    new_task_button.set_tooltip_text(Some("New Task"));
+    new_task_button.set_tooltip_text(Some("New task"));
     let connect_google_tasks_button = gtk::Button::with_label("Connect Google Tasks");
     connect_google_tasks_button.set_tooltip_text(Some("Sign in to Google Tasks (the Tasks API, separate from Google's event-only CalDAV)"));
 
@@ -4130,7 +4144,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let task_show_completed_action = gio::SimpleAction::new_stateful("task-show-completed", None, &settings.get_bool(crate::settings::TASKS_SHOW_COMPLETED).to_variant());
     let tasks_band = crate::ribbon::RibbonBand::new(&ribbon_style, &["toolbar"]);
     tasks_band.group("New", |group| {
-        group.button(&new_task_button, themed_icon_name(&["view-task-symbolic", "appointment-soon-symbolic"]), "New Task");
+        group.button(&new_task_button, themed_icon_name(&["view-task-symbolic", "appointment-soon-symbolic"]), "New task");
     });
     tasks_band.group("View", |group| {
         group.menu(
@@ -6612,7 +6626,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     &state,
                     &worker,
                     &reading_stack,
-                    "New message",
+                    "New mail",
                     cmd_tx,
                     prefill,
                     rich_text_default,
@@ -7936,6 +7950,23 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Use server folder names" (UX-03): repaint the folder
+    // pane under the server's own names, or Outlook's well-known role names,
+    // and refresh the open folder's header title.
+    {
+        let state = state.clone();
+        let list_header = list_header.clone();
+        config_view.server_folder_names_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_USE_SERVER_FOLDER_NAMES, row.is_active());
+            crate::settings::set_use_server_folder_names(row.is_active());
+            let refresh = state.borrow().folder_tree_refresh.clone();
+            if let Some(refresh) = refresh {
+                refresh();
+            }
+            refresh_list_header(&state, &list_header);
+        });
+    }
+
     // Config → Mail → "Internal domains" (item 6.2 / S-06): split the
     // comma/whitespace-separated entry into the `mail-internal-domains`
     // string list. The reading pane's external-sender tag reads it on the
@@ -8581,6 +8612,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
         config_view.message_theme_dark_row.set_active(persisted.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
+        config_view
+            .server_folder_names_row
+            .set_active(persisted.get_bool(crate::settings::MAIL_USE_SERVER_FOLDER_NAMES));
         config_view
             .focused_inbox_local_row
             .set_active(persisted.get_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL));
@@ -10962,7 +10996,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Compose button -> new-message composer in the reading pane,
     // "From" = the account owning the selected message (falling back to the
     // currently-open mailbox's account, then any connected account). The
-    // account choice is shared with the tray icon's "Compose…" menu item
+    // account choice is shared with the tray icon's "New mail" menu item
     // through `compose_new_message`.
     {
         let state = state.clone();
@@ -11735,7 +11769,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
-    // --- Calendar event editor: the "New Event" toolbar button opens a blank
+    // --- Calendar event editor: the "New event" toolbar button opens a blank
     // form prefilled for the displayed date (and the Day/Week grids' empty
     // time slots open one prefilled for the clicked slot - see the
     // `connect_slot_activated` block below); clicking an event in any calendar
@@ -11778,7 +11812,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             print_calendar_month(&calendar_state, &window);
         });
     }
-    // --- Task editor + list wiring: the "New Task" toolbar button opens a
+    // --- Task editor + list wiring: the "New task" toolbar button opens a
     // blank form, clicking a task row opens it for editing, and the row
     // checkbox flips completion (the modified task goes through the same
     // session route as a Save). Opening the Tasks view pulls a fresh task

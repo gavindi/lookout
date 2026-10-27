@@ -448,6 +448,69 @@ pub(crate) fn message_menu_targets(message_list: &MessageListModel, target: Mess
     }
 }
 
+/// The recent folders a Move ▸ / Copy ▸ menu or the ribbon's Move to menu can
+/// offer for `targets`: the account's remembered folders, most recent first,
+/// limited to ones that still exist and excluding the folder every target is
+/// already in.
+pub(crate) fn recent_folders_for_targets(st: &UiState, targets: &[EmailSummary]) -> Vec<(MailboxId, String)> {
+    let Some(account) = targets.first().and_then(|summary| mailbox_account_id(&summary.mailbox)) else {
+        return Vec::new();
+    };
+    let folders = st.accounts.get(&account).map(|handle| handle.folders.clone()).unwrap_or_default();
+    let current = targets.iter().all(|s| s.mailbox == targets[0].mailbox).then(|| targets[0].mailbox.clone());
+    st.recent_folders
+        .get(&account)
+        .into_iter()
+        .flatten()
+        .filter(|id| Some(*id) != current.as_ref())
+        .filter_map(|id| {
+            folders
+                .iter()
+                .find(|folder| folder.id == *id)
+                .map(|folder| (id.clone(), crate::settings::folder_display_name(folder)))
+        })
+        .collect()
+}
+
+/// The ribbon's **Move to ▾** popover (UX-06): the account's recent folders,
+/// then "Other folder…". It dispatches through the message menu's own
+/// action handler, so moving from the ribbon behaves and undoes exactly like
+/// moving from the right-click menu.
+pub(crate) fn build_move_to_menu(context: &MessageMenuContext, anchor: &gtk::Widget, popover: &gtk::Popover) -> gtk::Widget {
+    use crate::message_menu::MessageMenuAction;
+
+    let menu = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
+    let (targets, _) = message_menu_targets(&context.message_list, MessageMenuTarget::Selection);
+    let recent = {
+        let st = context.state.borrow();
+        recent_folders_for_targets(&st, &targets)
+    };
+    let run = {
+        let context = context.clone();
+        let anchor = anchor.clone();
+        let popover = popover.clone();
+        move |action: MessageMenuAction| {
+            popover.popdown();
+            let (targets, primary) = message_menu_targets(&context.message_list, MessageMenuTarget::Selection);
+            run_message_menu_action(&context, &anchor, &targets, primary.as_ref(), action);
+        }
+    };
+    for (id, name) in recent {
+        let button = gtk::Button::builder().label(name).css_classes(["flat"]).halign(gtk::Align::Start).build();
+        let run = run.clone();
+        button.connect_clicked(move |_| run(MessageMenuAction::MoveTo(id.clone())));
+        menu.append(&button);
+    }
+    if menu.first_child().is_some() {
+        menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    }
+    let other = gtk::Button::builder().label("Other folder…").css_classes(["flat"]).halign(gtk::Align::Start).build();
+    let run = run.clone();
+    other.connect_clicked(move |_| run(MessageMenuAction::MoveOther));
+    menu.append(&other);
+    menu.upcast()
+}
+
 /// Opens the message context menu (item 1.17) on `anchor`, pointing at
 /// `point` (in `anchor`'s coordinates) or at the whole widget. Returns
 /// whether there was anything to act on.
@@ -490,20 +553,7 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
         });
         // The account's recent folders that still exist, less the one every
         // target is already in.
-        let current = targets.iter().all(|s| s.mailbox == targets[0].mailbox).then(|| targets[0].mailbox.clone());
-        let recent: Vec<(MailboxId, String)> = account
-            .as_ref()
-            .and_then(|id| st.recent_folders.get(id))
-            .into_iter()
-            .flatten()
-            .filter(|id| Some(*id) != current.as_ref())
-            .filter_map(|id| {
-                folders
-                    .iter()
-                    .find(|folder| folder.id == *id)
-                    .map(|folder| (id.clone(), lookout_core::display_name(&folder.name)))
-            })
-            .collect();
+        let recent = recent_folders_for_targets(&st, &targets);
         // Whether the account provides Focused Inbox (M-03): Graph for
         // Microsoft 365, the local classifier's opt-in for every other
         // account (item 2.12).
@@ -2813,7 +2863,7 @@ pub(crate) fn reply_send_context(state: &Rc<RefCell<UiState>>, summary: &EmailSu
 /// Opens a new-message composer in the reading pane for the best-guess
 /// account: the selected message's account, else the open mailbox's, else
 /// any connected account - exactly the toolbar compose button's logic,
-/// shared with the tray icon's "Compose…" menu item.
+/// shared with the tray icon's "New mail" menu item.
 pub(crate) fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, reading_stack: &gtk::Stack, message_list: &MessageListModel) {
     let st = state.borrow();
     // A section header is selected exactly like "nothing selected" here:
@@ -2831,7 +2881,7 @@ pub(crate) fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Work
         state,
         worker,
         reading_stack,
-        "New Message",
+        "New mail",
         cmd_tx,
         crate::compose::ComposePrefill::default(),
         rich_text_default,

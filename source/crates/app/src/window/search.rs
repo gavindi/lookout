@@ -67,7 +67,11 @@ pub(crate) fn resolve_search_mailboxes(folders: &[lookout_core::Mailbox], scope:
         let needle = token.to_lowercase();
         let ids: Vec<MailboxId> = folders
             .iter()
-            .filter(|mailbox| mailbox.name.to_lowercase() == needle || display_name(&mailbox.name).to_lowercase() == needle)
+            .filter(|mailbox| {
+                mailbox.name.to_lowercase() == needle
+                    || display_name(&mailbox.name).to_lowercase() == needle
+                    || crate::settings::folder_display_name(mailbox).to_lowercase() == needle
+            })
             .map(|mailbox| mailbox.id.clone())
             .collect();
         return Some(ids);

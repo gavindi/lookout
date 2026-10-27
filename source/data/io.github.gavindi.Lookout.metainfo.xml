@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.289" date="2026-10-28">
+      <description>
+        <p>Lookout now uses Outlook's terminology throughout. Well-known folders show Outlook's names (Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive) unless "Use server folder names" is turned on in Settings, the tray says New mail, the ribbon gains a Move to menu with the recent folders, the Read command names the action it will take, and Discard really deletes a composer's saved draft. Tasks gains Outlook's Important and Planned smart lists.</p>
+      </description>
+    </release>
     <release version="0.9.288" date="2026-10-27">
       <description>
         <p>Focused Inbox now works on every account, not just Microsoft 365. An opt-in switch in Settings, Mail sorts the Inbox into Focused and Other: mail from contacts and people you have written to stays Focused, mailing-list mail goes to Other, and moving a sender always wins. Microsoft 365 continues to use Outlook's own classification. The Focused/Other tabs appear above the Inbox and the message menu gains Move to, Always move and Stop moving for local accounts too.</p>

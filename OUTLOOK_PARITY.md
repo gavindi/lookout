@@ -463,16 +463,16 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 
 | ID | Outlook term | Lookout today | Action |
 |---|---|---|---|
-| UX-01 | **Categorize** / Categories | UI says "Categorize"; docs and code say "color tags" | Keep the UI label; rename "tags" to "categories" in user-facing docs, settings and tooltips |
-| UX-02 | **Flag** (follow-up) vs **Pin** | Both icons in the ribbon; Flag is the follow-up flag (1.16) | ✅ Flag = follow-up flag (M-10); Pin = pin. Never use one word for the other |
-| UX-03 | **Junk Email** | Server folder name shown verbatim (e.g. "Junk Mail") | Show the well-known display name for SPECIAL-USE roles (Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive), with an option to "Use server folder names" |
-| UX-04 | **New mail** / **New event** / **New contact** / **New task** | Tray says "Compose…"; ribbon icon has no label | "New mail" everywhere (tray, ribbon, menus) |
-| UX-05 | **Report** ▸ Report junk / Report phishing / Not junk | "Report" (junk only) | Split button with the three verbs (M-17, S-09) |
-| UX-06 | **Move to** ▸ (recent folders, Other folder…) | Drag-and-drop; context menu Move ▸ / Copy ▸ with recent folders and Other folder… (1.17) | Ribbon action (UX-21), reusing the context menu's recent folders |
-| UX-07 | **Read / Unread**, **Mark all as read** | "Mark read/unread" toggle | Label shows the action that will happen ("Mark as unread" on a read message) |
-| UX-08 | **Discard** (compose) | Trash icon | Tooltip and accessible name "Discard" |
-| UX-09 | **Automatic replies**, **Focused / Other**, **Sweep**, **Quick steps**, **Rules**, **Reading pane**, **My Day**, **To Do** | Mostly absent (features missing) | Use these exact names when the features land |
-| UX-10 | **Tasks** vs **To Do** | "Tasks" | Keep "Tasks" (classic Outlook's name) but call the smart lists "My Day", "Important", "Planned", "Flagged email" (UX-71) |
+| UX-01 | **Categorize** / Categories | ✅ Categories everywhere: the Categorize menu, the ribbon's Categories group and the category editor; the user-facing docs call them categories | — |
+| UX-02 | **Flag** (follow-up) vs **Pin** | ✅ Flag is the follow-up flag (M-10); Pin is pin. Never use one word for the other | — |
+| UX-03 | **Junk Email** | ✅ Folder rows, the header and every picker show Inbox / Drafts / Sent Items / Deleted Items / Junk Email / Archive; Settings → Mail's **Use server folder names** restores the server's own spelling | — |
+| UX-04 | **New mail** / **New event** / **New contact** / **New task** | ✅ "New mail" in the tray, ribbon, menus and composer; "New event", "New task" and "New contact" in their modules | — |
+| UX-05 | **Report** ▸ Report junk / Report phishing / Not junk | ✅ Report ▾ offers Report junk, Report phishing and Not junk (M-17, S-09) | — |
+| UX-06 | **Move to** ▸ (recent folders, Other folder…) | ✅ The ribbon's **Move to ▾** lists the context menu's recent folders, then Other folder… (UX-21) | — |
+| UX-07 | **Read / Unread**, **Mark all as read** | ✅ The ribbon command reads "Mark as read" or "Mark as unread" for the current selection, and every folder's menu offers **Mark all as read** | — |
+| UX-08 | **Discard** (compose) | ✅ The composer's trash button is named and tooltipped **Discard**, and deletes the autosaved draft | — |
+| UX-09 | **Automatic replies**, **Focused / Other**, **Sweep**, **Quick steps**, **Rules**, **Reading pane**, **My Day**, **To Do** | ✅ The features use these exact names | — |
+| UX-10 | **Tasks** vs **To Do** | ✅ The module is **Tasks**; its smart lists are **My Day**, **Important**, **Planned**, **Flagged email** and **Tasks** ("Assigned to me" needs a server source, UX-71) | — |
 
 ### 6.3 Application shell
 
@@ -554,8 +554,8 @@ Use Outlook's words in the UI (code identifiers can stay as they are).
 
 | ID | Element | Outlook | Lookout today | Change | Effort |
 |---|---|---|---|---|---|
-| UX-71 | Navigation | Left: **My Day, Important, Planned, Assigned to me, Flagged email, Tasks**, then user lists (+ New list) | A navigation pane with **My Day, Flagged email, Tasks** then one row per source list + **New list** (4.8); the due buckets (Overdue / Today / This week / Later / Completed) group the Tasks list (T-09) | Add the remaining smart lists (Important, Planned, Assigned to me) as their data lands; keep the buckets as the grouping inside "Planned" | M |
-| UX-72 | Quick add | "**Add a task**" entry at the top of the list, with inline icons for due date, reminder and repeat; Enter adds | "New Task" button opens the editor dialog | Quick-add row; dialog only for details | S |
+| UX-71 | Navigation | Left: **My Day, Important, Planned, Assigned to me, Flagged email, Tasks**, then user lists (+ New list) | A navigation pane with **My Day, Important, Planned, Flagged email, Tasks** then one row per source list + **New list** (4.8); the due buckets (Overdue / Today / This week / Later / Completed) group the Tasks list (T-09) | Add **Assigned to me** when a server source provides assignments; keep the buckets as the grouping inside "Planned" | M |
+| UX-72 | Quick add | "**Add a task**" entry at the top of the list, with inline icons for due date, reminder and repeat; Enter adds | "New task" button opens the editor dialog | Quick-add row; dialog only for details | S |
 | UX-73 | Task details | **Right-hand details pane**: title + ☐, Steps ("+ Add step"), Add to My Day, Remind me, Add due date, Repeat, Pick a category, Add file, Add note; created/edited footer | Modal editor (`task_editor.rs`) | Details pane (T-05…T-08). ☆ Important toggle on rows (maps to priority High) | M |
 | UX-74 | Tasks View ribbon | Sort by (Importance, Due date, Added to My Day, Alphabetically, Creation date) · Group · Show completed | View tab disabled | Add (T-09) | S |
 
@@ -764,7 +764,7 @@ Shell-level work from §6 that isn't owned by a single feature. Feature-specific
 | # | Item | UX IDs | Approach | Effort | Lands with |
 |---|---|---|---|---|---|
 | U.1 | Shared ribbon component | UX-15, UX-16, UX-21, UX-50, UX-66 | One ribbon builder in a new `app/src/ribbon.rs`: groups, icon+label buttons, split buttons, adaptive collapse (label → icon → overflow) using `adw::Breakpoint`, optional Classic layout and collapse toggle. Migrate the Mail, Calendar, People and Tasks command bars to it; reorder Mail Home to UX-21 | M | Phase 1 |
-| U.2 | Terminology pass | UX-01…UX-10 | Rename user-visible strings (tray, tooltips, menus, settings) and add well-known folder display names | S | Phase 1 |
+| U.2 | ✅ ~~Terminology pass~~ | UX-01…UX-10 | Renamed the user-visible strings (tray, tooltips, menus, settings), added the well-known folder display names with the **Use server folder names** option, the Report/Move to/Read commands, Discard, and the Tasks smart lists | S | Phase 1 |
 | U.3 | Title bar and shell | UX-11, UX-13, UX-14, UX-19, UX-25 | ✅ ~~Centred search with scope dropdown and the advanced-search popover (UX-11)~~; ✅ ~~Settings gear in the title bar~~; ✅ ~~rail shortcut tooltips and accent-pill selected state (UX-14)~~; remaining: F6 pane cycling and folder-pane collapse | M | Phase 1 (scope, advanced search and nav rail finished) |
 | U.4 | Message list redesign | UX-26…UX-31, UX-39, UX-84 | ✅ ~~Three-line row with status icons and the category chip strip (UX-28)~~; remaining: merged Filter/Sort menu; single-line columnar layout with configurable headers; Outlook folder order and counts (UX-23, UX-24); [Draft] marker; hover checkbox | L | Phase 1 (1.4–1.6) |
 | U.5 | Reading pane polish | UX-32…UX-34, UX-37, UX-86 | Info-bar stack component; ⋯ menu contents; attachment tiles; double-click/Enter opens a window; per-message dark toggle; "After moving or deleting" setting | M | Phase 1 |

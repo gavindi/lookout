@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
-use lookout_core::{display_name, AccountId, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
+use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, MailboxRole, SystemFlagBit, Uid};
 use lookout_mail::session::AccountCommand;
 
 use crate::google_tasks::{self};
@@ -227,11 +227,12 @@ pub(crate) fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, Strin
     // Folders can arrive after the selection does (a restored view names a
     // mailbox its account hasn't listed yet), so fall back to the id's path
     // segment rather than showing nothing.
+    let role = mailbox_role(&st, mailbox_id).unwrap_or(MailboxRole::Custom);
     let folder = handle
         .and_then(|h| h.folders.iter().find(|m| &m.id == mailbox_id))
-        .map(|m| display_name(&m.name))
-        .or_else(|| mailbox_id.0.split_once(':').map(|(_, path)| display_name(path)))
-        .unwrap_or_else(|| display_name(&mailbox_id.0));
+        .map(crate::settings::folder_display_name)
+        .or_else(|| mailbox_id.0.split_once(':').map(|(_, path)| crate::settings::folder_display_name_of(path, role)))
+        .unwrap_or_else(|| crate::settings::folder_display_name_of(&mailbox_id.0, role));
     let account = handle
         .map(|h| if h.display_name.is_empty() { h.email.clone() } else { h.display_name.clone() })
         .unwrap_or_default();
@@ -400,7 +401,7 @@ pub(crate) fn refresh_pin_button(icon: &crate::ribbon::RibbonIcon, message_list:
     icon.set_tooltip_text(Some(if supported { "Pin/Unpin" } else { "Pin isn't available on Graph mail" }));
 }
 
-/// The Mark Read/Unread icon+tooltip for what clicking would currently do -
+/// The Mark as read / Mark as unread icon+label for what clicking would do -
 /// full-opacity icons only (the stock `mail-read-symbolic` has
 /// `fill-opacity: 0.5` baked into its own SVG, which reads as disabled next
 /// to this toolbar's other solid icons): a checkmark when `mark_read_action`
@@ -409,11 +410,14 @@ pub(crate) fn refresh_pin_button(icon: &crate::ribbon::RibbonIcon, message_list:
 /// message row's own hover-quickmenu button (single-message, bind-driven).
 pub(crate) fn mark_read_button_icon(mark_read_action: bool) -> (&'static str, &'static str) {
     if mark_read_action {
-        (themed_icon_name(&["mail-mark-read-symbolic", "object-select-symbolic", "emblem-ok-symbolic"]), "Mark Read")
+        (
+            themed_icon_name(&["mail-mark-read-symbolic", "object-select-symbolic", "emblem-ok-symbolic"]),
+            "Mark as read",
+        )
     } else {
         (
             themed_icon_name(&["mail-mark-unread-symbolic", "mail-unread-symbolic", "emblem-ok-symbolic"]),
-            "Mark Unread",
+            "Mark as unread",
         )
     }
 }
@@ -428,9 +432,10 @@ pub(crate) fn mark_read_button_icon(mark_read_action: bool) -> (&'static str, &'
 pub(crate) fn refresh_mark_read_button(icon: &crate::ribbon::RibbonIcon, message_list: &MessageListModel) {
     let summaries = message_list.selected_summaries();
     let mark_read = summaries.is_empty() || summaries.iter().any(|s| s.is_unread());
-    let (icon_name, tooltip) = mark_read_button_icon(mark_read);
+    let (icon_name, label) = mark_read_button_icon(mark_read);
     icon.set_icon_name(icon_name);
-    icon.set_tooltip_text(Some(tooltip));
+    icon.set_label(label);
+    icon.set_tooltip_text(Some(label));
 }
 
 /// The first of `candidates` the current icon theme actually has. Icon names

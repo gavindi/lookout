@@ -1146,12 +1146,7 @@ pub(crate) fn refresh_mail_overview_day_list(calendar_state: &Rc<RefCell<Calenda
         day_list_box.append(&grid);
     }
 
-    let tasks_header = gtk::Label::builder()
-        .label("Outstanding tasks")
-        .css_classes(["caption-heading"])
-        .xalign(0.0)
-        .margin_top(8)
-        .build();
+    let tasks_header = gtk::Label::builder().label("To Do").css_classes(["caption-heading"]).xalign(0.0).margin_top(8).build();
     crate::privacy::mark_ui(&tasks_header);
     day_list_box.append(&tasks_header);
 
@@ -1933,7 +1928,7 @@ pub(crate) fn event_ics_name(occ: &EventOccurrence) -> String {
 }
 
 /// Opens the "New event" editor prefilled for `suggested_start` (and
-/// optionally `suggested_end`), shared by the Calendar toolbar's New Event
+/// optionally `suggested_end`), shared by the Calendar toolbar's New event
 /// button, the Day/Week grids' highlighted slot ranges, and month-grid day
 /// activation so every entry point behaves identically (a connect-a-calendar
 /// toast when nothing writable exists, the editor otherwise).
@@ -2457,11 +2452,11 @@ pub(crate) fn task_list_names(calendar_state: &Rc<RefCell<CalendarUiState>>) -> 
     names
 }
 
-/// The Tasks navigation pane's rows (item 4.8 / T-01), in Outlook's order:
-/// the smart lists (My Day, Flagged email, Tasks), then every source list -
-/// CalDAV task calendars, Google Tasks lists, To Do lists and local lists -
-/// each with its assigned colour. The trailing "+ New list" row is added by
-/// the view.
+/// The Tasks navigation pane's rows (item 4.8 / T-01, UX-10), in Outlook's
+/// order: the smart lists (My Day, Important, Planned, Flagged email, Tasks),
+/// then every source list - CalDAV task calendars, Google Tasks lists, To Do
+/// lists and local lists - each with its assigned colour. The trailing
+/// "+ New list" row is added by the view.
 pub(crate) fn task_nav_rows(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Vec<crate::tasks_view::TasksNavRow> {
     use crate::tasks_view::{TasksFilter, TasksNavRow};
     let st = calendar_state.borrow();
@@ -2471,6 +2466,18 @@ pub(crate) fn task_nav_rows(calendar_state: &Rc<RefCell<CalendarUiState>>) -> Ve
         TasksNavRow {
             label: "My Day".to_string(),
             filter: TasksFilter::MyDay,
+            color: None,
+            list_id: None,
+        },
+        TasksNavRow {
+            label: "Important".to_string(),
+            filter: TasksFilter::Important,
+            color: None,
+            list_id: None,
+        },
+        TasksNavRow {
+            label: "Planned".to_string(),
+            filter: TasksFilter::Planned,
             color: None,
             list_id: None,
         },
@@ -2761,7 +2768,7 @@ pub(crate) fn route_task_toggle(
 
 /// Opens the task editor for a brand-new task. The picker lists every
 /// task-capable source; when none exists it falls back to a single "Local
-/// (this device)" entry, so New Task always has somewhere to go.
+/// (this device)" entry, so New task always has somewhere to go.
 pub(crate) fn show_new_task_editor(
     window: &adw::ApplicationWindow,
     state: &Rc<RefCell<UiState>>,

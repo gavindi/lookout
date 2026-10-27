@@ -245,6 +245,11 @@
       <summary>Load images from the web</summary>
       <description>Allow the reading pane to load image resources from remote servers.</description>
     </key>
+    <key name="mail-use-server-folder-names" type="b">
+      <default>false</default>
+      <summary>Use server folder names</summary>
+      <description>Show each mail folder under the server's own name instead of Outlook's spelling for well-known folders (Inbox, Drafts, Sent Items, Deleted Items, Junk Email, Archive).</description>
+    </key>
     <key name="mail-focused-inbox-local" type="b">
       <default>false</default>
       <summary>Local Focused Inbox</summary>

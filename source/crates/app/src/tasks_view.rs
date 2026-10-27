@@ -253,10 +253,11 @@ pub fn group_tasks(tasks: &[CalendarTask], now: NaiveDateTime) -> Vec<(TaskBucke
 }
 
 /// Which smart list / source the Tasks navigation pane has selected (item 4.8
-/// / T-01). `All` is Outlook's "Tasks" smart list; `MyDay` the per-day pin set
-/// (item 4.9 / T-02); `Flagged` the follow-up-flagged mail section (item 1.16);
-/// `List` one source (a CalDAV calendar, Google list, To Do list or local
-/// list).
+/// / T-01, UX-10). `All` is Outlook's "Tasks" smart list; `MyDay` the per-day
+/// pin set (item 4.9 / T-02); `Important` high-importance tasks; `Planned`
+/// tasks with a due date; `Flagged` the follow-up-flagged mail section (item
+/// 1.16); `List` one source (a CalDAV calendar, Google list, To Do list or
+/// local list).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TasksFilter {
     /// Every task from every source - Outlook's "Tasks".
@@ -264,6 +265,10 @@ pub enum TasksFilter {
     All,
     /// The My Day pin set plus its due-today/overdue suggestions.
     MyDay,
+    /// Open tasks whose priority marks them important (RFC 5545 1-4).
+    Important,
+    /// Open tasks that have a due date.
+    Planned,
     /// Open follow-up-flagged mail.
     Flagged,
     /// One task list / calendar.
@@ -788,10 +793,12 @@ pub fn set_tasks(view: &TasksView, tasks: &[CalendarTask], colors: &CalendarColo
     // task list renders `All` and a single `List`.
     match selected {
         TasksFilter::MyDay | TasksFilter::Flagged => return,
-        TasksFilter::All | TasksFilter::List(_) => {}
+        TasksFilter::All | TasksFilter::Important | TasksFilter::Planned | TasksFilter::List(_) => {}
     }
     let scoped: Vec<CalendarTask> = match &selected {
         TasksFilter::List(calendar_id) => tasks.iter().filter(|task| task.calendar_id == *calendar_id).cloned().collect(),
+        TasksFilter::Important => tasks.iter().filter(|task| task_is_important(task)).cloned().collect(),
+        TasksFilter::Planned => tasks.iter().filter(|task| task.due.is_some()).cloned().collect(),
         _ => tasks.to_vec(),
     };
     let visible: Vec<CalendarTask> = if show_completed {
@@ -1074,6 +1081,12 @@ pub(crate) fn task_row(
     }
     button.connect_clicked(move |_| activate(task.clone()));
     button
+}
+
+/// Whether RFC 5545's `PRIORITY` marks a task important (1-4; 5 is normal and
+/// 0 undefined).
+fn task_is_important(task: &CalendarTask) -> bool {
+    (1..=4).contains(&task.priority.0)
 }
 
 fn task_completed(task: &CalendarTask) -> bool {

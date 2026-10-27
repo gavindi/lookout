@@ -95,6 +95,7 @@ enum Look {
 #[derive(Clone)]
 pub(crate) struct RibbonIcon {
     image: gtk::Image,
+    label: glib::WeakRef<gtk::Label>,
     button: glib::WeakRef<gtk::Widget>,
 }
 
@@ -102,6 +103,18 @@ impl RibbonIcon {
     /// Swap the glyph, as the button's own `set_icon_name` used to.
     pub(crate) fn set_icon_name(&self, name: &str) {
         self.image.set_icon_name(Some(name));
+    }
+
+    /// Swap the control's label, for a command whose name names the action
+    /// it will take (Mark as read / Mark as unread, UX-07). The accessible
+    /// name follows so assistive technology hears the same wording.
+    pub(crate) fn set_label(&self, text: &str) {
+        if let Some(label) = self.label.upgrade() {
+            label.set_label(text);
+        }
+        if let Some(button) = self.button.upgrade() {
+            button.update_property(&[gtk::accessible::Property::Label(text)]);
+        }
     }
 
     /// Update the owning button's tooltip (Pin/Unpin, Mark Read/Unread).
@@ -438,6 +451,7 @@ impl RibbonGroup {
         self.register_widget(widget.clone(), content.downgrade(), image.downgrade(), label.downgrade(), size);
         RibbonIcon {
             image,
+            label: label.downgrade(),
             button: widget.downgrade(),
         }
     }

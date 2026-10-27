@@ -30,7 +30,7 @@ fn new_step_id() -> String {
 /// Presents the modal Quick Steps manager, anchored to `anchor`'s window.
 pub(crate) fn show_manage_quick_steps_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
     let dialog = {
-        let mut builder = gtk::Window::builder().modal(true).title("Quick Steps").default_width(640).default_height(560);
+        let mut builder = gtk::Window::builder().modal(true).title("Quick steps").default_width(640).default_height(560);
         if let Some(win) = anchor.root().and_downcast::<gtk::Window>() {
             builder = builder.transient_for(&win);
         }
@@ -40,7 +40,7 @@ pub(crate) fn show_manage_quick_steps_dialog(anchor: &gtk::Widget, state: Rc<Ref
     let page = adw::PreferencesPage::new();
     page.set_vexpand(true);
     let hint = gtk::Label::builder()
-        .label("Quick Steps run on the messages you select, in any folder. They appear in the Mail ribbon's Quick steps menu, and the first nine are bound to Ctrl+Shift+1 to Ctrl+Shift+9 in this order. Stored on this device.")
+        .label("Quick steps run on the messages you select, in any folder. They appear in the Mail ribbon's Quick steps menu, and the first nine are bound to Ctrl+Shift+1 to Ctrl+Shift+9 in this order. Stored on this device.")
         .wrap(true)
         .halign(gtk::Align::Start)
         .css_classes(["dim-label"])
@@ -61,7 +61,7 @@ pub(crate) fn show_manage_quick_steps_dialog(anchor: &gtk::Widget, state: Rc<Ref
             groups.borrow_mut().clear();
 
             let steps: Vec<QuickStep> = state.borrow().app_config.borrow().quick_steps.clone();
-            let group = adw::PreferencesGroup::builder().title("Quick Steps").build();
+            let group = adw::PreferencesGroup::builder().title("Quick steps").build();
             if steps.is_empty() {
                 let empty = gtk::Label::builder()
                     .label("No quick steps yet. Create one below; it appears in the ribbon's Quick steps menu.")

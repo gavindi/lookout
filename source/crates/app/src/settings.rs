@@ -127,6 +127,7 @@ pub const MAIL_INTERNAL_DOMAINS: &str = "mail-internal-domains";
 /// action.
 pub const MAIL_REPORT_PHISHING_ADDRESS: &str = "mail-report-phishing-address";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
+pub const MAIL_USE_SERVER_FOLDER_NAMES: &str = "mail-use-server-folder-names";
 /// Config → Mail → "Focused Inbox": whether non-Microsoft accounts sort the
 /// Inbox into Focused/Other with the local classifier (M-03 / item 2.12).
 pub const MAIL_FOCUSED_INBOX_LOCAL: &str = "mail-focused-inbox-local";
@@ -303,6 +304,37 @@ fn create_gio_settings() -> Option<gio::Settings> {
     None
 }
 
+/// The "Use server folder names" preference, mirrored in memory so the folder
+/// rows and menus painted immediately after a toggle already use the new
+/// names - a second `gio::Settings` instance would only see the write on the
+/// backend's next change notification. Loaded from the settings store at
+/// startup and updated by the Config switch (UX-03).
+static USE_SERVER_FOLDER_NAMES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the folder pane should show the server's own folder names instead
+/// of Outlook's spelling for well-known roles (UX-03).
+pub fn use_server_folder_names() -> bool {
+    USE_SERVER_FOLDER_NAMES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the in-memory mirror of the "Use server folder names" preference
+/// (UX-03); the caller persists it to GSettings separately.
+pub fn set_use_server_folder_names(value: bool) {
+    USE_SERVER_FOLDER_NAMES.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The name to show for an already-loaded mailbox, honouring the "Use server
+/// folder names" preference (UX-03).
+pub fn folder_display_name(mailbox: &lookout_core::Mailbox) -> String {
+    folder_display_name_of(&mailbox.name, mailbox.role)
+}
+
+/// [`folder_display_name`] for a mailbox that isn't loaded (a restored folder
+/// selection whose account hasn't listed its folders yet).
+pub fn folder_display_name_of(name: &str, role: lookout_core::MailboxRole) -> String {
+    lookout_core::display_name_for(name, role, use_server_folder_names())
+}
+
 /// The in-memory backend's initial state, mirroring the schema's defaults so
 /// the session-only path behaves identically to a fresh GSettings store.
 fn defaults() -> HashMap<&'static str, Value> {
@@ -346,6 +378,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_INTERNAL_DOMAINS, Value::Strv(Vec::new()));
     map.insert(MAIL_REPORT_PHISHING_ADDRESS, Value::String(String::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
+    map.insert(MAIL_USE_SERVER_FOLDER_NAMES, Value::Bool(false));
     map.insert(MAIL_FOCUSED_INBOX_LOCAL, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));

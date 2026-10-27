@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
-use lookout_core::{display_name, AccountId, Mailbox, MailboxId, MailboxRole};
+use lookout_core::{AccountId, Mailbox, MailboxId, MailboxRole};
 use lookout_mail::mailbox_name::{is_same_or_descendant, parent_mailbox_id, rekey_mailbox_id};
 
 use crate::calendar_colors::CALENDAR_PALETTE;
@@ -414,7 +414,7 @@ pub fn present_move_dialog(parent: &gtk::Widget, mailbox: &Mailbox, folders: Vec
     );
     present_folder_picker(
         parent,
-        &format!("Move \u{201c}{}\u{201d}", display_name(&mailbox.name)),
+        &format!("Move \u{201c}{}\u{201d}", crate::settings::folder_display_name(mailbox)),
         "Choose the folder to move it into.",
         "Move",
         rows,
@@ -437,7 +437,7 @@ pub fn folder_picker_rows(folders: Vec<Mailbox>, account_id: &AccountId, exclude
     ordered
         .into_iter()
         .filter(|(folder, _)| !exclude(folder))
-        .map(|(folder, depth)| (folder.id.clone(), display_name(&folder.name), depth))
+        .map(|(folder, depth)| (folder.id.clone(), crate::settings::folder_display_name(&folder), depth))
         .collect()
 }
 
@@ -507,7 +507,7 @@ pub fn present_folder_picker<T: Clone + 'static>(parent: &gtk::Widget, heading: 
 /// (or an account with no Trash): it is deleted for good, so the dialog says
 /// so and the button is destructive; otherwise it is moved under Trash.
 pub fn present_delete_dialog(parent: &gtk::Widget, mailbox: &Mailbox, permanent: bool, on_confirm: impl Fn() + 'static) {
-    let name = display_name(&mailbox.name);
+    let name = crate::settings::folder_display_name(mailbox);
     let (heading, body, label) = if permanent {
         (
             format!("Permanently delete \u{201c}{name}\u{201d}?"),
@@ -549,7 +549,7 @@ pub fn present_delete_dialog(parent: &gtk::Widget, mailbox: &Mailbox, permanent:
 /// asks first. Shared by the row's hover Empty button and the menu item.
 pub fn present_empty_dialog(parent: &gtk::Widget, mailbox: &Mailbox, on_confirm: impl Fn() + 'static) {
     let dialog = adw::AlertDialog::builder()
-        .heading(format!("Empty {}?", display_name(&mailbox.name)))
+        .heading(format!("Empty {}?", crate::settings::folder_display_name(mailbox)))
         .body("All messages in this folder will be permanently deleted. This cannot be undone.")
         .default_response("cancel")
         .close_response("cancel")

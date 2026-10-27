@@ -113,7 +113,7 @@ same types carry Graph identities (`lookout_graph::mail::identity`):
   `is_attachment`.
 - **`SystemFlagBit`** — `Seen | Answered | Flagged | Deleted | Draft` (RFC 3501 §2.3.2), excluding
   `\Recent` deliberately (session-scoped, not cacheable).
-- **Color tags** are implemented as IMAP custom keywords: `$Lookout-tag-<key>`
+- **Categories** are implemented as IMAP custom keywords: `$Lookout-tag-<key>`
   (`TAG_KEYWORD_PREFIX`), following the `$`-prefix convention other clients use for custom
   keywords. `tag_keyword`/`tag_key_from_keyword`/`sanitize_tag_key` round-trip between the two.
 - **`Mailbox`** — `id`, `account_id`, `name`, `parent: Option<MailboxId>`, `delimiter`,
@@ -903,7 +903,7 @@ address-book picker (§8.5 above, `compose.rs`), modeled on `identities.rs::show
 dialog skeleton; `reminders.rs` — VALARM-driven desktop notifications, fire/
 snooze state in `ui_state_db`; `recipient_entry.rs` — composer chip fields, repopulate-from-truth
 like `MessageListModel`; `signatures.rs`/`identities.rs` — Config editors writing through to
-`AppConfig`; `tags.rs` — client-side color-tag definitions (JSON file), applied server-side as
+`AppConfig`; `categories.rs` — client-side category definitions (JSON file), applied server-side as
 IMAP keywords; `trusted_senders.rs` — remote-content trust dialog; `task_editor.rs`/
 `tasks_view.rs` — VTODO editor and grouped list; `other_accounts.rs` — manual IMAP/SMTP account
 management, keyring-backed; `theme.rs` — bundled named-color CSS theming; `background_image.rs`
