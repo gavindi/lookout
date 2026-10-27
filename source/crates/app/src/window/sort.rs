@@ -34,17 +34,86 @@ pub(crate) type SortApplier = Rc<dyn Fn(SortKey, bool, bool)>;
 /// owns the applier, so a strong reference here would cycle).
 pub(crate) type HeaderCaret = Rc<RefCell<Weak<ColumnHeader>>>;
 
-/// Below this list-pane width, the single-line columns cannot all fit and the
-/// three-line row reads better - but a bottom/off reading pane always has the
-/// full window width, so it always gets the single-line layout.
-pub(crate) const SINGLE_LINE_MIN_WIDTH: i32 = 740;
+/// The width at which the automatic layout switches to Outlook's single-line
+/// columns. Deliberately derived from the column model
+/// (`message_columns::preferred_single_line_width`) rather than a second
+/// hand-maintained number: the threshold is always "the default columns fit".
+pub(crate) fn automatic_single_line_width() -> i32 {
+    crate::message_columns::preferred_single_line_width()
+}
 
-/// Which row layout the list uses. `reading_pane_position` is the stored
-/// "right" / "bottom" / "off" choice; "off" is the reading pane being hidden.
-pub(crate) fn is_single_line(reading_pane_position: &str, width: i32) -> bool {
-    match reading_pane_position {
-        "off" | "bottom" => true,
-        _ => width >= SINGLE_LINE_MIN_WIDTH,
+/// Which row layout the list uses (View ▸ Messages ▸ Message layout).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ListStyle {
+    /// Outlook's rule: single-line when the reading pane is bottom/off or the
+    /// list is wide enough, three-line otherwise.
+    Auto,
+    ThreeLine,
+    SingleLine,
+}
+
+impl ListStyle {
+    pub(crate) const ALL: [ListStyle; 3] = [ListStyle::Auto, ListStyle::ThreeLine, ListStyle::SingleLine];
+
+    /// Resolves the stored `mail-list-style` value; an unknown value lands on
+    /// `Auto`, like every other stored-choice helper in `settings.rs`.
+    pub(crate) fn from_setting(value: &str) -> Self {
+        match value {
+            "three-line" => ListStyle::ThreeLine,
+            "single-line" => ListStyle::SingleLine,
+            _ => ListStyle::Auto,
+        }
+    }
+
+    /// The value written to `mail-list-style` and used by the action state.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            ListStyle::Auto => "auto",
+            ListStyle::ThreeLine => "three-line",
+            ListStyle::SingleLine => "single-line",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ListStyle::Auto => "Automatic",
+            ListStyle::ThreeLine => "Three-line",
+            ListStyle::SingleLine => "Single-line",
+        }
+    }
+}
+
+/// The message list's current width, read from the split it lives in. In the
+/// horizontal (reading pane right) layout the paned's `position` is the start
+/// child's width, i.e. the list pane; in the vertical layout the full paned
+/// width is used, though the automatic rule already forces single-line there.
+/// `GtkPaned:position` is a real notifying property, unlike `GtkWidget:width`.
+pub(crate) fn list_pane_width(paned: &gtk::Paned) -> i32 {
+    if paned.orientation() == gtk::Orientation::Horizontal {
+        // With the end child hidden (Reading pane Off), the start child takes
+        // the whole allocation, so the remembered position is not its width.
+        let end_visible = paned.end_child().is_some_and(|child| child.is_visible());
+        if end_visible {
+            paned.position().max(0)
+        } else {
+            paned.width().max(0)
+        }
+    } else {
+        paned.width().max(0)
+    }
+}
+
+/// Whether `style` puts the list in the single-line columnar layout.
+/// `reading_pane_position` is the stored "right" / "bottom" / "off" choice;
+/// "off" is the reading pane being hidden. A forced style ignores both.
+pub(crate) fn single_line_for(style: ListStyle, reading_pane_position: &str, width: i32) -> bool {
+    match style {
+        ListStyle::SingleLine => true,
+        ListStyle::ThreeLine => false,
+        ListStyle::Auto => match reading_pane_position {
+            "off" | "bottom" => true,
+            _ => width >= automatic_single_line_width(),
+        },
     }
 }
 
@@ -117,22 +186,38 @@ mod tests {
 
     #[test]
     fn a_bottom_or_hidden_reading_pane_always_gets_the_columnar_list() {
-        assert!(is_single_line("bottom", 0));
-        assert!(is_single_line("off", 0));
+        assert!(single_line_for(ListStyle::Auto, "bottom", 0));
+        assert!(single_line_for(ListStyle::Auto, "off", 0));
     }
 
     #[test]
     fn a_right_reading_pane_gets_it_only_when_the_list_is_wide() {
-        assert!(!is_single_line("right", 0));
-        assert!(!is_single_line("right", SINGLE_LINE_MIN_WIDTH - 1));
-        assert!(is_single_line("right", SINGLE_LINE_MIN_WIDTH));
-        assert!(is_single_line("right", 1600));
+        let threshold = automatic_single_line_width();
+        assert_eq!(threshold, crate::message_columns::row_width(&crate::message_columns::DEFAULT_COLUMNS));
+        assert!(!single_line_for(ListStyle::Auto, "right", 0));
+        assert!(!single_line_for(ListStyle::Auto, "right", threshold - 1));
+        assert!(single_line_for(ListStyle::Auto, "right", threshold));
+        assert!(single_line_for(ListStyle::Auto, "right", 1600));
     }
 
     #[test]
     fn an_unknown_position_behaves_like_right() {
-        assert!(!is_single_line("sideways", 400));
-        assert!(is_single_line("sideways", 900));
+        assert!(!single_line_for(ListStyle::Auto, "sideways", 400));
+        assert!(single_line_for(ListStyle::Auto, "sideways", 900));
+    }
+
+    #[test]
+    fn a_forced_style_ignores_the_pane_and_width() {
+        assert!(single_line_for(ListStyle::SingleLine, "right", 0));
+        assert!(!single_line_for(ListStyle::ThreeLine, "bottom", 1600));
+        assert_eq!(ListStyle::from_setting("single-line"), ListStyle::SingleLine);
+        assert_eq!(ListStyle::from_setting("three-line"), ListStyle::ThreeLine);
+        assert_eq!(ListStyle::from_setting("auto"), ListStyle::Auto);
+        assert_eq!(ListStyle::from_setting("nonsense"), ListStyle::Auto);
+        for style in [ListStyle::Auto, ListStyle::ThreeLine, ListStyle::SingleLine] {
+            assert_eq!(ListStyle::from_setting(style.code()), style);
+            assert!(!style.label().is_empty());
+        }
     }
 
     #[test]

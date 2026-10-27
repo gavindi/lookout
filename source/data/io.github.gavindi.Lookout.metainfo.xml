@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.291" date="2026-10-28">
+      <description>
+        <p>The message list can now switch between Automatic, Three-line and Single-line from View, Messages. Automatic follows the width of the list pane while the divider is dragged, and no longer gets stuck in the column layout because the columns themselves made the pane too wide to shrink; the pane can now narrow enough to fall back to the three-line rows.</p>
+      </description>
+    </release>
     <release version="0.9.290" date="2026-10-28">
       <description>
         <p>The mail list gains Outlook's single-line layout, shown when the reading pane is at the bottom or the list is wide enough for columns. Click a column header to sort by it, right-click one to choose which columns appear or reset them, and the choice is remembered. Conversation rows line up under the same columns, and the sort menu, direction button and View ribbon share the new ordering with the headers.</p>

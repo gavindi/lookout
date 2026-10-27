@@ -173,7 +173,12 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) thread_box: gtk::Box,
     /// The conversation header's three-line column and single-line band.
     pub(crate) thread_three_line: gtk::Box,
-    pub(crate) thread_single_line: gtk::Box,
+    /// The no-scroll viewport around `thread_single_line`. It is the widget
+    /// that is shown/hidden (and registered for display changes): a scrolled
+    /// window reports a small minimum width, so the single-line column band
+    /// cannot force the whole message pane wider than the automatic layout
+    /// threshold - which would otherwise lock the list in column mode.
+    pub(crate) thread_single_line_wrapper: gtk::ScrolledWindow,
     pub(crate) thread_single_cells: Vec<(crate::message_columns::MessageColumn, gtk::Widget)>,
     pub(crate) thread_single_sender: gtk::Label,
     pub(crate) thread_single_subject: gtk::Label,
@@ -266,7 +271,10 @@ pub(crate) struct MessageRowWidgets {
     /// bottom/off). Both variants are built once per recycled row and toggled
     /// by [`RowDisplay::apply`]; `single_cells` carries each column's cell
     /// widget so the header's column choice can hide/show it.
-    pub(crate) single_line: gtk::Box,
+    /// The no-scroll viewport around `single_line`; see
+    /// `thread_single_line_wrapper`. This is the widget toggled by
+    /// [`RowDisplay::apply`].
+    pub(crate) single_line_wrapper: gtk::ScrolledWindow,
     pub(crate) single_cells: Vec<(crate::message_columns::MessageColumn, gtk::Widget)>,
     pub(crate) single_sender: gtk::Label,
     pub(crate) single_to: gtk::Label,
@@ -390,9 +398,9 @@ pub(crate) struct RowDisplayRefs {
     /// so a list-style change reaches rows already on screen (see
     /// [`RowDisplay::apply`]).
     pub(crate) three_line: glib::WeakRef<gtk::Box>,
-    pub(crate) single_line: glib::WeakRef<gtk::Box>,
+    pub(crate) single_line: glib::WeakRef<gtk::ScrolledWindow>,
     pub(crate) thread_three_line: glib::WeakRef<gtk::Box>,
-    pub(crate) thread_single_line: glib::WeakRef<gtk::Box>,
+    pub(crate) thread_single_line: glib::WeakRef<gtk::ScrolledWindow>,
     /// The conversation row's `TreeExpander` wraps the three-line column; it
     /// has to be hidden as a whole in the single-line layout, or its chevron
     /// would offset the columns.
@@ -443,7 +451,7 @@ impl RowDisplay {
     /// favour of the checkbox, and the list style swaps the three-line text
     /// column for the single-line column band.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply(self, avatar: &gtk::Overlay, checkbox: &gtk::CheckButton, preview: &gtk::Label, three_line: &gtk::Box, single_line: &gtk::Box) {
+    pub(crate) fn apply(self, avatar: &gtk::Overlay, checkbox: &gtk::CheckButton, preview: &gtk::Label, three_line: &impl IsA<gtk::Widget>, single_line: &impl IsA<gtk::Widget>) {
         avatar.set_visible(!self.select_mode && self.show_sender_images);
         checkbox.set_visible(self.select_mode);
         apply_preview_lines(preview, self.preview_lines);

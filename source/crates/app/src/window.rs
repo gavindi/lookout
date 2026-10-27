@@ -871,7 +871,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The unread accent bar: full row height, flush against the pane's
         // leading edge (which is why `.message-list > row` zeroes its
         // padding), colored only when the message is unread.
-        let accent = gtk::Box::builder().width_request(3).vexpand(true).build();
+        let accent = gtk::Box::builder().width_request(crate::message_columns::UNREAD_ACCENT_WIDTH).vexpand(true).build();
         accent.add_css_class("message-accent-bar");
         // The avatar overlay: a coloured circle with the sender's initials,
         // and on top of it (when there is one) the contact's photo. A photo
@@ -1173,11 +1173,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
         let single_line = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+            .spacing(crate::message_columns::COLUMN_SPACING)
             .hexpand(true)
-            .margin_end(10)
+            .margin_end(crate::message_columns::ROW_TRAILING_MARGIN)
             .valign(gtk::Align::Center)
-            .visible(false)
             .build();
         single_line.add_css_class("message-single-line");
         // The single-line sender, recipient and subject duplicate content the
@@ -1188,6 +1187,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         for (_, cell) in &single_cells {
             single_line.append(cell);
         }
+        // The band's fixed cells must not set the message pane's minimum
+        // width: a scrolled window reports a small minimum and clips instead,
+        // so Automatic can shrink the pane below the column layout's own
+        // width and fall back to the three-line rows.
+        let single_line_wrapper = single_line_viewport(&single_line);
 
         // Same footprint as the avatar it replaces (32x32, centered) so
         // toggling Select mode swaps one for the other in place rather than
@@ -1207,7 +1211,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // replaced it with a checkbox, or "Show sender images" has hidden both.
         let leading_cell = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .width_request(48)
+            .width_request(crate::message_columns::ROW_LEADING_WIDTH - crate::message_columns::UNREAD_ACCENT_WIDTH)
             .halign(gtk::Align::Start)
             .valign(gtk::Align::Start)
             .build();
@@ -1218,7 +1222,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         leading_cell.append(&checkbox);
         message_box.append(&leading_cell);
         message_box.append(&text_column);
-        message_box.append(&single_line);
+        message_box.append(&single_line_wrapper);
 
         // The conversation-header row: its own expander (the section header's
         // expander lives in `header_box`) driving the same sender / subject /
@@ -1465,15 +1469,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
         let thread_single_line = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(8)
+            .spacing(crate::message_columns::COLUMN_SPACING)
             .hexpand(true)
-            .margin_end(10)
+            .margin_end(crate::message_columns::ROW_TRAILING_MARGIN)
             .valign(gtk::Align::Center)
             // Match a message row's height (the 32 px avatar sets it), so a
             // conversation header does not sit shorter than the messages it
             // groups in the single-line layout.
             .height_request(32)
-            .visible(false)
             .build();
         thread_single_line.add_css_class("message-single-line");
         thread_single_line.append(&thread_leading);
@@ -1483,6 +1486,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         for (_, cell) in &thread_single_cells {
             thread_single_line.append(cell);
         }
+        let thread_single_line_wrapper = single_line_viewport(&thread_single_line);
 
         let thread_expander = gtk::TreeExpander::new();
         thread_expander.set_child(Some(&thread_column));
@@ -1490,7 +1494,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let thread_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         thread_box.add_css_class("message-thread-row");
         thread_box.append(&thread_expander);
-        thread_box.append(&thread_single_line);
+        thread_box.append(&thread_single_line_wrapper);
 
         // The avatar/checkbox swap and the preview line count depend on
         // app-wide display settings (Select mode, "Show sender images",
@@ -1505,9 +1509,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             preview_label: preview_label.downgrade(),
             thread_preview_label: thread_preview_label.downgrade(),
             three_line: text_column.downgrade(),
-            single_line: single_line.downgrade(),
+            single_line: single_line_wrapper.downgrade(),
             thread_three_line: thread_column.downgrade(),
-            thread_single_line: thread_single_line.downgrade(),
+            thread_single_line: thread_single_line_wrapper.downgrade(),
             thread_expander: thread_expander.downgrade(),
         });
 
@@ -1967,7 +1971,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     date_label,
                     preview_label,
                     three_line: text_column,
-                    single_line,
+                    single_line_wrapper,
                     single_cells,
                     single_sender,
                     single_to,
@@ -1982,7 +1986,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     single_pin_icon,
                     single_flag_icon,
                     thread_three_line: thread_column,
-                    thread_single_line,
+                    thread_single_line_wrapper,
                     thread_single_cells,
                     thread_single_sender,
                     thread_single_subject,
@@ -2121,9 +2125,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
                 // Display settings that don't change per message: the preview
                 // line count, and whether the avatar is shown at all.
-                row_display_for_bind
-                    .get()
-                    .apply(&widgets.avatar, &widgets.checkbox, &widgets.preview_label, &widgets.three_line, &widgets.single_line);
+                row_display_for_bind.get().apply(
+                    &widgets.avatar,
+                    &widgets.checkbox,
+                    &widgets.preview_label,
+                    &widgets.three_line,
+                    &widgets.single_line_wrapper,
+                );
 
                 let unread = summary.is_unread();
                 widgets.sender_label.set_css_classes(sender_label_classes(unread));
@@ -2239,7 +2247,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     &widgets.checkbox,
                     &widgets.thread_preview_label,
                     &widgets.thread_three_line,
-                    &widgets.thread_single_line,
+                    &widgets.thread_single_line_wrapper,
                 );
                 // A row bound while the single-line layout is already current
                 // hasn't been through `update_row_display`, so hide the
@@ -2573,15 +2581,25 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // --- Which row layout the list uses (M-07 / UX-27) ---
     //
     // Outlook switches to the single-line columnar list when the reading pane
-    // is at the bottom (or off) or the list pane is wide enough. `RowDisplay`
+    // is at the bottom (or off) or the list pane is wide enough; View ▸
+    // Messages ▸ Message layout can force either layout instead. `RowDisplay`
     // drives every live row through the registry, and the header only exists
-    // in this layout.
+    // in the single-line layout.
+    let list_style: Rc<Cell<crate::window::sort::ListStyle>> = Rc::new(Cell::new(crate::window::sort::ListStyle::from_setting(
+        &state.borrow().settings.get_string(crate::settings::MAIL_LIST_STYLE),
+    )));
+    // The list pane width comes from the message/reading split (the paned's
+    // `position`, a real notifying property - `GtkWidget` has no notify-able
+    // `width`), refreshed when that split or the reading pane's orientation
+    // changes. The cell starts at 0 until the first layout pass.
+    let list_width: Rc<Cell<i32>> = Rc::new(Cell::new(0));
     let apply_list_style: Rc<dyn Fn(bool)> = {
         let row_display = row_display.clone();
         let registry = row_display_registry.clone();
         let header = column_header.clone();
-        let scroller = message_scroller.clone();
+        let width = list_width.clone();
         Rc::new(move |single_line: bool| {
+            tracing::debug!("message-list layout: single-line={single_line}");
             let display = RowDisplay { single_line, ..row_display.get() };
             if row_display.get() != display {
                 row_display.set(display);
@@ -2592,29 +2610,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 // Re-fit on every width change while the columns are on
                 // screen: `set_width` only rebuilds when the fitting band
                 // actually changes.
-                header.set_width(scroller.width());
+                header.set_width(width.get());
             }
         })
     };
-    {
-        // A width change can cross the single-line threshold (or shrink the
-        // columns); the reading-pane position stays whatever it was.
+    // The one place the style is re-evaluated from the stored choice, the
+    // current pane width and the reading-pane position.
+    let refresh_list_style: Rc<dyn Fn()> = {
         let state = state.clone();
+        let style = list_style.clone();
+        let width = list_width.clone();
         let apply = apply_list_style.clone();
-        message_scroller.connect_notify_local(Some("width"), move |scroller, _| {
+        Rc::new(move || {
             let choice = crate::window::state::reading_pane_action_state(&state.borrow().settings);
-            apply(crate::window::sort::is_single_line(&choice, scroller.width()));
-        });
-    }
-    // Seed the initial style from the stored reading-pane choice and the
-    // width the window will be laid out at.
-    let apply_list_style_for_pane = apply_list_style.clone();
-    {
-        let state = state.clone();
-        let scroller = message_scroller.clone();
-        let choice = crate::window::state::reading_pane_action_state(&state.borrow().settings);
-        apply_list_style(crate::window::sort::is_single_line(&choice, scroller.width()));
-    }
+            let single_line = crate::window::sort::single_line_for(style.get(), &choice, width.get());
+            tracing::debug!(
+                "message-list style: mode={:?} reading-pane={choice} list-width={} single-line={single_line}",
+                style.get(),
+                width.get()
+            );
+            apply(single_line);
+        })
+    };
+    // Seed the initial style. The pane width is 0 until the first layout; the
+    // split's position/map handlers below set it and refresh.
+    refresh_list_style();
     // The button's `active` state drives each row's avatar/checkbox swap; the
     // shared `row_display` and the row registry make the swap reach rows
     // already on screen (see `update_row_display`). The one side effect that
@@ -3135,6 +3155,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // content stack toggles between the HTML web view and the plain-text
     // view without disturbing the outer crossfade.
     let reading_stack = gtk::Stack::new();
+    // Size to the page on screen, not the largest page ever added. The
+    // in-place composer and the conversation page have much wider natural
+    // sizes than a single message, and a homogeneous stack made the reading
+    // pane's minimum width the widest of all of them - which in turn capped
+    // how wide the message/reading split could put the message list.
+    reading_stack.set_hhomogeneous(false);
+    reading_stack.set_vhomogeneous(false);
     let content_stack = gtk::Stack::new();
     content_stack.set_widget_name("body");
     content_stack.set_transition_type(gtk::StackTransitionType::None);
@@ -3750,6 +3777,60 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .shrink_end_child(false)
         .position(368)
         .build();
+    // The message list's row style follows the split's position (the list
+    // pane's width). `GtkPaned:position` is a real notifying property, unlike
+    // a widget's `width`; a map-time idle catches the first allocation, and
+    // the reading-pane control below refreshes on an orientation change.
+    let apply_list_style_for_pane = {
+        let paned = messages_reading_paned.clone();
+        let width = list_width.clone();
+        let style = list_style.clone();
+        let apply = apply_list_style.clone();
+        Rc::new(move |choice: &str| {
+            width.set(crate::window::sort::list_pane_width(&paned));
+            let single_line = crate::window::sort::single_line_for(style.get(), choice, width.get());
+            tracing::debug!(
+                "message-list style (pane): mode={:?} reading-pane={choice} list-width={} single-line={single_line}",
+                style.get(),
+                width.get()
+            );
+            apply(single_line);
+        })
+    };
+    {
+        let paned = messages_reading_paned.clone();
+        let width = list_width.clone();
+        let refresh = refresh_list_style.clone();
+        paned.connect_notify_local(Some("position"), move |paned, _| {
+            let width_now = crate::window::sort::list_pane_width(paned);
+            tracing::debug!("message-list split: position={} width={}", paned.position(), width_now);
+            width.set(width_now);
+            refresh();
+        });
+    }
+    {
+        let paned = messages_reading_paned.clone();
+        let width = list_width.clone();
+        let refresh = refresh_list_style.clone();
+        paned.connect_notify_local(Some("orientation"), move |paned, _| {
+            width.set(crate::window::sort::list_pane_width(paned));
+            refresh();
+        });
+    }
+    {
+        let paned = messages_reading_paned.clone();
+        let width = list_width.clone();
+        let refresh = refresh_list_style.clone();
+        paned.connect_map(move |paned| {
+            let paned = paned.clone();
+            let width = width.clone();
+            let refresh = refresh.clone();
+            glib::idle_add_local_once(move || {
+                width.set(crate::window::sort::list_pane_width(&paned));
+                refresh();
+            });
+        });
+    }
     // Apply the persisted visibility here; the View ribbon's "Reading pane"
     // dropdown only re-applies it when the user picks a new position.
     reading_card.set_visible(settings.get_bool(crate::settings::LAYOUT_READING_PANE));
@@ -4673,6 +4754,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         order_section.append(Some(label), Some(&format!("win.conversation-order('{value}')")));
     }
     messages_menu.append_section(Some("Conversation reading pane"), &order_section);
+    // View ▸ Messages ▸ Message layout: Automatic (Outlook's width rule),
+    // Three-line, or Single-line. Forcing a layout is useful on a narrow
+    // window (to try the columns) or a wide one (to keep the taller rows).
+    let layout_section = gio::Menu::new();
+    for style in crate::window::sort::ListStyle::ALL {
+        layout_section.append(Some(style.label()), Some(&format!("win.message-layout('{}')", style.code())));
+    }
+    messages_menu.append_section(Some("Message layout"), &layout_section);
     let messages_button = gtk::MenuButton::builder()
         .icon_name(themed_icon_name(&["mail-unread-symbolic", "mail-read-symbolic", "mail-message-new-symbolic"]))
         .tooltip_text("Messages")
@@ -4685,6 +4774,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         Some(glib::VariantTy::STRING),
         &message_organization_value(settings.get_bool(crate::settings::MAIL_THREADED)).to_variant(),
     );
+    let message_layout_action = gio::SimpleAction::new_stateful("message-layout", Some(glib::VariantTy::STRING), &list_style.get().code().to_variant());
+    {
+        let state = state.clone();
+        let style = list_style.clone();
+        let apply = apply_list_style_for_pane.clone();
+        message_layout_action.connect_activate(move |action, parameter| {
+            let Some(value) = parameter.and_then(|p| p.str()) else { return };
+            let new_style = crate::window::sort::ListStyle::from_setting(value);
+            action.set_state(&new_style.code().to_variant());
+            style.set(new_style);
+            state.borrow().settings.set_string(crate::settings::MAIL_LIST_STYLE, new_style.code());
+            // Read the split's current width now, so switching to Automatic
+            // at a narrow pane leaves column mode even if the cached width is
+            // stale.
+            let choice = crate::window::state::reading_pane_action_state(&state.borrow().settings);
+            apply(&choice);
+        });
+    }
     let conversation_order_action = gio::SimpleAction::new_stateful(
         "conversation-order",
         Some(glib::VariantTy::STRING),
@@ -6088,6 +6195,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     window.add_action(&reading_pane_action);
     window.add_action(&density_action);
     window.add_action(&message_organization_action);
+    window.add_action(&message_layout_action);
     window.add_action(&conversation_order_action);
     window.add_action(&task_sort_action);
     window.add_action(&task_group_action);
@@ -6600,16 +6708,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let suppress_row = suppress_row.clone();
             Rc::new(move |choice: &str, persist: bool| {
                 reading_pane_action.set_state(&choice.to_variant());
-                // The list's row layout follows the pane's position and the
-                // list's width (M-07 / UX-27): bottom or off always has room
-                // for Outlook's columns.
-                apply_list_style_for_pane(crate::window::sort::is_single_line(choice, message_scroller.width()));
                 let store = state.borrow().settings.clone();
                 let visible = choice != "off";
                 if persist {
                     store.set_bool(crate::settings::LAYOUT_READING_PANE, visible);
                 }
                 reading_card.set_visible(visible);
+                // The list's row layout follows the pane's position and the
+                // list's width (M-07 / UX-27): bottom or off always has room
+                // for Outlook's columns. Called after the card's visibility so
+                // Reading pane Off measures the now-full-width list.
+                apply_list_style_for_pane(choice);
                 reading_pane_button.set_tooltip_text(Some(&reading_pane_tooltip(&store)));
                 suppress_row.set(true);
                 reading_pane_row.set_selected(reading_pane_choice_index(choice));
@@ -12886,4 +12995,30 @@ fn contacts_filter_switch_row(label: &str, switch: &gtk::Switch) -> gtk::Box {
     row.append(&text);
     row.append(switch);
     row
+}
+
+/// Wraps a single-line column band in a scrollbar-less viewport.
+///
+/// A `GtkScrolledWindow` deliberately does not propagate its child's minimum
+/// size along the scrollable axis, so the band's fixed column widths cannot
+/// become the message pane's minimum. That matters for the automatic layout:
+/// if the columns set the pane's minimum, the pane can never shrink below
+/// their width, and Automatic would always see a "wide" list and stay in
+/// column mode. With this viewport the pane shrinks normally and the automatic
+/// rule can fall back to the three-line rows; the band is only ever shown at
+/// widths where its fitted columns fit, so the clipped overflow is not seen.
+fn single_line_viewport(child: &impl IsA<gtk::Widget>) -> gtk::ScrolledWindow {
+    let viewport = gtk::ScrolledWindow::builder()
+        .child(child)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(false)
+        .propagate_natural_height(true)
+        .has_frame(false)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    viewport.add_css_class("message-single-line-viewport");
+    viewport
 }

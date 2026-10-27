@@ -238,6 +238,16 @@
       <summary>Single-line message list columns</summary>
       <description>The visible columns of the single-line (wide) message list, in order: importance, attachment, from, to, subject, received, size, categories, flag. Empty shows Outlook's default set.</description>
     </key>
+    <key name="mail-list-style" type="s">
+      <choices>
+        <choice value='auto'/>
+        <choice value='three-line'/>
+        <choice value='single-line'/>
+      </choices>
+      <default>'auto'</default>
+      <summary>Message row layout</summary>
+      <description>How message rows are laid out: automatic (single-line columns when the reading pane is at the bottom or off, or the list is wide enough), three-line (sender, subject and preview), or single-line (Outlook's columnar list).</description>
+    </key>
     <key name="mail-search-scope" type="s">
       <default>'all'</default>
       <summary>Search scope</summary>

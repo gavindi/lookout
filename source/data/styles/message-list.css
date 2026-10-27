@@ -142,6 +142,14 @@ button.message-column-header-button:hover {
 .message-single-line {
     padding: 0;
 }
+/* Scrollbar-less viewports around the single-line band and the column header:
+   their job is to report a small minimum width, so they must not paint a
+   frame or background of their own. */
+.message-single-line-viewport,
+.message-column-header-viewport {
+    background: transparent;
+    border: none;
+}
 .message-single-cell {
     min-height: 22px;
 }

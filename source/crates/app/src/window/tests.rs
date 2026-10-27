@@ -2749,9 +2749,11 @@ fn row_display_applies_select_mode_sender_images_preview_lines_and_layout() {
     let preview = gtk::Label::new(Some("preview"));
     let thread_preview = gtk::Label::new(Some("thread preview"));
     let three_line = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let single_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let single_line = gtk::ScrolledWindow::new();
+    single_line.set_child(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
     let thread_three_line = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let thread_single_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let thread_single_line = gtk::ScrolledWindow::new();
+    thread_single_line.set_child(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
     let thread_expander = gtk::TreeExpander::new();
     let display = RowDisplay {
         select_mode: false,

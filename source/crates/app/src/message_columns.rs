@@ -139,6 +139,39 @@ pub const DEFAULT_COLUMNS: [MessageColumn; 8] = [
 /// same number so its labels sit exactly over their cells.
 pub const ROW_LEADING_WIDTH: i32 = 51;
 
+/// The unread accent bar's width; the rest of [`ROW_LEADING_WIDTH`] is the
+/// avatar/checkbox slot the rows and the header share.
+pub const UNREAD_ACCENT_WIDTH: i32 = 3;
+
+/// The gap between two column cells, used by both the rows and the header and
+/// by every width calculation, so the automatic layout threshold and the
+/// fitting rule can never drift from what is actually drawn.
+pub const COLUMN_SPACING: i32 = 8;
+
+/// The margin after the last column, in the rows and the header.
+pub const ROW_TRAILING_MARGIN: i32 = 10;
+
+/// The width the Subject column is allowed at minimum when deciding whether a
+/// column set fits; the flexible cell itself may take more.
+pub const SUBJECT_MIN_WIDTH: i32 = 90;
+
+/// The width one single-line row needs for `columns`: the leading gutter, the
+/// column cells (with the Subject at its minimum), the gaps between them and
+/// the trailing margin. This is the one width formula the column fitting and
+/// the automatic layout threshold share.
+pub fn row_width(columns: &[MessageColumn]) -> i32 {
+    let cells: i32 = columns.iter().map(|column| if column.expands() { SUBJECT_MIN_WIDTH } else { column.width() }).sum();
+    ROW_LEADING_WIDTH + ROW_TRAILING_MARGIN + cells + COLUMN_SPACING * (columns.len().saturating_sub(1) as i32)
+}
+
+/// The width at which Outlook's default column set fits. The automatic layout
+/// switches to the single-line list at or above this width; it is derived
+/// from the column model, so changing a column width or the spacing moves the
+/// threshold with it.
+pub fn preferred_single_line_width() -> i32 {
+    row_width(&DEFAULT_COLUMNS)
+}
+
 /// Parses the stored `mail-list-columns` value into the configured column
 /// order. Ids that no longer exist are ignored, duplicates are dropped, and an
 /// empty (or entirely unknown) value falls back to [`DEFAULT_COLUMNS`], so a
@@ -183,15 +216,10 @@ pub fn columns_for_width(configured: &[MessageColumn], available: i32) -> Vec<Me
         MessageColumn::Flag,
         MessageColumn::Importance,
     ];
-    // The width the row actually needs for `columns`: the leading gutter, the
-    // trailing margin, each fixed cell (the subject at a readable minimum) and
-    // the 8 px gaps between cells.
-    let width_of = |columns: &[MessageColumn]| -> i32 {
-        let cells: i32 = columns.iter().map(|column| if column.expands() { 90 } else { column.width() }).sum();
-        ROW_LEADING_WIDTH + 10 + cells + 8 * (columns.len().saturating_sub(1) as i32)
-    };
+    // The width each candidate set actually needs - one formula, shared with
+    // the automatic layout threshold (`preferred_single_line_width`).
     for column in SHED_ORDER {
-        if width_of(&columns) <= available {
+        if row_width(&columns) <= available {
             break;
         }
         columns.retain(|candidate| *candidate != column);
@@ -299,6 +327,19 @@ mod tests {
             }
             previous = Some(columns);
         }
+    }
+
+    #[test]
+    fn the_automatic_threshold_is_the_default_columns_preferred_width() {
+        let threshold = preferred_single_line_width();
+        assert_eq!(threshold, row_width(&DEFAULT_COLUMNS));
+        assert_eq!(
+            columns_for_width(&DEFAULT_COLUMNS, threshold),
+            DEFAULT_COLUMNS.to_vec(),
+            "the default set fits exactly at the automatic threshold"
+        );
+        let just_narrower = columns_for_width(&DEFAULT_COLUMNS, threshold - 1);
+        assert!(just_narrower.len() < DEFAULT_COLUMNS.len(), "one column is shed just below it");
     }
 
     #[test]

@@ -152,13 +152,33 @@ pub(crate) fn build_column_header(
     set_sort: Rc<dyn Fn(SortKey, bool, bool)>,
     on_columns_changed: Rc<dyn Fn()>,
 ) -> Rc<ColumnHeader> {
+    let root_build = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(0)
+        .css_classes(["message-column-header"])
+        .build();
+    // The header's fixed column widths must not become the message pane's
+    // minimum: the scrollbar-less viewport clips instead of propagating them,
+    // so Automatic can shrink the pane below the columns and fall back to the
+    // three-line rows. The inner box stays visible; the viewport is toggled.
+    let viewport = gtk::ScrolledWindow::builder()
+        .child(&root_build)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(false)
+        .propagate_natural_height(true)
+        .has_frame(false)
+        .hexpand(true)
+        .visible(false)
+        .build();
+    viewport.add_css_class("message-column-header-viewport");
     Rc::new(ColumnHeader {
         parts: HeaderParts {
             cells: gtk::Box::builder()
                 .orientation(gtk::Orientation::Horizontal)
-                .spacing(8)
+                .spacing(crate::message_columns::COLUMN_SPACING)
                 .hexpand(true)
-                .margin_end(10)
+                .margin_end(crate::message_columns::ROW_TRAILING_MARGIN)
                 .build(),
             buttons: Rc::new(RefCell::new(Vec::new())),
             state,
@@ -167,12 +187,8 @@ pub(crate) fn build_column_header(
             set_sort,
             on_columns_changed,
         },
-        root_build: gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(0)
-            .css_classes(["message-column-header"])
-            .visible(false)
-            .build(),
+        root_build,
+        viewport,
     })
 }
 
@@ -180,16 +196,17 @@ pub(crate) fn build_column_header(
 pub(crate) struct ColumnHeader {
     parts: HeaderParts,
     root_build: gtk::Box,
+    viewport: gtk::ScrolledWindow,
 }
 
 impl ColumnHeader {
-    pub(crate) fn root(&self) -> gtk::Box {
-        self.root_build.clone()
+    pub(crate) fn root(&self) -> gtk::ScrolledWindow {
+        self.viewport.clone()
     }
 
     /// Whether the header is on screen.
     pub(crate) fn set_visible(&self, visible: bool) {
-        self.root_build.set_visible(visible);
+        self.viewport.set_visible(visible);
     }
 
     /// Builds the column buttons once the root is in the widget tree. Called

@@ -115,6 +115,10 @@ pub const MAIL_FILTERS: &str = "mail-filters";
 /// UX-27): a `strv` of `message_columns::MessageColumn` ids. Empty means
 /// Outlook's default set.
 pub const MAIL_LIST_COLUMNS: &str = "mail-list-columns";
+/// How the message list lays its rows out (M-07 / UX-27): `auto` picks the
+/// single-line columnar layout when the reading pane is bottom/off or the list
+/// is wide enough; `three-line` and `single-line` force one.
+pub const MAIL_LIST_STYLE: &str = "mail-list-style";
 /// Config → Mail → search scope: which folders a title-bar search sweeps, one
 /// of `lookout_mail::SearchScope`'s strings (folder / subfolders / account /
 /// all). Defaults to "all", the pre-scope behaviour of searching every
@@ -378,6 +382,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
     map.insert(MAIL_LIST_COLUMNS, Value::Strv(Vec::new()));
+    map.insert(MAIL_LIST_STYLE, Value::String("auto".into()));
     map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(CALENDAR_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(MAIL_INTERNAL_DOMAINS, Value::Strv(Vec::new()));
