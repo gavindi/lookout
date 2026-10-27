@@ -341,6 +341,16 @@ pub enum FocusedScope {
     Sender,
 }
 
+/// The local Focused Inbox classifier's session state (M-03 / item 2.12).
+/// Seeded from [`AccountConfig`] once in `run_account_session` and passed
+/// through `connect_and_run`, so a reconnect keeps the current opt-in and
+/// contact set rather than reverting to the values from process start.
+#[derive(Debug, Clone, Default)]
+struct LocalFocusSettings {
+    enabled: bool,
+    contacts: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum AccountCommand {
     /// Select a mailbox and (re)fetch its envelopes.
@@ -682,6 +692,15 @@ pub enum AccountCommand {
     /// (M-03).
     ClearInferenceOverride {
         sender: String,
+    },
+    /// Enables or disables the local Focused Inbox classifier (M-03 / item
+    /// 2.12), updates its known contacts, and optionally backfills the cached
+    /// Inbox from the Sent folders already in the cache. Sent by the app on
+    /// the Settings switch and whenever the contact set changes.
+    ConfigureLocalFocus {
+        enabled: bool,
+        contacts: Vec<String>,
+        backfill: bool,
     },
     /// Kick off background body prefetch for all mailboxes. The prefetch
     /// runs cooperatively in batches between IDLE cycles, fetching full
@@ -1321,6 +1340,29 @@ pub async fn run_account_session(
         c.set_mention_matcher(lookout_core::MentionMatcher::new(&config.mention_addresses, &config.mention_names));
     }
 
+    // Seed the local Focused Inbox classifier's Sent-recipient set from the
+    // cache before the first sync (M-03 / item 2.12). A setting that was
+    // already on at launch doesn't send a `ConfigureLocalFocus` command, and
+    // the first Sent sync may see everything as already cached - so without
+    // this, known correspondents from previous sessions would be missing
+    // exactly when the first Inbox sync classifies. A later enable goes
+    // through the command's own backfill instead.
+    if config.local_focus_enabled {
+        let account_id = config.account_id.clone();
+        if let Some(Ok(mailboxes)) = cache_op(&cache, move |c| c.load_mailboxes(&account_id)).await {
+            let sent_mailboxes: Vec<MailboxId> = mailboxes
+                .into_iter()
+                .filter(|mailbox| mailbox.role == MailboxRole::Sent)
+                .map(|mailbox| mailbox.id)
+                .collect();
+            if !sent_mailboxes.is_empty() {
+                if let Some(Err(e)) = cache_op(&cache, move |c| c.rebuild_sent_correspondents(&sent_mailboxes)).await {
+                    tracing::warn!("failed to rebuild the local Focused Inbox correspondents: {e}");
+                }
+            }
+        }
+    }
+
     // Fast first paint: emit whatever's cached from the previous session
     // before the network connection even starts. This is immediately
     // superseded by live data once the connection succeeds - the cache is
@@ -1405,6 +1447,14 @@ pub async fn run_account_session(
     // folder whose message can never be parsed instead of looping on it
     // forever (see `PREFETCH_FAILURE_LIMIT`).
     let mut prefetch_failures: HashMap<MailboxId, u32> = HashMap::new();
+    // The local Focused Inbox opt-in and contacts (M-03 / item 2.12). Lives
+    // outside `connect_and_run` so a `ConfigureLocalFocus` command sent while
+    // disconnected survives the reconnect, and the next connection's first
+    // sync classifies with the current setting rather than the startup one.
+    let mut local_focus = LocalFocusSettings {
+        enabled: config.local_focus_enabled,
+        contacts: config.local_focus_contacts.clone(),
+    };
     // Where this session's moves put each message, for undo (`RevertMove`).
     // Outlives a reconnect, like `prefetch_failures`: undo is offered for a
     // few seconds and a network blip in between mustn't defeat it.
@@ -1442,6 +1492,7 @@ pub async fn run_account_session(
             &idle_notify_rx,
             carried_command.take(),
             &mut prefetch_failures,
+            &mut local_focus,
             &mut move_ledger,
             &mut copy_ledger,
         )
@@ -1529,6 +1580,7 @@ async fn connect_and_run(
     idle_notify: &async_channel::Receiver<MailboxId>,
     mut carried_command: Option<AccountCommand>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
+    local_focus: &mut LocalFocusSettings,
     move_ledger: &mut MoveLedger,
     copy_ledger: &mut MoveLedger,
 ) -> Result<ShutdownReason> {
@@ -1593,6 +1645,7 @@ async fn connect_and_run(
         None,
         condstore,
         qresync,
+        local_focus,
     )
     .await?;
 
@@ -1786,6 +1839,7 @@ async fn connect_and_run(
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
+                                    local_focus,
                                 )
                                 .await?;
                                 dirty_mailboxes.remove(&sent_id);
@@ -1811,6 +1865,7 @@ async fn connect_and_run(
                                         Some(&session_selected),
                                         condstore,
                                         qresync,
+                                        local_focus,
                                     )
                                     .await?;
                                     dirty_mailboxes.remove(&current_mailbox_id);
@@ -1923,6 +1978,7 @@ async fn connect_and_run(
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
+                                    local_focus,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -2154,6 +2210,7 @@ async fn connect_and_run(
                     Some(&session_selected),
                     condstore,
                     qresync,
+                    local_focus,
                 )
                 .await?;
                 dirty_mailboxes.remove(&current_mailbox_id);
@@ -2186,6 +2243,7 @@ async fn connect_and_run(
                         Some(&session_selected),
                         condstore,
                         qresync,
+                        local_focus,
                     )
                     .await?;
                     dirty_mailboxes.remove(&current_mailbox_id);
@@ -2256,6 +2314,7 @@ async fn connect_and_run(
                         Some(&session_selected),
                         condstore,
                         qresync,
+                        local_focus,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -2337,6 +2396,7 @@ async fn connect_and_run(
                             Some(&session_selected),
                             condstore,
                             qresync,
+                            local_focus,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -2732,6 +2792,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             dirty_mailboxes.remove(&current_mailbox_id);
@@ -2894,6 +2955,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -2967,6 +3029,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3045,6 +3108,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3157,6 +3221,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3222,6 +3287,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3283,6 +3349,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3342,6 +3409,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3395,6 +3463,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3541,6 +3610,7 @@ async fn connect_and_run(
                         Some(&session_selected),
                         condstore,
                         qresync,
+                        local_focus,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -3688,6 +3758,7 @@ async fn connect_and_run(
                         Some(&session_selected),
                         condstore,
                         qresync,
+                        local_focus,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -3767,6 +3838,7 @@ async fn connect_and_run(
                         Some(&session_selected),
                         condstore,
                         qresync,
+                        local_focus,
                     )
                     .await?;
                     session_selected = current_mailbox_id.clone();
@@ -3824,6 +3896,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -3888,6 +3961,7 @@ async fn connect_and_run(
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
+                                    local_focus,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -3974,6 +4048,7 @@ async fn connect_and_run(
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
+                                    local_focus,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -4085,6 +4160,7 @@ async fn connect_and_run(
                                         Some(&session_selected),
                                         condstore,
                                         qresync,
+                                        local_focus,
                                     )
                                     .await?;
                                     session_selected = current_mailbox_id.clone();
@@ -4124,6 +4200,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4188,6 +4265,7 @@ async fn connect_and_run(
                                         Some(&session_selected),
                                         condstore,
                                         qresync,
+                                        local_focus,
                                     )
                                     .await?;
                                     session_selected = current_mailbox_id.clone();
@@ -4227,6 +4305,7 @@ async fn connect_and_run(
                                 Some(&session_selected),
                                 condstore,
                                 qresync,
+                                local_focus,
                             )
                             .await?;
                             session_selected = current_mailbox_id.clone();
@@ -4276,6 +4355,7 @@ async fn connect_and_run(
                                     Some(&session_selected),
                                     condstore,
                                     qresync,
+                                    local_focus,
                                 )
                                 .await?;
                                 session_selected = current_mailbox_id.clone();
@@ -4421,6 +4501,42 @@ async fn connect_and_run(
                         tracing::warn!("failed to clear a Focused/Other override: {e}");
                     }
                 }
+                AccountCommand::ConfigureLocalFocus { enabled, contacts, backfill } => {
+                    local_focus.enabled = enabled;
+                    local_focus.contacts = contacts;
+                    if backfill && enabled {
+                        // Rebuild the known-sender set from the Sent folders
+                        // already cached on disk (including prefetch rows),
+                        // then classify the cached Inbox. The first-sync path
+                        // above covers everything that arrives after this; this
+                        // is what makes enabling the switch reclassify the mail
+                        // already listed. Only a pass that inserted rows needs a
+                        // repaint.
+                        let sent_mailboxes: Vec<MailboxId> = folders.iter().filter(|folder| folder.role == MailboxRole::Sent).map(|folder| folder.id.clone()).collect();
+                        let contacts = local_focus.contacts.clone();
+                        let inserted = cache_op(cache, {
+                            let inbox_id = inbox_id.clone();
+                            let sent_mailboxes = sent_mailboxes.clone();
+                            move |c| {
+                                if !sent_mailboxes.is_empty() {
+                                    c.rebuild_sent_correspondents(&sent_mailboxes)?;
+                                }
+                                let messages = c.load_messages(&inbox_id)?;
+                                c.classify_local_inference(&messages, &contacts)
+                            }
+                        })
+                        .await;
+                        match inserted {
+                            Some(Ok(inserted)) => {
+                                if inserted > 0 {
+                                    emit_cached_messages(cache, &inbox_id, events).await;
+                                }
+                            }
+                            Some(Err(e)) => tracing::warn!("failed to backfill the local Focused Inbox: {e}"),
+                            None => {}
+                        }
+                    }
+                }
                 AccountCommand::SetImportance { mailbox, uids, importance } => {
                     if uids.is_empty() {
                         continue;
@@ -4552,6 +4668,7 @@ async fn connect_and_run(
                             Some(&session_selected),
                             condstore,
                             qresync,
+                            local_focus,
                         )
                         .await?;
                         session_selected = current_mailbox_id.clone();
@@ -6595,6 +6712,7 @@ async fn sync_mailbox(
     session_selected: Option<&MailboxId>,
     condstore: bool,
     qresync: bool,
+    local_focus: &LocalFocusSettings,
 ) -> Result<()> {
     let _ = events.send(AccountEvent::MailboxSyncStarted { mailbox: mailbox_id.clone() }).await;
     // Any change already reported to this connection is covered by the fetch
@@ -6605,6 +6723,7 @@ async fn sync_mailbox(
     // *during* this sync is left for that check.
     take_mailbox_change(&session.unsolicited_responses);
     let is_sent = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Sent));
+    let is_inbox = folders.iter().find(|f| f.id == *mailbox_id).is_some_and(|f| matches!(f.role, MailboxRole::Inbox));
     // `None` = a fresh session with nothing SELECTed yet (the connect-time
     // INBOX sync). Otherwise, when the session is already on this folder -
     // the IDLE wake path guarantees it via the pre-IDLE re-select, and
@@ -6813,6 +6932,38 @@ async fn sync_mailbox(
                     messages: new_messages.clone(),
                 })
                 .await;
+        }
+
+        // The local Focused Inbox pass (M-03 / item 2.12) runs here, inside
+        // the first sync too, before `connect_and_run`'s command loop starts -
+        // so a fresh account's Inbox is classified as it lands rather than
+        // waiting for the first `ConfigureLocalFocus`. `emit_messages` below
+        // overlays every local property, including the rows this inserts.
+        // Microsoft 365 never reaches this path (`local_focus.enabled` is
+        // false there), so Graph remains its only classifier.
+        if local_focus.enabled {
+            if is_inbox {
+                let contacts = local_focus.contacts.clone();
+                match cache_op(cache, {
+                    let new_messages = new_messages.clone();
+                    move |c| c.classify_local_inference(&new_messages, &contacts)
+                })
+                .await
+                {
+                    Some(Ok(inserted)) if inserted > 0 => tracing::debug!(count = inserted, %mailbox_id, "local Focused Inbox classified new mail"),
+                    Some(Err(e)) => tracing::warn!("failed to classify new mail for {mailbox_id}: {e}"),
+                    _ => {}
+                }
+            } else if is_sent {
+                if let Some(Err(e)) = cache_op(cache, {
+                    let new_messages = new_messages.clone();
+                    move |c| c.record_sent_correspondents(&new_messages)
+                })
+                .await
+                {
+                    tracing::warn!("failed to record Sent correspondents for {mailbox_id}: {e}");
+                }
+            }
         }
 
         messages.extend(new_messages);

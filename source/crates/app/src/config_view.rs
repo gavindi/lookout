@@ -353,6 +353,10 @@ pub struct ConfigView {
     /// "Rich text" switch (Config → Mail), exposed so the caller can wire its
     /// `active` state into the composer's default body mode.
     pub rich_text_row: adw::SwitchRow,
+    /// "Focused Inbox" switch (Config → Mail), exposed so the caller can
+    /// persist the local classifier's opt-in and push it to non-Microsoft
+    /// sessions (M-03 / item 2.12).
+    pub focused_inbox_local_row: adw::SwitchRow,
     /// "Check spelling as you type" switch (Config → Mail), exposed so the
     /// caller can persist it and apply it to the composer's spellchecking.
     pub spell_check_row: adw::SwitchRow,
@@ -787,6 +791,11 @@ pub fn build() -> ConfigView {
         .active(true)
         .build();
     mail_settings_group.add(&rich_text_row);
+    let focused_inbox_local_row = adw::SwitchRow::builder()
+        .title("Focused Inbox")
+        .subtitle("Sort the Inbox into Focused and Other on non-Microsoft accounts")
+        .build();
+    mail_settings_group.add(&focused_inbox_local_row);
     let spell_check_row = adw::SwitchRow::builder()
         .title("Check spelling as you type")
         .subtitle("Underline misspelled words in the composer")
@@ -1332,6 +1341,7 @@ pub fn build() -> ConfigView {
         quick_steps_row,
         automatic_replies_row,
         rich_text_row,
+        focused_inbox_local_row,
         spell_check_row,
         spell_languages_row,
         read_receipts_row,

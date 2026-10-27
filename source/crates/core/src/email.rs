@@ -185,9 +185,10 @@ pub struct EmailSummary {
     pub sensitivity: MessageSensitivity,
     /// The message's Focused Inbox classification (M-03). `Focused` is the
     /// default; on Microsoft 365 it is read from Graph's
-    /// `inferenceClassification` and overlaid from the cache (item 5.4), so an
-    /// un-fetched or non-Microsoft message reads as Focused until item 2.12's
-    /// local heuristic lands.
+    /// `inferenceClassification` and overlaid from the cache (item 5.4), while
+    /// non-Microsoft accounts get the opt-in local classifier (item 2.12),
+    /// whose `Other` rows are overlaid the same way. An unclassified message
+    /// reads as Focused.
     #[serde(default)]
     pub inference_classification: InferenceClassification,
     /// The message's RFC 2919 `List-Id`, when present - the list a mailing

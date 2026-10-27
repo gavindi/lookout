@@ -127,6 +127,9 @@ pub const MAIL_INTERNAL_DOMAINS: &str = "mail-internal-domains";
 /// action.
 pub const MAIL_REPORT_PHISHING_ADDRESS: &str = "mail-report-phishing-address";
 pub const MAIL_LOAD_REMOTE_IMAGES: &str = "mail-load-remote-images";
+/// Config → Mail → "Focused Inbox": whether non-Microsoft accounts sort the
+/// Inbox into Focused/Other with the local classifier (M-03 / item 2.12).
+pub const MAIL_FOCUSED_INBOX_LOCAL: &str = "mail-focused-inbox-local";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
 /// Config → Mail → "Check spelling as you type": whether the composer's
@@ -343,6 +346,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_INTERNAL_DOMAINS, Value::Strv(Vec::new()));
     map.insert(MAIL_REPORT_PHISHING_ADDRESS, Value::String(String::new()));
     map.insert(MAIL_LOAD_REMOTE_IMAGES, Value::Bool(false));
+    map.insert(MAIL_FOCUSED_INBOX_LOCAL, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
     map.insert(MAIL_SPELL_CHECK, Value::Bool(true));
@@ -953,6 +957,16 @@ mod tests {
         assert!(!store.get_bool(ANIMATE_TRANSITIONS));
         store.set_bool(ANIMATE_TRANSITIONS, true);
         assert!(store.get_bool(ANIMATE_TRANSITIONS));
+    }
+
+    #[test]
+    fn focused_inbox_local_defaults_off_and_round_trips() {
+        let store = resolve();
+        assert!(!store.get_bool(MAIL_FOCUSED_INBOX_LOCAL));
+        store.set_bool(MAIL_FOCUSED_INBOX_LOCAL, true);
+        assert!(store.get_bool(MAIL_FOCUSED_INBOX_LOCAL));
+        store.set_bool(MAIL_FOCUSED_INBOX_LOCAL, false);
+        assert!(!store.get_bool(MAIL_FOCUSED_INBOX_LOCAL));
     }
 
     #[test]

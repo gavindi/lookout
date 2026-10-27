@@ -98,6 +98,16 @@ pub(crate) struct AccountHandle {
     /// mailbox's automatic replies (item 2.11 / M-24) through Graph, once the
     /// account has granted Graph access. See `graph_automatic_replies`.
     pub(crate) graph_automatic_replies: Option<Rc<crate::graph_automatic_replies::GraphAutomaticRepliesClient>>,
+    /// Whether this account is a Microsoft 365 mailbox (including a shared
+    /// mailbox using its parent's token). Focused Inbox availability branches
+    /// on this: Microsoft 365 uses Graph, every other account the local
+    /// classifier's opt-in setting (M-03 / item 2.12).
+    pub(crate) microsoft_365: bool,
+    /// The contact addresses last pushed to this account's local Focused
+    /// Inbox classifier. Compared before sending another
+    /// `ConfigureLocalFocus`, so a contact poll that changed nothing doesn't
+    /// churn the session.
+    pub(crate) local_focus_contacts: Vec<String>,
     /// Whether this account's server advertised ManageSieve at login (item
     /// 2.5), from `AccountEvent::SieveAdvertised`. Gates offering the Sieve
     /// backend for the account.

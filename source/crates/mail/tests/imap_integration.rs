@@ -82,6 +82,8 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         email: "testuser@localhost".to_string(),
         mention_addresses: vec!["testuser@localhost".to_string()],
         mention_names: vec!["Test Account".to_string()],
+        local_focus_enabled: false,
+        local_focus_contacts: Vec::new(),
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,
@@ -726,6 +728,8 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
         email: "testuser@localhost".to_string(),
         mention_addresses: vec!["testuser@localhost".to_string()],
         mention_names: vec!["Test Account".to_string()],
+        local_focus_enabled: false,
+        local_focus_contacts: Vec::new(),
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,

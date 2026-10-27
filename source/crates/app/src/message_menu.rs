@@ -374,7 +374,8 @@ pub fn message_menu_description(state: &MessageMenuState, choices: &MenuChoices)
     };
     menu = menu.submenu("Categorize", MenuDescription::new().section().custom(CATEGORIZE_SLOT));
     // Tags group (M-12, M-03): Importance ▸ is universal; Focused Inbox ▸ is
-    // offered only on an account that provides a classification (item 5.4).
+    // offered on an account that provides a classification - Graph on
+    // Microsoft 365, the local classifier elsewhere (items 5.4, 2.12).
     menu = menu.submenu(
         "Importance",
         MenuDescription::new()

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.288" date="2026-10-27">
+      <description>
+        <p>Focused Inbox now works on every account, not just Microsoft 365. An opt-in switch in Settings, Mail sorts the Inbox into Focused and Other: mail from contacts and people you have written to stays Focused, mailing-list mail goes to Other, and moving a sender always wins. Microsoft 365 continues to use Outlook's own classification. The Focused/Other tabs appear above the Inbox and the message menu gains Move to, Always move and Stop moving for local accounts too.</p>
+      </description>
+    </release>
     <release version="0.9.287" date="2026-10-24">
       <description>
         <p>People can now merge duplicate contacts. Lookout finds copies within an account that share an email address, phone number or name, then lets you choose which contact to keep and pick a value for every field before the other copies are deleted. The merge only proceeds once the kept contact has been saved, and favourites move across with it.</p>

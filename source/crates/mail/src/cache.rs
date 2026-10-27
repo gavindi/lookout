@@ -807,6 +807,16 @@ impl Cache {
                 override_id TEXT,
                 updated_at INTEGER NOT NULL
             );
+            -- Addressees of mail the user has sent, used by the local Focused
+            -- Inbox classifier (M-03 / item 2.12) to treat a correspondent as
+            -- known on non-Microsoft accounts. Append-only: a rebuild from the
+            -- cached Sent folders replaces it, and the envelope wipe leaves it
+            -- untouched, so no `user_version` bump. Empty on Microsoft 365,
+            -- whose classification comes from Graph.
+            CREATE TABLE IF NOT EXISTS sent_correspondents (
+                address TEXT PRIMARY KEY,
+                last_seen INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS graph_delta_cursor (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 cursor TEXT NOT NULL,
@@ -2652,6 +2662,143 @@ impl Cache {
         Ok(())
     }
 
+    /// Records the recipients of sent mail for the local Focused Inbox
+    /// classifier (M-03 / item 2.12): the union of every message's `To` and
+    /// `Cc` addresses, normalised for case-insensitive matching.
+    pub fn record_sent_correspondents(&self, messages: &[EmailSummary]) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO sent_correspondents (address, last_seen) VALUES (?1, ?2) \
+                 ON CONFLICT(address) DO UPDATE SET last_seen = excluded.last_seen",
+            )?;
+            for message in messages {
+                for recipient in message.to.iter().chain(&message.cc) {
+                    let address = lookout_core::normalize_address(&recipient.address);
+                    if !address.is_empty() {
+                        stmt.execute(rusqlite::params![address, now])?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The known correspondents recorded from sent mail, lowercased.
+    pub fn sent_correspondents(&self) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT address FROM sent_correspondents")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut addresses = HashSet::new();
+        for row in rows {
+            addresses.insert(row?);
+        }
+        Ok(addresses)
+    }
+
+    /// Rebuilds the sent-correspondent set from the cached envelopes of the
+    /// account's Sent folders, including the background prefetch's `partial`
+    /// rows, so enabling the local classifier can learn the user's existing
+    /// correspondents without waiting for those folders to be synced again.
+    pub fn rebuild_sent_correspondents(&self, sent_mailboxes: &[MailboxId]) -> Result<()> {
+        let now = Utc::now().timestamp();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM sent_correspondents", [])?;
+        {
+            let mut select = tx.prepare("SELECT data FROM messages WHERE mailbox_id = ?1")?;
+            let mut upsert = tx.prepare(
+                "INSERT INTO sent_correspondents (address, last_seen) VALUES (?1, ?2) \
+                 ON CONFLICT(address) DO UPDATE SET last_seen = excluded.last_seen",
+            )?;
+            for mailbox_id in sent_mailboxes {
+                let rows = select.query_map([&mailbox_id.0], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let Ok(message) = serde_json::from_str::<EmailSummary>(&row?) else { continue };
+                    for recipient in message.to.iter().chain(&message.cc) {
+                        let address = lookout_core::normalize_address(&recipient.address);
+                        if !address.is_empty() {
+                            upsert.execute(rusqlite::params![address, now])?;
+                        }
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Runs the local Focused Inbox classifier over `messages` (M-03 / item
+    /// 2.12), storing only `Other` results - `Focused` is the default and
+    /// needs no row. `contacts` are the user's address-book entries; the
+    /// account's sent correspondents are loaded here. Messages that already
+    /// have a local classification (an earlier heuristic pass or an explicit
+    /// "Move to Focused/Other") are left exactly as they are.
+    ///
+    /// Returns how many `Other` rows were inserted, so the caller can re-emit
+    /// a folder only when the classification actually changed something.
+    pub fn classify_local_inference(&self, messages: &[EmailSummary], contacts: &[String]) -> Result<usize> {
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let overrides: HashMap<String, InferenceClassification> = {
+            let mut stmt = tx.prepare("SELECT sender, classify_as FROM inference_overrides")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, classification_from_code(row.get(1)?))))?;
+            let mut overrides = HashMap::new();
+            for row in rows {
+                let (sender, classification) = row?;
+                overrides.insert(lookout_core::normalize_address(&sender), classification);
+            }
+            overrides
+        };
+        let mut known: HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT address FROM sent_correspondents")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        known.extend(
+            contacts
+                .iter()
+                .map(|address| lookout_core::normalize_address(address))
+                .filter(|address| !address.is_empty()),
+        );
+        let mut classified: HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT message_key FROM local_inference")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let now = Utc::now().timestamp();
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare("INSERT OR IGNORE INTO local_inference (message_key, classification, updated_at) VALUES (?1, ?2, ?3)")?;
+            for message in messages {
+                let key = follow_up_key(message);
+                if classified.contains(&key) {
+                    continue;
+                }
+                let sender = message
+                    .from
+                    .first()
+                    .map(|address| lookout_core::normalize_address(&address.address))
+                    .filter(|address| !address.is_empty());
+                let override_class = sender.as_ref().and_then(|sender| overrides.get(sender)).copied();
+                let known_sender = sender.as_ref().is_some_and(|sender| known.contains(sender));
+                let classification = lookout_core::classify_focused(sender.as_deref(), message.list_id.as_deref(), override_class, known_sender);
+                if classification == InferenceClassification::Other {
+                    inserted += stmt.execute(rusqlite::params![key, classification_code(classification), now])?;
+                }
+                classified.insert(key);
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
     /// Replaces the local Focused/Other override rows with a Graph snapshot
     /// (M-03 / item 5.4), keyed by sender. A row changed here after `taken_at`
     /// (an override just set, not yet on Graph) is kept as it is.
@@ -4144,6 +4291,133 @@ mod tests {
         assert_eq!(rows[1].sender, "outlook@x");
         assert_eq!(rows[1].classify_as, lookout_core::InferenceClassification::Focused);
         assert_eq!(rows[1].override_id.as_deref(), Some("o1"));
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The local classifier's Sent-recipient set records To/Cc addresses
+    /// lowercased, reads back, and can be rebuilt from the cached rows of the
+    /// account's Sent folders - including the background prefetch's `partial`
+    /// rows.
+    #[test]
+    fn sent_correspondents_record_read_and_rebuild_from_cached_sent_folders() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        let sent = MailboxId::new(&account_id, "Sent");
+
+        // A stale entry proves the rebuild replaces rather than accumulates.
+        let mut stale = sample_summary(&inbox, 99, None);
+        stale.to = vec![EmailAddress::new("stale@example.com")];
+        cache.record_sent_correspondents(&[stale]).unwrap();
+        assert!(cache.sent_correspondents().unwrap().contains("stale@example.com"));
+
+        let mut first = with_message_id(sample_summary(&sent, 1, None), "sent-one@x");
+        first.to = vec![EmailAddress::new("Ada@Example.com")];
+        first.cc = vec![EmailAddress::new("bob@example.com")];
+        let mut second = with_message_id(sample_summary(&sent, 2, None), "sent-two@x");
+        second.to = vec![EmailAddress::new("carol@example.com")];
+        // Prefetch rows are `partial`, and a rebuild must still see them.
+        cache.store_partial_messages(&sent, UidValidity(1), &[first.clone(), second]).unwrap();
+
+        cache.record_sent_correspondents(std::slice::from_ref(&first)).unwrap();
+        let recorded = cache.sent_correspondents().unwrap();
+        assert!(recorded.contains("ada@example.com"));
+        assert!(recorded.contains("bob@example.com"));
+        assert!(recorded.contains("stale@example.com"));
+
+        cache.rebuild_sent_correspondents(std::slice::from_ref(&sent)).unwrap();
+        let rebuilt = cache.sent_correspondents().unwrap();
+        assert_eq!(
+            rebuilt,
+            HashSet::from(["ada@example.com".to_string(), "bob@example.com".to_string(), "carol@example.com".to_string()])
+        );
+        assert!(!rebuilt.contains("stale@example.com"), "the rebuild replaces the old set");
+
+        cache.rebuild_sent_correspondents(&[]).unwrap();
+        assert!(cache.sent_correspondents().unwrap().is_empty());
+
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The local classifier marks list mail from unknown senders as Other,
+    /// leaves ordinary and known senders Focused, honours explicit overrides,
+    /// preserves rows it did not create, and is a no-op on a second pass.
+    #[test]
+    fn local_classifier_marks_list_mail_and_respects_known_senders_and_overrides() {
+        let account_id = temp_account_id();
+        let cache = Cache::open(&account_id).unwrap();
+        let inbox = MailboxId::new(&account_id, "INBOX");
+        let sent = MailboxId::new(&account_id, "Sent");
+
+        let message = |uid: u32, from: &str, list_id: Option<&str>| {
+            let mut message = with_message_id(sample_summary(&inbox, uid, None), &format!("m{uid}@x"));
+            message.from = vec![EmailAddress::new(from)];
+            message.list_id = list_id.map(str::to_string);
+            message
+        };
+        let unknown_list = message(1, "news@example.com", Some("<announce.example.com>"));
+        let unknown_plain = message(2, "stranger@example.com", None);
+        let known_from_sent = message(3, "GINA@example.com", Some("<list.example.com>"));
+        let known_from_contact = message(4, "contact@example.com", Some("<list.example.com>"));
+        let override_focused = message(5, "override-focus@example.com", Some("<list.example.com>"));
+        let override_other = message(6, "ada@example.com", None);
+        let existing_other = message(7, "existing@example.com", Some("<list.example.com>"));
+        let messages = vec![
+            unknown_list.clone(),
+            unknown_plain,
+            known_from_sent,
+            known_from_contact,
+            override_focused,
+            override_other,
+            existing_other.clone(),
+        ];
+        cache.replace_messages(&inbox, UidValidity(1), &messages).unwrap();
+
+        let mut sent_message = with_message_id(sample_summary(&sent, 1, None), "sent@x");
+        sent_message.to = vec![EmailAddress::new("Gina@Example.com")];
+        cache.record_sent_correspondents(&[sent_message]).unwrap();
+        let now = Utc::now();
+        cache
+            .set_inference_override("override-focus@example.com", lookout_core::InferenceClassification::Focused, None, now)
+            .unwrap();
+        cache
+            .set_inference_override("ADA@Example.com", lookout_core::InferenceClassification::Other, None, now)
+            .unwrap();
+        // An explicit local choice on a sender the heuristic would call Focused:
+        // it must survive because the row already exists.
+        cache
+            .set_local_inference(std::slice::from_ref(&existing_other), lookout_core::InferenceClassification::Other, now)
+            .unwrap();
+
+        let inserted = cache.classify_local_inference(&messages, &["Contact@Example.com".to_string()]).unwrap();
+        assert_eq!(inserted, 2, "only the unknown-list and override-Other messages gained rows");
+
+        let loaded = cache.load_messages(&inbox).unwrap();
+        let classification = |uid: u32| loaded.iter().find(|message| message.uid == Uid(uid)).unwrap().inference_classification;
+        assert_eq!(classification(1), lookout_core::InferenceClassification::Other, "unknown list mail is bulk");
+        assert_eq!(classification(2), lookout_core::InferenceClassification::Focused);
+        assert_eq!(
+            classification(3),
+            lookout_core::InferenceClassification::Focused,
+            "Sent makes the sender known, case-insensitively"
+        );
+        assert_eq!(
+            classification(4),
+            lookout_core::InferenceClassification::Focused,
+            "contacts make the sender known, case-insensitively"
+        );
+        assert_eq!(classification(5), lookout_core::InferenceClassification::Focused, "an override beats List-Id");
+        assert_eq!(classification(6), lookout_core::InferenceClassification::Other, "an override beats a known sender");
+        assert_eq!(classification(7), lookout_core::InferenceClassification::Other, "an existing row is preserved");
+
+        assert_eq!(
+            cache.classify_local_inference(&messages, &["Contact@Example.com".to_string()]).unwrap(),
+            0,
+            "a second pass inserts nothing"
+        );
 
         let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
         let _ = std::fs::remove_file(path);

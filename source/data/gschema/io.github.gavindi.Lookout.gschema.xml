@@ -245,6 +245,11 @@
       <summary>Load images from the web</summary>
       <description>Allow the reading pane to load image resources from remote servers.</description>
     </key>
+    <key name="mail-focused-inbox-local" type="b">
+      <default>false</default>
+      <summary>Local Focused Inbox</summary>
+      <description>Sort the Inbox into Focused and Other on non-Microsoft accounts, using the local classifier: mail from your contacts and Sent Items stays Focused, mailing-list mail goes to Other, and an explicit sender choice always wins. Microsoft 365 accounts use Outlook's own classification instead and ignore this key.</description>
+    </key>
     <key name="mail-rich-text-default" type="b">
       <default>true</default>
       <summary>Start new messages in the formatted editor</summary>

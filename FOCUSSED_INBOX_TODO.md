@@ -25,7 +25,7 @@ What is missing is the local classifier for non-Microsoft accounts:
 
 ## Tasks
 
-### [ ] 2.12.1 — Pure classifier (`S`)
+### [x] 2.12.1 — Pure classifier (`S`)
 
 Add `source/crates/core/src/interop/focused.rs`, register it in `interop/mod.rs`
 and re-export from `interop` / `lib.rs`.
@@ -44,7 +44,7 @@ and re-export from `interop` / `lib.rs`.
   - sender matching is case-insensitive;
   - missing sender falls through to Focused.
 
-### [ ] 2.12.2 — Cache support (`M`)
+### [x] 2.12.2 — Cache support (`M`)
 
 Touch `source/crates/mail/src/cache.rs`.
 
@@ -74,7 +74,7 @@ Touch `source/crates/mail/src/cache.rs`.
   - existing rows preserved;
   - a second pass inserts nothing.
 
-### [ ] 2.12.3 — Session classification (`L`)
+### [x] 2.12.3 — Session classification (`L`)
 
 - `source/crates/mail/src/config.rs`: add to `AccountConfig`:
   - `local_focus_enabled: bool`
@@ -98,7 +98,7 @@ Touch `source/crates/mail/src/cache.rs`.
   classifier + `classify_local_inference` integration, with a code comment noting
   that first-sync classification happens before the command loop starts.
 
-### [ ] 2.12.4 — Tabs and message menu (`S`)
+### [x] 2.12.4 — Tabs and message menu (`S`)
 
 - `source/crates/app/src/window/state.rs`: add `microsoft_365: bool` to
   `AccountHandle`; set it in both connect paths and the test constructor in
@@ -113,7 +113,7 @@ Touch `source/crates/mail/src/cache.rs`.
   - availability matrix: Microsoft 365 consent/no consent, local setting on/off;
   - the Focused Inbox submenu appears for an enabled local account.
 
-### [ ] 2.12.5 — Opt-in setting and contact propagation (`M`)
+### [x] 2.12.5 — Opt-in setting and contact propagation (`M`)
 
 - `source/crates/app/src/settings.rs`:
   `MAIL_FOCUSED_INBOX_LOCAL = "mail-focused-inbox-local"`, default `false`.
@@ -131,7 +131,7 @@ Touch `source/crates/mail/src/cache.rs`.
   `contacts_by_account.insert`), skipping identical pushes.
 - Tests: settings default/round-trip and the contact-set assembly.
 
-### [ ] 2.12.6 — Local “Always move / Stop moving” (`S`)
+### [x] 2.12.6 — Local “Always move / Stop moving” (`S`)
 
 - Refactor `stop_moving_focused` (`window/mail_actions.rs:921`): always send
   `AccountCommand::ClearInferenceOverride`; only do the Graph override
@@ -142,7 +142,7 @@ Touch `source/crates/mail/src/cache.rs`.
 - No reclassification of older mail from that sender — matches Outlook’s
   “future mail” semantics.
 
-### [ ] 2.12.7 — Close-out (`S`)
+### [x] 2.12.7 — Close-out (`S`)
 
 - `OUTLOOK_PARITY.md`:
   - mark 2.12 ✅;

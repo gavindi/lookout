@@ -117,6 +117,19 @@ pub(crate) fn test_snapshot(display_name: &str, contacts: Vec<lookout_dav::Conta
     }
 }
 
+/// A snapshot with the given address suggestions, for the Focused Inbox
+/// contact-set tests in other modules (item 2.12).
+#[cfg(test)]
+pub(crate) fn test_snapshot_with_suggestions(suggestions: Vec<EmailAddress>) -> ContactsAccountSnapshot {
+    ContactsAccountSnapshot {
+        display_name: String::new(),
+        books: Vec::new(),
+        contacts: Vec::new(),
+        suggestions,
+        contact_lists: Vec::new(),
+    }
+}
+
 /// Which bucket a left-pane row filters the right-hand contact list down to.
 /// The first four are fixed, always-present rows under each account's
 /// header; `Category` rows are dynamic, one per distinct vCard `CATEGORIES`
@@ -2256,6 +2269,10 @@ pub fn sync_contacts_account(
                     }
                     st.contacts_by_account.insert(account_id.clone(), contacts);
                     drop(st);
+                    // The local Focused Inbox classifier treats any contact as
+                    // a known sender (M-03 / item 2.12); push the new union to
+                    // every non-Microsoft session that doesn't already hold it.
+                    crate::window::push_local_focus_contacts(&state);
                     refresh_contacts_ui(None);
                 }
                 Err(message) => {

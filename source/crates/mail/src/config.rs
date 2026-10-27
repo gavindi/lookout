@@ -41,6 +41,14 @@ pub struct AccountConfig {
     /// The user's names for `@mentions`: the display name, its first word and
     /// address local-parts, so `@Name`, `@First` and `@local-part` all match.
     pub mention_names: Vec<String>,
+    /// Whether the local Focused Inbox classifier runs for this account
+    /// (M-03 / item 2.12). Only ever set for non-Microsoft accounts; Microsoft
+    /// 365 gets its classification from Graph.
+    pub local_focus_enabled: bool,
+    /// The user's known contact addresses (lowercased), fed to the local
+    /// classifier so a message from a contact stays Focused even when it
+    /// carries a `List-Id`.
+    pub local_focus_contacts: Vec<String>,
     pub imap: EndpointConfig,
     pub smtp: EndpointConfig,
 }

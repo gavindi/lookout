@@ -714,6 +714,8 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
                     graph_categories: None,
                     graph_rules: None,
                     graph_automatic_replies: None,
+                    microsoft_365: false,
+                    local_focus_contacts: Vec::new(),
                     sieve_advertised: false,
                     uses_graph_mail: false,
                 },
@@ -2218,6 +2220,125 @@ fn set_focused_shows_sends_and_undoes_per_previous_state() {
             (vec![Uid(2)], lookout_core::InferenceClassification::Focused)
         ]
     );
+}
+
+/// The Focused Inbox availability rule: Microsoft 365 needs Graph, every
+/// other account reads the local classifier's opt-in switch (M-03 / item
+/// 2.12).
+#[test]
+fn focused_inbox_availability_matrix() {
+    assert!(!focused_inbox_available_for(false, false, false), "local off");
+    assert!(focused_inbox_available_for(false, false, true), "local on");
+    assert!(
+        !focused_inbox_available_for(true, false, true),
+        "Microsoft 365 without consent stays hidden even when the local switch is on"
+    );
+    assert!(focused_inbox_available_for(true, true, false), "Microsoft 365 with Graph access");
+}
+
+/// With the local switch on, a non-Microsoft account reports Focused Inbox
+/// available, and the message menu therefore builds its Focused Inbox
+/// submenu.
+#[test]
+fn local_account_with_focused_inbox_enabled_gets_the_menu_submenu() {
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+    state.borrow().settings.set_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL, false);
+    assert!(!focused_inbox_available(&state.borrow(), &acc));
+    state.borrow().settings.set_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL, true);
+    assert!(focused_inbox_available(&state.borrow(), &acc));
+
+    let description = crate::message_menu::message_menu_description(
+        &crate::message_menu::message_menu_state(&[], false, false),
+        &crate::message_menu::MenuChoices {
+            focused_inbox: focused_inbox_available(&state.borrow(), &acc),
+            ..Default::default()
+        },
+    );
+    assert!(
+        description
+            .sections_for_test()
+            .iter()
+            .flatten()
+            .any(|item| matches!(item, crate::context_menu::MenuItem::Submenu { label, .. } if label == "Focused Inbox")),
+        "the Focused Inbox submenu is offered for an enabled local account"
+    );
+}
+
+/// The known-sender set handed to the local classifier is the deduped,
+/// lowercased union of every account's contact suggestions (item 2.12).
+#[test]
+fn local_focus_contacts_are_a_deduped_lowercase_union() {
+    let state = test_state(Vec::new());
+    let snapshot = crate::contacts_view::test_snapshot_with_suggestions;
+    {
+        let mut st = state.borrow_mut();
+        st.contacts_by_account.insert(
+            AccountId("a".into()),
+            snapshot(vec![EmailAddress::new("Ada@Example.com"), EmailAddress::new("grace@example.com")]),
+        );
+        st.contacts_by_account.insert(
+            AccountId("b".into()),
+            snapshot(vec![EmailAddress::new("ADA@example.com"), EmailAddress::new("  bob@example.com  ")]),
+        );
+    }
+    assert_eq!(
+        local_focus_contacts(&state.borrow()),
+        vec!["ada@example.com".to_string(), "bob@example.com".to_string(), "grace@example.com".to_string()]
+    );
+}
+
+/// "Stop moving" always clears the local override, even with no Graph client;
+/// the Graph half is simply skipped (item 2.12).
+#[test]
+fn stop_moving_without_graph_still_clears_the_local_override() {
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+    let mut message = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+    message.from = vec![EmailAddress::new("Ada@Example.com")];
+
+    stop_moving_focused(&state, &message);
+
+    match cmd_rx.try_recv() {
+        Ok(AccountCommand::ClearInferenceOverride { sender }) => assert_eq!(sender, "Ada@Example.com"),
+        other => panic!("expected ClearInferenceOverride, got {other:?}"),
+    }
+}
+
+/// "Always move" persists the sender scope through `SetFocused` without any
+/// Graph client - the local override is the whole mechanism on a
+/// non-Microsoft account (item 2.12).
+#[test]
+fn always_move_without_graph_still_sends_a_sender_scoped_command() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let acc = AccountId("acc".into());
+    let state = test_state(vec![(acc.clone(), vec![test_mailbox(&acc, "INBOX", 1)])]);
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&acc).unwrap().cmd_tx = cmd_tx;
+    let mut message = summary(Uid(1), "acc:INBOX", 2026, 8, 1, 9);
+    message.from = vec![EmailAddress::new("ada@example.com")];
+    let message_list = MessageListModel::build();
+    message_list.repopulate(vec![message], SortKey::Date, true);
+
+    set_focused(
+        &state,
+        &message_list,
+        &message_list.all_messages(),
+        lookout_core::InferenceClassification::Other,
+        lookout_mail::session::FocusedScope::Sender,
+    );
+
+    match cmd_rx.try_recv() {
+        Ok(AccountCommand::SetFocused { scope, classification, .. }) => {
+            assert_eq!(scope, lookout_mail::session::FocusedScope::Sender);
+            assert_eq!(classification, lookout_core::InferenceClassification::Other);
+        }
+        other => panic!("expected SetFocused, got {other:?}"),
+    }
 }
 
 /// A toast's own Undo button removes exactly its entry, leaving later

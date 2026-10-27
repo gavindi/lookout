@@ -1005,6 +1005,10 @@ impl GraphMailSession {
                     tracing::warn!("failed to clear a Focused/Other override: {e}");
                 }
             }
+            AccountCommand::ConfigureLocalFocus { .. } => {
+                // Graph classifications come from Outlook itself; the local
+                // classifier (item 2.12) is only for non-Microsoft accounts.
+            }
             AccountCommand::SetPrefetchPolicy(_) | AccountCommand::Reconnect | AccountCommand::PrefetchBodies => {}
             AccountCommand::PutSieveScript { .. } => {
                 let _ = self

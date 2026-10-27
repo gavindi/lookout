@@ -504,13 +504,10 @@ pub(crate) fn open_message_menu(context: &MessageMenuContext, anchor: &gtk::Widg
                     .map(|folder| (id.clone(), lookout_core::display_name(&folder.name)))
             })
             .collect();
-        // Whether the account provides Focused Inbox (M-03 / item 5.4): a
-        // Microsoft 365 account with Graph access.
-        let focused_inbox = account
-            .as_ref()
-            .and_then(|id| st.accounts.get(id))
-            .and_then(|handle| handle.graph_mail.clone())
-            .is_some_and(|client| client.consented());
+        // Whether the account provides Focused Inbox (M-03): Graph for
+        // Microsoft 365, the local classifier's opt-in for every other
+        // account (item 2.12).
+        let focused_inbox = account.as_ref().is_some_and(|id| focused_inbox_available(&st, id));
         // Whether the target conversation is already ignored (item 2.8 /
         // M-20), so the menu reads "Stop ignoring".
         let thread_ignored = primary.as_ref().is_some_and(|summary| {
@@ -924,9 +921,12 @@ fn optimistic_set_focused(state: &Rc<RefCell<UiState>>, message_list: &MessageLi
     }
 }
 
-/// "Stop moving from this sender" (M-03): delete the sender's Focused/Other
-/// override on Graph and drop the local row. Uses the id from the last
-/// override sync when it's known, else a live lookup.
+/// "Stop moving from this sender" (M-03): drop the sender's local Focused/Other
+/// override. On a Microsoft 365 account with a consented Graph client, also
+/// delete Outlook's own override - looked up by its stored id when known, else
+/// with a live read. Every other account (and a Microsoft 365 account without
+/// Graph) still clears its local row; the local classifier and "Always move"
+/// are useful on their own.
 pub(crate) fn stop_moving_focused(state: &Rc<RefCell<UiState>>, summary: &EmailSummary) {
     let Some(account_id) = mailbox_account_id(&summary.mailbox) else {
         return;
@@ -934,12 +934,16 @@ pub(crate) fn stop_moving_focused(state: &Rc<RefCell<UiState>>, summary: &EmailS
     let (client, cmd_tx, read_cache) = {
         let st = state.borrow();
         let Some(handle) = st.accounts.get(&account_id) else { return };
-        let Some(client) = handle.graph_mail.clone().filter(|client| client.consented()) else {
-            return;
-        };
+        let client = handle.graph_mail.clone().filter(|client| client.consented());
         (client, handle.cmd_tx.clone(), handle.address_cache.clone())
     };
     let Some(sender) = summary.from.first().cloned() else {
+        return;
+    };
+    // Drop the local row whatever Graph says - the local classifier may be the
+    // only classifier this account has (item 2.12).
+    let _ = cmd_tx.send_blocking(AccountCommand::ClearInferenceOverride { sender: sender.address.clone() });
+    let Some(client) = client else {
         return;
     };
     let local_id = read_cache.as_ref().and_then(|cache| cache.inference_overrides().ok()).and_then(|rows| {
@@ -947,8 +951,6 @@ pub(crate) fn stop_moving_focused(state: &Rc<RefCell<UiState>>, summary: &EmailS
             .find(|row| row.sender.eq_ignore_ascii_case(&sender.address))
             .and_then(|row| row.override_id)
     });
-    // Drop the local row whatever Graph says.
-    let _ = cmd_tx.send_blocking(AccountCommand::ClearInferenceOverride { sender: sender.address.clone() });
     glib::spawn_future_local(async move {
         let ids: Vec<String> = match local_id {
             Some(id) => vec![id],

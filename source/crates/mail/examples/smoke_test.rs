@@ -65,6 +65,8 @@ async fn main() -> anyhow::Result<()> {
         email: account.email.clone(),
         mention_addresses: vec![account.email.clone()],
         mention_names: vec![account.display_name.clone()],
+        local_focus_enabled: false,
+        local_focus_contacts: Vec::new(),
         imap: EndpointConfig {
             host: account.imap.host.clone(),
             port: account.imap.port.unwrap_or(993),

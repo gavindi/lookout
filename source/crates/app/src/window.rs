@@ -8057,6 +8057,33 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Focused Inbox": the local classifier's opt-in for
+    // non-Microsoft accounts (M-03 / item 2.12). Persists the setting, pushes
+    // it (with the current contact set) to every non-Microsoft session, and
+    // repaints the list header so the Focused/Other tabs appear or disappear
+    // immediately.
+    {
+        let state = state.clone();
+        let list_header = list_header.clone();
+        config_view.focused_inbox_local_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            state.borrow().settings.set_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL, enabled);
+            let contacts = local_focus_contacts(&state.borrow());
+            {
+                let mut st = state.borrow_mut();
+                for handle in st.accounts.values_mut().filter(|handle| !handle.microsoft_365) {
+                    handle.local_focus_contacts = contacts.clone();
+                    let _ = handle.cmd_tx.send_blocking(AccountCommand::ConfigureLocalFocus {
+                        enabled,
+                        contacts: contacts.clone(),
+                        backfill: enabled,
+                    });
+                }
+            }
+            refresh_list_header(&state, &list_header);
+        });
+    }
+
     // Config → Mail → "Check spelling as you type": persists the setting and
     // applies it to the composer's shared WebKit context immediately, so a
     // change (or the F7 toggle) affects an already-open composer.
@@ -8554,6 +8581,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         config_view.animations_row.set_active(persisted.get_bool(crate::settings::ANIMATE_TRANSITIONS));
         config_view.message_theme_dark_row.set_active(persisted.get_bool(crate::settings::MAIL_MESSAGE_THEME_DARK));
         config_view.remote_images_row.set_active(persisted.get_bool(crate::settings::MAIL_LOAD_REMOTE_IMAGES));
+        config_view
+            .focused_inbox_local_row
+            .set_active(persisted.get_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL));
         config_view
             .internal_domains_entry
             .set_text(&crate::settings::format_domain_list(&persisted.get_strv(crate::settings::MAIL_INTERNAL_DOMAINS)));

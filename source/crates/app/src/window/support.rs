@@ -282,12 +282,7 @@ pub(crate) fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHea
                     .is_some_and(|folder| folder.role == lookout_core::MailboxRole::Inbox)
             })
         });
-        inbox
-            && account
-                .as_ref()
-                .and_then(|id| st.accounts.get(id))
-                .and_then(|handle| handle.graph_mail.clone())
-                .is_some_and(|client| client.consented())
+        inbox && account.as_ref().is_some_and(|account_id| focused_inbox_available(&st, account_id))
     };
     if focused_available != header.focused_available.get() {
         header.focused_available.set(focused_available);
@@ -632,6 +627,70 @@ pub(crate) fn account_label(state: &Rc<RefCell<UiState>>, account_id: &AccountId
         .get(account_id)
         .map(|h| h.display_name.clone())
         .unwrap_or_else(|| account_id.0.clone())
+}
+
+/// The pure availability rule behind [`focused_inbox_available`]: Microsoft
+/// 365 needs Graph, every other account reads the local classifier's opt-in
+/// setting. Split out so the four-way matrix is testable without building a
+/// Graph client.
+pub(crate) fn focused_inbox_available_for(microsoft_365: bool, graph_available: bool, local_enabled: bool) -> bool {
+    if microsoft_365 {
+        graph_available
+    } else {
+        local_enabled
+    }
+}
+
+/// Whether `account_id` provides a Focused/Other classification (M-03):
+/// Microsoft 365 through a consented Graph client (or the Graph mail
+/// transport, which owns its own Graph access), every other account through
+/// `mail-focused-inbox-local` and the local classifier (item 2.12).
+pub(crate) fn focused_inbox_available(state: &UiState, account_id: &AccountId) -> bool {
+    let Some(handle) = state.accounts.get(account_id) else {
+        return false;
+    };
+    let graph_available = handle.uses_graph_mail || handle.graph_mail.as_ref().is_some_and(|client| client.consented());
+    focused_inbox_available_for(handle.microsoft_365, graph_available, state.settings.get_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL))
+}
+
+/// The deduped, lowercased address union of every account's contact
+/// suggestions - the known-sender set the local Focused Inbox classifier
+/// receives (item 2.12). Sorted so two identical snapshots produce identical
+/// vectors and the push below can skip a no-op command.
+pub(crate) fn local_focus_contacts(state: &UiState) -> Vec<String> {
+    let mut addresses: Vec<String> = state
+        .contacts_by_account
+        .values()
+        .flat_map(|snapshot| snapshot.suggestions.iter())
+        .map(|contact| lookout_core::normalize_address(&contact.address))
+        .filter(|address| !address.is_empty())
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    addresses
+}
+
+/// Pushes the current contact set to every non-Microsoft 365 session's local
+/// Focused Inbox classifier (item 2.12), skipping sessions already holding
+/// the same set. Called after a contact snapshot changes; the per-account
+/// opt-in itself travels separately through the Settings switch.
+pub(crate) fn push_local_focus_contacts(state: &Rc<RefCell<UiState>>) {
+    let (contacts, enabled) = {
+        let st = state.borrow();
+        (local_focus_contacts(&st), st.settings.get_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL))
+    };
+    let mut st = state.borrow_mut();
+    for handle in st.accounts.values_mut().filter(|handle| !handle.microsoft_365) {
+        if handle.local_focus_contacts == contacts {
+            continue;
+        }
+        handle.local_focus_contacts = contacts.clone();
+        let _ = handle.cmd_tx.send_blocking(AccountCommand::ConfigureLocalFocus {
+            enabled,
+            contacts: contacts.clone(),
+            backfill: false,
+        });
+    }
 }
 
 /// The snapshot `rebuild_folder_tree` takes of `UiState` before touching the

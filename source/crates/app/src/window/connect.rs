@@ -226,12 +226,18 @@ pub(crate) fn connect_account(
     let account_id = AccountId(account.account_id.0.clone());
     let display_name = account.display_name.clone();
     let (mention_addresses, mention_names) = mention_identity_lists(&state.borrow().app_config.borrow().identities_for_account(&account_id, &display_name, &account.email));
-    let config = AccountConfig {
+    let local_focus_contacts = local_focus_contacts(&state.borrow());
+    let mut config = AccountConfig {
         account_id: account_id.clone(),
         display_name: account.display_name.clone(),
         email: account.email.clone(),
         mention_addresses,
         mention_names,
+        // Seeded from Settings for non-Microsoft accounts below, once
+        // `is_microsoft_365` is known. The contacts travel with the config so
+        // the very first sync classifies with them (item 2.12).
+        local_focus_enabled: false,
+        local_focus_contacts: local_focus_contacts.clone(),
         imap: EndpointConfig {
             host: account.imap.host.clone(),
             port: account.imap.port.unwrap_or(993),
@@ -252,6 +258,7 @@ pub(crate) fn connect_account(
     // sync is skipped - only the parent account mirrors message properties.
     let shared_parent = state.borrow().app_config.borrow().shared_mailbox_parent(&account_id);
     let is_microsoft_365 = account.is_microsoft_365() || shared_parent.is_some();
+    config.local_focus_enabled = !is_microsoft_365 && state.borrow().settings.get_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL);
     let graph_own = is_microsoft_365 && shared_parent.is_none();
     // The experimental Graph mail transport (item 5.7.6) replaces IMAP/SMTP
     // for an opted-in Microsoft 365 mailbox. Applies to the account's own
@@ -328,6 +335,8 @@ pub(crate) fn connect_account(
             graph_categories: graph_own.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
             graph_rules: graph_own.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
             graph_automatic_replies: graph_own.then(|| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account_id.clone()))),
+            microsoft_365: is_microsoft_365,
+            local_focus_contacts: local_focus_contacts.clone(),
             sieve_advertised: false,
             uses_graph_mail,
         },
@@ -1504,12 +1513,17 @@ pub(crate) fn connect_other_account(
     let account_id = AccountId(account.id.clone());
     let display_name = account.display_name.clone();
     let (mention_addresses, mention_names) = mention_identity_lists(&state.borrow().app_config.borrow().identities_for_account(&account_id, &display_name, &account.email));
+    let local_focus_contacts = local_focus_contacts(&state.borrow());
     let config = AccountConfig {
         account_id: account_id.clone(),
         display_name: account.display_name.clone(),
         email: account.email.clone(),
         mention_addresses,
         mention_names,
+        // Manual ("other") accounts are never Microsoft 365, so the local
+        // classifier's switch applies directly.
+        local_focus_enabled: state.borrow().settings.get_bool(crate::settings::MAIL_FOCUSED_INBOX_LOCAL),
+        local_focus_contacts: local_focus_contacts.clone(),
         imap: EndpointConfig {
             host: account.imap_host.clone(),
             port: account.imap_port,
@@ -1564,6 +1578,8 @@ pub(crate) fn connect_other_account(
             graph_categories: None,
             graph_rules: None,
             graph_automatic_replies: None,
+            microsoft_365: false,
+            local_focus_contacts: local_focus_contacts.clone(),
             sieve_advertised: false,
             uses_graph_mail: false,
         },
