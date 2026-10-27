@@ -162,11 +162,36 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) expander: gtk::TreeExpander,
     pub(crate) header_label: gtk::Label,
     pub(crate) message_box: gtk::Box,
+    /// The message row's three-line text column (sender / subject / preview)
+    /// and its single-line counterpart below. Toggled together with the
+    /// conversation header's variants by [`RowDisplay::apply`].
+    pub(crate) three_line: gtk::Box,
     /// The conversation-header row: an expander over the same sender /
     /// subject / date line a message row shows, plus the participant count.
     /// Built in `connect_setup` and toggled in `bind` like the other two row
     /// kinds (see the `header_box`/`message_box` notes there).
     pub(crate) thread_box: gtk::Box,
+    /// The conversation header's three-line column and single-line band.
+    pub(crate) thread_three_line: gtk::Box,
+    pub(crate) thread_single_line: gtk::Box,
+    pub(crate) thread_single_cells: Vec<(crate::message_columns::MessageColumn, gtk::Widget)>,
+    pub(crate) thread_single_sender: gtk::Label,
+    pub(crate) thread_single_subject: gtk::Label,
+    pub(crate) thread_single_date: gtk::Label,
+    pub(crate) thread_single_size: gtk::Label,
+    pub(crate) thread_single_categories: gtk::Label,
+    pub(crate) thread_single_to: gtk::Label,
+    pub(crate) thread_single_attachment_icon: gtk::Image,
+    pub(crate) thread_single_calendar_icon: gtk::Image,
+    pub(crate) thread_single_mention_icon: gtk::Image,
+    pub(crate) thread_single_importance_icon: gtk::Image,
+    pub(crate) thread_single_pin_icon: gtk::Image,
+    pub(crate) thread_single_flag_icon: gtk::Image,
+    pub(crate) thread_single_toggle: gtk::Button,
+    /// The `TreeListRow` this conversation header is bound to, so the
+    /// single-line layout's own chevron can expand/collapse it (the
+    /// three-line layout keeps the `TreeExpander` doing that).
+    pub(crate) thread_row: Rc<RefCell<Option<gtk::TreeListRow>>>,
     pub(crate) thread_expander: gtk::TreeExpander,
     pub(crate) thread_sender: gtk::Label,
     /// Attachment/calendar indicator icons on the conversation-header row,
@@ -235,6 +260,26 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) category_overflow: gtk::Label,
     pub(crate) date_label: gtk::Label,
     pub(crate) preview_label: gtk::Label,
+    /// The message row's single-line layout (M-07 / UX-27): a horizontal band
+    /// of Outlook's columns, shown instead of the three-line sender / subject
+    /// / preview column when the list is wide enough (or the reading pane is
+    /// bottom/off). Both variants are built once per recycled row and toggled
+    /// by [`RowDisplay::apply`]; `single_cells` carries each column's cell
+    /// widget so the header's column choice can hide/show it.
+    pub(crate) single_line: gtk::Box,
+    pub(crate) single_cells: Vec<(crate::message_columns::MessageColumn, gtk::Widget)>,
+    pub(crate) single_sender: gtk::Label,
+    pub(crate) single_to: gtk::Label,
+    pub(crate) single_subject: gtk::Label,
+    pub(crate) single_date: gtk::Label,
+    pub(crate) single_size: gtk::Label,
+    pub(crate) single_categories: gtk::Label,
+    pub(crate) single_attachment_icon: gtk::Image,
+    pub(crate) single_calendar_icon: gtk::Image,
+    pub(crate) single_mention_icon: gtk::Image,
+    pub(crate) single_importance_icon: gtk::Image,
+    pub(crate) single_pin_icon: gtk::Image,
+    pub(crate) single_flag_icon: gtk::Image,
     /// The conversation header's body preview (the newest message's snippet),
     /// on the third line of its three-line row.
     pub(crate) thread_preview_label: gtk::Label,
@@ -341,6 +386,17 @@ pub(crate) struct RowDisplayRefs {
     pub(crate) checkbox: glib::WeakRef<gtk::CheckButton>,
     pub(crate) preview_label: glib::WeakRef<gtk::Label>,
     pub(crate) thread_preview_label: glib::WeakRef<gtk::Label>,
+    /// The two message-row variants and the two conversation-header variants,
+    /// so a list-style change reaches rows already on screen (see
+    /// [`RowDisplay::apply`]).
+    pub(crate) three_line: glib::WeakRef<gtk::Box>,
+    pub(crate) single_line: glib::WeakRef<gtk::Box>,
+    pub(crate) thread_three_line: glib::WeakRef<gtk::Box>,
+    pub(crate) thread_single_line: glib::WeakRef<gtk::Box>,
+    /// The conversation row's `TreeExpander` wraps the three-line column; it
+    /// has to be hidden as a whole in the single-line layout, or its chevron
+    /// would offset the columns.
+    pub(crate) thread_expander: glib::WeakRef<gtk::TreeExpander>,
 }
 
 /// Configures a row's preview label for `lines` body-preview lines: 0 hides
@@ -367,6 +423,9 @@ pub(crate) struct RowDisplay {
     pub(crate) select_mode: bool,
     pub(crate) show_sender_images: bool,
     pub(crate) preview_lines: i32,
+    /// Outlook's single-line columnar row (M-07 / UX-27) instead of the
+    /// three-line sender / subject / preview row.
+    pub(crate) single_line: bool,
 }
 
 impl RowDisplay {
@@ -376,15 +435,20 @@ impl RowDisplay {
             select_mode: false,
             show_sender_images: settings.get_bool(crate::settings::MAIL_SHOW_SENDER_IMAGES),
             preview_lines: settings.get_int(crate::settings::LAYOUT_PREVIEW_LINES),
+            single_line: false,
         }
     }
 
     /// Applies these settings to one row: Select mode hides the avatar in
-    /// favour of the checkbox.
-    pub(crate) fn apply(self, avatar: &gtk::Overlay, checkbox: &gtk::CheckButton, preview: &gtk::Label) {
+    /// favour of the checkbox, and the list style swaps the three-line text
+    /// column for the single-line column band.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply(self, avatar: &gtk::Overlay, checkbox: &gtk::CheckButton, preview: &gtk::Label, three_line: &gtk::Box, single_line: &gtk::Box) {
         avatar.set_visible(!self.select_mode && self.show_sender_images);
         checkbox.set_visible(self.select_mode);
         apply_preview_lines(preview, self.preview_lines);
+        three_line.set_visible(!self.single_line);
+        single_line.set_visible(self.single_line);
     }
 }
 
@@ -392,16 +456,33 @@ impl RowDisplay {
 /// are dropped on the way.
 pub(crate) fn update_row_display(registry: &Rc<RefCell<Vec<RowDisplayRefs>>>, display: RowDisplay) {
     registry.borrow_mut().retain(|refs| {
-        let (Some(avatar), Some(checkbox), Some(preview), Some(thread_preview)) = (
+        let (
+            Some(avatar),
+            Some(checkbox),
+            Some(preview),
+            Some(thread_preview),
+            Some(three_line),
+            Some(single_line),
+            Some(thread_three_line),
+            Some(thread_single_line),
+            Some(thread_expander),
+        ) = (
             refs.avatar.upgrade(),
             refs.checkbox.upgrade(),
             refs.preview_label.upgrade(),
             refs.thread_preview_label.upgrade(),
-        ) else {
+            refs.three_line.upgrade(),
+            refs.single_line.upgrade(),
+            refs.thread_three_line.upgrade(),
+            refs.thread_single_line.upgrade(),
+            refs.thread_expander.upgrade(),
+        )
+        else {
             return false;
         };
-        display.apply(&avatar, &checkbox, &preview);
-        display.apply(&avatar, &checkbox, &thread_preview);
+        display.apply(&avatar, &checkbox, &preview, &three_line, &single_line);
+        display.apply(&avatar, &checkbox, &thread_preview, &thread_three_line, &thread_single_line);
+        thread_expander.set_visible(!display.single_line);
         true
     });
 }

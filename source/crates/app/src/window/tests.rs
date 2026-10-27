@@ -2736,10 +2736,11 @@ fn tag_dot_recolours_without_replacing_its_area() {
     assert_eq!(dot.rgba(), hex_to_rgba("#00ff00"));
 }
 
-/// One `RowDisplay` drives the avatar, the Select-mode checkbox and the
-/// preview line count, both on bind and for the rows already on screen.
+/// One `RowDisplay` drives the avatar, the Select-mode checkbox, the preview
+/// line count and the row layout, both on bind and for the rows already on
+/// screen.
 #[test]
-fn row_display_applies_select_mode_sender_images_and_preview_lines() {
+fn row_display_applies_select_mode_sender_images_preview_lines_and_layout() {
     if !crate::gtk_test::gtk_ready() {
         return;
     }
@@ -2747,15 +2748,22 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
     let checkbox = gtk::CheckButton::new();
     let preview = gtk::Label::new(Some("preview"));
     let thread_preview = gtk::Label::new(Some("thread preview"));
+    let three_line = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let single_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let thread_three_line = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let thread_single_line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let thread_expander = gtk::TreeExpander::new();
     let display = RowDisplay {
         select_mode: false,
         show_sender_images: true,
         preview_lines: 2,
+        single_line: false,
     };
-    display.apply(&avatar, &checkbox, &preview);
+    display.apply(&avatar, &checkbox, &preview, &three_line, &single_line);
     assert!(avatar.is_visible() && !checkbox.is_visible());
     assert!(preview.is_visible());
     assert_eq!(preview.lines(), 2);
+    assert!(three_line.is_visible() && !single_line.is_visible());
 
     // Select mode swaps the avatar for the checkbox; 0 lines hides the preview.
     let registry = Rc::new(RefCell::new(vec![RowDisplayRefs {
@@ -2763,6 +2771,11 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
         checkbox: checkbox.downgrade(),
         preview_label: preview.downgrade(),
         thread_preview_label: thread_preview.downgrade(),
+        three_line: three_line.downgrade(),
+        single_line: single_line.downgrade(),
+        thread_three_line: thread_three_line.downgrade(),
+        thread_single_line: thread_single_line.downgrade(),
+        thread_expander: thread_expander.downgrade(),
     }]));
     update_row_display(
         &registry,
@@ -2782,8 +2795,24 @@ fn row_display_applies_select_mode_sender_images_and_preview_lines() {
         show_sender_images: false,
         ..display
     }
-    .apply(&avatar, &checkbox, &preview);
+    .apply(&avatar, &checkbox, &preview, &three_line, &single_line);
     assert!(!avatar.is_visible() && !checkbox.is_visible());
+
+    // The single-line style swaps the three-line column for the column band on
+    // message rows and conversation headers, and hides the thread expander
+    // that would otherwise push the conversation's cells out of line.
+    update_row_display(
+        &registry,
+        RowDisplay {
+            select_mode: false,
+            show_sender_images: true,
+            preview_lines: 1,
+            single_line: true,
+        },
+    );
+    assert!(!three_line.is_visible() && single_line.is_visible());
+    assert!(!thread_three_line.is_visible() && thread_single_line.is_visible());
+    assert!(!thread_expander.is_visible());
 }
 
 #[test]

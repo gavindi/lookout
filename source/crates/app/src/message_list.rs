@@ -87,6 +87,19 @@ impl SortKey {
         }
     }
 
+    /// The direction a click on this field's column header uses first: the
+    /// "most first" order for the keys that have one (newest, largest, high
+    /// importance, flagged, with attachments) and A-Z for the text keys. A
+    /// second click on the same header reverses it. This is separate from the
+    /// sort menu, which keeps the current direction while switching keys -
+    /// Outlook behaves the same way.
+    pub fn natural_descending(self) -> bool {
+        match self {
+            SortKey::Date | SortKey::Size | SortKey::Importance | SortKey::Flag | SortKey::Attachments => true,
+            SortKey::Sender | SortKey::Subject | SortKey::Category | SortKey::To => false,
+        }
+    }
+
     /// The sort-direction toggle's tooltip when it is "descending" - the
     /// natural "most first" order for this key.
     pub fn descending_label(self) -> &'static str {
@@ -630,6 +643,8 @@ pub struct ThreadRow {
     pub count: usize,
     /// The newest message's date - the header's date column.
     pub latest: DateTime<Utc>,
+    /// The thread's total size, for the single-line Size column (M-07).
+    pub size: u32,
     /// Any message in the thread is unread - the header bolds like an unread
     /// message row does.
     pub has_unread: bool,
@@ -837,6 +852,7 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             tags: latest.keywords.iter().filter(|k| lookout_core::tag_key_from_keyword(k).is_some()).cloned().collect(),
             count: emails.len(),
             latest: latest.date,
+            size: emails.iter().map(|message| message.size).sum(),
             has_unread: latest.is_unread() || emails.iter().any(|m| m.is_unread()),
             has_pinned: latest.is_pinned() || emails.iter().any(|m| m.is_pinned()),
             follow_up: thread_follow_up(&emails),
@@ -1015,6 +1031,7 @@ struct ThreadRowKey {
     tags: BTreeSet<String>,
     count: usize,
     latest: DateTime<Utc>,
+    size: u32,
     has_unread: bool,
     has_pinned: bool,
     has_attachment: bool,
@@ -1034,6 +1051,7 @@ fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
         tags: row.tags.clone(),
         count: row.count,
         latest: row.latest,
+        size: row.size,
         has_unread: row.has_unread,
         has_pinned: row.has_pinned,
         has_attachment: row.has_attachment,
@@ -3547,6 +3565,7 @@ mod tests {
             tags: BTreeSet::new(),
             count: 2,
             latest: Utc.with_ymd_and_hms(2024, 1, 10, 10, 0, 0).unwrap(),
+            size: 2048,
             has_unread: false,
             has_pinned: false,
             follow_up: None,
@@ -3598,6 +3617,10 @@ mod tests {
         let mut other_latest = base.clone();
         other_latest.latest = Utc.with_ymd_and_hms(2024, 1, 11, 10, 0, 0).unwrap();
         assert_ne!(thread_row_key(&other_latest), base_key);
+
+        let mut other_size = base.clone();
+        other_size.size = 4096;
+        assert_ne!(thread_row_key(&other_size), base_key);
 
         let mut other_unread = base.clone();
         other_unread.has_unread = true;

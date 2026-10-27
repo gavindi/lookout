@@ -126,3 +126,30 @@ button.list-header-action {
     font-size: 0.85em;
     font-weight: bold;
 }
+/* A column header is a flat button so it can be clicked to sort; the
+   padding is small so the label sits over its row cell (the cell boxes
+   have none). */
+button.message-column-header-button {
+    padding: 0 1px;
+    min-height: 22px;
+    border-radius: 4px;
+}
+button.message-column-header-button:hover {
+    background-color: alpha(currentColor, 0.08);
+}
+/* The single-line message row (M-07 / UX-27): one line per message, each
+   field in the same fixed-width cell the header above uses. */
+.message-single-line {
+    padding: 0;
+}
+.message-single-cell {
+    min-height: 22px;
+}
+.message-single-dim {
+    color: @lookout-muted;
+}
+button.message-thread-toggle {
+    min-width: 22px;
+    min-height: 22px;
+    padding: 0;
+}

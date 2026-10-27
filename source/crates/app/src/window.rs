@@ -28,6 +28,7 @@ use crate::last_view::{self};
 use crate::message_list::{format_row_date, Filter, FilterSet, MessageItem, MessageListModel, ReadingTarget, SelectionKind, SortKey, ThreadId};
 use crate::ui_state_db::UiStateDb;
 use crate::util::card_section;
+use crate::window::columns::column_cell;
 use crate::worker::Worker;
 
 // The shell is split by concern: each submodule owns one slice of the
@@ -36,6 +37,7 @@ use crate::worker::Worker;
 mod attachments;
 mod calendar_glue;
 mod calendar_search;
+mod columns;
 mod compose_host;
 mod connect;
 mod conversation;
@@ -49,6 +51,7 @@ mod mail_actions;
 mod optimistic;
 mod reading;
 mod search;
+mod sort;
 mod state;
 mod support;
 mod undo;
@@ -835,6 +838,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // row factory so `bind` can apply them without a settings lookup per row
     // (see `RowDisplay`, `RowDisplayRefs`).
     let row_display: Rc<Cell<RowDisplay>> = Rc::new(Cell::new(RowDisplay::from_settings(&state.borrow().settings)));
+    // The single-line column set (M-07 / UX-27), shared by the header and
+    // every row. Built before the row factory so each row's bind can hide the
+    // cells the user has turned off (or the width cannot fit).
+    let column_state = crate::window::columns::ColumnState::from_settings(&state.borrow().settings);
+    let column_state_for_rows = column_state.clone();
     // Weak handles to every created row's display-dependent widgets, so a
     // change to Select mode, "Show sender images" or the preview line count
     // updates the rows already on screen in place (the list view recycles row
@@ -1052,6 +1060,135 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         text_column.append(&preview_line);
         text_column.append(&category_row);
 
+        // --- Single-line columnar row (M-07 / UX-27) ---
+        //
+        // The same message, laid out as Outlook's wide list: one line per
+        // message, each field a fixed-width cell matching the column header
+        // above the list. Built alongside the three-line column because both
+        // share the row's avatar/checkbox/accent; `RowDisplay::apply` shows
+        // exactly one of them. Every cell is also registered in
+        // `single_cells` so the header's column chooser can hide it.
+        use crate::message_columns::MessageColumn;
+        let mut single_cells: Vec<(MessageColumn, gtk::Widget)> = Vec::new();
+        let single_label = |chars: i32, align_end: bool| {
+            let label = gtk::Label::builder()
+                .xalign(if align_end { 1.0 } else { 0.0 })
+                .hexpand(false)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .width_chars(chars)
+                .build();
+            if chars > 0 {
+                // Cap the natural width at the cell's width, or a long value
+                // would widen the cell and push the following columns out of
+                // line with the header.
+                label.set_max_width_chars(chars);
+            }
+            label
+        };
+
+        let single_importance_icon = gtk::Image::builder()
+            .icon_name("emblem-important-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .visible(false)
+            .build();
+        let importance_cell = column_cell(MessageColumn::Importance);
+        importance_cell.append(&single_importance_icon);
+        single_cells.push((MessageColumn::Importance, importance_cell.clone().upcast()));
+
+        let single_attachment_icon = gtk::Image::builder()
+            .icon_name("mail-attachment-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .tooltip_text("Has attachments")
+            .visible(false)
+            .build();
+        let single_calendar_icon = gtk::Image::builder()
+            .icon_name("x-office-calendar-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .tooltip_text("Meeting invite")
+            .visible(false)
+            .build();
+        let attachment_cell = column_cell(MessageColumn::Attachment);
+        attachment_cell.append(&single_attachment_icon);
+        attachment_cell.append(&single_calendar_icon);
+        single_cells.push((MessageColumn::Attachment, attachment_cell.clone().upcast()));
+
+        let single_sender = single_label(22, false);
+        let from_cell = column_cell(MessageColumn::From);
+        from_cell.append(&single_sender);
+        single_cells.push((MessageColumn::From, from_cell.clone().upcast()));
+
+        let single_to = single_label(19, false);
+        let to_cell = column_cell(MessageColumn::To);
+        to_cell.append(&single_to);
+        single_cells.push((MessageColumn::To, to_cell.clone().upcast()));
+
+        let single_mention_icon = gtk::Image::builder()
+            .icon_name(themed_icon_name(&["at-symbolic", "chat-message-new-symbolic", "user-info-symbolic"]))
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .tooltip_text("Mentions you")
+            .visible(false)
+            .build();
+        let single_subject = single_label(-1, false);
+        single_subject.set_hexpand(true);
+        let subject_cell = column_cell(MessageColumn::Subject);
+        subject_cell.append(&single_mention_icon);
+        subject_cell.append(&single_subject);
+        single_cells.push((MessageColumn::Subject, subject_cell.clone().upcast()));
+
+        let single_date = single_label(13, true);
+        single_date.add_css_class("caption");
+        let received_cell = column_cell(MessageColumn::Received);
+        received_cell.append(&single_date);
+        single_cells.push((MessageColumn::Received, received_cell.clone().upcast()));
+
+        let single_size = single_label(8, true);
+        single_size.add_css_class("caption");
+        single_size.add_css_class("message-single-dim");
+        let size_cell = column_cell(MessageColumn::Size);
+        size_cell.append(&single_size);
+        single_cells.push((MessageColumn::Size, size_cell.clone().upcast()));
+
+        let single_categories = single_label(14, false);
+        single_categories.add_css_class("caption");
+        single_categories.add_css_class("message-single-dim");
+        let categories_cell = column_cell(MessageColumn::Categories);
+        categories_cell.append(&single_categories);
+        single_cells.push((MessageColumn::Categories, categories_cell.clone().upcast()));
+
+        let single_pin_icon = gtk::Image::builder()
+            .icon_name(pin_icon_name(true))
+            .pixel_size(12)
+            .css_classes(["message-pin-icon"])
+            .visible(false)
+            .build();
+        let single_flag_icon = gtk::Image::builder().pixel_size(12).visible(false).build();
+        let flag_cell = column_cell(MessageColumn::Flag);
+        flag_cell.append(&single_pin_icon);
+        flag_cell.append(&single_flag_icon);
+        single_cells.push((MessageColumn::Flag, flag_cell.clone().upcast()));
+
+        let single_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .hexpand(true)
+            .margin_end(10)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        single_line.add_css_class("message-single-line");
+        // The single-line sender, recipient and subject duplicate content the
+        // three-line row tags as sensitive; privacy mode has to blur them too.
+        crate::privacy::mark(&single_sender);
+        crate::privacy::mark(&single_to);
+        crate::privacy::mark(&single_subject);
+        for (_, cell) in &single_cells {
+            single_line.append(cell);
+        }
+
         // Same footprint as the avatar it replaces (32x32, centered) so
         // toggling Select mode swaps one for the other in place rather than
         // adding a separate column.
@@ -1064,12 +1201,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         checkbox.add_css_class("message-select-checkbox");
 
+        // The avatar/checkbox slot: a fixed 48 px cell (the avatar's own 8 px
+        // margins plus its 32 px circle) so the single-line columns line up
+        // under the header whether the avatar is shown, Select mode has
+        // replaced it with a checkbox, or "Show sender images" has hidden both.
+        let leading_cell = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .width_request(48)
+            .halign(gtk::Align::Start)
+            .valign(gtk::Align::Start)
+            .build();
         let message_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         message_box.add_css_class("message-row");
         message_box.append(&accent);
-        message_box.append(&avatar);
-        message_box.append(&checkbox);
+        leading_cell.append(&avatar);
+        leading_cell.append(&checkbox);
+        message_box.append(&leading_cell);
         message_box.append(&text_column);
+        message_box.append(&single_line);
 
         // The conversation-header row: its own expander (the section header's
         // expander lives in `header_box`) driving the same sender / subject /
@@ -1179,17 +1328,169 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         thread_preview_line.append(&thread_preview_label);
 
-        let thread_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).build();
+        let thread_column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).hexpand(true).margin_end(10).build();
         thread_column.append(&thread_sender_line);
         thread_column.append(&thread_subject_line);
         thread_column.append(&thread_preview_line);
         thread_column.append(&thread_category_row);
 
+        // --- The conversation header's single-line variant (M-07 / UX-27) ---
+        // Columns start at the same x as a message row's: a 51 px leading cell
+        // (the message row's accent bar + avatar cell) holds the expander
+        // chevron, so thread and message cells line up under the header.
+        let thread_single_toggle = gtk::Button::builder()
+            .icon_name("pan-end-symbolic")
+            .css_classes(["flat", "message-thread-toggle"])
+            .tooltip_text("Expand conversation")
+            .halign(gtk::Align::Center)
+            .focusable(true)
+            .build();
+        let thread_row: Rc<RefCell<Option<gtk::TreeListRow>>> = Rc::new(RefCell::new(None));
+        thread_single_toggle.update_property(&[gtk::accessible::Property::Label("Expand or collapse conversation")]);
+        {
+            let thread_row = thread_row.clone();
+            let toggle = thread_single_toggle.clone();
+            thread_single_toggle.connect_clicked(move |_| {
+                let Some(row) = thread_row.borrow().as_ref().cloned() else { return };
+                let expanded = !row.is_expanded();
+                row.set_expanded(expanded);
+                toggle.set_icon_name(if expanded { "pan-down-symbolic" } else { "pan-end-symbolic" });
+                toggle.set_tooltip_text(Some(if expanded { "Collapse conversation" } else { "Expand conversation" }));
+            });
+        }
+        let thread_leading = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .width_request(crate::message_columns::ROW_LEADING_WIDTH)
+            .halign(gtk::Align::Start)
+            .build();
+        thread_leading.append(&thread_single_toggle);
+
+        let mut thread_single_cells: Vec<(MessageColumn, gtk::Widget)> = Vec::new();
+        let thread_single_label = |chars: i32, align_end: bool| {
+            let label = gtk::Label::builder()
+                .xalign(if align_end { 1.0 } else { 0.0 })
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .width_chars(chars)
+                .build();
+            if chars > 0 {
+                label.set_max_width_chars(chars);
+            }
+            label
+        };
+
+        let thread_single_importance_icon = gtk::Image::builder()
+            .icon_name("emblem-important-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .visible(false)
+            .build();
+        let cell = column_cell(MessageColumn::Importance);
+        cell.append(&thread_single_importance_icon);
+        thread_single_cells.push((MessageColumn::Importance, cell.upcast()));
+
+        let thread_single_attachment_icon = gtk::Image::builder()
+            .icon_name("mail-attachment-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .tooltip_text("Has attachments")
+            .visible(false)
+            .build();
+        let thread_single_calendar_icon = gtk::Image::builder()
+            .icon_name("x-office-calendar-symbolic")
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .tooltip_text("Meeting invite")
+            .visible(false)
+            .build();
+        let cell = column_cell(MessageColumn::Attachment);
+        cell.append(&thread_single_attachment_icon);
+        cell.append(&thread_single_calendar_icon);
+        thread_single_cells.push((MessageColumn::Attachment, cell.upcast()));
+
+        let thread_single_sender = thread_single_label(22, false);
+        let cell = column_cell(MessageColumn::From);
+        cell.append(&thread_single_sender);
+        thread_single_cells.push((MessageColumn::From, cell.upcast()));
+
+        let thread_single_to = thread_single_label(19, false);
+        let cell = column_cell(MessageColumn::To);
+        cell.append(&thread_single_to);
+        thread_single_cells.push((MessageColumn::To, cell.upcast()));
+
+        let thread_single_mention_icon = gtk::Image::builder()
+            .icon_name(themed_icon_name(&["at-symbolic", "chat-message-new-symbolic", "user-info-symbolic"]))
+            .pixel_size(12)
+            .css_classes(["message-row-icon"])
+            .tooltip_text("Mentions you")
+            .visible(false)
+            .build();
+        let thread_single_subject = thread_single_label(-1, false);
+        thread_single_subject.set_hexpand(true);
+        let cell = column_cell(MessageColumn::Subject);
+        cell.append(&thread_single_mention_icon);
+        cell.append(&thread_single_subject);
+        thread_single_cells.push((MessageColumn::Subject, cell.upcast()));
+
+        let thread_single_date = thread_single_label(13, true);
+        thread_single_date.add_css_class("caption");
+        let cell = column_cell(MessageColumn::Received);
+        cell.append(&thread_single_date);
+        thread_single_cells.push((MessageColumn::Received, cell.upcast()));
+
+        let thread_single_size = thread_single_label(8, true);
+        thread_single_size.add_css_class("caption");
+        thread_single_size.add_css_class("message-single-dim");
+        let cell = column_cell(MessageColumn::Size);
+        cell.append(&thread_single_size);
+        thread_single_cells.push((MessageColumn::Size, cell.upcast()));
+
+        let thread_single_categories = thread_single_label(14, false);
+        thread_single_categories.add_css_class("caption");
+        thread_single_categories.add_css_class("message-single-dim");
+        let cell = column_cell(MessageColumn::Categories);
+        cell.append(&thread_single_categories);
+        thread_single_cells.push((MessageColumn::Categories, cell.upcast()));
+
+        let thread_single_pin_icon = gtk::Image::builder()
+            .icon_name(pin_icon_name(true))
+            .pixel_size(12)
+            .css_classes(["message-pin-icon"])
+            .visible(false)
+            .build();
+        let thread_single_flag_icon = gtk::Image::builder().pixel_size(12).visible(false).build();
+        let cell = column_cell(MessageColumn::Flag);
+        cell.append(&thread_single_pin_icon);
+        cell.append(&thread_single_flag_icon);
+        thread_single_cells.push((MessageColumn::Flag, cell.upcast()));
+
+        let thread_single_line = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .hexpand(true)
+            .margin_end(10)
+            .valign(gtk::Align::Center)
+            // Match a message row's height (the 32 px avatar sets it), so a
+            // conversation header does not sit shorter than the messages it
+            // groups in the single-line layout.
+            .height_request(32)
+            .visible(false)
+            .build();
+        thread_single_line.add_css_class("message-single-line");
+        thread_single_line.append(&thread_leading);
+        crate::privacy::mark(&thread_single_sender);
+        crate::privacy::mark(&thread_single_to);
+        crate::privacy::mark(&thread_single_subject);
+        for (_, cell) in &thread_single_cells {
+            thread_single_line.append(cell);
+        }
+
         let thread_expander = gtk::TreeExpander::new();
         thread_expander.set_child(Some(&thread_column));
-        let thread_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).margin_start(14).margin_end(10).build();
+        thread_expander.set_margin_start(14);
+        let thread_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).build();
         thread_box.add_css_class("message-thread-row");
         thread_box.append(&thread_expander);
+        thread_box.append(&thread_single_line);
 
         // The avatar/checkbox swap and the preview line count depend on
         // app-wide display settings (Select mode, "Show sender images",
@@ -1203,6 +1504,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             checkbox: checkbox.downgrade(),
             preview_label: preview_label.downgrade(),
             thread_preview_label: thread_preview_label.downgrade(),
+            three_line: text_column.downgrade(),
+            single_line: single_line.downgrade(),
+            thread_three_line: thread_column.downgrade(),
+            thread_single_line: thread_single_line.downgrade(),
+            thread_expander: thread_expander.downgrade(),
         });
 
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
@@ -1278,6 +1584,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 })
             };
             crate::profile_card::attach_person_trigger(provider.clone(), &sender_label, false, resolve.clone());
+            crate::profile_card::attach_person_trigger(provider.clone(), &single_sender, false, resolve.clone());
             crate::profile_card::attach_person_trigger(provider, &avatar, false, resolve);
         }
 
@@ -1659,6 +1966,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     category_overflow,
                     date_label,
                     preview_label,
+                    three_line: text_column,
+                    single_line,
+                    single_cells,
+                    single_sender,
+                    single_to,
+                    single_subject,
+                    single_date,
+                    single_size,
+                    single_categories,
+                    single_attachment_icon,
+                    single_calendar_icon,
+                    single_mention_icon,
+                    single_importance_icon,
+                    single_pin_icon,
+                    single_flag_icon,
+                    thread_three_line: thread_column,
+                    thread_single_line,
+                    thread_single_cells,
+                    thread_single_sender,
+                    thread_single_subject,
+                    thread_single_date,
+                    thread_single_size,
+                    thread_single_categories,
+                    thread_single_to,
+                    thread_single_attachment_icon,
+                    thread_single_calendar_icon,
+                    thread_single_mention_icon,
+                    thread_single_importance_icon,
+                    thread_single_pin_icon,
+                    thread_single_flag_icon,
+                    thread_single_toggle,
+                    thread_row,
                     action_box,
                     mark_read_btn,
                     follow_up_btn,
@@ -1671,6 +2010,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         list_item.set_child(Some(&overlay));
     });
     let row_display_for_bind = row_display.clone();
+    let column_state_for_bind = column_state_for_rows.clone();
     let sender_photo_cache_for_bind = sender_photo_cache.clone();
     message_factory.connect_bind(move |_, list_item| {
         let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
@@ -1781,7 +2121,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.preview_label.set_label(summary.preview.as_deref().unwrap_or(""));
                 // Display settings that don't change per message: the preview
                 // line count, and whether the avatar is shown at all.
-                row_display_for_bind.get().apply(&widgets.avatar, &widgets.checkbox, &widgets.preview_label);
+                row_display_for_bind
+                    .get()
+                    .apply(&widgets.avatar, &widgets.checkbox, &widgets.preview_label, &widgets.three_line, &widgets.single_line);
 
                 let unread = summary.is_unread();
                 widgets.sender_label.set_css_classes(sender_label_classes(unread));
@@ -1820,6 +2162,38 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let tags_borrow = tags_for_bind.borrow();
                 let shown = crate::categories::categories_for_keywords(&tags_borrow, &summary.keywords);
                 bind_category_chips(&widgets.category_row, &widgets.category_chips, &widgets.category_overflow, &shown);
+
+                // --- The same message in the single-line columns (M-07) ---
+                // The three-line labels were just filled, so the single-line
+                // ones reuse their text rather than recomputing the account
+                // suffix, subject fallback or date format.
+                widgets.single_sender.set_label(&widgets.sender_label.label());
+                widgets.single_subject.set_label(&widgets.subject_label.label());
+                widgets.single_date.set_label(&widgets.date_label.label());
+                let to_text = summary.to.first().map(|address| address.display_label()).unwrap_or_default();
+                widgets.single_to.set_label(to_text);
+                widgets.single_size.set_label(&crate::message_columns::format_size(summary.size));
+                let category_names: Vec<&str> = shown.iter().map(|category| category.name.as_str()).collect();
+                widgets.single_categories.set_label(&crate::message_columns::categories_text(&category_names));
+                widgets.single_attachment_icon.set_visible(summary.has_attachment);
+                widgets.single_calendar_icon.set_visible(summary.has_calendar);
+                widgets.single_mention_icon.set_visible(summary.mentions);
+                widgets.single_importance_icon.set_icon_name(Some(imp_icon));
+                widgets.single_importance_icon.set_tooltip_text(Some(imp_tip));
+                widgets.single_importance_icon.set_visible(summary.importance != lookout_core::Importance::Normal);
+                widgets.single_pin_icon.set_visible(summary.is_pinned());
+                apply_flag_indicator(&widgets.single_flag_icon, None, follow_up.as_ref());
+                widgets.single_sender.set_css_classes(sender_label_classes(unread));
+                widgets.single_to.set_css_classes(sender_label_classes(unread));
+                widgets
+                    .single_subject
+                    .set_css_classes(if unread { &["message-subject-unread"] } else { &["message-subject-read"] });
+                widgets.single_date.set_css_classes(if unread {
+                    &["caption", "message-date-unread"]
+                } else {
+                    &["caption", "message-date-read"]
+                });
+                crate::window::columns::apply_cell_visibility(&widgets.single_cells, &column_state_for_bind);
 
                 *widgets.bound.borrow_mut() = Some(Rc::clone(summary));
                 *widgets.bound_thread.borrow_mut() = None;
@@ -1860,7 +2234,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.thread_preview_label.set_label(thread.preview.as_deref().unwrap_or(""));
                 // The header's preview follows the same "Message preview"
                 // line-count setting as a message row's.
-                row_display_for_bind.get().apply(&widgets.avatar, &widgets.checkbox, &widgets.thread_preview_label);
+                row_display_for_bind.get().apply(
+                    &widgets.avatar,
+                    &widgets.checkbox,
+                    &widgets.thread_preview_label,
+                    &widgets.thread_three_line,
+                    &widgets.thread_single_line,
+                );
+                // A row bound while the single-line layout is already current
+                // hasn't been through `update_row_display`, so hide the
+                // three-line expander here too (it would otherwise offset the
+                // conversation's cells from the header's columns).
+                widgets.thread_expander.set_visible(!row_display_for_bind.get().single_line);
                 // The newest message's category chips, on their own line under
                 // the preview, exactly like a message row's strip.
                 let tags_borrow = tags_for_bind.borrow();
@@ -1881,6 +2266,39 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 } else {
                     &["caption", "message-date-read"]
                 });
+
+                // --- The conversation header in the single-line columns ---
+                widgets.thread_single_sender.set_label(&thread.sender);
+                let subject = thread.subject.as_deref().unwrap_or("(no subject)");
+                widgets.thread_single_subject.set_label(&format!("{subject} ({})", thread.count));
+                widgets.thread_single_date.set_label(&widgets.thread_date.label());
+                let category_names: Vec<&str> = shown.iter().map(|category| category.name.as_str()).collect();
+                widgets.thread_single_categories.set_label(&crate::message_columns::categories_text(&category_names));
+                widgets.thread_single_to.set_label(&thread.participants.join(", "));
+                widgets.thread_single_size.set_label(&crate::message_columns::format_size(thread.size));
+                widgets.thread_single_attachment_icon.set_visible(thread.has_attachment);
+                widgets.thread_single_calendar_icon.set_visible(thread.has_calendar);
+                widgets.thread_single_mention_icon.set_visible(thread.has_mentions);
+                widgets.thread_single_importance_icon.set_icon_name(Some(imp_icon));
+                widgets.thread_single_importance_icon.set_tooltip_text(Some(imp_tip));
+                widgets.thread_single_importance_icon.set_visible(thread.importance != lookout_core::Importance::Normal);
+                widgets.thread_single_pin_icon.set_visible(thread.has_pinned);
+                apply_flag_indicator(&widgets.thread_single_flag_icon, None, thread.follow_up.as_ref());
+                widgets.thread_single_sender.set_css_classes(sender_label_classes(unread));
+                widgets.thread_single_to.set_css_classes(sender_label_classes(unread));
+                widgets
+                    .thread_single_subject
+                    .set_css_classes(if unread { &["message-subject-unread"] } else { &["message-subject-read"] });
+                widgets.thread_single_date.set_css_classes(if unread {
+                    &["caption", "message-date-unread"]
+                } else {
+                    &["caption", "message-date-read"]
+                });
+                crate::window::columns::apply_cell_visibility(&widgets.thread_single_cells, &column_state_for_bind);
+                *widgets.thread_row.borrow_mut() = Some(row.clone());
+                widgets
+                    .thread_single_toggle
+                    .set_icon_name(if row.is_expanded() { "pan-down-symbolic" } else { "pan-end-symbolic" });
             }
         }
     });
@@ -1892,6 +2310,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let widgets = unsafe { widgets.as_ref() };
         *widgets.bound.borrow_mut() = None;
         *widgets.bound_thread.borrow_mut() = None;
+        *widgets.thread_row.borrow_mut() = None;
         widgets.action_box.set_visible(false);
         // Don't keep a recycled row pinned to a `TreeListRow` it no longer
         // renders.
@@ -2098,6 +2517,104 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .valign(gtk::Align::Center)
         .menu_model(&sort_key_menu)
         .build();
+
+    // --- The shared sort path (M-07 / UX-27) ---
+    //
+    // The list-header menu, the direction toggle, the View ribbon and the
+    // single-line column headers all go through `apply_sort`, so the four
+    // surfaces can never disagree. The action is stateful so the menu renders
+    // radio checks; it is added to the window later, once the window exists.
+    let sort_key_action = gio::SimpleAction::new_stateful("sort-key", Some(glib::VariantTy::STRING), &state.borrow().sort_key.action_state().to_variant());
+    // Restore the persisted direction before the toggle's handler is wired, so
+    // startup doesn't write anything through.
+    {
+        let descending = state.borrow().sort_descending;
+        sort_direction_button.set_active(descending);
+        sort_direction_button.set_icon_name(sort_direction_icon(descending));
+        sort_direction_button.set_tooltip_text(Some(sort_direction_tooltip(state.borrow().sort_key, descending)));
+    }
+    let (apply_sort, header_caret) = crate::window::sort::sort_applier(&state, &message_list, &sort_key_action, &sort_key_button, &sort_direction_button);
+    {
+        let apply = apply_sort.clone();
+        let state = state.clone();
+        sort_key_action.connect_activate(move |_action, parameter| {
+            let Some(key) = parameter.and_then(|p| p.str()).and_then(SortKey::from_action_state) else {
+                return;
+            };
+            let descending = state.borrow().sort_descending;
+            apply(key, descending, true);
+        });
+    }
+    crate::window::sort::connect_direction_toggle(&sort_direction_button, state.clone(), apply_sort.clone());
+
+    // The single-line column header. Its widths are the row cells' own
+    // constants, so the labels sit over their data. `Rc` is kept for the
+    // window's lifetime by the list-style closures below (and the header's
+    // own handlers hold only weak references back to it).
+    let column_header = crate::window::columns::build_column_header(
+        column_state.clone(),
+        state.borrow().settings.clone(),
+        apply_sort.clone(),
+        Rc::new({
+            let message_list = message_list.clone();
+            // Deferred: a width notification can arrive mid-allocation, and
+            // rebuilding the list's rows from there is not safe. Only a
+            // column-band change gets here, so at most a handful of idles.
+            move || {
+                let message_list = message_list.clone();
+                glib::idle_add_local_once(move || message_list.refresh());
+            }
+        }),
+    );
+    column_header.init();
+    *header_caret.borrow_mut() = Rc::downgrade(&column_header);
+    column_header.refresh(state.borrow().sort_key, state.borrow().sort_descending);
+
+    // --- Which row layout the list uses (M-07 / UX-27) ---
+    //
+    // Outlook switches to the single-line columnar list when the reading pane
+    // is at the bottom (or off) or the list pane is wide enough. `RowDisplay`
+    // drives every live row through the registry, and the header only exists
+    // in this layout.
+    let apply_list_style: Rc<dyn Fn(bool)> = {
+        let row_display = row_display.clone();
+        let registry = row_display_registry.clone();
+        let header = column_header.clone();
+        let scroller = message_scroller.clone();
+        Rc::new(move |single_line: bool| {
+            let display = RowDisplay { single_line, ..row_display.get() };
+            if row_display.get() != display {
+                row_display.set(display);
+                update_row_display(&registry, display);
+            }
+            header.set_visible(single_line);
+            if single_line {
+                // Re-fit on every width change while the columns are on
+                // screen: `set_width` only rebuilds when the fitting band
+                // actually changes.
+                header.set_width(scroller.width());
+            }
+        })
+    };
+    {
+        // A width change can cross the single-line threshold (or shrink the
+        // columns); the reading-pane position stays whatever it was.
+        let state = state.clone();
+        let apply = apply_list_style.clone();
+        message_scroller.connect_notify_local(Some("width"), move |scroller, _| {
+            let choice = crate::window::state::reading_pane_action_state(&state.borrow().settings);
+            apply(crate::window::sort::is_single_line(&choice, scroller.width()));
+        });
+    }
+    // Seed the initial style from the stored reading-pane choice and the
+    // width the window will be laid out at.
+    let apply_list_style_for_pane = apply_list_style.clone();
+    {
+        let state = state.clone();
+        let scroller = message_scroller.clone();
+        let choice = crate::window::state::reading_pane_action_state(&state.borrow().settings);
+        apply_list_style(crate::window::sort::is_single_line(&choice, scroller.width()));
+    }
     // The button's `active` state drives each row's avatar/checkbox swap; the
     // shared `row_display` and the row registry make the swap reach rows
     // already on screen (see `update_row_display`). The one side effect that
@@ -2200,32 +2717,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     };
     refresh_list_header(&state, &list_header);
 
-    // Secondary header: the message list's column names. Outlook shows these
-    // only in its single-line columnar layout (UX-27); the three-line message
-    // row (UX-28) has no columns to name, so the strip stays built but hidden
-    // until that layout lands. Its geometry follows the old fixed sender /
-    // subject / date columns and will need to be rebuilt on that layout's own
-    // terms rather than reused as-is.
-    let column_header_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_end(10)
-        .css_classes(["message-column-header"])
-        .visible(false)
-        .build();
+    // Secondary header: the single-line message list's column names, with
+    // each one sorting the list (M-07 / UX-27). Built above; shown only in the
+    // single-line layout, which the list-style wiring selects.
+    let column_header_row = column_header.root();
     // Column names are chrome, not message content.
     crate::privacy::mark_ui(&column_header_row);
-    // The sender column starts 51px in (3px accent + 8px margin + 32px avatar
-    // + 8px margin); the box's own 8px spacing covers the last of that, so the
-    // gutter is 43 wide.
-    let avatar_gutter = gtk::Box::builder().width_request(43).build();
-    column_header_row.append(&avatar_gutter);
-    let sender_header = gtk::Label::builder().label("Sender").xalign(0.0).width_request(180).build();
-    let subject_header = gtk::Label::builder().label("Subject").xalign(0.0).hexpand(true).build();
-    let date_header = gtk::Label::builder().label("Date").xalign(1.0).build();
-    column_header_row.append(&sender_header);
-    column_header_row.append(&subject_header);
-    column_header_row.append(&date_header);
 
     // --- Full-text search: a permanent `gtk::SearchEntry` in the window
     // header bar (see the header section below), wired up after the nav-rail
@@ -2296,53 +2793,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         sync_button.connect_clicked(move |_| resync_current_view(&state));
     }
 
-    // --- Sort direction toggle -> flip the order and re-sort in place. The
-    // re-sort reads the visible list back out of the model rather than
-    // re-fetching, so it costs nothing and keeps the selection (see
-    // `MessageListModel::displayed_messages`). ---
-    {
-        // Phase 5: put the button back on the persisted direction before the
-        // handler below is wired, so startup doesn't write anything through.
-        let descending = state.borrow().sort_descending;
-        sort_direction_button.set_active(descending);
-        sort_direction_button.set_icon_name(sort_direction_icon(descending));
-        sort_direction_button.set_tooltip_text(Some(sort_direction_tooltip(state.borrow().sort_key, descending)));
-    }
-    {
-        let state = state.clone();
-        let message_list = message_list.clone();
-        sort_direction_button.connect_toggled(move |button| {
-            let descending = button.is_active();
-            button.set_icon_name(sort_direction_icon(descending));
-            button.set_tooltip_text(Some(sort_direction_tooltip(state.borrow().sort_key, descending)));
-            state.borrow_mut().sort_descending = descending;
-            state.borrow().settings.set_bool(crate::settings::SORT_DESCENDING, descending);
-            resort_message_list(&state, &message_list);
-        });
-    }
-
-    // --- Sort key -> a stateful action so the menu renders radio checks. The
-    // action is added to the window once it exists (see `sort_key_action`
-    // below); menu actions resolve through the widget hierarchy at activation
-    // time, so registering it after the menu is built is fine. ---
-    let sort_key_action = gio::SimpleAction::new_stateful("sort-key", Some(glib::VariantTy::STRING), &state.borrow().sort_key.action_state().to_variant());
-    {
-        let state = state.clone();
-        let message_list = message_list.clone();
-        let sort_key_button = sort_key_button.clone();
-        let sort_direction_button = sort_direction_button.clone();
-        sort_key_action.connect_activate(move |action, parameter| {
-            let Some(key) = parameter.and_then(|p| p.str()).and_then(SortKey::from_action_state) else {
-                return;
-            };
-            action.set_state(&key.action_state().to_variant());
-            sort_key_button.set_label(key.label());
-            sort_direction_button.set_tooltip_text(Some(sort_direction_tooltip(key, sort_direction_button.is_active())));
-            state.borrow_mut().sort_key = key;
-            state.borrow().settings.set_string(crate::settings::SORT_KEY, key.action_state());
-            resort_message_list(&state, &message_list);
-        });
-    }
+    // --- Sort direction and sort key are wired above, through the shared
+    // `apply_sort` path (M-07): the same callback the column headers use. ---
 
     // --- Filters -> one stateful boolean action per `Filter` (win.filter-*),
     // so the menu renders independent check marks. Toggling one updates the
@@ -4248,8 +4700,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let reverse_sort_button = gtk::Button::from_icon_name("view-sort-descending-symbolic");
     reverse_sort_button.set_tooltip_text(Some("Reverse sort"));
     {
-        let sort_direction_button = sort_direction_button.clone();
-        reverse_sort_button.connect_clicked(move |_| sort_direction_button.set_active(!sort_direction_button.is_active()));
+        let state = state.clone();
+        let apply = apply_sort.clone();
+        reverse_sort_button.connect_clicked(move |_| {
+            let descending = !state.borrow().sort_descending;
+            let key = state.borrow().sort_key;
+            apply(key, descending, true);
+        });
     }
     // View ▸ Icons (UX-80): the optional Fluent pack, appended as its own
     // group. The default is the desktop's GNOME theme; the setting and the
@@ -6143,6 +6600,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let suppress_row = suppress_row.clone();
             Rc::new(move |choice: &str, persist: bool| {
                 reading_pane_action.set_state(&choice.to_variant());
+                // The list's row layout follows the pane's position and the
+                // list's width (M-07 / UX-27): bottom or off always has room
+                // for Outlook's columns.
+                apply_list_style_for_pane(crate::window::sort::is_single_line(choice, message_scroller.width()));
                 let store = state.borrow().settings.clone();
                 let visible = choice != "off";
                 if persist {

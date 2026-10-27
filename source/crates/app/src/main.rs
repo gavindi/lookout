@@ -60,6 +60,7 @@ mod ldap_directory;
 mod link_safety;
 mod lookout_view;
 mod mail_notifications;
+mod message_columns;
 mod message_header;
 mod message_list;
 mod message_menu;

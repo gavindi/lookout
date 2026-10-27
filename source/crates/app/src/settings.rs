@@ -111,6 +111,10 @@ pub const MAIL_CONVERSATION_INCLUDE_SENT: &str = "mail-conversation-include-sent
 /// `message_list::FilterSet`): any subset of unread, flagged, has-attachments,
 /// high-importance, categorised, to-me. Empty shows every message.
 pub const MAIL_FILTERS: &str = "mail-filters";
+/// The single-line message list's column order (OUTLOOK_PARITY.md M-07 /
+/// UX-27): a `strv` of `message_columns::MessageColumn` ids. Empty means
+/// Outlook's default set.
+pub const MAIL_LIST_COLUMNS: &str = "mail-list-columns";
 /// Config → Mail → search scope: which folders a title-bar search sweeps, one
 /// of `lookout_mail::SearchScope`'s strings (folder / subfolders / account /
 /// all). Defaults to "all", the pre-scope behaviour of searching every
@@ -373,6 +377,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_CONVERSATION_ORDER, Value::String("newest-top".into()));
     map.insert(MAIL_CONVERSATION_INCLUDE_SENT, Value::Bool(true));
     map.insert(MAIL_FILTERS, Value::Strv(Vec::new()));
+    map.insert(MAIL_LIST_COLUMNS, Value::Strv(Vec::new()));
     map.insert(MAIL_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(CALENDAR_SEARCH_SCOPE, Value::String("all".into()));
     map.insert(MAIL_INTERNAL_DOMAINS, Value::Strv(Vec::new()));
