@@ -50,9 +50,21 @@ if [ "${#missing_libs[@]}" -gt 0 ]; then
     exit 1
 fi
 
-if [ "$DEB" = true ] && ! command -v cargo-deb >/dev/null 2>&1; then
-    echo "error: cargo-deb not found. Install it with: cargo install cargo-deb --locked" >&2
-    exit 1
+if [ "$DEB" = true ]; then
+    # `cargo install` puts binaries in $CARGO_HOME/bin (default ~/.cargo/bin).
+    # With a distro-packaged cargo that directory is often not on PATH, so
+    # `command -v` misses cargo-deb even though `cargo deb` would find it.
+    CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+    case ":$PATH:" in
+        *":$CARGO_BIN_DIR:"*) ;;
+        *) PATH="$CARGO_BIN_DIR:$PATH" ;;
+    esac
+    export PATH
+
+    if ! command -v cargo-deb >/dev/null 2>&1; then
+        echo "error: cargo-deb not found. Install it with: cargo install cargo-deb --locked" >&2
+        exit 1
+    fi
 fi
 
 cd "$WORKSPACE_DIR"
