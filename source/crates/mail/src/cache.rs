@@ -938,7 +938,12 @@ impl Cache {
         // `ENVELOPE_CACHE_VERSION`, or the shared `user_version` high-water
         // mark would swallow it (the envelope bump to 7 already exceeds this
         // value).
-        const BODY_CACHE_VERSION: i64 = 6;
+        // Version 8: `EmailBody` gained `dsn` (the parsed RFC 3464 delivery
+        // status notification, M-27). Those rows were fetched before the
+        // `message/delivery-status`/`text/rfc822-headers` parts were
+        // requested, so a cached bounce would never show its card; wiping
+        // bodies makes the next open re-fetch them.
+        const BODY_CACHE_VERSION: i64 = 8;
         // Version 3: the whole-message fallback path (`parse_body`) used to
         // number attachment parts by enumerate counter ("0", "1", ...) instead
         // of their IMAP section paths, so cached bodies from those builds
@@ -3836,25 +3841,25 @@ mod tests {
         assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "a pre-migration body must be wiped");
 
-        // Simulate a version-6 database (bodies current at `BODY_CACHE_VERSION`,
-        // envelopes one behind at `ENVELOPE_CACHE_VERSION`): the envelope rows
-        // are wiped so the preview/mention pass re-inspects each body (M-25),
-        // while the bodies themselves survive.
+        // Simulate a version-7 database (envelopes current at
+        // `ENVELOPE_CACHE_VERSION`, bodies one behind): the body rows are
+        // wiped so each message is re-fetched with the delivery-report parts
+        // (M-27), while the envelope rows survive.
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 3, None)]).unwrap();
         cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
         }
         cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
         let cache = Cache::open(&account_id).unwrap();
         assert!(
-            cache.load_messages(&mailbox_id).unwrap().is_empty(),
-            "a version-6 cache's envelope rows must be wiped for the mention pass"
+            !cache.load_messages(&mailbox_id).unwrap().is_empty(),
+            "a version-7 cache's envelope rows survive a body-only bump"
         );
         assert!(
-            cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
-            "a version-6 cache's bodies must survive the envelope-only bump"
+            !cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
+            "a version-7 cache's bodies must be wiped for the delivery-report field"
         );
 
         let _ = std::fs::remove_file(path);
@@ -4685,6 +4690,7 @@ mod tests {
             text_body: Some(text.to_string()),
             html_body: None,
             calendar_ics: None,
+            dsn: None,
             parts: Vec::new(),
             headers: Vec::new(),
             auth_results: None,

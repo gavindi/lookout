@@ -618,6 +618,7 @@ mod tests {
             text_body: text.map(str::to_string),
             html_body: html.map(str::to_string),
             calendar_ics: None,
+            dsn: None,
             parts: Vec::new(),
             headers: Vec::new(),
             auth_results: None,

@@ -917,6 +917,7 @@ pub(crate) fn send_read_receipt(state: &Rc<RefCell<UiState>>, automatic: bool) -
             original_headers: context.headers,
         }),
         request_read_receipt: false,
+        request_delivery_receipt: false,
         importance: lookout_core::Importance::Normal,
         sensitivity: lookout_core::MessageSensitivity::Normal,
         in_reply_to: Some(bare_id.clone()),
@@ -1307,6 +1308,10 @@ pub(crate) fn render_body(
             render_invite_card(reading_stack, invitation.as_ref(), &conflicts, timeline);
         }
     }
+    // Delivery status notification card (M-27 / C-07): a message that is an
+    // RFC 3464 report shows its verdict and per-recipient outcome above the
+    // body, while its own prose still renders below.
+    render_delivery_report_card(reading_stack, body.dsn.as_ref());
     // An incoming REPLY (METHOD:REPLY) updates the organizer's stored event
     // the first time its message is rendered (item 3.6 / CAL-16). Runs after
     // the block above so its `RefCell` borrow is released; the applied set
@@ -1554,4 +1559,128 @@ pub(crate) fn render_body(
     }
     reading_stack.set_visible_child_name("empty");
     state.borrow_mut().rendered_message = None;
+}
+
+/// Fills the reading pane's delivery status notification card (M-27 / C-07)
+/// from a parsed RFC 3464 report, or hides it for ordinary mail. Outlook's
+/// wording is used for the headline ("Delivery has failed to these
+/// recipients or groups"), with one row per reported recipient carrying the
+/// enhanced status code and the reporting server's own diagnostic, plus the
+/// original message's subject when the report echoed its headers.
+pub(crate) fn render_delivery_report_card(reading_stack: &gtk::Stack, report: Option<&lookout_core::DeliveryReport>) {
+    use lookout_core::ReportAction;
+
+    let Some(card) = find_named_child(reading_stack, "dsn-card").and_then(|child| child.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    let Some(report) = report else {
+        card.set_visible(false);
+        return;
+    };
+    let Some(headline) = find_named_descendant(&card, "dsn-headline").and_then(|child| child.downcast::<gtk::Label>().ok()) else {
+        return;
+    };
+    let Some(rows) = find_named_descendant(&card, "dsn-rows").and_then(|child| child.downcast::<gtk::Box>().ok()) else {
+        return;
+    };
+    let original = find_named_descendant(&card, "dsn-original").and_then(|child| child.downcast::<gtk::Label>().ok());
+
+    headline.set_label(delivery_report_headline(report.kind));
+    crate::privacy::mark_ui(&headline);
+
+    // A re-render (theme toggle, trust change) rebuilds the rows from scratch.
+    while let Some(child) = rows.first_child() {
+        rows.remove(&child);
+    }
+    for recipient in &report.recipients {
+        let row = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(1).build();
+        let address = gtk::Label::builder().label(&recipient.final_recipient).xalign(0.0).wrap(true).build();
+        address.add_css_class("caption-heading");
+        crate::privacy::mark(&address);
+        row.append(&address);
+        let mut detail = String::from(delivery_report_action_label(recipient.action));
+        if let Some(status) = recipient.status.as_deref().filter(|status| !status.trim().is_empty()) {
+            detail.push_str(&format!(" · {status}"));
+        }
+        if recipient.action == ReportAction::Failed {
+            if let Some(mta) = recipient.remote_mta.as_deref().filter(|mta| !mta.trim().is_empty()) {
+                detail.push_str(&format!(" · {mta}"));
+            }
+        }
+        let detail_label = gtk::Label::builder().label(&detail).xalign(0.0).wrap(true).css_classes(["dim-label", "caption"]).build();
+        crate::privacy::mark_ui(&detail_label);
+        row.append(&detail_label);
+        if let Some(diagnostic) = recipient.diagnostic_code.as_deref().filter(|code| !code.trim().is_empty()) {
+            // The RFC 3464 `Diagnostic-Code` starts with its own type
+            // (`smtp;`), which means nothing to a reader - show the text.
+            let diagnostic = diagnostic.split_once(';').map_or(diagnostic, |(_, rest)| rest).trim();
+            let diagnostic_label = gtk::Label::builder().label(diagnostic).xalign(0.0).wrap(true).css_classes(["dim-label", "caption"]).build();
+            crate::privacy::mark_ui(&diagnostic_label);
+            row.append(&diagnostic_label);
+        }
+        rows.append(&row);
+    }
+
+    if let Some(original) = original {
+        match report.original_subject.as_deref().filter(|subject| !subject.trim().is_empty()) {
+            Some(subject) => {
+                original.set_label(&format!("Original message: {subject}"));
+                crate::privacy::mark_content(&original);
+                original.set_visible(true);
+            }
+            None => original.set_visible(false),
+        }
+    }
+    card.set_visible(true);
+}
+
+/// Outlook's headline for each report verdict.
+fn delivery_report_headline(kind: lookout_core::DeliveryReportKind) -> &'static str {
+    match kind {
+        lookout_core::DeliveryReportKind::Failed => "Delivery has failed to these recipients or groups",
+        lookout_core::DeliveryReportKind::Delivered => "Delivered",
+        lookout_core::DeliveryReportKind::Delayed => "Delivery is delayed",
+        lookout_core::DeliveryReportKind::Mixed => "Delivery status",
+    }
+}
+
+/// The one-word outcome shown beside a recipient's address.
+fn delivery_report_action_label(action: lookout_core::ReportAction) -> &'static str {
+    match action {
+        lookout_core::ReportAction::Delivered => "Delivered",
+        lookout_core::ReportAction::Failed => "Delivery failed",
+        lookout_core::ReportAction::Delayed => "Delivery delayed",
+        lookout_core::ReportAction::Relayed => "Relayed",
+        lookout_core::ReportAction::Expanded => "Expanded to a list",
+        lookout_core::ReportAction::Unknown => "Unknown outcome",
+    }
+}
+
+/// Builds the delivery status notification card's widget tree (M-27 / C-07),
+/// ready for `render_delivery_report_card` to fill per message. Named so both
+/// the reading pane and a popped-out message window can host one; hidden
+/// until a report arrives.
+pub(crate) fn build_delivery_report_card() -> gtk::Box {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .css_classes(["card"])
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(8)
+        .margin_bottom(4)
+        .build();
+    card.set_widget_name("dsn-card");
+    card.set_visible(false);
+    let headline = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["heading"]).build();
+    headline.set_widget_name("dsn-headline");
+    card.append(&headline);
+    let rows = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+    rows.set_widget_name("dsn-rows");
+    card.append(&rows);
+    let original = gtk::Label::builder().xalign(0.0).wrap(true).css_classes(["dim-label", "caption"]).build();
+    original.set_widget_name("dsn-original");
+    original.set_visible(false);
+    card.append(&original);
+    card
 }

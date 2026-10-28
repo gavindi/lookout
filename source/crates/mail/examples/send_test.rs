@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
                                 calendar_part: None,
                                 read_receipt: None,
                                 request_read_receipt: false,
+            request_delivery_receipt: false,
                                 importance: lookout_core::Importance::Normal,
                                 sensitivity: lookout_core::MessageSensitivity::Normal,
                                 in_reply_to: None,

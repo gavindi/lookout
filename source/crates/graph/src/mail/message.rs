@@ -369,6 +369,10 @@ pub fn email_body_from_graph(value: &Value, uid: Uid, attachments: &[GraphAttach
         text_body: if is_html { None } else { content.clone() },
         html_body: if is_html { content } else { None },
         calendar_ics: None,
+        // A delivery status notification's machine-readable block isn't part
+        // of Graph's JSON body, so the reading-pane report card (M-27) is
+        // IMAP-only for now; the report's own prose body still renders.
+        dsn: None,
         parts: attachments.iter().map(body_part_from_attachment).collect(),
         auth_results: auth_results_from_headers(&headers),
         headers,

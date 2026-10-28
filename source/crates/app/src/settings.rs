@@ -140,6 +140,11 @@ pub const MAIL_USE_SERVER_FOLDER_NAMES: &str = "mail-use-server-folder-names";
 /// Inbox into Focused/Other with the local classifier (M-03 / item 2.12).
 pub const MAIL_FOCUSED_INBOX_LOCAL: &str = "mail-focused-inbox-local";
 pub const MAIL_SEND_READ_RECEIPTS: &str = "mail-send-read-receipts";
+/// Config → Mail → "Request a delivery receipt for all messages I send"
+/// (RFC 3461, M-27 / C-07): seeds the composer's delivery-receipt switch for
+/// new messages, replies and forwards. The per-message switch overrides it,
+/// and a reopened draft keeps its own saved choice.
+pub const MAIL_REQUEST_DELIVERY_RECEIPT: &str = "mail-request-delivery-receipt";
 pub const MAIL_RICH_TEXT_DEFAULT: &str = "mail-rich-text-default";
 /// Config → Mail → "Check spelling as you type": whether the composer's
 /// WebKit view spellchecks as the user types.
@@ -391,6 +396,7 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(MAIL_USE_SERVER_FOLDER_NAMES, Value::Bool(false));
     map.insert(MAIL_FOCUSED_INBOX_LOCAL, Value::Bool(false));
     map.insert(MAIL_SEND_READ_RECEIPTS, Value::Bool(false));
+    map.insert(MAIL_REQUEST_DELIVERY_RECEIPT, Value::Bool(false));
     map.insert(MAIL_RICH_TEXT_DEFAULT, Value::Bool(true));
     map.insert(MAIL_SPELL_CHECK, Value::Bool(true));
     map.insert(MAIL_SPELL_CHECK_LANGUAGES, Value::Strv(Vec::new()));
@@ -1000,6 +1006,16 @@ mod tests {
         assert!(!store.get_bool(ANIMATE_TRANSITIONS));
         store.set_bool(ANIMATE_TRANSITIONS, true);
         assert!(store.get_bool(ANIMATE_TRANSITIONS));
+    }
+
+    #[test]
+    fn request_delivery_receipt_defaults_off_and_round_trips() {
+        let store = resolve();
+        assert!(!store.get_bool(MAIL_REQUEST_DELIVERY_RECEIPT), "Outlook's account-wide delivery-receipt default starts off");
+        store.set_bool(MAIL_REQUEST_DELIVERY_RECEIPT, true);
+        assert!(store.get_bool(MAIL_REQUEST_DELIVERY_RECEIPT));
+        store.set_bool(MAIL_REQUEST_DELIVERY_RECEIPT, false);
+        assert!(!store.get_bool(MAIL_REQUEST_DELIVERY_RECEIPT));
     }
 
     #[test]

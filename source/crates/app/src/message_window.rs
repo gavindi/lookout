@@ -237,6 +237,9 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     message_page.append(&auth_banner);
     message_page.append(&external_banner);
     message_page.append(&sensitivity_banner);
+    // A delivery status notification's report card (M-27 / C-07), the same
+    // widget the reading pane hosts.
+    message_page.append(&crate::window::build_delivery_report_card());
     message_page.append(&attachments);
     message_page.append(&content_stack);
 
@@ -611,6 +614,10 @@ fn render_data(state: &Rc<RefCell<UiState>>, entry: &Rc<RefCell<MessageWindowSta
             None => sensitivity_banner.set_revealed(false),
         }
     }
+
+    // The delivery status notification card (M-27 / C-07), like the reading
+    // pane's: a bounced message shows its verdict above the body here too.
+    crate::window::render_delivery_report_card(&page_stack, body.dsn.as_ref());
 
     // The reading pane's attachment strip, reused verbatim: its Open/Save
     // actions ask the account for the part's bytes; the completed fetch is

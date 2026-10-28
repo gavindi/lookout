@@ -1,0 +1,59 @@
+Return-Path: <>
+From: Mail Delivery Subsystem <MAILER-DAEMON@mx.contoso.com>
+To: bob@example.com
+Subject: Delayed delivery: Quarterly report
+Date: Mon, 12 Jan 2026 18:00:00 +0000
+Message-ID: <dsn-delayed-20260112@mx.contoso.com>
+Auto-Submitted: auto-replied
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status;
+	boundary="report-delayed-20260112"
+Content-Transfer-Encoding: 7bit
+
+This is a MIME-encapsulated message.
+
+--report-delayed-20260112
+Content-Description: Notification
+Content-Type: text/plain; charset="us-ascii"
+
+This is the mail system at host mx.contoso.com.
+
+Your message has not yet been delivered. Delivery will continue to
+be attempted for the next 5 days. You will receive a notification
+if the message cannot be delivered.
+
+                   The mail system
+
+<carol@contoso.com>: delivery delayed
+
+--report-delayed-20260112
+Content-Description: Delivery report
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mx.contoso.com
+X-Postfix-Queue-ID: 4A1B2C3D50
+X-Postfix-Sender: rfc822; bob@example.com
+Arrival-Date: Mon, 12 Jan 2026 10:00:00 +0000
+
+Final-Recipient: rfc822; carol@contoso.com
+Original-Recipient: rfc822; carol@contoso.com
+Action: delayed
+Status: 4.4.1
+Remote-MTA: dns; mx.contoso.com
+Diagnostic-Code: smtp; 450 4.4.1 Connection timed out
+Last-Attempt-Date: Mon, 12 Jan 2026 17:59:30 +0000
+Will-Retry-Until: Sat, 17 Jan 2026 10:00:00 +0000
+
+--report-delayed-20260112
+Content-Description: Delayed Message Headers
+Content-Type: text/rfc822-headers; charset="us-ascii"
+Content-Transfer-Encoding: 7bit
+
+Return-Path: <bob@example.com>
+From: Bob Example <bob@example.com>
+To: carol@contoso.com
+Subject: Quarterly report
+Date: Mon, 12 Jan 2026 10:00:00 +0000
+Message-ID: <quarterly-20260112@example.com>
+
+--report-delayed-20260112--

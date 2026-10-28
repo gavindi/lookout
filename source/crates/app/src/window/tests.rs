@@ -2686,6 +2686,7 @@ fn cached_body_for(uid: u32) -> Rc<lookout_core::EmailBody> {
         text_body: Some(format!("body {uid}")),
         html_body: None,
         calendar_ics: None,
+        dsn: None,
         parts: Vec::new(),
         headers: Vec::new(),
         auth_results: None,

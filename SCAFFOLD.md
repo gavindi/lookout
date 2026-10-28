@@ -235,8 +235,9 @@ in `AppConfig`; the composer inserts them as HTML or plain text.
 - **`interop/`** is the single home for Microsoft wire strings and mappings: importance and
   sensitivity headers, `X-MICROSOFT-CDO-*` busy status, category colour presets (`preset0`–`24`),
   follow-up-flag keywords, `$Junk`/`$NotJunk`, snooze keywords, TNEF/RTF decoding, `@mentions`
-  detection, online-meeting URL detection and Focused-Inbox classification. Feature code calls
-  these helpers rather than hard-coding Outlook-specific values.
+  detection, online-meeting URL detection, Focused-Inbox classification and RFC 3461/3464
+  delivery receipts (`dsn.rs`: the `NOTIFY` request value and the report parser). Feature code
+  calls these helpers rather than hard-coding Outlook-specific values.
 
 ### Serde convention
 

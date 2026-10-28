@@ -3208,6 +3208,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     imip_join_button.set_visible(false);
     imip_invite_card.append(&imip_join_button);
     message_page.append(&imip_invite_card);
+    // The delivery status notification card (M-27 / C-07), above the body:
+    // a message that is an RFC 3464 report shows its verdict and per-recipient
+    // outcome here, with the report's own prose still rendered below.
+    // `render_delivery_report_card` fills it per message and hides it for
+    // everything that isn't one.
+    message_page.append(&crate::window::build_delivery_report_card());
     message_page.append(&content_stack);
     message_page.append(&message_header.action_bar);
     // The List-Unsubscribe banner, between the header and the body: revealed
@@ -8690,6 +8696,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
 
+    // Config → Mail → "Request a delivery receipt for all messages I send":
+    // seeds each new composer's delivery-receipt switch (C-07). Read at
+    // composer-open time, so an already-open composer keeps its own choice.
+    {
+        let state = state.clone();
+        config_view.request_delivery_receipt_row.connect_active_notify(move |row| {
+            state.borrow().settings.set_bool(crate::settings::MAIL_REQUEST_DELIVERY_RECEIPT, row.is_active());
+        });
+    }
+
     // Config → Mail → "Mark as read": which mode decides when opening a
     // message marks it read (item 1.8). Read fresh in the selection handler on
     // every navigation, so a change takes effect on the next message; any mark
@@ -9174,6 +9190,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             config_view.spell_languages_row.set_selected(index as u32);
         }
         config_view.read_receipts_row.set_active(persisted.get_bool(crate::settings::MAIL_SEND_READ_RECEIPTS));
+        config_view
+            .request_delivery_receipt_row
+            .set_active(persisted.get_bool(crate::settings::MAIL_REQUEST_DELIVERY_RECEIPT));
         {
             let mark_mode = persisted.get_string(crate::settings::MARK_AS_READ_MODE);
             config_view.mark_as_read_row.set_selected(crate::settings::mark_as_read_index(&mark_mode));

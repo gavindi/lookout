@@ -291,6 +291,13 @@ pub(crate) fn show_composer_in_reading_pane_full(
     if let Some(existing) = reading_stack.child_by_name("compose") {
         reading_stack.remove(&existing);
     }
+    // Seed the delivery-receipt checkbox (C-07) from the global "request for
+    // all messages I send" setting. A composer that already carries a
+    // decision - a reopened draft or a withdrawn scheduled send - keeps it.
+    let mut prefill = prefill;
+    if prefill.request_delivery_receipt.is_none() {
+        prefill.request_delivery_receipt = Some(state.borrow().settings.get_bool(crate::settings::MAIL_REQUEST_DELIVERY_RECEIPT));
+    }
     let previous_page = reading_stack.visible_child_name().map(|s| s.to_string()).unwrap_or_else(|| "empty".to_string());
     let reading_stack_for_close = reading_stack.clone();
     let state_for_close = state.clone();
@@ -437,6 +444,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             handle.top_row.remove(&handle.status_label);
             handle.top_row.remove(&handle.from_dropdown);
             handle.top_row.remove(&handle.read_receipt_toggle);
+            handle.top_row.remove(&handle.delivery_receipt_toggle);
             handle.top_row.remove(&handle.light_view_button);
             // A button to pop the composer back into the reading pane
             // without closing the session: it closes the window, and the
@@ -461,6 +469,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
             header.pack_end(&handle.cancel_button);
             header.pack_end(&back_button);
             header.pack_end(&handle.read_receipt_toggle);
+            header.pack_end(&handle.delivery_receipt_toggle);
             header.pack_end(&handle.light_view_button);
             let content_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
             content_box.append(&header);
@@ -496,6 +505,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
                         handle.status_label.unparent();
                         handle.from_dropdown.unparent();
                         handle.read_receipt_toggle.unparent();
+                        handle.delivery_receipt_toggle.unparent();
                         handle.light_view_button.unparent();
                         handle.top_row.prepend(&handle.from_dropdown);
                         handle.top_row.prepend(&handle.send_button);
@@ -503,9 +513,11 @@ pub(crate) fn show_composer_in_reading_pane_full(
                         handle.top_row.append(&handle.status_label);
                         handle.top_row.reorder_child_after(&handle.status_label, Some(&handle.title_label));
                         handle.top_row.append(&handle.read_receipt_toggle);
+                        handle.top_row.append(&handle.delivery_receipt_toggle);
                         handle.top_row.append(&handle.light_view_button);
                         handle.top_row.reorder_child_after(&handle.light_view_button, Some(&handle.status_label));
                         handle.top_row.reorder_child_after(&handle.read_receipt_toggle, Some(&handle.light_view_button));
+                        handle.top_row.reorder_child_after(&handle.delivery_receipt_toggle, Some(&handle.read_receipt_toggle));
                         if let Some(existing) = reading_stack_for_close.child_by_name("compose") {
                             reading_stack_for_close.remove(&existing);
                         }

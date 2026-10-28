@@ -1788,7 +1788,7 @@ async fn connect_and_run(
                     continue;
                 };
                 let sent = match credentials.smtp_credential().await {
-                    Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw).await,
+                    Ok(cred) => send_smtp(&config.smtp, cred, &message.from, &message.recipients, &raw, message.request_delivery_receipt).await,
                     Err(e) => Err(Error::LoginFailed(e)),
                 };
                 match sent {
@@ -7460,7 +7460,13 @@ fn body_from_fetch(uid: Uid, fetch: &Fetch, parts: &[BodyPart]) -> Option<EmailB
         .unwrap_or_default();
 
     let mut fetched: Vec<(String, Vec<u8>)> = Vec::new();
-    for part in parts.iter().filter(|p| p.is_text() || p.is_calendar() || p.is_tnef()) {
+    // A delivery status notification's `message/delivery-status` and
+    // `text/rfc822-headers` parts ride along so the reading pane can show the
+    // report as a card (M-27) instead of just its prose body.
+    for part in parts
+        .iter()
+        .filter(|p| p.is_text() || p.is_calendar() || p.is_tnef() || p.is_delivery_status() || p.is_rfc822_headers())
+    {
         if let Some(bytes) = fetch.section(&part_section_path(&part.part_number)) {
             fetched.push((part.part_number.clone(), bytes.to_vec()));
         }
@@ -7483,7 +7489,10 @@ fn body_from_fetch(uid: Uid, fetch: &Fetch, parts: &[BodyPart]) -> Option<EmailB
 /// to fetch or the server didn't return the requested sections; the caller
 /// falls back to a whole-message fetch rather than showing an empty pane.
 async fn fetch_body_partial(session: &mut Session<SessionStream>, uid: Uid, parts: &[BodyPart]) -> Result<Option<EmailBody>> {
-    let text_parts: Vec<&BodyPart> = parts.iter().filter(|p| p.is_text() || p.is_calendar() || p.is_tnef()).collect();
+    let text_parts: Vec<&BodyPart> = parts
+        .iter()
+        .filter(|p| p.is_text() || p.is_calendar() || p.is_tnef() || p.is_delivery_status() || p.is_rfc822_headers())
+        .collect();
     if text_parts.is_empty() {
         return Ok(None);
     }
@@ -7550,7 +7559,10 @@ async fn fetch_bodies_batch(
     // section and falls back to a whole-message fetch below.
     let mut part_numbers: Vec<&str> = Vec::new();
     for parts in batch.iter().filter_map(|uid| structures.get(uid)) {
-        for part in parts.iter().filter(|p| p.is_text() || p.is_calendar() || p.is_tnef()) {
+        for part in parts
+            .iter()
+            .filter(|p| p.is_text() || p.is_calendar() || p.is_tnef() || p.is_delivery_status() || p.is_rfc822_headers())
+        {
             if !part_numbers.contains(&part.part_number.as_str()) {
                 part_numbers.push(part.part_number.as_str());
             }
@@ -7939,6 +7951,7 @@ mod tests {
                 draft_message_id: Some(format!("{subject}@lookout.local")),
                 subject: subject.into(),
                 bcc: bcc.iter().map(|b| b.to_string()).collect(),
+                request_delivery_receipt: false,
             })
             .unwrap()
         };

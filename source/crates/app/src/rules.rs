@@ -642,6 +642,7 @@ pub(crate) fn build_rule_forward(from: &str, display_name: &str, pending: &Pendi
         calendar_part: None,
         read_receipt: None,
         request_read_receipt: false,
+        request_delivery_receipt: false,
         in_reply_to: None,
         references: Vec::new(),
         message_id: None,

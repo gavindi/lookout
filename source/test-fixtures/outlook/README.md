@@ -18,6 +18,9 @@ behaviour rather than an interpretation of the specs.
 | `importance-high.eml` | `Importance: High` + `X-Priority: 1 (Highest)` + `X-MSMail-Priority: High`, a `Sensitivity: Private`, and a `List-Id`. |
 | `sensitivity-private.eml` | RFC 2156 `Sensitivity: Company-Confidential`. |
 | `auth-results.eml` | RFC 8601 `Authentication-Results` (SPF softfail, DKIM fail, DMARC fail, plus a second header), with a `From` display name impersonating a different address — drives the unverified-sender banner (S-03, M-35). |
+| `dsn-failed.eml` | An RFC 3464 delivery status notification for a rejected recipient: `multipart/report; report-type=delivery-status`, a `text/plain` explanation, the `message/delivery-status` block (`Action: failed`, `Status: 5.1.1`, `Diagnostic-Code`, `Remote-MTA`) and the original headers as `text/rfc822-headers` — pins the report parser and the reading-pane failure card (M-27, C-07). |
+| `dsn-delivered.eml` | The successful form of the same report (`Action: delivered`, `Status: 2.0.0`), which `NOTIFY=SUCCESS` asks for (M-27, C-07). |
+| `dsn-delayed.eml` | The delayed form (`Action: delayed`, `Status: 4.4.1`, `Will-Retry-Until`) (M-27, C-07). |
 | `winmail.dat` | A synthetic TNEF stream (`[MS-OXTNEF]`): plain/RTF/HTML bodies, a MAPI property stream, two attachments and an inline image. |
 | `tnef-message.eml` | The `winmail.dat` above wrapped in the MIME envelope Outlook sends: `text/plain` plus `application/ms-tnef; name="winmail.dat"`. |
 | `freebusy-request.ics` | The RFC 6638 §B.5 `VFREEBUSY` `METHOD:REQUEST` body a client POSTs to a CalDAV schedule-outbox (CAL-19). |

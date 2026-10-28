@@ -367,6 +367,10 @@ pub struct ConfigView {
     /// the caller can wire its `active` state into the reading pane's
     /// read-receipt policy (read per message at display time).
     pub read_receipts_row: adw::SwitchRow,
+    /// Config → Mail → "Request a delivery receipt for all messages I send"
+    /// (RFC 3461, C-07): the composer's default for new messages, replies and
+    /// forwards.
+    pub request_delivery_receipt_row: adw::SwitchRow,
     /// "Mark as read" combo (Config → Mail); its selected index maps to
     /// `MARK_AS_READ_MODES`.
     pub mark_as_read_row: adw::ComboRow,
@@ -821,6 +825,11 @@ pub fn build() -> ConfigView {
         .subtitle("Reply with a read receipt when a message asks for one; when off, the reading pane asks first")
         .build();
     mail_settings_group.add(&read_receipts_row);
+    let request_delivery_receipt_row = adw::SwitchRow::builder()
+        .title("Request a delivery receipt for all messages I send")
+        .subtitle("Ask the sending server to report delivery (RFC 3461); the composer's switch overrides this per message")
+        .build();
+    mail_settings_group.add(&request_delivery_receipt_row);
     let mark_as_read_row = adw::ComboRow::builder()
         .title("Mark as read")
         .subtitle("When looking at a message marks it as read")
@@ -1354,6 +1363,7 @@ pub fn build() -> ConfigView {
         spell_check_row,
         spell_languages_row,
         read_receipts_row,
+        request_delivery_receipt_row,
         mark_as_read_row,
         mark_as_read_delay_row,
         undo_send_row,

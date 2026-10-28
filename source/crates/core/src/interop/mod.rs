@@ -14,6 +14,8 @@
 //! - [`focused`] — the local Focused/Other classifier for non-Microsoft
 //!   accounts (§4.1, M-03 / item 2.12).
 //! - [`cdo`] — the `X-MICROSOFT-CDO-*` calendar properties (§4.3).
+//! - [`dsn`] — delivery status notifications: the RFC 3461 request and the
+//!   RFC 3464 report (§4.1, M-27 / C-07).
 //! - [`categories`] — Outlook's 25 category colour presets (§4.4, UX-85).
 //! - [`flags`] — follow-up flag semantics (§4.1, §4.4, M-10).
 //! - [`junk`] — the RFC 5788 `$Junk` / `$NotJunk` keywords (§4.2, M-17).
@@ -31,6 +33,7 @@
 pub mod categories;
 pub mod cdo;
 pub mod contacts_csv;
+pub mod dsn;
 pub mod flags;
 pub mod focused;
 pub mod headers;
@@ -43,6 +46,11 @@ pub mod tnef;
 pub use categories::{graph_preset, nearest_preset_for_rgb, preset_by_graph, preset_by_index, preset_by_name, CategoryPreset, OUTLOOK_CATEGORY_PRESETS};
 pub use cdo::{disallow_counter, BusyStatus};
 pub use contacts_csv::{ContactsCsvError, OUTLOOK_CSV_COLUMNS};
+pub use dsn::{
+    draft_requests_delivery_receipt, is_delivery_report, parse_delivery_report, rcpt_notify_parameter, report_type, DeliveryReport, DeliveryReportKind, ReportAction,
+    ReportedRecipient, DELIVERY_RECEIPT_DRAFT_HEADER, DELIVERY_RECEIPT_DRAFT_VALUE, DELIVERY_STATUS_PART_CONTENT_TYPE, DELIVERY_STATUS_REPORT_TYPE,
+    DISPOSITION_NOTIFICATION_REPORT_TYPE, NOTIFY_PARAMETER, NOTIFY_SUCCESS_FAILURE, RET_PARAMETER,
+};
 pub use flags::{
     flag_due_for_date, flag_due_from_keyword, flag_due_keyword, flag_keywords, follow_up_from_headers, follow_up_from_keywords, follow_up_headers, follow_up_keywords,
     is_flag_keyword, FlagStatus, FollowUpFlag, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD,

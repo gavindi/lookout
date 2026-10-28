@@ -294,6 +294,11 @@
       <summary>Open HTML messages in dark mode</summary>
       <description>When on, newly-opened HTML messages show with their own background removed and colours inverted instead of in their original light form. The reading pane's per-message "Switch message theme" toggle overrides this for the current message either way.</description>
     </key>
+    <key name="mail-request-delivery-receipt" type="b">
+      <default>false</default>
+      <summary>Request a delivery receipt for all messages I send</summary>
+      <description>Turn on the composer's "Request a delivery receipt" switch for every new message, reply and forward (RFC 3461 delivery status notifications). Off by default; the per-message switch still overrides it, and a reopened draft keeps the choice it was saved with.</description>
+    </key>
     <key name="mail-send-read-receipts" type="b">
       <default>false</default>
       <summary>Send read receipts automatically</summary>

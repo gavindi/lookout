@@ -44,6 +44,12 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
 
     let headers: Vec<(String, String)> = message.headers_raw().map(|(name, value)| (name.to_string(), value.trim().to_string())).collect();
 
+    // A delivery status notification (M-27 / C-07): the machine-readable
+    // `message/delivery-status` block plus, when present, the original
+    // message's headers in the report's third part. Parsed here from the raw
+    // message; the partial-fetch path parses the same two parts by number.
+    let dsn = delivery_report_from_parts(&message.parts, &headers, text_body.as_deref());
+
     // mail-parser numbers its parts by flat index, not by IMAP section path;
     // compute the `BODY[<n>]` path for every part so `EmailBody::parts`
     // carries numbers an on-demand `FetchAttachment` can actually fetch with.
@@ -74,6 +80,12 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
             // surfaces in the strip's metadata list (matching the
             // partial-fetch assembly path's filter below).
             if content_type.eq_ignore_ascii_case("text/calendar") {
+                return None;
+            }
+            // A delivery status notification's machine-readable block and the
+            // original headers are body content too - the reading pane's card
+            // consumes them, the strip must not list them.
+            if content_type.eq_ignore_ascii_case(lookout_core::DELIVERY_STATUS_PART_CONTENT_TYPE) || content_type.eq_ignore_ascii_case("text/rfc822-headers") {
                 return None;
             }
             // Same heuristic as the BODYSTRUCTURE path (`structure.rs`): a
@@ -112,10 +124,29 @@ pub fn parse_body(uid: Uid, raw: &[u8]) -> Option<EmailBody> {
         text_body,
         html_body,
         calendar_ics,
+        dsn,
         parts,
         headers,
         auth_results,
     })
+}
+
+/// Extracts an RFC 3464 delivery status notification from mail-parser's flat
+/// part list: the `message/delivery-status` block plus the original headers
+/// part when the report carries one. `None` for anything that isn't a DSN.
+fn delivery_report_from_parts(parts: &[mail_parser::MessagePart<'_>], headers: &[(String, String)], human_text: Option<&str>) -> Option<lookout_core::DeliveryReport> {
+    if !lookout_core::is_delivery_report(headers) {
+        return None;
+    }
+    let find = |mime: &str| {
+        parts.iter().find_map(|part| {
+            let content_type = part.content_type().map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or(""))).unwrap_or_default();
+            content_type.eq_ignore_ascii_case(mime).then(|| part.contents().to_vec())
+        })
+    };
+    let delivery_status = find(lookout_core::DELIVERY_STATUS_PART_CONTENT_TYPE)?;
+    let original_headers = find("text/rfc822-headers");
+    lookout_core::parse_delivery_report(headers, &delivery_status, original_headers.as_deref(), human_text.map(str::to_string))
 }
 
 /// Applies a decoded TNEF payload to a message's assembled pieces (item 1.21,
@@ -263,6 +294,11 @@ pub struct DraftPrefillContent {
     /// Whether the draft asked for a read receipt
     /// (`Disposition-Notification-To` present).
     pub request_read_receipt: bool,
+    /// Whether the draft asked for a delivery receipt. There is no standard
+    /// header for an RFC 3461 envelope parameter, so a draft records it in
+    /// the private `X-Lookout-Delivery-Receipt` marker (see
+    /// `lookout_core::DELIVERY_RECEIPT_DRAFT_HEADER`).
+    pub request_delivery_receipt: bool,
     /// The envelope, parsed from the raw headers. A reopened draft takes
     /// these from its cached `EmailSummary` instead; a withdrawn scheduled
     /// send (item 1.14) has no summary, only the outbox's raw bytes, so it
@@ -343,6 +379,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         .map(|value| value.split_whitespace().map(|id| id.trim_start_matches('<').trim_end_matches('>').to_string()).collect())
         .unwrap_or_default();
     let request_read_receipt = !lookout_core::parse_disposition_notification_to(&headers).is_empty();
+    let request_delivery_receipt = lookout_core::draft_requests_delivery_receipt(&headers);
     let importance = lookout_core::importance_from_headers(&headers).unwrap_or_default();
     let sensitivity = lookout_core::sensitivity_from_headers(&headers).unwrap_or_default();
 
@@ -354,6 +391,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
         in_reply_to,
         references,
         request_read_receipt,
+        request_delivery_receipt,
         from,
         to,
         cc,
@@ -459,6 +497,10 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
     // The message's TNEF payload (item 1.21 / M-45), transfer-decoded like an
     // attachment and applied after the text parts are assembled.
     let mut tnef_payload: Option<(String, Vec<u8>)> = None;
+    // A delivery status notification's two machine-readable parts (M-27):
+    // the RFC 3464 block and the original message's headers.
+    let mut delivery_status: Option<Vec<u8>> = None;
+    let mut original_headers: Option<Vec<u8>> = None;
     for (part_number, bytes) in fetched {
         let Some(part) = all_parts.iter().find(|p| p.part_number == *part_number) else {
             continue;
@@ -469,6 +511,14 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         }
         if part.is_tnef() {
             tnef_payload = Some((part.part_number.clone(), transfer_part_bytes(part, bytes)));
+            continue;
+        }
+        if part.is_delivery_status() {
+            delivery_status = Some(transfer_part_bytes(part, bytes));
+            continue;
+        }
+        if part.is_rfc822_headers() {
+            original_headers = Some(transfer_part_bytes(part, bytes));
             continue;
         }
         if !part.is_text() {
@@ -493,10 +543,16 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         .and_then(|(_, _, html)| html.clone())
         .or_else(|| decoded.iter().find_map(|(_, _, html)| html.clone()));
 
-    // The calendar part is body content, not an attachment - it must not
-    // surface in the strip's metadata list alongside the actual attachments
-    // (same treatment as the text leaves).
-    let parts: Vec<BodyPart> = all_parts.iter().filter(|p| !p.is_text() && !p.is_calendar()).cloned().collect();
+    let dsn = delivery_status.and_then(|bytes| lookout_core::parse_delivery_report(&headers, &bytes, original_headers.as_deref(), text_body.clone()));
+
+    // The calendar part (and a delivery report's two blocks) is body content,
+    // not an attachment - it must not surface in the strip's metadata list
+    // alongside the actual attachments (same treatment as the text leaves).
+    let parts: Vec<BodyPart> = all_parts
+        .iter()
+        .filter(|p| !p.is_text() && !p.is_calendar() && !p.is_delivery_status() && !p.is_rfc822_headers())
+        .cloned()
+        .collect();
     let (parts, text_body, html_body, calendar_ics) = match tnef_payload {
         Some((source_part, payload)) => match tnef::parse(&payload) {
             Ok(contents) => apply_tnef(&contents, &source_part, parts, text_body, html_body, has_real_html, calendar_ics),
@@ -512,6 +568,7 @@ pub fn assemble_body_from_parts(uid: Uid, headers: Vec<(String, String)>, all_pa
         text_body,
         html_body,
         calendar_ics,
+        dsn,
         parts,
         headers,
         auth_results,
@@ -1374,6 +1431,7 @@ mod tests {
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: false,
+            request_delivery_receipt: true,
             in_reply_to: None,
             references: vec![],
             message_id: Some("draft-rt@lookout.local".to_string()),
@@ -1390,6 +1448,8 @@ mod tests {
         assert_eq!(prefill.attachments[0].filename, "notes.txt");
         assert_eq!(prefill.attachments[0].bytes, b"attached notes");
         assert_eq!(prefill.bcc, vec!["Ada <hidden@example.com>".to_string()]);
+        assert!(prefill.request_delivery_receipt, "the delivery-receipt request survives a draft save/reopen");
+        assert!(!prefill.request_read_receipt);
         assert_eq!(prefill.from.as_deref(), Some("me@example.com"));
         assert_eq!(prefill.to, vec!["you@example.com".to_string()]);
         assert_eq!(prefill.cc, vec!["Bo <cc@example.com>".to_string()]);

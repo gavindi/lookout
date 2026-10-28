@@ -828,6 +828,13 @@ impl GraphMailSession {
                 cache_op(&self.cache, move |cache| cache.delete_outbox(id)).await;
                 continue;
             };
+            if message.request_delivery_receipt {
+                // DSN is an SMTP envelope service (RFC 3461); Graph's send has
+                // no equivalent, so the request is dropped rather than
+                // silently pretended (M-27). The composer still offers the
+                // switch for this transport, as the doc's C-07 row notes.
+                tracing::warn!(id, "graph mail cannot request a delivery receipt; sending without one");
+            }
             let raw = with_bcc_header(raw, &message.bcc);
             match self.client.send_mime(&raw).await {
                 Ok(()) => {

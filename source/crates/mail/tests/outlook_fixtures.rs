@@ -4,7 +4,10 @@
 
 use std::path::PathBuf;
 
-use lookout_core::{header_value, importance_from_headers, parse_imip_method, sensitivity_from_headers, EmailBody, ImipMethod, Importance, MessageSensitivity, Uid};
+use lookout_core::{
+    header_value, importance_from_headers, parse_imip_method, sensitivity_from_headers, DeliveryReportKind, EmailBody, ImipMethod, Importance, MessageSensitivity, ReportAction,
+    Uid,
+};
 use lookout_mail::body::parse_body;
 
 fn outlook_dir() -> PathBuf {
@@ -116,4 +119,39 @@ fn importance_and_sensitivity_headers_round_trip() {
 
     let confidential = parse("sensitivity-private.eml");
     assert_eq!(sensitivity_from_headers(&confidential.headers), Some(MessageSensitivity::CompanyConfidential));
+}
+
+/// The three RFC 3464 delivery status notification shapes (M-27 / C-07): the
+/// machine-readable block parses into a report with the right verdict, the
+/// report's prose stays the body, and none of its parts leak into the
+/// attachment strip.
+#[test]
+fn dsn_fixtures_expose_their_delivery_reports() {
+    let failed = parse("dsn-failed.eml");
+    let report = failed.dsn.clone().expect("the failed DSN parses");
+    assert_eq!(report.kind, DeliveryReportKind::Failed);
+    assert_eq!(report.reporting_mta.as_deref(), Some("mx.contoso.com"));
+    assert_eq!(report.original_subject.as_deref(), Some("Quarterly report"));
+    assert_eq!(report.original_message_id.as_deref(), Some("quarterly-20260112@example.com"));
+    assert_eq!(report.recipients.len(), 1);
+    let recipient = &report.recipients[0];
+    assert_eq!(recipient.final_recipient, "nobody@contoso.com");
+    assert_eq!(recipient.action, ReportAction::Failed);
+    assert_eq!(recipient.status.as_deref(), Some("5.1.1"));
+    assert!(recipient.diagnostic_code.as_deref().is_some_and(|code| code.contains("User unknown")));
+    assert!(failed.text_body.as_deref().is_some_and(|text| text.contains("could not")));
+    assert!(failed.parts.iter().all(|part| !part.is_delivery_status() && !part.is_rfc822_headers()));
+
+    let delivered = parse("dsn-delivered.eml").dsn.expect("the delivered DSN parses");
+    assert_eq!(delivered.kind, DeliveryReportKind::Delivered);
+    assert_eq!(delivered.recipients[0].action, ReportAction::Delivered);
+    assert_eq!(delivered.recipients[0].status.as_deref(), Some("2.0.0"));
+
+    let delayed = parse("dsn-delayed.eml").dsn.expect("the delayed DSN parses");
+    assert_eq!(delayed.kind, DeliveryReportKind::Delayed);
+    assert_eq!(delayed.recipients[0].action, ReportAction::Delayed);
+    assert_eq!(delayed.recipients[0].status.as_deref(), Some("4.4.1"));
+
+    // A read receipt is a report too, but never a delivery report.
+    assert_eq!(parse("auth-results.eml").dsn, None);
 }

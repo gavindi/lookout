@@ -48,6 +48,10 @@ pub use interop::{
     Importance, InferenceClassification, MessageSensitivity, AUTHENTICATION_RESULTS_HEADER, FLAG_DONE_KEYWORD, FLAG_DUE_KEYWORD_PREFIX, FLAG_KEYWORD, OUTLOOK_CATEGORY_PRESETS,
 };
 pub use interop::{
+    draft_requests_delivery_receipt, is_delivery_report, parse_delivery_report, rcpt_notify_parameter, DeliveryReport, DeliveryReportKind, ReportAction, ReportedRecipient,
+    DELIVERY_RECEIPT_DRAFT_HEADER, DELIVERY_RECEIPT_DRAFT_VALUE, DELIVERY_STATUS_PART_CONTENT_TYPE, DELIVERY_STATUS_REPORT_TYPE, NOTIFY_PARAMETER, NOTIFY_SUCCESS_FAILURE,
+};
+pub use interop::{
     is_tnef_content_type, junk_keyword, junk_keyword_change, junk_keywords, tnef_attachment_ref, tnef_part_number, TnefAttachment, TnefContents, TnefError, JUNK_KEYWORD,
     NOT_JUNK_KEYWORD, TNEF_CONTENT_TYPE,
 };

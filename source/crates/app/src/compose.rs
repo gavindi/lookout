@@ -41,8 +41,8 @@ const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
 ///   the window once Send or Cancel has already finished the session.
 ///
 /// The window layer also relocates the header row's Cancel, Send, From and
-/// read-receipt-toggle widgets into the pop-out window's title bar (`top_row`
-/// is where they normally live, so they can be returned on pop-back-in); the
+/// receipt-toggle widgets into the pop-out window's title bar (`top_row` is
+/// where they normally live, so they can be returned on pop-back-in); the
 /// widgets keep their click/state handlers across the move, since they're
 /// the same widgets.
 ///
@@ -66,6 +66,9 @@ pub struct PopOutHandle {
     pub send_button: adw::SplitButton,
     pub from_dropdown: gtk::DropDown,
     pub read_receipt_toggle: gtk::ToggleButton,
+    /// The delivery-receipt toggle (C-07), which rides with the read-receipt
+    /// toggle into the pop-out window's title bar.
+    pub delivery_receipt_toggle: gtk::ToggleButton,
     /// "View in Light Mode", which rides with the read-receipt toggle.
     pub light_view_button: gtk::ToggleButton,
     /// The composer's own header row, which the widgets above are removed
@@ -124,6 +127,13 @@ pub struct ComposePrefill {
     /// Whether the saved draft asked for a read receipt
     /// (`Disposition-Notification-To`).
     pub request_read_receipt: bool,
+    /// Whether a delivery receipt was requested (RFC 3461). `None` means the
+    /// composer has no opinion (a new message, reply or forward), so the
+    /// global "request for all messages I send" setting seeds the checkbox.
+    /// A draft records its own answer in a private draft-only header, and a
+    /// withdrawn scheduled send carries it in the outbox payload, since a
+    /// sent message never has the header (C-07).
+    pub request_delivery_receipt: Option<bool>,
     /// Files to seed the composer's attachment list with, bytes included
     /// (decoded from the saved draft's MIME parts by
     /// `parse_draft_prefill`).
@@ -362,6 +372,7 @@ pub fn build_draft_prefill(summary: &EmailSummary, content: &DraftPrefillContent
         importance: summary.importance,
         sensitivity: content.sensitivity,
         request_read_receipt: content.request_read_receipt,
+        request_delivery_receipt: Some(content.request_delivery_receipt),
         attachments: content.attachments.clone(),
         // Defensive bracket strip: envelope-parsed ids are usually bare, but
         // a pre-parse fallback could carry the brackets.
@@ -402,6 +413,7 @@ pub fn build_resend_prefill(msg: &ComposedMessage) -> ComposePrefill {
         importance: msg.importance,
         sensitivity: msg.sensitivity,
         request_read_receipt: msg.request_read_receipt,
+        request_delivery_receipt: Some(msg.request_delivery_receipt),
         attachments,
         draft_message_id: msg.message_id.clone(),
         draft_saved: msg.message_id.is_some(),
@@ -436,6 +448,7 @@ pub fn build_outbox_prefill(message: &lookout_mail::send::OutboxMessage) -> Opti
         importance: content.importance,
         sensitivity: content.sensitivity,
         request_read_receipt: content.request_read_receipt,
+        request_delivery_receipt: Some(message.request_delivery_receipt),
         attachments: content.attachments,
         draft_message_id: message.draft_message_id.clone(),
         draft_saved: message.draft_message_id.is_some(),
@@ -861,6 +874,10 @@ struct DraftSnapshot {
     /// draft so the stored copy carries (or stops carrying) the
     /// `Disposition-Notification-To` header, like any other edit.
     read_receipt: bool,
+    /// Whether the "Request delivery receipt" switch is on (RFC 3461) - a
+    /// flip re-saves the draft so the stored copy carries (or drops) the
+    /// draft-only marker header, like any other edit.
+    delivery_receipt: bool,
     /// The composed message's Outlook importance (High/Normal/Low), from the
     /// toolbar's High/Low toggles - a flip re-saves the draft so it carries
     /// the matching `Importance`/`X-Priority` headers.
@@ -965,6 +982,7 @@ struct AutosaveCtx {
     bcc_row: RecipientEntry,
     subject_row: adw::EntryRow,
     read_receipt_toggle: gtk::ToggleButton,
+    delivery_receipt_toggle: gtk::ToggleButton,
     high_importance_toggle: gtk::ToggleButton,
     low_importance_toggle: gtk::ToggleButton,
     sensitivity_dropdown: gtk::DropDown,
@@ -1034,6 +1052,7 @@ impl AutosaveCtx {
             subject: self.subject_row.text().to_string(),
             rich,
             read_receipt: self.read_receipt_toggle.is_active(),
+            delivery_receipt: self.delivery_receipt_toggle.is_active(),
             importance: selected_importance(&self.high_importance_toggle, &self.low_importance_toggle),
             sensitivity: selected_sensitivity(&self.sensitivity_dropdown),
             body,
@@ -1108,6 +1127,7 @@ impl AutosaveCtx {
             calendar_part: self.calendar_part.clone(),
             read_receipt: None,
             request_read_receipt: snap.read_receipt,
+            request_delivery_receipt: snap.delivery_receipt,
             importance: snap.importance,
             sensitivity: snap.sensitivity,
             in_reply_to: self.in_reply_to.clone(),
@@ -1887,6 +1907,17 @@ pub fn build_compose_view(
         .icon_name("mark-location-symbolic")
         .tooltip_text("Request read receipt")
         .build();
+    // --- Delivery-receipt request (RFC 3461, M-27 / C-07): the ask rides the
+    // SMTP envelope (`RCPT TO ... NOTIFY=`), so nothing is written into the
+    // message; the toggle's state flows through the draft snapshot (a
+    // draft-only marker header) and the send. Sits beside the read-receipt
+    // toggle, where Outlook keeps both until the compose Options tab (UX-40)
+    // exists to host a Tracking group.
+    let delivery_receipt_toggle = gtk::ToggleButton::builder()
+        .icon_name("document-send-symbolic")
+        .tooltip_text("Request a delivery receipt")
+        .build();
+    delivery_receipt_toggle.update_property(&[gtk::accessible::Property::Label("Request a delivery receipt")]);
 
     // --- Importance: Outlook's High/Low buttons (RFC 2156 `Importance`,
     // `X-Priority`, `X-MSMail-Priority` - written by `build_raw_message`).
@@ -1921,6 +1952,7 @@ pub fn build_compose_view(
         Importance::Normal => {}
     }
     read_receipt_toggle.set_active(prefill.request_read_receipt);
+    delivery_receipt_toggle.set_active(prefill.request_delivery_receipt.unwrap_or_default());
 
     // --- Sensitivity: RFC 2156 `Sensitivity` (Normal / Personal / Private /
     // Company-Confidential), written by `build_raw_message` when it isn't
@@ -2463,6 +2495,7 @@ pub fn build_compose_view(
         bcc_row: bcc_row.clone(),
         subject_row: subject_row.clone(),
         read_receipt_toggle: read_receipt_toggle.clone(),
+        delivery_receipt_toggle: delivery_receipt_toggle.clone(),
         high_importance_toggle: high_importance_toggle.clone(),
         low_importance_toggle: low_importance_toggle.clone(),
         sensitivity_dropdown: sensitivity_dropdown.clone(),
@@ -2594,6 +2627,7 @@ pub fn build_compose_view(
     top_row.append(&status_label);
     top_row.append(&light_view_button);
     top_row.append(&read_receipt_toggle);
+    top_row.append(&delivery_receipt_toggle);
     if on_pop_out.is_some() {
         top_row.append(&pop_out_button);
     }
@@ -2673,6 +2707,7 @@ pub fn build_compose_view(
         let closed = closed.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
+        let delivery_receipt_toggle = delivery_receipt_toggle.clone();
         let high_importance_toggle = high_importance_toggle.clone();
         let low_importance_toggle = low_importance_toggle.clone();
         let on_send_started = on_send_started.clone();
@@ -2709,6 +2744,7 @@ pub fn build_compose_view(
             let identities = identities.clone();
             let from_dropdown = from_dropdown.clone();
             let read_receipt_toggle = read_receipt_toggle.clone();
+            let delivery_receipt_toggle = delivery_receipt_toggle.clone();
             let high_importance_toggle = high_importance_toggle.clone();
             let low_importance_toggle = low_importance_toggle.clone();
             let sensitivity_dropdown = sensitivity_dropdown.clone();
@@ -2807,6 +2843,7 @@ pub fn build_compose_view(
                     calendar_part,
                     read_receipt: None,
                     request_read_receipt: read_receipt_toggle.is_active(),
+                    request_delivery_receipt: delivery_receipt_toggle.is_active(),
                     importance: selected_importance(&high_importance_toggle, &low_importance_toggle),
                     sensitivity: selected_sensitivity(&sensitivity_dropdown),
                     in_reply_to,
@@ -2861,6 +2898,7 @@ pub fn build_compose_view(
         let send_button = send_button.clone();
         let from_dropdown = from_dropdown.clone();
         let read_receipt_toggle = read_receipt_toggle.clone();
+        let delivery_receipt_toggle = delivery_receipt_toggle.clone();
         let light_view_button = light_view_button.clone();
         let editor_toolbar = editor_toolbar.clone();
         let attachment_flow = attachment_flow.clone();
@@ -2878,6 +2916,7 @@ pub fn build_compose_view(
                 send_button: send_button.clone(),
                 from_dropdown: from_dropdown.clone(),
                 read_receipt_toggle: read_receipt_toggle.clone(),
+                delivery_receipt_toggle: delivery_receipt_toggle.clone(),
                 light_view_button: light_view_button.clone(),
                 top_row: top_row.clone(),
                 title_label: title_label.clone(),
@@ -2992,6 +3031,7 @@ mod tests {
             text_body: text_body.map(str::to_string),
             html_body: None,
             calendar_ics: None,
+            dsn: None,
             parts: Vec::<BodyPart>::new(),
             headers,
             auth_results: None,
@@ -3041,6 +3081,7 @@ mod tests {
             in_reply_to: Some("older@example.com".to_string()),
             references: vec!["older@example.com".to_string()],
             request_read_receipt: true,
+            request_delivery_receipt: true,
             sensitivity: MessageSensitivity::Private,
             ..Default::default()
         };
@@ -3056,6 +3097,7 @@ mod tests {
         assert_eq!(prefill.importance, Importance::High);
         assert_eq!(prefill.sensitivity, MessageSensitivity::Private);
         assert!(prefill.request_read_receipt);
+        assert_eq!(prefill.request_delivery_receipt, Some(true), "the draft's own receipt choice survives reopening");
         assert_eq!(prefill.attachments.len(), 1);
         assert_eq!(prefill.attachments[0].bytes, b"notes");
         assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-1@lookout.local"));
@@ -3095,6 +3137,7 @@ mod tests {
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: true,
+            request_delivery_receipt: true,
             importance: Importance::Low,
             sensitivity: MessageSensitivity::Private,
             in_reply_to: Some("older@example.com".to_string()),
@@ -3115,6 +3158,11 @@ mod tests {
         assert_eq!(prefill.importance, Importance::Low);
         assert_eq!(prefill.sensitivity, MessageSensitivity::Private);
         assert!(prefill.request_read_receipt);
+        assert_eq!(
+            prefill.request_delivery_receipt,
+            Some(true),
+            "the outbox payload, not the sent headers, carries the receipt request"
+        );
         assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
         assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-9@lookout.local"));
         assert!(prefill.draft_saved);
@@ -3182,6 +3230,7 @@ mod tests {
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: true,
+            request_delivery_receipt: false,
             importance: Importance::High,
             sensitivity: MessageSensitivity::CompanyConfidential,
             in_reply_to: Some("older@example.com".to_string()),
@@ -3385,6 +3434,7 @@ mod tests {
             subject: subject.to_string(),
             rich: false,
             read_receipt: false,
+            delivery_receipt: false,
             importance: Importance::Normal,
             sensitivity: MessageSensitivity::Normal,
             body: body_text.to_string(),
@@ -3443,6 +3493,7 @@ mod tests {
             subject: String::new(),
             rich: true,
             read_receipt: false,
+            delivery_receipt: false,
             importance: Importance::Normal,
             sensitivity: MessageSensitivity::Normal,
             body: "<p><br></p>".to_string(),

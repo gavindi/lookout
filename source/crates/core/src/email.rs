@@ -275,6 +275,22 @@ impl BodyPart {
     pub fn is_tnef(&self) -> bool {
         crate::interop::is_tnef_content_type(&self.content_type)
     }
+
+    /// Whether this part is an RFC 3464 `message/delivery-status` block - the
+    /// machine-readable half of a delivery status notification (M-27). The
+    /// body-fetch path downloads it alongside the text parts so the reading
+    /// pane can show the report as a card; it is body content, never an
+    /// attachment in the strip.
+    pub fn is_delivery_status(&self) -> bool {
+        self.content_type.eq_ignore_ascii_case(crate::interop::DELIVERY_STATUS_PART_CONTENT_TYPE)
+    }
+
+    /// Whether this part is an RFC 3464 §6 `text/rfc822-headers` block (the
+    /// original message's headers, attached to a DSN). Fetched with the
+    /// report so the card can name the message that bounced.
+    pub fn is_rfc822_headers(&self) -> bool {
+        self.content_type.eq_ignore_ascii_case("text/rfc822-headers")
+    }
 }
 
 /// Matches a `cid:` reference from a message's HTML against a MIME part's
@@ -449,6 +465,12 @@ pub struct EmailBody {
     /// fetched for display; `None` for the vast majority of messages.
     #[serde(default)]
     pub calendar_ics: Option<String>,
+    /// A parsed RFC 3464 delivery status notification (M-27 / C-07), when
+    /// the message is one. The reading pane renders it as a status card
+    /// above the report's own text; every message body cached before this
+    /// field existed decodes with `None`.
+    #[serde(default)]
+    pub dsn: Option<crate::interop::DeliveryReport>,
     pub parts: Vec<BodyPart>,
     pub headers: Vec<(String, String)>,
     pub auth_results: Option<AuthenticationResults>,

@@ -2389,6 +2389,7 @@ pub(crate) fn report_phishing_message(state: &Rc<RefCell<UiState>>, summary: &Em
         calendar_part: None,
         read_receipt: None,
         request_read_receipt: false,
+        request_delivery_receipt: false,
         in_reply_to: None,
         references: vec![],
         message_id: None,

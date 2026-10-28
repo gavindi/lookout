@@ -1,7 +1,10 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use lettre::address::Envelope;
-use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::transport::smtp::authentication::{Credentials, Mechanism, DEFAULT_MECHANISMS};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
+use lettre::transport::smtp::commands::{Data, Ehlo, Mail, Rcpt};
+use lettre::transport::smtp::extension::{ClientId, Extension, MailBodyParameter, MailParameter, RcptParameter};
 use lettre::{Address as SmtpAddress, AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 use mail_builder::headers::address::Address as BuilderAddress;
 use mail_builder::headers::content_type::ContentType;
@@ -127,6 +130,11 @@ pub struct ComposedMessage {
     /// Ask the recipients for a read receipt: adds RFC 8098's
     /// `Disposition-Notification-To: <from>` header to the built message.
     pub request_read_receipt: bool,
+    /// Ask the SMTP servers for a *delivery* receipt (RFC 3461 §4): the ask
+    /// is an envelope parameter on each `RCPT TO` (`NOTIFY=`), so it never
+    /// appears as a header. Outlook's "Request a delivery receipt" checkbox
+    /// (M-27 / C-07). Transports with no DSN support (Graph mail) ignore it.
+    pub request_delivery_receipt: bool,
     /// RFC 5322 `In-Reply-To`, when replying to a message.
     pub in_reply_to: Option<String>,
     /// RFC 5322 `References`, when replying to a message.
@@ -169,6 +177,12 @@ pub struct OutboxMessage {
     /// (item 1.14). Defaulted so rows queued before it existed still decode.
     #[serde(default)]
     pub bcc: Vec<String>,
+    /// Whether the sender asked for an RFC 3461 delivery receipt. It can't be
+    /// recovered from the raw message (it's an envelope parameter), so the
+    /// drain needs it alongside the bytes. Defaulted so rows queued before it
+    /// existed still decode, sending without one.
+    #[serde(default)]
+    pub request_delivery_receipt: bool,
 }
 
 impl OutboxMessage {
@@ -184,6 +198,7 @@ impl OutboxMessage {
             draft_message_id: msg.message_id.clone(),
             subject: msg.subject.clone(),
             bcc: msg.bcc.clone(),
+            request_delivery_receipt: msg.request_delivery_receipt,
         }
     }
 
@@ -201,10 +216,13 @@ pub fn new_message_id() -> String {
 }
 
 /// Builds the raw RFC 5322 message a *draft* save should store. Identical to
-/// [`build_raw_message`] except the `Bcc` header is written: it is the only
-/// place a saved draft records its blind-copy list, so reopening the draft
-/// can restore it. Send must keep using `build_raw_message` - a `Bcc` header
-/// on the wire would leak every blind recipient's address.
+/// [`build_raw_message`] except the draft-only headers are written: `Bcc` (the
+/// only place a saved draft records its blind-copy list, so reopening the
+/// draft can restore it) and the delivery-receipt marker
+/// (`lookout_core::DELIVERY_RECEIPT_DRAFT_HEADER`, an RFC 3461 envelope
+/// parameter the message itself can never carry). Send must keep using
+/// [`build_raw_message`] - a `Bcc` header on the wire would leak every blind
+/// recipient's address, and a receipt marker would be meaningless.
 pub fn build_draft_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>) {
     build_raw_message_inner(msg, true)
 }
@@ -214,17 +232,20 @@ pub fn build_draft_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<S
 /// `ComposedMessage::message_id`). Bcc is never written as a header - it only
 /// reaches the SMTP envelope (RFC 5322 §3.6.3: the destination addresses are
 /// the envelope's `RCPT TO` list, not a header); drafts that must round-trip
-/// their Bcc through a save use `build_draft_raw_message`. Returns the bytes
-/// plus the Message-ID in use (the caller may want it for thread-tracking)
-/// and the flat recipient list (to/cc/bcc combined) needed for the SMTP
-/// envelope, since MIME headers alone aren't necessarily what the envelope's
-/// `RCPT TO` list should be (bcc must be in the envelope but never in a
-/// header).
+/// their Bcc through a save use `build_draft_raw_message`. The same goes for
+/// the delivery-receipt request, which is an RFC 3461 envelope parameter: a
+/// draft records it in a private header, a sent message never carries it.
+/// Returns the bytes plus the Message-ID in use (the caller may want it for
+/// thread-tracking) and the flat recipient list (to/cc/bcc combined) needed
+/// for the SMTP envelope, since MIME headers alone aren't necessarily what
+/// the envelope's `RCPT TO` list should be (bcc must be in the envelope but
+/// never in a header). `draft_only` writes the draft-only headers (Bcc and
+/// the delivery-receipt marker); a send passes `false`.
 pub fn build_raw_message(msg: &ComposedMessage) -> (Vec<u8>, String, Vec<String>) {
     build_raw_message_inner(msg, false)
 }
 
-fn build_raw_message_inner(msg: &ComposedMessage, include_bcc: bool) -> (Vec<u8>, String, Vec<String>) {
+fn build_raw_message_inner(msg: &ComposedMessage, draft_only: bool) -> (Vec<u8>, String, Vec<String>) {
     let message_id = msg.message_id.clone().unwrap_or_else(new_message_id);
 
     let mut builder = MessageBuilder::new()
@@ -326,7 +347,7 @@ fn build_raw_message_inner(msg: &ComposedMessage, include_bcc: bool) -> (Vec<u8>
                 .collect(),
         ));
     }
-    if include_bcc && !msg.bcc.is_empty() {
+    if draft_only && !msg.bcc.is_empty() {
         // Drafts only (see `build_draft_raw_message`): a `Bcc` header is how
         // a saved draft remembers its blind-copy list. Send never writes it -
         // the header would leak every bcc recipient's address to the To/Cc
@@ -351,6 +372,15 @@ fn build_raw_message_inner(msg: &ComposedMessage, include_bcc: bool) -> (Vec<u8>
                 })
                 .collect(),
         ));
+    }
+    // Drafts only, like Bcc: a delivery-receipt request is an RFC 3461 SMTP
+    // envelope parameter (`RCPT TO ... NOTIFY=`), so there is no header a
+    // sent message could carry - but a saved draft has to remember the
+    // checkbox somehow, and its own envelope is gone by the time the send
+    // path builds a fresh one. This private header bridges that gap; send
+    // never writes it (see `draft_only` flag).
+    if draft_only && msg.request_delivery_receipt {
+        builder = builder.header(lookout_core::DELIVERY_RECEIPT_DRAFT_HEADER, raw_header(lookout_core::DELIVERY_RECEIPT_DRAFT_VALUE));
     }
     // Bcc is deliberately not added as a header (that would leak it to
     // every recipient) - it only affects the SMTP envelope's RCPT TO list,
@@ -462,8 +492,33 @@ fn raw_header(value: impl Into<String>) -> HeaderType<'static> {
 /// configurations - GOA's `SmtpUseSsl`/`SmtpUseTls` flags don't map cleanly
 /// enough onto lettre's implicit-vs-STARTTLS split to trust directly (Gmail
 /// reports both as true), so the port is the more reliable signal here.
-pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: &str, recipients: &[String], raw: &[u8]) -> Result<()> {
+///
+/// `request_delivery_receipt` asks for an RFC 3461 delivery status
+/// notification (M-27 / C-07). It is an envelope parameter, so requesting one
+/// switches to [`send_smtp_with_delivery_receipt`] - lettre's
+/// `AsyncTransport::send_raw` has no way to pass `RCPT TO ... NOTIFY=`.
+/// Everything else keeps using the plain transport untouched.
+pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: &str, recipients: &[String], raw: &[u8], request_delivery_receipt: bool) -> Result<()> {
     crate::connection::ensure_crypto_provider_installed();
+
+    let from_addr: SmtpAddress = from.parse().map_err(|_| Error::LoginFailed(format!("invalid From address: {from}")))?;
+    // `recipients` (built from `ComposedMessage::to`/`cc`/`bcc`) may carry a
+    // display name alongside the address (`Name <address>`) - the envelope
+    // only wants the bare address, `Address`'s parser has no notion of the
+    // `Name <address>` form.
+    let to_addrs: Vec<SmtpAddress> = recipients
+        .iter()
+        .map(|r| {
+            let address = split_mailbox(r).1;
+            address.parse::<SmtpAddress>().map_err(|_| Error::LoginFailed(format!("invalid recipient address: {r}")))
+        })
+        .collect::<Result<_>>()?;
+    let envelope = Envelope::new(Some(from_addr), to_addrs).map_err(|e| Error::LoginFailed(e.to_string()))?;
+
+    if request_delivery_receipt {
+        return send_smtp_with_delivery_receipt(endpoint, credential, &envelope, raw).await;
+    }
+
     let builder = if endpoint.port == 465 {
         AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host)
     } else {
@@ -481,21 +536,145 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
 
     let transport = builder.build();
 
-    let from_addr: SmtpAddress = from.parse().map_err(|_| Error::LoginFailed(format!("invalid From address: {from}")))?;
-    // `recipients` (built from `ComposedMessage::to`/`cc`/`bcc`) may carry a
-    // display name alongside the address (`Name <address>`) - the envelope
-    // only wants the bare address, `Address`'s parser has no notion of the
-    // `Name <address>` form.
-    let to_addrs: Vec<SmtpAddress> = recipients
-        .iter()
-        .map(|r| {
-            let address = split_mailbox(r).1;
-            address.parse::<SmtpAddress>().map_err(|_| Error::LoginFailed(format!("invalid recipient address: {r}")))
-        })
-        .collect::<Result<_>>()?;
-    let envelope = Envelope::new(Some(from_addr), to_addrs).map_err(|e| Error::LoginFailed(e.to_string()))?;
-
     transport.send_raw(&envelope, raw).await.map_err(|e| Error::LoginFailed(e.to_string()))?;
+    Ok(())
+}
+
+/// Sends a message that asks for an RFC 3461 delivery receipt. lettre's
+/// `AsyncSmtpTransport` can't put `NOTIFY=` on `RCPT TO` (its `Envelope`
+/// models no DSN parameters), so this drives `AsyncSmtpConnection` directly:
+/// connect, STARTTLS, authenticate, probe the `DSN` EHLO keyword, then run
+/// the `MAIL FROM` / `RCPT TO` / `DATA` / message sequence by hand.
+///
+/// The request degrades softly (§10): a server that doesn't advertise `DSN`
+/// still receives the message, just without the `NOTIFY` parameter (and so
+/// without a receipt). Real-world servers also accept `NOTIFY=SUCCESS` and
+/// silently never send a success report, which is why Outlook shows mostly
+/// failure notifications - the option is honest about the request, not a
+/// promise of an answer.
+async fn send_smtp_with_delivery_receipt(endpoint: &EndpointConfig, credential: Credential, envelope: &Envelope, raw: &[u8]) -> Result<()> {
+    let hello = ClientId::default();
+    let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| Error::LoginFailed(format!("invalid SMTP host name: {e}")));
+    let implicit_tls = (endpoint.port == 465).then(tls_parameters).transpose()?;
+
+    let mut connection = AsyncSmtpConnection::connect_tokio1(
+        (endpoint.host.as_str(), endpoint.port),
+        Some(std::time::Duration::from_secs(60)),
+        &hello,
+        implicit_tls,
+        None,
+    )
+    .await
+    .map_err(|e| Error::LoginFailed(format!("SMTP connection to {} failed: {e}", endpoint.host)))?;
+
+    if !connection.is_encrypted() {
+        if !connection.can_starttls() {
+            connection.abort().await;
+            return Err(Error::LoginFailed("SMTP server does not offer STARTTLS".to_string()));
+        }
+        if let Err(e) = connection.starttls(tls_parameters()?, &hello).await {
+            connection.abort().await;
+            return Err(Error::LoginFailed(format!("SMTP STARTTLS failed: {e}")));
+        }
+    }
+
+    let (mechanisms, credentials) = match credential {
+        Credential::OAuth2AccessToken(token) => (vec![Mechanism::Xoauth2], Credentials::new(endpoint.username.clone(), token)),
+        Credential::Password(password) => (DEFAULT_MECHANISMS.to_vec(), Credentials::new(endpoint.username.clone(), password)),
+    };
+    if let Err(e) = connection.auth(&mechanisms, &credentials).await {
+        connection.abort().await;
+        return Err(Error::LoginFailed(format!("SMTP authentication failed: {e}")));
+    }
+
+    // lettre's `ServerInfo` only records the ESMTP keywords it models, and
+    // `DSN` (RFC 3461) isn't one of them, so the capability has to come from
+    // the EHLO response text itself. Re-issuing EHLO is legal and leaves the
+    // connection exactly where it was (only `server_info`, which we don't
+    // rely on for DSN, would be refreshed).
+    let dsn_supported = match connection.command(Ehlo::new(hello.clone())).await {
+        Ok(response) if response.is_positive() => ehlo_advertises_dsn(response.message()),
+        _ => false,
+    };
+    if !dsn_supported {
+        tracing::warn!("SMTP server {} does not advertise DSN; sending without a delivery receipt", endpoint.host);
+    }
+
+    let sent = submit_dsn(&mut connection, envelope, raw, dsn_supported).await;
+    match sent {
+        Ok(()) => {
+            // `quit` is best-effort: the message is already accepted.
+            let _ = connection.quit().await;
+            Ok(())
+        }
+        Err(e) => {
+            connection.abort().await;
+            Err(Error::LoginFailed(format!("SMTP send failed: {e}")))
+        }
+    }
+}
+
+/// Whether an EHLO response's extension lines include RFC 3461's `DSN`
+/// keyword. Kept as a pure helper because lettre's parsed `ServerInfo` cannot
+/// answer it (its `Extension` enum doesn't model DSN).
+fn ehlo_advertises_dsn<'a>(lines: impl Iterator<Item = &'a str>) -> bool {
+    lines
+        .into_iter()
+        .any(|line| line.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| token.eq_ignore_ascii_case("dsn")))
+}
+
+/// The DSN-aware `MAIL FROM`/`RCPT TO`/`DATA` sequence. Returns a plain
+/// string on failure (lettre's SMTP error type has no public constructor), so
+/// the caller can abort the connection and wrap it in its own error.
+async fn submit_dsn(connection: &mut AsyncSmtpConnection, envelope: &Envelope, raw: &[u8], request_delivery_receipt: bool) -> std::result::Result<(), String> {
+    // The same internationalisation checks lettre's own `send` performs, so
+    // the hand-driven path behaves identically for non-ASCII mail.
+    let mut mail_parameters = Vec::new();
+    let non_ascii_addresses = envelope.from().is_some_and(|address| !address.to_string().is_ascii()) || envelope.to().iter().any(|address| !address.to_string().is_ascii());
+    if non_ascii_addresses {
+        if !connection.server_info().supports_feature(Extension::SmtpUtfEight) {
+            return Err("envelope contains non-ascii addresses but the server does not support SMTPUTF8".to_string());
+        }
+        mail_parameters.push(MailParameter::SmtpUtfEight);
+    }
+    if !raw.is_ascii() {
+        if !connection.server_info().supports_feature(Extension::EightBitMime) {
+            return Err("message contains non-ascii bytes but the server does not support 8BITMIME".to_string());
+        }
+        mail_parameters.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+    }
+
+    let response = connection.command(Mail::new(envelope.from().cloned(), mail_parameters)).await.map_err(|e| e.to_string())?;
+    if !response.is_positive() {
+        return Err("MAIL FROM was rejected".to_string());
+    }
+
+    // RFC 3461 §4: `NOTIFY` is per-recipient, so every recipient asks for
+    // the same success+failure report Outlook requests.
+    let notify: Vec<RcptParameter> = if request_delivery_receipt {
+        vec![RcptParameter::Other {
+            keyword: lookout_core::NOTIFY_PARAMETER.to_string(),
+            value: Some(lookout_core::NOTIFY_SUCCESS_FAILURE.to_string()),
+        }]
+    } else {
+        Vec::new()
+    };
+    for address in envelope.to() {
+        let response = connection.command(Rcpt::new(address.clone(), notify.clone())).await.map_err(|e| e.to_string())?;
+        if !response.is_positive() {
+            return Err(format!("recipient {address} was rejected"));
+        }
+    }
+
+    let response = connection.command(Data).await.map_err(|e| e.to_string())?;
+    if !response.is_positive() {
+        return Err("DATA was rejected".to_string());
+    }
+
+    let response = connection.message(raw).await.map_err(|e| e.to_string())?;
+    if !response.is_positive() {
+        return Err("the message was rejected".to_string());
+    }
     Ok(())
 }
 
@@ -519,6 +698,7 @@ mod tests {
             calendar_part: None,
             read_receipt: None,
             request_read_receipt: false,
+            request_delivery_receipt: false,
             importance: lookout_core::Importance::Normal,
             sensitivity: lookout_core::MessageSensitivity::Normal,
             in_reply_to: None,
@@ -561,17 +741,49 @@ mod tests {
             draft_message_id: None,
             subject: String::new(),
             bcc: vec![],
+            request_delivery_receipt: false,
         };
         assert_eq!(outbox.raw(), None);
     }
 
     /// Rows queued before `bcc` existed (v0.9.166) still decode, with no Bcc.
+    /// The delivery-receipt flag arrived later still, and must default to
+    /// "no receipt requested" rather than failing to decode.
     #[test]
-    fn outbox_message_without_bcc_field_still_decodes() {
+    fn outbox_message_without_newer_fields_still_decodes() {
         let json = br#"{"from":"a@example.com","recipients":["b@example.com"],"raw_base64":"","draft_message_id":null,"subject":"old"}"#;
         let decoded: OutboxMessage = serde_json::from_slice(json).unwrap();
         assert_eq!(decoded.subject, "old");
         assert!(decoded.bcc.is_empty());
+        assert!(!decoded.request_delivery_receipt);
+    }
+
+    /// The delivery-receipt request is an RFC 3461 envelope parameter, so an
+    /// outbox row has to carry it beside the raw bytes; a draft records it in
+    /// a private header for the composer to restore, and a sent message never
+    /// carries that header (it would be meaningless on the wire).
+    #[test]
+    fn delivery_receipt_request_rides_the_outbox_and_the_draft_only() {
+        let mut msg = sample_message(None);
+        msg.request_delivery_receipt = true;
+
+        let outbox = OutboxMessage::from_composed(&msg);
+        assert!(outbox.request_delivery_receipt);
+        assert_eq!(serde_json::from_slice::<OutboxMessage>(&serde_json::to_vec(&outbox).unwrap()).unwrap(), outbox);
+
+        let (draft_raw, _, _) = build_draft_raw_message(&msg);
+        let draft = String::from_utf8(draft_raw).expect("draft is valid UTF-8");
+        assert!(
+            draft.to_lowercase().contains(&lookout_core::DELIVERY_RECEIPT_DRAFT_HEADER.to_lowercase()),
+            "draft raw missing the delivery-receipt marker: {draft}"
+        );
+
+        let (send_raw, _, _) = build_raw_message(&msg);
+        let sent = String::from_utf8(send_raw).expect("message is valid UTF-8");
+        assert!(
+            !sent.to_lowercase().contains(&lookout_core::DELIVERY_RECEIPT_DRAFT_HEADER.to_lowercase()),
+            "send raw must not carry the draft-only marker: {sent}"
+        );
     }
 
     /// Draft saves write the Bcc header - it is the only place a draft
@@ -939,5 +1151,119 @@ mod tests {
         msg.read_receipt = Some(receipt);
         let raw = raw_to_string(&msg);
         assert!(raw.contains("Original-Message-ID: <bare-id@example.com>"), "raw:\n{raw}");
+    }
+
+    #[test]
+    fn ehlo_capability_scan_finds_the_dsn_keyword() {
+        assert!(ehlo_advertises_dsn(["mx.example.test Hello", "SIZE 35882577", "DSN", "STARTTLS"].into_iter()));
+        assert!(ehlo_advertises_dsn(["mx.example.test Hello", "dsn"].into_iter()));
+        // Not a substring hit: `DSN` must be its own token.
+        assert!(!ehlo_advertises_dsn(["mx.example.test Hello", "X-DSN-HELPER"].into_iter()));
+        assert!(!ehlo_advertises_dsn(["mx.example.test Hello", "SIZE 100"].into_iter()));
+        assert!(!ehlo_advertises_dsn(std::iter::empty()));
+    }
+
+    /// A minimal plaintext SMTP server: accepts one connection, answers EHLO
+    /// with the given extension lines, and records the envelope lines the
+    /// client sends so a test can assert the exact `MAIL FROM`/`RCPT TO`
+    /// parameters. Used by the DSN tests below; the production paths always
+    /// negotiate TLS before this point.
+    async fn fake_smtp_server(extensions: &'static [&'static str]) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind a loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept a client");
+            let (read_half, mut write_half) = socket.into_split();
+            let mut reader = BufReader::new(read_half);
+            write_half.write_all(b"220 fake ESMTP\r\n").await.unwrap();
+            let mut lines = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let command = line.trim_end().to_string();
+                lines.push(command.clone());
+                let upper = command.to_ascii_uppercase();
+                if upper.starts_with("EHLO") {
+                    let mut reply = String::from("250-fake\r\n");
+                    for extension in extensions {
+                        reply.push_str(&format!("250-{extension}\r\n"));
+                    }
+                    reply.push_str("250 HELP\r\n");
+                    write_half.write_all(reply.as_bytes()).await.unwrap();
+                } else if upper.starts_with("MAIL FROM") || upper.starts_with("RCPT TO") {
+                    write_half.write_all(b"250 ok\r\n").await.unwrap();
+                } else if upper == "DATA" {
+                    write_half.write_all(b"354 go ahead\r\n").await.unwrap();
+                    // Consume the message body up to the terminating dot.
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        if line == ".\r\n" || line == ".\n" {
+                            break;
+                        }
+                    }
+                    write_half.write_all(b"250 queued\r\n").await.unwrap();
+                } else if upper == "QUIT" {
+                    write_half.write_all(b"221 bye\r\n").await.unwrap();
+                    break;
+                } else {
+                    write_half.write_all(b"250 ok\r\n").await.unwrap();
+                }
+            }
+            lines
+        });
+        (address, handle)
+    }
+
+    /// Drives `submit_dsn` against the fake server and returns the envelope
+    /// lines it saw. TLS/auth are skipped: `submit_dsn` is exactly the
+    /// post-handshake half of the DSN path.
+    async fn record_envelope(request_delivery_receipt: bool) -> Vec<String> {
+        let (address, server) = fake_smtp_server(&["DSN", "8BITMIME"]).await;
+        let hello = ClientId::default();
+        let mut connection = AsyncSmtpConnection::connect_tokio1(address, Some(std::time::Duration::from_secs(10)), &hello, None, None)
+            .await
+            .expect("connect to the fake server");
+        let envelope = Envelope::new(Some("me@example.com".parse().unwrap()), vec!["you@example.com".parse().unwrap()]).unwrap();
+        submit_dsn(&mut connection, &envelope, b"Subject: test\r\n\r\nbody\r\n", request_delivery_receipt)
+            .await
+            .expect("the fake server accepts the message");
+        let _ = connection.quit().await;
+        server.await.expect("the fake server finishes")
+    }
+
+    #[tokio::test]
+    async fn dsn_request_puts_notify_on_every_rcpt_to() {
+        let lines = record_envelope(true).await;
+        let rcpt: Vec<&String> = lines.iter().filter(|line| line.to_ascii_uppercase().starts_with("RCPT TO")).collect();
+        assert_eq!(rcpt.len(), 1, "one recipient, one RCPT TO: {lines:?}");
+        assert!(
+            rcpt[0].to_ascii_uppercase().contains("NOTIFY=SUCCESS,FAILURE"),
+            "the receipt request must ride the envelope, not a header: {lines:?}"
+        );
+        let mail_from = lines.iter().find(|line| line.to_ascii_uppercase().starts_with("MAIL FROM")).expect("MAIL FROM was sent");
+        assert!(
+            !mail_from.to_ascii_uppercase().contains("NOTIFY"),
+            "NOTIFY is a RCPT parameter, never a MAIL one: {mail_from}"
+        );
+    }
+
+    /// A server that doesn't advertise DSN still receives the message, just
+    /// without the receipt parameter (the documented degrade-softly rule).
+    #[tokio::test]
+    async fn a_plain_send_carries_no_notify_parameter() {
+        let lines = record_envelope(false).await;
+        assert!(
+            lines.iter().all(|line| !line.to_ascii_uppercase().contains("NOTIFY=")),
+            "no receipt was requested, so no NOTIFY may appear: {lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.to_ascii_uppercase().starts_with("RCPT TO")));
     }
 }
