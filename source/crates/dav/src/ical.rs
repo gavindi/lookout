@@ -3,7 +3,7 @@
 use base64::Engine as _;
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use icalendar::{
-    Alarm, Attendee as IcalAttendee, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, EventStatus as IcalEventStatus, PartStat,
+    Alarm, Attendee as IcalAttendee, CUType, Calendar, CalendarComponent, CalendarDateTime, Class, Component, DatePerhapsTime, EventLike, EventStatus as IcalEventStatus, PartStat,
     Property, Role, TodoStatus, Trigger,
 };
 use lookout_core::interop::{cdo, onlinemeeting};
@@ -269,9 +269,14 @@ fn parse_attendees(event: &icalendar::Event) -> Vec<Attendee> {
                 name: a.cn.clone(),
                 address: strip_mailto(&a.cal_address).to_string(),
             },
-            role: match a.role {
-                Some(Role::OptParticipant) => AttendeeRole::Optional,
-                _ => AttendeeRole::Required,
+            // A room/equipment mailbox is `CUTYPE=RESOURCE`, not a ROLE, so
+            // it wins over the participation role (CAL-19).
+            role: match a.cutype {
+                Some(CUType::Resource | CUType::Room) => AttendeeRole::Resource,
+                _ => match a.role {
+                    Some(Role::OptParticipant) => AttendeeRole::Optional,
+                    _ => AttendeeRole::Required,
+                },
             },
             status: match a.part_stat {
                 Some(PartStat::Accepted) => AttendeeStatus::Accepted,
@@ -1073,7 +1078,9 @@ fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee], rsvp:
     for attendee in attendees {
         let mut ical_attendee = IcalAttendee::new(format!("mailto:{}", attendee.address.address))
             .role(match attendee.role {
-                AttendeeRole::Required => Role::ReqParticipant,
+                // A resource is still a required participant; its room-ness
+                // rides on `CUTYPE` below, as Outlook writes it (CAL-19).
+                AttendeeRole::Required | AttendeeRole::Resource => Role::ReqParticipant,
                 AttendeeRole::Optional => Role::OptParticipant,
             })
             .partstat(match attendee.status {
@@ -1082,6 +1089,9 @@ fn append_attendees(vevent: &mut icalendar::Event, attendees: &[Attendee], rsvp:
                 AttendeeStatus::Declined => PartStat::Declined,
                 AttendeeStatus::Tentative => PartStat::Tentative,
             });
+        if attendee.role == AttendeeRole::Resource {
+            ical_attendee = ical_attendee.cutype(CUType::Resource);
+        }
         if let Some(name) = &attendee.address.name {
             ical_attendee = ical_attendee.cn(name.clone());
         }
@@ -1402,6 +1412,20 @@ mod tests {
         assert_eq!(attendees[1].address.address, "bob@example.com");
         assert_eq!(attendees[1].role, AttendeeRole::Optional);
         assert_eq!(attendees[1].status, AttendeeStatus::NeedsAction);
+    }
+
+    #[test]
+    fn a_room_is_cutype_resource_and_round_trips() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\nBEGIN:VEVENT\r\nUID:room-1@example.com\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20260715T140000Z\r\nDTEND:20260715T150000Z\r\nSUMMARY:Sync\r\nATTENDEE;CUTYPE=RESOURCE;ROLE=REQ-PARTICIPANT;CN=Room 4:mailto:room4@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let event = &parse_vevents(&cal_id(), ics)[0];
+        assert_eq!(event.attendees[0].role, AttendeeRole::Resource);
+        assert_eq!(event.attendees[0].address.name.as_deref(), Some("Room 4"));
+
+        let written = build_vcalendar(event);
+        assert!(written.contains("CUTYPE=RESOURCE"), "a room is written as a resource: {written}");
+        assert!(written.contains("ROLE=REQ-PARTICIPANT"), "a resource stays a required participant: {written}");
+        let round = &parse_vevents(&cal_id(), &written)[0];
+        assert_eq!(round.attendees[0].role, AttendeeRole::Resource, "the room survives the round trip");
     }
 
     #[test]

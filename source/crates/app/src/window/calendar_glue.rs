@@ -1448,6 +1448,7 @@ pub(crate) fn open_event_editor_for(
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     let categories = state.borrow().app_config.borrow().categories.clone();
     let scheduling = scheduling_context(state, calendar_state);
+    let rooms = room_finder_context(calendar_state);
     let graph_calendars = graph_calendar_ids(calendar_state);
     crate::event_editor::show_event_editor(
         window,
@@ -1470,6 +1471,7 @@ pub(crate) fn open_event_editor_for(
             suggested_attendees: &[],
             scheduling: Some(&scheduling),
             attachment_fetch: Some(attachment_fetch_callback(calendar_state)),
+            rooms: Some(&rooms),
         },
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
@@ -1955,6 +1957,7 @@ pub(crate) fn show_new_event_editor(
     let calendar_prefs = state.borrow().settings.calendar_preferences();
     let categories = state.borrow().app_config.borrow().categories.clone();
     let scheduling = scheduling_context(state, calendar_state);
+    let rooms = room_finder_context(calendar_state);
     let graph_calendars = graph_calendar_ids(calendar_state);
     crate::event_editor::show_event_editor(
         window,
@@ -1977,6 +1980,7 @@ pub(crate) fn show_new_event_editor(
             suggested_attendees: attendees,
             scheduling: Some(&scheduling),
             attachment_fetch: Some(attachment_fetch_callback(calendar_state)),
+            rooms: Some(&rooms),
         },
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
@@ -2252,6 +2256,87 @@ pub(crate) fn scheduling_context(state: &Rc<RefCell<UiState>>, calendar_state: &
         }) as Rc<dyn Fn(crate::event_editor::AvailabilityRequest)>
     };
     crate::event_editor::SchedulingContext { handle, request }
+}
+
+/// The Microsoft 365 account whose calendar `calendar_id` belongs to, if that
+/// account is served by the Graph backend. The room finder (CAL-19) only has a
+/// directory to ask on such an account.
+fn graph_calendar_account(calendar_state: &Rc<RefCell<CalendarUiState>>, calendar_id: &CalendarId) -> Option<AccountId> {
+    calendar_state
+        .borrow()
+        .accounts
+        .iter()
+        .find(|(_, handle)| handle.graph && handle.calendars.iter().any(|calendar| calendar.id == *calendar_id))
+        .map(|(account_id, _)| account_id.clone())
+}
+
+/// Maps a Graph room-directory failure onto the popover's two states: a
+/// missing/denied scope becomes the Allow prompt, anything else a visible
+/// error. A tenant policy that blocks `Place.Read.All` still answers 403, so
+/// the editor only offers Allow once before treating a repeat as policy.
+fn room_lookup_error(error: lookout_graph::GraphError) -> crate::room_finder::RoomLookupError {
+    use crate::room_finder::RoomLookupError;
+    match error {
+        lookout_graph::GraphError::ConsentRequired(_) | lookout_graph::GraphError::Unauthorized | lookout_graph::GraphError::Status { status: 401 | 403, .. } => {
+            RoomLookupError::ConsentRequired
+        }
+        other => RoomLookupError::Unavailable(other.to_string()),
+    }
+}
+
+/// The event editor's room-finder bridge (item 3.8 / CAL-19): the tenant room
+/// directory and the candidate rooms' free/busy for the selected calendar's
+/// Microsoft 365 account. CalDAV/webcal calendars have no room-directory
+/// standard, so the editor never offers the action for them; every failure
+/// degrades to the free-text Location rather than an error dialog (§10).
+pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>) -> crate::room_finder::RoomFinder {
+    use crate::room_finder::{ConsentFinished, RoomAvailabilityLoaded, RoomAvailabilityLookup, RoomFinder, RoomLookupError, RoomSuggestion, RoomsLoaded};
+
+    let load: Rc<dyn Fn(CalendarId, RoomsLoaded)> = {
+        let calendar_state = calendar_state.clone();
+        Rc::new(move |calendar_id, on_result: RoomsLoaded| {
+            let Some(account_id) = graph_calendar_account(&calendar_state, &calendar_id) else {
+                on_result(Err(RoomLookupError::Unavailable("This calendar isn't a Microsoft 365 calendar.".to_string())));
+                return;
+            };
+            let client = crate::graph_rooms::GraphRoomsClient::new(account_id);
+            glib::spawn_future_local(async move {
+                match client.list_rooms().await {
+                    Ok(rooms) => on_result(Ok(rooms.into_iter().map(RoomSuggestion::from).collect())),
+                    Err(error) => on_result(Err(room_lookup_error(error))),
+                }
+            });
+        })
+    };
+
+    let grant: Rc<dyn Fn(CalendarId, ConsentFinished)> = {
+        let calendar_state = calendar_state.clone();
+        Rc::new(move |calendar_id, on_result: ConsentFinished| {
+            let Some(account_id) = graph_calendar_account(&calendar_state, &calendar_id) else {
+                on_result(Err("This calendar isn't a Microsoft 365 calendar.".to_string()));
+                return;
+            };
+            let client = crate::graph_rooms::GraphRoomsClient::new(account_id);
+            glib::spawn_future_local(async move { on_result(client.ensure_consent().await) });
+        })
+    };
+
+    let availability: RoomAvailabilityLookup = {
+        let calendar_state = calendar_state.clone();
+        Rc::new(move |calendar_id, addresses, start, end, generation, on_result: RoomAvailabilityLoaded| {
+            let Some(account_id) = graph_calendar_account(&calendar_state, &calendar_id) else {
+                on_result(generation, Vec::new());
+                return;
+            };
+            let client = crate::graph_rooms::GraphRoomsClient::new(account_id);
+            glib::spawn_future_local(async move {
+                let answers = client.room_availability(&addresses, start, end).await;
+                on_result(generation, answers);
+            });
+        })
+    };
+
+    RoomFinder { load, grant, availability }
 }
 
 /// The account session that owns `calendar_id`, for task writes - the

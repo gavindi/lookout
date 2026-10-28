@@ -31,6 +31,10 @@ use super::{
 pub struct Room {
     pub display_name: String,
     pub address: String,
+    /// Seats, when the tenant records it (Graph `capacity`).
+    pub capacity: Option<u32>,
+    /// Building name, when the tenant records it (Graph `building`).
+    pub building: Option<String>,
 }
 
 /// The `availabilityViewInterval` (minutes) Graph quantises free/busy to. The
@@ -295,7 +299,7 @@ impl CalendarClient {
     pub async fn list_rooms(&self) -> Result<Vec<Room>> {
         let items = self
             .graph
-            .get_all("places/microsoft.graph.room?$top=100&$select=id,displayName,emailAddress", MAX_ROOMS)
+            .get_all("places/microsoft.graph.room?$top=100&$select=id,displayName,emailAddress,capacity,building", MAX_ROOMS)
             .await?;
         Ok(items
             .iter()
@@ -305,7 +309,18 @@ impl CalendarClient {
                     return None;
                 }
                 let display_name = value.get("displayName").and_then(Value::as_str).unwrap_or(&address).to_string();
-                Some(Room { display_name, address })
+                let capacity = value.get("capacity").and_then(Value::as_u64).and_then(|capacity| u32::try_from(capacity).ok());
+                let building = value
+                    .get("building")
+                    .and_then(Value::as_str)
+                    .filter(|building| !building.trim().is_empty())
+                    .map(str::to_string);
+                Some(Room {
+                    display_name,
+                    address,
+                    capacity,
+                    building,
+                })
             })
             .collect())
     }
@@ -867,15 +882,28 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1.0/places/microsoft.graph.room"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "value": [{ "id": "r1", "displayName": "Room 4", "emailAddress": "room4@example.com" }]
+                "value": [
+                    {
+                        "id": "r1",
+                        "displayName": "Room 4",
+                        "emailAddress": "room4@example.com",
+                        "capacity": 12,
+                        "building": "HQ"
+                    },
+                    { "id": "r2", "displayName": "No capacity", "emailAddress": "room5@example.com" }
+                ]
             })))
             .mount(&server)
             .await;
 
         let rooms = client(&server).list_rooms().await.unwrap();
-        assert_eq!(rooms.len(), 1);
+        assert_eq!(rooms.len(), 2);
         assert_eq!(rooms[0].display_name, "Room 4");
         assert_eq!(rooms[0].address, "room4@example.com");
+        assert_eq!(rooms[0].capacity, Some(12));
+        assert_eq!(rooms[0].building.as_deref(), Some("HQ"));
+        assert_eq!(rooms[1].capacity, None, "an unrecorded capacity stays unknown");
+        assert_eq!(rooms[1].building, None);
     }
 
     #[test]

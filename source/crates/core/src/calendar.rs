@@ -25,6 +25,11 @@ pub enum AttendeeRole {
     #[default]
     Required,
     Optional,
+    /// A bookable resource (a room or equipment mailbox, CAL-19): a required
+    /// participant Graph calls `resource` and iCalendar marks
+    /// `CUTYPE=RESOURCE`, distinct from an ordinary required attendee so the
+    /// server books it rather than inviting a person.
+    Resource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

@@ -223,6 +223,8 @@ pub fn attendee_to_graph(attendee: &Attendee) -> Value {
         "type": match attendee.role {
             AttendeeRole::Required => "required",
             AttendeeRole::Optional => "optional",
+            // A room/equipment mailbox Graph books as a resource (CAL-19).
+            AttendeeRole::Resource => "resource",
         },
     })
 }
@@ -237,8 +239,7 @@ pub fn attendee_from_graph(value: &Value) -> Option<Attendee> {
     let name = email.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).map(str::to_string);
     let role = match value.get("type").and_then(Value::as_str) {
         Some("optional") => AttendeeRole::Optional,
-        // "resource" (a room/equipment mailbox) has no distinct role in the
-        // model yet; treat it as a required participant.
+        Some("resource") => AttendeeRole::Resource,
         _ => AttendeeRole::Required,
     };
     let status = match value.get("status").and_then(|status| status.get("response")).and_then(Value::as_str) {
@@ -938,15 +939,19 @@ mod tests {
     }
 
     #[test]
-    fn attendee_role_resource_is_treated_as_required() {
+    fn a_graph_room_maps_to_the_resource_role_and_back() {
         let attendee = attendee_from_graph(&json!({
-            "emailAddress": { "address": "room@example.com" },
+            "emailAddress": { "name": "Room 4", "address": "room@example.com" },
             "type": "resource",
             "status": { "response": "none" }
         }))
         .unwrap();
-        assert_eq!(attendee.role, AttendeeRole::Required);
+        assert_eq!(attendee.role, AttendeeRole::Resource, "a room is booked as a resource, not a required guest");
         assert_eq!(attendee.status, AttendeeStatus::NeedsAction);
+
+        let written = attendee_to_graph(&attendee);
+        assert_eq!(written["type"], json!("resource"));
+        assert_eq!(written["emailAddress"]["address"], json!("room@example.com"));
     }
 
     #[test]

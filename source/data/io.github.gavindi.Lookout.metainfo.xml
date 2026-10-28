@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.295" date="2026-10-29">
+      <description>
+        <p>Microsoft 365 calendars gain Outlook's room finder. The event editor's Location row offers a "Find a room" button that lists your organization's bookable rooms with their seats, building and live free/busy for the meeting, and choosing one fills the location and books the room as a resource attendee. Room lookups ask for permission the first time and fall back to the free-text location if your organization does not allow them. CalDAV and webcal calendars are unchanged.</p>
+      </description>
+    </release>
     <release version="0.9.294" date="2026-10-29">
       <description>
         <p>Microsoft 365 events can now become Teams meetings from the event editor. On a Microsoft 365 calendar the video-call row becomes Outlook's "Teams meeting" switch: turn it on and Microsoft creates the join link when the event is saved, with no URL to paste. Turning it off removes the link. Other calendars keep the manual meeting-link field. The Teams link appears on the event peek, reminders and invitation cards.</p>

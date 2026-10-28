@@ -229,6 +229,11 @@ pub struct EventEditorPrefill<'a> {
     /// listed attachment that isn't inline can be saved through the owning
     /// calendar session. `None` leaves such rows display-only.
     pub attachment_fetch: Option<AttachmentFetchCallback>,
+    /// The room-finder bridge (item 3.8 / CAL-19): when present, the Location
+    /// row offers Microsoft 365's bookable rooms for a Graph-backed calendar.
+    /// `None` hides the action entirely (no Graph account, or a CalDAV-only
+    /// setup).
+    pub rooms: Option<&'a crate::room_finder::RoomFinder>,
 }
 
 /// Opens the event editor as a modal dialog. `on_save` fires with the chosen
@@ -449,6 +454,33 @@ pub fn show_event_editor(
 
     // --- Location + video call + notes.
     let location_row = adw::EntryRow::builder().title("Location").build();
+    // Room finder (CAL-19): Microsoft 365's tenant room directory with each
+    // room's free/busy for the meeting window. The button rides the Location
+    // row as a suffix and is shown only for a Graph-backed calendar - CalDAV
+    // and webcal events keep Outlook's free-text Location.
+    let room_finder = prefill.rooms.map(|finder| {
+        crate::room_finder::attach(crate::room_finder::RoomFinderInputs {
+            location_row: &location_row,
+            attendees_field: &attendees_field,
+            calendar_dropdown: &calendar_dropdown,
+            calendar_ids: &calendar_ids,
+            graph_calendars: prefill.graph_calendars,
+            start_date: &start_date,
+            end_date: &end_date,
+            start_hour: &start_hour,
+            start_minute: &start_minute,
+            end_hour: &end_hour,
+            end_minute: &end_minute,
+            start_calendar: &start_calendar,
+            end_calendar: &end_calendar,
+            all_day_switch: &all_day_switch,
+            zone_dropdown: &zone_dropdown,
+            finder: finder.clone(),
+        })
+    });
+    let resource_attendees = room_finder.as_ref().map(|widgets| widgets.resource_attendees.clone()).unwrap_or_default();
+    let room_button = room_finder.map(|widgets| widgets.button);
+
     let video_toggle = adw::SwitchRow::builder().title("Video call link").subtitle("Add a join-this-meeting URL").build();
     let video_url_row = adw::EntryRow::builder().title("Meeting URL").build();
     video_url_row.set_visible(video_toggle.is_active());
@@ -1332,6 +1364,7 @@ pub fn show_event_editor(
                 owner_email: owner_email.clone(),
                 existing_meta: existing_meta.clone(),
                 attachments: attachments.borrow().clone(),
+                resource_attendees: resource_attendees.borrow().iter().cloned().collect(),
             };
             match build_event_from_input(input) {
                 Ok(mut event) => {
@@ -1462,6 +1495,10 @@ pub fn show_event_editor(
             widget.set_sensitive(false);
         }
         delete_button.set_visible(false);
+        // A read-only event can't book a room.
+        if let Some(button) = &room_button {
+            button.set_visible(false);
+        }
     }
 
     dialog.present();
@@ -1800,8 +1837,11 @@ fn build_tracking_page(occurrence: &EventOccurrence, owner_email: Option<&str>) 
         if named {
             subtitle_parts.push(attendee.address.address.clone());
         }
-        if attendee.role == AttendeeRole::Optional {
-            subtitle_parts.push("Optional".to_string());
+        match attendee.role {
+            AttendeeRole::Optional => subtitle_parts.push("Optional".to_string()),
+            // A booked room is a resource attendee (CAL-19), not a guest.
+            AttendeeRole::Resource => subtitle_parts.push("Room".to_string()),
+            AttendeeRole::Required => {}
         }
         if owner_email.is_some_and(|owner| owner.eq_ignore_ascii_case(&attendee.address.address)) {
             subtitle_parts.push("You".to_string());
@@ -1969,7 +2009,7 @@ fn default_event_times() -> (NaiveDateTime, NaiveDateTime) {
 /// local naive datetime. All-day events are pinned to 00:00 - the +1-day
 /// exclusive-end shift from the form's inclusive last day happens in
 /// [`build_event_from_input`].
-fn date_time_from_form(date: &Rc<Cell<NaiveDate>>, hour: &gtk::SpinButton, minute: &gtk::SpinButton, all_day: bool) -> NaiveDateTime {
+pub(crate) fn date_time_from_form(date: &Rc<Cell<NaiveDate>>, hour: &gtk::SpinButton, minute: &gtk::SpinButton, all_day: bool) -> NaiveDateTime {
     let (h, m) = if all_day { (0, 0) } else { (hour.value() as u32, minute.value() as u32) };
     date.get().and_hms_opt(h, m, 0).unwrap_or(date.get().and_hms_opt(0, 0, 0).unwrap())
 }
@@ -1995,7 +2035,7 @@ fn boundary_to_utc(naive: NaiveDateTime, all_day: bool) -> DateTime<Utc> {
 /// zone (CAL-11) when it has one - the form's wall-clock fields are entered in
 /// the "Time zone" picker's zone. Falls back to the calendar display zone when
 /// the event carries none or the stored name doesn't parse.
-fn boundary_to_utc_in(zone: Option<chrono_tz::Tz>, naive: NaiveDateTime, all_day: bool) -> DateTime<Utc> {
+pub(crate) fn boundary_to_utc_in(zone: Option<chrono_tz::Tz>, naive: NaiveDateTime, all_day: bool) -> DateTime<Utc> {
     zone.map(crate::calendar_tz::DisplayZone::Named)
         .unwrap_or_else(crate::calendar_tz::display_zone)
         .occurrence_from_local(naive, all_day)
@@ -2033,7 +2073,7 @@ fn index_of_zone(name: &str) -> u32 {
 }
 
 /// The zone the time-zone picker currently shows.
-fn selected_zone(dropdown: &gtk::DropDown) -> Option<chrono_tz::Tz> {
+pub(crate) fn selected_zone(dropdown: &gtk::DropDown) -> Option<chrono_tz::Tz> {
     zone_name_at(dropdown.selected()).and_then(|name| name.parse().ok())
 }
 
@@ -2267,6 +2307,10 @@ struct FormInput {
     existing_meta: Option<EventMeta>,
     /// The event's files (CAL-21), carried from the editor's attachment list.
     attachments: Vec<EventAttachment>,
+    /// Addresses chosen through the room finder (CAL-19), lower-cased. A new
+    /// attendee from this set is written as a [`AttendeeRole::Resource`] (a
+    /// booked room) instead of an ordinary required guest.
+    resource_attendees: Vec<String>,
 }
 
 /// Builds a [`CalendarEvent`] from already-extracted form values. `Err` on an
@@ -2400,7 +2444,8 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
             // save: an Optional guest was being promoted to Required).
             let existing = input.existing_attendees.iter().find(|a| a.address.address.eq_ignore_ascii_case(&address));
             let status = existing.map(|a| a.status).unwrap_or(AttendeeStatus::NeedsAction);
-            let role = existing.map(|a| a.role).unwrap_or(AttendeeRole::Required);
+            let is_room = input.resource_attendees.iter().any(|room| room.eq_ignore_ascii_case(&address));
+            let role = existing.map(|a| a.role).unwrap_or(if is_room { AttendeeRole::Resource } else { AttendeeRole::Required });
             Attendee {
                 address: EmailAddress { name: name_of(token), address },
                 role,
@@ -2501,6 +2546,7 @@ mod tests {
             owner_email: None,
             existing_meta: None,
             attachments: Vec::new(),
+            resource_attendees: Vec::new(),
         }
     }
 
@@ -3061,5 +3107,16 @@ mod tests {
         apply_edit_scope(&mut event, 0, Some(&occ));
         assert_eq!(event.recurrence_id, None);
         assert_eq!(event.rrule, None);
+    }
+
+    #[test]
+    fn a_room_chosen_by_the_finder_is_written_as_a_resource() {
+        let mut input = base_input();
+        input.attendee_tokens = vec!["Room 4 <room4@example.com>".to_string(), "grace@example.com".to_string()];
+        input.resource_attendees = vec!["room4@example.com".to_string()];
+        let event = build_event_from_input(input).expect("valid range");
+        assert_eq!(event.attendees[0].role, AttendeeRole::Resource, "a booked room is a resource, not a guest");
+        assert_eq!(event.attendees[0].address.name.as_deref(), Some("Room 4"));
+        assert_eq!(event.attendees[1].role, AttendeeRole::Required, "a person from the same form stays required");
     }
 }

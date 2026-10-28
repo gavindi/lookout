@@ -46,6 +46,7 @@ mod graph_categories;
 mod graph_directory;
 mod graph_mail;
 mod graph_pin;
+mod graph_rooms;
 mod graph_rules;
 #[cfg(test)]
 mod gtk_test;
@@ -79,6 +80,7 @@ mod reminders;
 mod reply_with_meeting;
 mod resources;
 mod ribbon;
+mod room_finder;
 mod rules;
 mod rules_view;
 mod schedule_grid;
