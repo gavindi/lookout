@@ -54,7 +54,7 @@ const MAX_EVENT_ATTACHMENTS: usize = 500;
 
 /// The `$select` fields the calendar-view read needs (exactly what the mapper
 /// consumes, so full bodies aren't fetched).
-const EVENT_SELECT: &str = "$select=id,changeKey,iCalUId,subject,body,start,end,isAllDay,location,showAs,sensitivity,categories,isCancelled,isReminderOn,reminderMinutesBeforeStart,organizer,attendees,onlineMeeting,onlineMeetingUrl";
+const EVENT_SELECT: &str = "$select=id,changeKey,iCalUId,subject,body,start,end,isAllDay,location,showAs,sensitivity,categories,isCancelled,isReminderOn,reminderMinutesBeforeStart,organizer,attendees,isOnlineMeeting,onlineMeeting,onlineMeetingUrl";
 /// Attachment metadata (never `contentBytes`, which only a single-attachment
 /// read returns) expanded onto every calendar-view event (CAL-21).
 const EVENT_EXPAND: &str = "&$expand=attachments($select=id,name,contentType,size,isInline)";
@@ -523,6 +523,15 @@ mod tests {
             "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" },
             "end": { "dateTime": "2026-10-15T09:30:00", "timeZone": "UTC" }
         })
+    }
+
+    /// CAL-20: the calendar-view read must ask for the Graph flag that says an
+    /// event has a Teams link, not just the join URL, so the editor can show
+    /// its Teams toggle from the server's own state.
+    #[test]
+    fn calendar_view_selects_the_online_meeting_flag() {
+        assert!(EVENT_SELECT.contains("isOnlineMeeting"), "EVENT_SELECT is missing isOnlineMeeting: {EVENT_SELECT}");
+        assert!(EVENT_SELECT.contains("onlineMeeting"), "EVENT_SELECT is missing the join URL: {EVENT_SELECT}");
     }
 
     #[tokio::test]

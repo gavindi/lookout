@@ -452,19 +452,45 @@ pub fn show_event_editor(
     let video_toggle = adw::SwitchRow::builder().title("Video call link").subtitle("Add a join-this-meeting URL").build();
     let video_url_row = adw::EntryRow::builder().title("Meeting URL").build();
     video_url_row.set_visible(video_toggle.is_active());
-    {
-        let video_url_row = video_url_row.clone();
-        video_toggle.connect_active_notify(move |row| video_url_row.set_visible(row.is_active()));
-    }
-    // CAL-20 / 3.17: name the provider once a recognised meeting URL is typed.
-    {
+    // CAL-20 / 3.17: on a Microsoft 365 calendar this is Outlook's "Teams
+    // meeting" toggle - Graph creates the join link on save, so there is no
+    // URL to type. Other calendars keep the manual join-link row, whose
+    // subtitle names the provider once a recognised URL is entered.
+    let sync_video_row: Rc<dyn Fn()> = {
         let video_toggle = video_toggle.clone();
-        video_url_row.connect_changed(move |row| {
-            video_toggle.set_subtitle(&match lookout_core::interop::onlinemeeting::classify(row.text().trim()) {
-                Some(provider) => format!("{} meeting link", provider.display_name()),
-                None => "Add a join-this-meeting URL".to_string(),
-            });
-        });
+        let video_url_row = video_url_row.clone();
+        let calendar_dropdown = calendar_dropdown.clone();
+        let calendar_ids = calendar_ids.clone();
+        let graph_calendars = prefill.graph_calendars.clone();
+        Rc::new(move || {
+            let graph = calendar_ids
+                .get(calendar_dropdown.selected() as usize)
+                .is_some_and(|calendar_id| graph_calendars.contains(calendar_id));
+            if graph {
+                video_toggle.set_title("Teams meeting");
+                video_toggle.set_subtitle("Microsoft Teams adds a join link when you save");
+                video_url_row.set_visible(false);
+            } else {
+                video_toggle.set_title("Video call link");
+                video_toggle.set_subtitle(&match lookout_core::interop::onlinemeeting::classify(video_url_row.text().trim()) {
+                    Some(provider) => format!("{} meeting link", provider.display_name()),
+                    None => "Add a join-this-meeting URL".to_string(),
+                });
+                video_url_row.set_visible(video_toggle.is_active());
+            }
+        })
+    };
+    {
+        let sync_video_row = sync_video_row.clone();
+        video_toggle.connect_active_notify(move |_| sync_video_row());
+    }
+    {
+        let sync_video_row = sync_video_row.clone();
+        video_url_row.connect_changed(move |_| sync_video_row());
+    }
+    {
+        let sync_video_row = sync_video_row.clone();
+        calendar_dropdown.connect_selected_notify(move |_| sync_video_row());
     }
 
     let description_buffer = gtk::TextBuffer::new(None);
@@ -742,7 +768,6 @@ pub fn show_event_editor(
         }
         video_toggle.set_active(occ.conference_url.is_some());
         video_url_row.set_text(occ.conference_url.as_deref().unwrap_or(""));
-        video_url_row.set_visible(occ.conference_url.is_some());
     } else {
         if let Some(subject) = prefill.suggested_subject.map(str::trim).filter(|subject| !subject.is_empty()) {
             title_row.set_text(subject);
@@ -761,6 +786,9 @@ pub fn show_event_editor(
             );
         }
     }
+    // The form may default to a Microsoft 365 calendar, where the switch is
+    // the Teams-meeting toggle rather than a manual join link.
+    sync_video_row();
 
     // --- Right-hand preview wiring: re-renders the mini-calendar + day strip
     // from the caller's snapshot every time the form's date/time/title/
@@ -1296,6 +1324,7 @@ pub fn show_event_editor(
                 reminder_minutes_before: reminder_choices.get(reminder_dropdown.selected() as usize).and_then(|(_, m)| *m),
                 video_enabled: video_toggle.is_active(),
                 conference_url_text: video_url_row.text().to_string(),
+                graph_calendar: graph_calendars.contains(&calendar_id),
                 rrule,
                 recurrence_id: None,
                 recurrence_range: RecurrenceRange::default(),
@@ -2138,7 +2167,8 @@ fn printable_event_html(
     }
     if video_toggle.is_active() {
         let url = video_url_row.text().to_string();
-        rows.push(("Video call", if url.is_empty() { "Yes".to_string() } else { url }));
+        let label = if video_toggle.title() == "Teams meeting" { "Teams meeting" } else { "Video call" };
+        rows.push((label, if url.is_empty() { "Yes".to_string() } else { url }));
     }
     let categories = categories.join(", ");
     if !categories.is_empty() {
@@ -2217,8 +2247,14 @@ struct FormInput {
     /// has no status control yet.
     status: EventStatus,
     reminder_minutes_before: Option<i64>,
+    /// The join-link switch is on. On a Graph calendar this means "create a
+    /// Teams meeting"; elsewhere it means "use `conference_url_text`".
     video_enabled: bool,
     conference_url_text: String,
+    /// Whether the picked calendar is served by the Microsoft Graph backend
+    /// (CAL-20). Graph creates the Teams link itself from `isOnlineMeeting`,
+    /// while every other backend writes the manual join URL instead.
+    graph_calendar: bool,
     rrule: Option<String>,
     /// The instance this event is an override of (see
     /// [`CalendarEvent::recurrence_id`]) - set by the scope control, not the
@@ -2381,6 +2417,15 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
     } else {
         None
     };
+    // CAL-20: Graph creates the Teams link from `isOnlineMeeting` alone, so on
+    // a Microsoft 365 calendar the switch is the flag and the URL stays None.
+    // Other backends keep the RFC 7986 `CONFERENCE` URL path (and only a
+    // Teams URL marks the event as a Teams meeting for a later Graph write).
+    let is_online_meeting = if input.graph_calendar {
+        input.video_enabled
+    } else {
+        lookout_core::interop::is_teams_meeting(conference_url.as_deref())
+    };
 
     let (uid, href, etag) = input.existing_meta.unwrap_or_else(|| (EventUid(uuid::Uuid::new_v4().to_string()), None, None));
 
@@ -2419,10 +2464,7 @@ fn build_event_from_input(input: FormInput) -> Result<CalendarEvent, String> {
         show_as: input.show_as,
         status: input.status,
         reminder_minutes_before: input.reminder_minutes_before,
-        // A typed Teams URL (or a Teams link carried over) means "this is a
-        // Teams meeting", so a Graph write preserves/creates the link; the
-        // dedicated Teams toggle lands with the Microsoft calendar wiring.
-        is_online_meeting: lookout_core::interop::is_teams_meeting(conference_url.as_deref()),
+        is_online_meeting,
         conference_url,
         attachments: input.attachments,
     })
@@ -2451,6 +2493,7 @@ mod tests {
             reminder_minutes_before: None,
             video_enabled: false,
             conference_url_text: String::new(),
+            graph_calendar: false,
             rrule: None,
             recurrence_id: None,
             recurrence_range: RecurrenceRange::default(),
@@ -2715,6 +2758,56 @@ mod tests {
         input.conference_url_text = "https://example.com/join".to_string();
         let event = build_event_from_input(input).unwrap();
         assert_eq!(event.conference_url.as_deref(), Some("https://example.com/join"));
+    }
+
+    /// CAL-20: on a Microsoft 365 calendar the toggle alone asks Graph to
+    /// create the Teams link, so no join URL is typed or written.
+    #[test]
+    fn graph_calendar_toggle_asks_graph_to_create_a_teams_link() {
+        let mut input = base_input();
+        input.graph_calendar = true;
+        input.video_enabled = true;
+        let event = build_event_from_input(input).unwrap();
+        assert!(event.is_online_meeting);
+        assert!(event.conference_url.is_none(), "Graph fills in the join URL");
+    }
+
+    /// Turning the Teams switch off must clear the link, not just ignore the
+    /// last URL left in the hidden field.
+    #[test]
+    fn graph_calendar_switch_off_clears_the_existing_link() {
+        let mut input = base_input();
+        input.graph_calendar = true;
+        input.video_enabled = false;
+        input.conference_url_text = "https://teams.microsoft.com/l/meetup-join/abc".to_string();
+        let event = build_event_from_input(input).unwrap();
+        assert!(!event.is_online_meeting);
+        assert!(event.conference_url.is_none());
+    }
+
+    /// An existing Teams link carried into an edit is preserved while the
+    /// switch stays on.
+    #[test]
+    fn graph_calendar_keeps_an_existing_join_url() {
+        let mut input = base_input();
+        input.graph_calendar = true;
+        input.video_enabled = true;
+        input.conference_url_text = "https://teams.microsoft.com/l/meetup-join/abc".to_string();
+        let event = build_event_from_input(input).unwrap();
+        assert!(event.is_online_meeting);
+        assert_eq!(event.conference_url.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/abc"));
+    }
+
+    /// A non-Graph calendar still writes the RFC 7986 `CONFERENCE` URL, and
+    /// only a Teams URL additionally marks the event as a Teams meeting.
+    #[test]
+    fn non_graph_calendar_still_classifies_the_join_url() {
+        let mut input = base_input();
+        input.video_enabled = true;
+        input.conference_url_text = "https://teams.microsoft.com/l/meetup-join/abc".to_string();
+        let event = build_event_from_input(input).unwrap();
+        assert!(event.is_online_meeting);
+        assert_eq!(event.conference_url.as_deref(), Some("https://teams.microsoft.com/l/meetup-join/abc"));
     }
 
     #[test]
