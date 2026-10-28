@@ -561,8 +561,7 @@ impl AppConfig {
     }
 
     /// Records (or clears) `account_id`'s company-directory opt-in. The
-    /// Settings → People switch that calls this is item 4.7.9.
-    #[allow(dead_code)]
+    /// Settings → People switch calls this (item 4.7.9).
     pub fn set_directory_enabled(&mut self, account_id: &AccountId, enabled: bool) {
         self.directory_accounts.retain(|id| id != account_id);
         if enabled {
@@ -593,9 +592,8 @@ impl AppConfig {
     }
 
     /// Inserts `directory`, replacing any existing entry with the same id (the
-    /// edit path) or appending it (the add path). The dialog that calls this is
-    /// item 4.7.9.
-    #[allow(dead_code)]
+    /// edit path) or appending it (the add path). The Settings → People LDAP
+    /// dialog calls this (item 4.7.9).
     pub fn upsert_ldap_directory(&mut self, directory: LdapDirectory) {
         if let Some(existing) = self.ldap_directories.iter_mut().find(|d| d.id == directory.id) {
             *existing = directory;
@@ -606,10 +604,14 @@ impl AppConfig {
 
     /// Removes the LDAP directory with `id`, if any. The caller drops its
     /// keyring password separately (`KeyringStore::delete_account`); the
-    /// dialog that calls this is item 4.7.9.
-    #[allow(dead_code)]
+    /// Settings → People dialog calls this (item 4.7.9).
     pub fn remove_ldap_directory(&mut self, id: &str) {
         self.ldap_directories.retain(|d| d.id != id);
+    }
+
+    /// A fresh LDAP directory id (`ldap:<uuid>`, item 4.7.9).
+    pub fn new_ldap_directory_id() -> String {
+        format!("{LDAP_DIRECTORY_ID_PREFIX}{}", uuid::Uuid::new_v4())
     }
 
     /// A fresh, empty calendar group id (`group:<uuid>`, item 3.13 / CAL-33).
@@ -1415,6 +1417,13 @@ mod tests {
         assert!(hand_written.filter.is_empty());
         assert!(hand_written.mail_attr.is_empty());
         assert!(hand_written.name_attr.is_empty());
+
+        // A dialog-created entry gets a fresh `ldap:<uuid>` id each time.
+        let first = AppConfig::new_ldap_directory_id();
+        let second = AppConfig::new_ldap_directory_id();
+        assert!(first.starts_with(LDAP_DIRECTORY_ID_PREFIX));
+        assert!(second.starts_with(LDAP_DIRECTORY_ID_PREFIX));
+        assert_ne!(first, second);
 
         // Removal drops only the named entry; an unknown id is a no-op.
         config.remove_ldap_directory(&directory.id);

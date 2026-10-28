@@ -20,8 +20,9 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 use lookout_core::{EmailAddress, EmailSummary, VCard};
+use lookout_graph::DirectoryPerson;
 
-use crate::contacts_view::{contact_photo_texture, vcard_display_name, vcard_primary_email, ContactsListEntry};
+use crate::contacts_view::{contact_photo_texture, directory_person_display_name, directory_person_secondary, vcard_display_name, vcard_primary_email, ContactsListEntry};
 use crate::profile_card::{EventsForPersonFn, OpenMessageFn, PersonActionFn, SendEmailFn};
 use crate::util::{action_button, clear_box};
 use crate::window::UiState;
@@ -54,6 +55,10 @@ pub struct ContactsDetailsActions {
     pub delete: Rc<dyn Fn(&ContactsListEntry)>,
     /// Open an external URI (an IMPP/URL from the card) in the default handler.
     pub open_uri: Rc<dyn Fn(&str)>,
+    /// Save a live company-directory hit as a contact (item 4.7.8): opens the
+    /// create form seeded with the directory's name, address, title and
+    /// company.
+    pub add_directory_contact: Rc<dyn Fn(&DirectoryPerson)>,
 }
 
 /// The details pane's persistent widgets. `root` swaps between the empty state
@@ -72,6 +77,10 @@ pub struct ContactsDetailsPane {
     pub files: gtk::Box,
     /// The inline editor's host (UX-65), shown as the `edit` page.
     pub edit_slot: gtk::Box,
+    /// The Overview / Contact info / Files / Emails switcher and stack, kept
+    /// so directory mode (item 4.7.8) can hide the tabs and pin Overview.
+    switcher: adw::ViewSwitcher,
+    view_stack: adw::ViewStack,
     /// Bumped on every `set_contact`, so an in-flight Emails/Files load from a
     /// previous selection doesn't append into a now-reused tab.
     generation: Rc<Cell<u64>>,
@@ -156,6 +165,8 @@ impl ContactsDetailsPane {
             emails,
             files,
             edit_slot,
+            switcher,
+            view_stack,
             generation: Rc::new(Cell::new(0)),
         }
     }
@@ -176,6 +187,7 @@ impl ContactsDetailsPane {
             return;
         };
         self.root.set_visible_child_name("details");
+        self.switcher.set_visible(true);
 
         let display_name = vcard_display_name(entry.card());
         let primary_email = vcard_primary_email(entry.card());
@@ -193,6 +205,32 @@ impl ContactsDetailsPane {
         fill_contact_info(&self.contact_info, entry.card());
         spawn_recent_mail(&self.emails, &address, entry, state, worker, actions, &self.generation, generation);
         spawn_files(&self.files, &address, entry, state, worker, actions, &self.generation, generation);
+    }
+
+    /// Repaints the pane for a live company-directory hit (item 4.7.8). The
+    /// pane's four stored-contact tabs don't apply to someone who isn't in the
+    /// address book, so the switcher is hidden and Overview carries the
+    /// directory's fields plus Send email / Add to contacts.
+    pub fn set_directory_person(&self, person: Option<&DirectoryPerson>, actions: &ContactsDetailsActions) {
+        clear_box(&self.header_slot);
+        clear_box(&self.actions_slot);
+        for tab in [&self.overview, &self.contact_info, &self.emails, &self.files] {
+            clear_box(tab);
+        }
+        // Cancel any Emails/Files load still in flight for the last contact.
+        self.generation.set(self.generation.get().wrapping_add(1));
+
+        let Some(person) = person else {
+            self.root.set_visible_child_name("empty");
+            return;
+        };
+        self.root.set_visible_child_name("details");
+        self.switcher.set_visible(false);
+        self.view_stack.set_visible_child_name("overview");
+
+        self.header_slot.append(&build_directory_header(person));
+        self.actions_slot.append(&build_directory_actions(person, actions));
+        fill_directory_overview(&self.overview, person);
     }
 
     /// Whether the pane is currently showing the inline editor (UX-65.7).
@@ -413,6 +451,101 @@ fn build_actions(entry: &ContactsListEntry, address: &EmailAddress, actions: &Co
     row.append(&delete);
 
     row.upcast()
+}
+
+/// The directory hit's header (item 4.7.8): avatar initials, name, the
+/// "Title · Company" line the directory gave us, and the address when it
+/// isn't already the secondary line.
+fn build_directory_header(person: &DirectoryPerson) -> gtk::Widget {
+    let display_name = directory_person_display_name(person);
+    let secondary = directory_person_secondary(person);
+    let address = person.address.trim();
+
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(10).build();
+
+    let avatar_label = gtk::Label::builder()
+        .css_classes(["avatar-circle"])
+        .label(crate::message_header::initials(Some(&display_name), address))
+        .build();
+    avatar_label.add_css_class(crate::message_header::avatar_color_class(address));
+    let avatar = gtk::Overlay::builder()
+        .width_request(64)
+        .height_request(64)
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .child(&avatar_label)
+        .build();
+    crate::privacy::mark(&avatar);
+    row.append(&avatar);
+
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(1)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    text.append(&gtk::Label::builder().label(&display_name).xalign(0.0).wrap(true).css_classes(["heading"]).build());
+    if !secondary.is_empty() {
+        text.append(&gtk::Label::builder().label(&secondary).xalign(0.0).wrap(true).css_classes(["caption", "dim-label"]).build());
+    }
+    if !address.is_empty() && address != secondary {
+        text.append(&gtk::Label::builder().label(address).xalign(0.0).wrap(true).css_classes(["caption"]).build());
+    }
+    crate::privacy::mark(&text);
+    row.append(&text);
+    row.upcast()
+}
+
+/// The directory hit's action row (item 4.7.8): Send email and Add to
+/// contacts. Editing/deleting doesn't apply - the person isn't in the address
+/// book yet.
+fn build_directory_actions(person: &DirectoryPerson, actions: &ContactsDetailsActions) -> gtk::Widget {
+    let row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(4).build();
+    let address = EmailAddress {
+        name: person.name.clone().filter(|name| !name.trim().is_empty()),
+        address: person.address.trim().to_string(),
+    };
+
+    let send = action_button("mail-send-symbolic", "Send email");
+    send.set_tooltip_text(Some("Send a new message to this person"));
+    send.set_sensitive(!address.address.is_empty());
+    {
+        let actions = actions.clone();
+        let address = address.clone();
+        send.connect_clicked(move |_| (actions.send_email)(&address, None));
+    }
+    row.append(&send);
+
+    let add = action_button("contact-new-symbolic", "Add to contacts");
+    add.set_tooltip_text(Some("Save this person in one of your address books"));
+    {
+        let actions = actions.clone();
+        let person = person.clone();
+        add.connect_clicked(move |_| (actions.add_directory_contact)(&person));
+    }
+    row.append(&add);
+
+    row.upcast()
+}
+
+/// Fills the Overview tab for a directory hit: the fields the directory
+/// carries, with a note that this person isn't in the user's contacts yet.
+fn fill_directory_overview(container: &gtk::Box, person: &DirectoryPerson) {
+    container.append(&section_heading("Company directory"));
+
+    let address = person.address.trim();
+    if !address.is_empty() {
+        container.append(&section_heading("Email"));
+        container.append(&info_value(address));
+    }
+    if let Some(title) = person.title.as_deref().map(str::trim).filter(|title| !title.is_empty()) {
+        container.append(&section_heading("Title"));
+        container.append(&info_value(title));
+    }
+    if let Some(company) = person.company.as_deref().map(str::trim).filter(|company| !company.is_empty()) {
+        container.append(&section_heading("Company"));
+        container.append(&info_value(company));
+    }
 }
 
 /// Fills the Overview tab: the key contact fields, then upcoming shared

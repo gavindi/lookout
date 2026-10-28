@@ -1250,6 +1250,31 @@ pub(crate) struct UiState {
     /// (UX-65) - set once the details widgets exist, and called whenever the
     /// selection changes or the list is rebuilt. A no-op until wired.
     pub(crate) contacts_details_refresh: Option<Rc<dyn Fn()>>,
+    /// Repaints the whole People screen and selects the default bucket
+    /// (`None`) or a specific one. Used by the title-bar search to leave the
+    /// live Directory mode and land on the stored contacts it filters
+    /// (item 4.7.8). A no-op until wired.
+    pub(crate) contacts_refresh_all: Option<Rc<dyn Fn(Option<i32>)>>,
+    /// The People Directory mode's dispatcher (item 4.7.8): the Graph GALs and
+    /// enabled LDAP directories, without the desktop's address books (People
+    /// already lists those separately). Built lazily on first entry and
+    /// dropped when the directory configuration changes.
+    pub(crate) contacts_directory_source: Option<crate::directory::DirectorySource>,
+    /// The query currently in the Directory search box.
+    pub(crate) contacts_directory_query: String,
+    /// The live directory hits for `contacts_directory_query`.
+    pub(crate) contacts_directory_results: Vec<lookout_graph::DirectoryPerson>,
+    /// The selected index into `contacts_directory_results`.
+    pub(crate) contacts_directory_selected: Option<usize>,
+    /// Whether a directory lookup is in flight (drives the "Searching…" state).
+    pub(crate) contacts_directory_searching: bool,
+    /// Whether the People rail's Directory row is the active list mode. Set by
+    /// `rebuild_contacts_list_ui` for every render, and read by the details
+    /// pane so it knows to show a `DirectoryPerson` rather than a contact.
+    pub(crate) contacts_directory_active: bool,
+    /// Bumped on every directory keystroke so a late answer from an older
+    /// query is discarded.
+    pub(crate) contacts_directory_generation: u64,
     /// The desktop's own address books (EDS_TODO.md E1.5), shown read-only
     /// in the People screen's "Desktop" section. Refilled by
     /// `desktop_contacts::reload`; empty when the feature is off or the

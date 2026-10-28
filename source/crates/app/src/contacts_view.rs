@@ -134,6 +134,9 @@ pub(crate) fn test_snapshot_with_suggestions(suggestions: Vec<EmailAddress>) -> 
 /// The first four are fixed, always-present rows under each account's
 /// header; `Category` rows are dynamic, one per distinct vCard `CATEGORIES`
 /// value found across every connected account (see `refresh_contacts_category_ui`).
+/// `Directory` is a marker, not a stored-contact bucket (item 4.7.8): its
+/// member list is always empty, and `rebuild_contacts_list_ui` renders the
+/// live `DirectoryPerson` results from `UiState` instead.
 #[derive(Clone)]
 enum ContactsBucketKind {
     AllContacts,
@@ -143,6 +146,8 @@ enum ContactsBucketKind {
     Category(String),
     /// One of the desktop's address books (E1.5), by display name.
     DesktopBook(String),
+    /// The live company-directory search (item 4.7.8).
+    Directory,
 }
 
 fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
@@ -151,6 +156,7 @@ fn contacts_bucket_label(kind: &ContactsBucketKind) -> String {
         ContactsBucketKind::Favourites => "Favourites".to_string(),
         ContactsBucketKind::ContactLists => "Your contact lists".to_string(),
         ContactsBucketKind::Deleted => "Deleted".to_string(),
+        ContactsBucketKind::Directory => "Directory".to_string(),
         ContactsBucketKind::Category(name) | ContactsBucketKind::DesktopBook(name) => name.clone(),
     }
 }
@@ -173,6 +179,12 @@ pub struct ContactsCategoryChoice {
 impl ContactsCategoryChoice {
     pub fn label(&self) -> String {
         contacts_bucket_label(&self.kind)
+    }
+
+    /// Whether this row is the live Directory search (item 4.7.8) rather than
+    /// a stored-contact bucket. Its `contacts` list is always empty.
+    pub(crate) fn is_directory(&self) -> bool {
+        matches!(self.kind, ContactsBucketKind::Directory)
     }
 
     #[cfg(test)]
@@ -785,6 +797,66 @@ pub fn show_create_contact_for(
     sender: &EmailAddress,
     preferred_account: Option<AccountId>,
 ) {
+    // The seed card: name from the sender (falling back to the address, so
+    // the form saves as-is when no display name came with it) and one email
+    // row carrying the sender's address. A fresh UID per opened dialog keeps
+    // repeated creates on distinct server hrefs.
+    let seed = VCard {
+        version: "4.0".to_string(),
+        kind: None,
+        uid: Some(uuid::Uuid::new_v4().to_string()),
+        full_name: Some(sender.name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(&sender.address).to_string()),
+        name: None,
+        organization: None,
+        title: None,
+        file_as: None,
+        photo: None,
+        emails: vec![EmailField {
+            types: vec!["work".to_string()],
+            address: sender.address.clone(),
+        }],
+        telephones: Vec::new(),
+        addresses: Vec::new(),
+        urls: Vec::new(),
+        impp: Vec::new(),
+        note: None,
+        birthday: None,
+        anniversary: None,
+        categories: Vec::new(),
+        other: Vec::new(),
+    };
+    show_create_contact_with_seed(window, state, toast_overlay, seed, preferred_account);
+}
+
+/// Opens the create form prefilled from a company-directory hit (item 4.7.8),
+/// keeping the title and company the directory knows. A person already in the
+/// stored contacts is reported rather than duplicated.
+pub fn show_create_contact_from_directory(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay, person: &DirectoryPerson) {
+    let address = person.address.trim();
+    if address.is_empty() {
+        return;
+    }
+    if let Some((_, existing)) = find_contact_by_address(state, address, None) {
+        let name = vcard_display_name(existing.card());
+        let text = glib::markup_escape_text(&format!("{name} is already in your contacts"));
+        toast_overlay.add_toast(adw::Toast::new(&text));
+        return;
+    }
+    let seed = directory_person_seed(person);
+    show_create_contact_with_seed(window, state, toast_overlay, seed, None);
+}
+
+/// The shared "new contact" flow behind `show_create_contact_for` and the
+/// Directory row's Add to contacts: check there is a writable book, collect
+/// every account's books (preferring `preferred_account`'s), and open the
+/// editor with `seed`.
+fn show_create_contact_with_seed(
+    window: &adw::ApplicationWindow,
+    state: &Rc<RefCell<UiState>>,
+    toast_overlay: &adw::ToastOverlay,
+    seed: VCard,
+    preferred_account: Option<AccountId>,
+) {
     let writable = {
         let st = state.borrow();
         st.contacts_by_account.values().any(|snapshot| !snapshot.books.is_empty())
@@ -825,34 +897,6 @@ pub fn show_create_contact_for(
         }
         let fallback_account = accounts[0].0.clone();
         (books, book_accounts, fallback_account)
-    };
-    // The seed card: name from the sender (falling back to the address, so
-    // the form saves as-is when no display name came with it) and one email
-    // row carrying the sender's address. A fresh UID per opened dialog keeps
-    // repeated creates on distinct server hrefs.
-    let seed = VCard {
-        version: "4.0".to_string(),
-        kind: None,
-        uid: Some(uuid::Uuid::new_v4().to_string()),
-        full_name: Some(sender.name.as_deref().filter(|n| !n.trim().is_empty()).unwrap_or(&sender.address).to_string()),
-        name: None,
-        organization: None,
-        title: None,
-        file_as: None,
-        photo: None,
-        emails: vec![EmailField {
-            types: vec!["work".to_string()],
-            address: sender.address.clone(),
-        }],
-        telephones: Vec::new(),
-        addresses: Vec::new(),
-        urls: Vec::new(),
-        impp: Vec::new(),
-        note: None,
-        birthday: None,
-        anniversary: None,
-        categories: Vec::new(),
-        other: Vec::new(),
     };
     let state = state.clone();
     let toast_overlay = toast_overlay.clone();
@@ -1255,6 +1299,73 @@ fn directory_matches_prefix(person: &DirectoryPerson, prefix: &str) -> bool {
     person.address.to_lowercase().starts_with(&needle) || person.name.as_deref().is_some_and(|name| name.to_lowercase().starts_with(&needle))
 }
 
+/// The label a directory hit shows in the People Directory list and details
+/// header: its display name, falling back to the address when the directory
+/// carries no name (item 4.7.8).
+pub(crate) fn directory_person_display_name(person: &DirectoryPerson) -> String {
+    person
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| person.address.trim())
+        .to_string()
+}
+
+/// The secondary line for a directory hit: "Title · Company", or the address
+/// when the directory knows neither.
+pub(crate) fn directory_person_secondary(person: &DirectoryPerson) -> String {
+    let parts: Vec<&str> = [person.title.as_deref(), person.company.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        person.address.trim().to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// The seed card for "Add to contacts" on a directory hit (item 4.7.8): the
+/// name, work email, title and company the directory gave us, under a fresh
+/// UID so repeated creates land on distinct server hrefs.
+pub(crate) fn directory_person_seed(person: &DirectoryPerson) -> VCard {
+    let display_name = directory_person_display_name(person);
+    let organization = person
+        .company
+        .as_deref()
+        .map(str::trim)
+        .filter(|company| !company.is_empty())
+        .map(|company| vec![company.to_string()]);
+    let title = person.title.as_deref().map(str::trim).filter(|title| !title.is_empty()).map(str::to_string);
+    VCard {
+        version: "4.0".to_string(),
+        kind: None,
+        uid: Some(uuid::Uuid::new_v4().to_string()),
+        full_name: Some(display_name),
+        name: None,
+        organization,
+        title,
+        file_as: None,
+        photo: None,
+        emails: vec![EmailField {
+            types: vec!["work".to_string()],
+            address: person.address.trim().to_string(),
+        }],
+        telephones: Vec::new(),
+        addresses: Vec::new(),
+        urls: Vec::new(),
+        impp: Vec::new(),
+        note: None,
+        birthday: None,
+        anniversary: None,
+        categories: Vec::new(),
+        other: Vec::new(),
+    }
+}
+
 pub fn merge_contact_suggestions(
     mail_history: Vec<EmailAddress>,
     carddav: &[EmailAddress],
@@ -1528,21 +1639,29 @@ pub fn refresh_contacts_category_ui(
         favourite_candidates.extend(desktop_books.iter().flat_map(|(_, records)| records.iter().cloned()));
 
         // Outlook's fixed People rail, ahead of the per-account sections: the
-        // four buckets over every account at once (UX-65). Favourites keeps
-        // the full contact list - membership depends on `starred_contacts`,
-        // which changes without a resync - so the filter is applied live in
-        // `rebuild_contacts_list_ui`. The Directory row lands with 4.7.8.
-        for kind in [
+        // four buckets over every account at once (UX-65), plus the live
+        // Directory row when a GAL/LDAP source is configured (item 4.7.8).
+        // Favourites keeps the full contact list - membership depends on
+        // `starred_contacts`, which changes without a resync - so the filter
+        // is applied live in `rebuild_contacts_list_ui`. The Directory row is
+        // a marker with no members: its results are live `DirectoryPerson`s
+        // rendered by `rebuild_directory_list_ui`.
+        let mut fixed_kinds = vec![
             ContactsBucketKind::Favourites,
             ContactsBucketKind::AllContacts,
             ContactsBucketKind::ContactLists,
             ContactsBucketKind::Deleted,
-        ] {
+        ];
+        if crate::directory::directory_configured_for_state(&st) {
+            fixed_kinds.push(ContactsBucketKind::Directory);
+        }
+        for kind in fixed_kinds {
             let members = match kind {
                 ContactsBucketKind::Favourites => favourite_candidates.clone(),
                 ContactsBucketKind::AllContacts => all_contacts.clone(),
                 ContactsBucketKind::ContactLists => all_lists.clone(),
                 ContactsBucketKind::Deleted => all_deleted.clone(),
+                ContactsBucketKind::Directory => Vec::new(),
                 ContactsBucketKind::Category(_) | ContactsBucketKind::DesktopBook(_) => continue,
             };
             let label = contacts_bucket_label(&kind);
@@ -1698,12 +1817,23 @@ pub fn rebuild_contacts_list_ui(
     }
 
     let Some(choice) = categories.borrow().get(selected_category_index as usize).cloned() else {
+        state.borrow_mut().contacts_directory_active = false;
         contacts.borrow_mut().clear();
         selected.borrow_mut().clear();
         refresh_actions();
         details_refresh();
         return;
     };
+
+    // The Directory row is a live search, not a stored-contact bucket
+    // (item 4.7.8): render its `DirectoryPerson` results and leave the
+    // stored list/selection empty, so the bulk actions stay insensitive.
+    if choice.is_directory() {
+        state.borrow_mut().contacts_directory_active = true;
+        rebuild_directory_list_ui(contact_list, state, contacts, selected, refresh_actions, details_refresh);
+        return;
+    }
+    state.borrow_mut().contacts_directory_active = false;
 
     let category_label = contacts_bucket_label(&choice.kind);
     let favourites_only = matches!(choice.kind, ContactsBucketKind::Favourites);
@@ -1983,6 +2113,131 @@ pub fn rebuild_contacts_list_ui(
     details_refresh();
 }
 
+/// Renders the People screen's live Directory results (item 4.7.8) into the
+/// middle list. Unlike `rebuild_contacts_list_ui` there are no stored
+/// `ContactsListEntry`s here - the hits are `DirectoryPerson`s from
+/// [`crate::directory::DirectorySource`], and the details pane renders the
+/// selected one through `ContactsDetailsPane::set_directory_person`. The
+/// stored list and checkbox selection are cleared so the ribbon's
+/// Edit/Delete/Email actions stay insensitive; Send email and Add to contacts
+/// live on the details pane instead.
+fn rebuild_directory_list_ui(
+    contact_list: &gtk::ListBox,
+    state: &Rc<RefCell<UiState>>,
+    contacts: &Rc<RefCell<Vec<ContactsListEntry>>>,
+    selected: &Rc<RefCell<HashSet<(AccountId, String)>>>,
+    refresh_actions: &Rc<dyn Fn()>,
+    details_refresh: &Rc<dyn Fn()>,
+) {
+    while let Some(child) = contact_list.first_child() {
+        contact_list.remove(&child);
+    }
+    contacts.borrow_mut().clear();
+    selected.borrow_mut().clear();
+    refresh_actions();
+
+    let (query, searching, results, selected_index) = {
+        let st = state.borrow();
+        (
+            st.contacts_directory_query.trim().to_string(),
+            st.contacts_directory_searching,
+            st.contacts_directory_results.clone(),
+            st.contacts_directory_selected,
+        )
+    };
+
+    let clear_selection = || {
+        state.borrow_mut().contacts_directory_selected = None;
+    };
+    let show_message = |text: &str| {
+        let label = gtk::Label::builder().label(text).xalign(0.0).wrap(true).css_classes(["dim-label"]).build();
+        crate::privacy::mark_ui(&label);
+        label.set_margin_start(10);
+        label.set_margin_end(10);
+        label.set_margin_top(10);
+        label.set_margin_bottom(10);
+        contact_list.append(&label);
+    };
+
+    if query.chars().count() < crate::directory::DIRECTORY_MIN_CHARS {
+        clear_selection();
+        show_message("Type at least three characters to search the directory");
+        details_refresh();
+        return;
+    }
+    if searching {
+        clear_selection();
+        show_message("Searching the directory…");
+        details_refresh();
+        return;
+    }
+    if results.is_empty() {
+        clear_selection();
+        show_message(&format!("No matches in the directory for “{query}”"));
+        details_refresh();
+        return;
+    }
+
+    let mut row_widgets: Vec<(gtk::ListBoxRow, usize)> = Vec::new();
+    for (index, person) in results.iter().enumerate() {
+        let display_name = directory_person_display_name(person);
+        let secondary = directory_person_secondary(person);
+
+        let name = gtk::Label::builder().label(&display_name).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        let detail = gtk::Label::builder()
+            .label(&secondary)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+        // Directory names, addresses and organisations are content.
+        crate::privacy::mark(&name);
+        crate::privacy::mark(&detail);
+        let text_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        text_box.append(&name);
+        text_box.append(&detail);
+
+        let avatar_label = gtk::Label::builder()
+            .css_classes(["avatar-circle"])
+            .label(crate::message_header::initials(Some(&display_name), &person.address))
+            .build();
+        avatar_label.add_css_class(crate::message_header::avatar_color_class(&person.address));
+        let avatar = gtk::Overlay::builder()
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .child(&avatar_label)
+            .build();
+        crate::privacy::mark(&avatar);
+
+        let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(8).build();
+        row_box.set_margin_start(10);
+        row_box.set_margin_end(10);
+        row_box.set_margin_top(6);
+        row_box.set_margin_bottom(6);
+        row_box.append(&avatar);
+        row_box.append(&text_box);
+        contact_list.append(&row_box);
+        if let Some(row) = row_box.parent().and_then(|parent| parent.downcast::<gtk::ListBoxRow>().ok()) {
+            unsafe { row.set_data("contacts-directory-index", index) };
+            row_widgets.push((row, index));
+        }
+    }
+
+    let target = selected_index.filter(|index| *index < row_widgets.len()).unwrap_or(0);
+    state.borrow_mut().contacts_directory_selected = Some(target);
+    if let Some((row, _)) = row_widgets.get(target) {
+        contact_list.select_row(Some(row));
+    }
+    details_refresh();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_contacts_discovery(
     worker: Rc<Worker>,
@@ -2102,11 +2357,17 @@ pub fn spawn_contacts_discovery(
                 }
                 // The desktop's address books (E1.5) are read once the
                 // synced accounts are known, so E1.3 can skip GOA copies; the
-                // People screen shows when either has contacts.
+                // People screen shows when either has contacts, or when a
+                // GAL/LDAP source is configured for its Directory row (4.7.8).
                 let has_desktop = crate::desktop_contacts::reload_now(&state, &worker).await;
-                if started.is_empty() && !has_desktop {
+                let has_directory = crate::directory::directory_configured_for_state(&state.borrow());
+                if started.is_empty() && !has_desktop && !has_directory {
                     show_page("contacts-empty");
                 } else {
+                    // Repaint now that the account list and directory config
+                    // are known, so the rail's Directory row (4.7.8) can
+                    // appear even when no contacts account loaded.
+                    refresh_contacts_ui(None);
                     show_page("contacts");
                 }
             }
@@ -2118,9 +2379,16 @@ pub fn spawn_contacts_discovery(
                     toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't reach GNOME Online Accounts contacts: {e}"))));
                 }
                 // Without GOA there are no account contacts, but the desktop
-                // may still have address books (E1.5).
+                // may still have address books (E1.5) and a configured
+                // directory still has its People row (4.7.8).
                 let has_desktop = crate::desktop_contacts::reload_now(&state, &worker).await;
-                show_page(if has_desktop { "contacts" } else { "contacts-empty" });
+                let has_directory = crate::directory::directory_configured_for_state(&state.borrow());
+                if has_desktop || has_directory {
+                    refresh_contacts_ui(None);
+                    show_page("contacts");
+                } else {
+                    show_page("contacts-empty");
+                }
             }
         }
     });
@@ -3322,5 +3590,59 @@ mod tests {
         assert_eq!(record.href, "c1");
         assert_eq!(record.etag.as_deref(), Some("ck1"));
         assert_eq!(record.card.emails[0].address, "ada@example.com");
+    }
+
+    #[test]
+    fn the_directory_bucket_is_a_marker_with_no_stored_members() {
+        let choice = ContactsCategoryChoice {
+            kind: ContactsBucketKind::Directory,
+            contacts: Vec::new(),
+        };
+        assert!(choice.is_directory());
+        assert_eq!(choice.label(), "Directory");
+        assert!(choice.members().is_empty());
+        // Every stored bucket stays a non-directory row.
+        assert!(!ContactsCategoryChoice {
+            kind: ContactsBucketKind::AllContacts,
+            contacts: Vec::new(),
+        }
+        .is_directory());
+    }
+
+    #[test]
+    fn a_directory_person_labels_falls_back_and_builds_a_seed_card() {
+        let named = DirectoryPerson {
+            id: Some("u1".to_string()),
+            name: Some("  Grace Hopper  ".to_string()),
+            address: " grace@example.com ".to_string(),
+            title: Some("Admiral".to_string()),
+            company: Some("US Navy".to_string()),
+        };
+        assert_eq!(directory_person_display_name(&named), "Grace Hopper");
+        assert_eq!(directory_person_secondary(&named), "Admiral · US Navy");
+
+        let seed = directory_person_seed(&named);
+        assert_eq!(seed.full_name.as_deref(), Some("Grace Hopper"));
+        assert_eq!(seed.title.as_deref(), Some("Admiral"));
+        assert_eq!(seed.organization.as_deref(), Some(&["US Navy".to_string()][..]));
+        assert_eq!(seed.emails.len(), 1);
+        assert_eq!(seed.emails[0].address, "grace@example.com");
+        assert!(seed.uid.is_some());
+
+        // A nameless, title-less hit uses the address for both lines and
+        // leaves the optional card fields empty.
+        let bare = DirectoryPerson {
+            id: None,
+            name: None,
+            address: "ada@example.com".to_string(),
+            title: None,
+            company: None,
+        };
+        assert_eq!(directory_person_display_name(&bare), "ada@example.com");
+        assert_eq!(directory_person_secondary(&bare), "ada@example.com");
+        let seed = directory_person_seed(&bare);
+        assert_eq!(seed.full_name.as_deref(), Some("ada@example.com"));
+        assert!(seed.title.is_none());
+        assert!(seed.organization.is_none());
     }
 }

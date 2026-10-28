@@ -2,8 +2,8 @@
 //! source that fans a recipient/People search out across every configured
 //! directory backend - the Microsoft 365 GAL (`/users?$search=`, backed by
 //! `lookout_graph::contacts`) and LDAP servers - and hands back the hits the
-//! recipient autocomplete, the address-book picker and People search merge in
-//! beside stored contacts and mail history.
+//! recipient autocomplete, the address-book picker and the People screen's
+//! live **Directory** mode (item 4.7.8) render.
 //!
 //! Autocomplete fires on every keystroke, and a directory is a network round
 //! trip, so a lookup is gated three ways: a minimum query length, a short
@@ -23,7 +23,9 @@
 //! unions every account's directories (the calendar attendee field, where an
 //! invitee isn't tied to the event's calendar account). The desktop's books
 //! serve both scopes. A disabled, unconsented or unconfigured source simply
-//! contributes no hits.
+//! contributes no hits. [`people_directory_source`] is the same dispatcher
+//! without the desktop books, for the People screen's Directory mode (item
+//! 4.7.8), which already lists the desktop's books in their own section.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
@@ -289,6 +291,23 @@ impl DirectorySource {
 /// desktop's address books ([`EdsDirectoryBackend`]) serve every scope and
 /// come last; without EDS they simply answer empty.
 pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<AccountId>, worker: Rc<Worker>) -> DirectorySource {
+    assemble_directory_source(state, account, worker, true)
+}
+
+/// The People screen's Directory mode (item 4.7.8): the Graph GALs and enabled
+/// LDAP directories only. The desktop's address books are deliberately left
+/// out because People already lists them in their own read-only section; a
+/// directory search that repeated them would show every desktop contact
+/// twice. The source is unioned across accounts, like the attendee field's:
+/// the People Directory row isn't tied to a sending account.
+pub(crate) fn people_directory_source(state: &Rc<RefCell<UiState>>, worker: Rc<Worker>) -> DirectorySource {
+    assemble_directory_source(state, None, worker, false)
+}
+
+/// Builds a source over the configured backends. `include_desktop` is the one
+/// difference between the suggestion surfaces (which fall back to the
+/// desktop's books) and the People Directory mode.
+fn assemble_directory_source(state: &Rc<RefCell<UiState>>, account: Option<AccountId>, worker: Rc<Worker>, include_desktop: bool) -> DirectorySource {
     // Read the config and the Graph-capable account ids out under one short
     // borrow. An account carries the Graph clients only when it is a
     // Microsoft 365 account with its own token (a shared mailbox borrows its
@@ -330,7 +349,10 @@ pub(crate) fn directory_source(state: &Rc<RefCell<UiState>>, account: Option<Acc
     // to EDS on the first lookup and contributes nothing without it. It is
     // added even while Config → People switches desktop books off: the switch
     // is read on every lookup, so turning it on reaches open composers too.
-    backends.push(Arc::new(EdsDirectoryBackend::desktop(synced_goa)));
+    // The People Directory mode omits it (see `people_directory_source`).
+    if include_desktop {
+        backends.push(Arc::new(EdsDirectoryBackend::desktop(synced_goa)));
+    }
     DirectorySource::new(backends, worker)
 }
 
@@ -345,6 +367,29 @@ fn ldap_directories_in_scope<'a>(config: &'a AppConfig, account: Option<&Account
         .filter(|directory| directory.enabled)
         .filter(|directory| account.is_none_or(|scope| &directory.account_id == scope))
         .collect()
+}
+
+/// Whether the People rail should offer its Directory row: at least one
+/// Microsoft 365 account the user has opted into GAL search for, or one
+/// enabled LDAP directory (item 4.7.8). Pure, so the visibility rule is
+/// unit-tested without a window or a live directory; a configured but
+/// unconsented GAL still shows the row, and its search simply answers empty
+/// until the opt-in flow is completed.
+pub(crate) fn directory_configured(config: &AppConfig, graph_accounts: &[AccountId]) -> bool {
+    graph_accounts.iter().any(|account_id| config.directory_enabled_for(account_id)) || config.ldap_directories.iter().any(|directory| directory.enabled)
+}
+
+/// [`directory_configured`] for the running window: the Graph-capable
+/// accounts are the ones that own a Microsoft 365 mailbox (`graph_pin`).
+pub(crate) fn directory_configured_for_state(state: &UiState) -> bool {
+    let config = state.app_config.borrow();
+    let graph_accounts: Vec<AccountId> = state
+        .accounts
+        .iter()
+        .filter(|(_, handle)| handle.graph_pin.is_some())
+        .map(|(account_id, _)| account_id.clone())
+        .collect();
+    directory_configured(&config, &graph_accounts)
 }
 
 /// Maps a source's hits to the read-only picker suggestions of item 4.7.7.
@@ -496,5 +541,26 @@ mod tests {
         assert_eq!(suggestions, vec![Suggestion::Directory(person("Grace", "grace@y.com"))]);
         // An empty hit list is a valid answer that clears the picker's section.
         assert!(directory_suggestions(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn directory_configured_needs_an_opt_in_or_an_enabled_ldap_directory() {
+        let account = AccountId("account_1".into());
+        let mut config = AppConfig::default();
+        assert!(!directory_configured(&config, &[]));
+        assert!(!directory_configured(&config, std::slice::from_ref(&account)));
+
+        // A GAL opt-in counts only for an account that is actually Graph
+        // capable (the caller passes just those ids).
+        config.set_directory_enabled(&account, true);
+        assert!(directory_configured(&config, std::slice::from_ref(&account)));
+        assert!(!directory_configured(&config, &[]));
+
+        // An enabled LDAP directory is enough on its own; a disabled one is not.
+        config.directory_accounts.clear();
+        config.ldap_directories = vec![ldap("ldap:a", "account_1", true)];
+        assert!(directory_configured(&config, &[]));
+        config.ldap_directories[0].enabled = false;
+        assert!(!directory_configured(&config, &[]));
     }
 }

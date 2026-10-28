@@ -58,6 +58,7 @@ mod invite_conflicts;
 mod last_view;
 mod launcher_entry;
 mod ldap_directory;
+mod ldap_directory_view;
 mod link_safety;
 mod lookout_view;
 mod mail_notifications;

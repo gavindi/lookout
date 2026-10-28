@@ -589,14 +589,14 @@ pub(crate) fn new_other_account_id() -> String {
 }
 
 /// A right-aligned field label for the two-column form grid.
-fn field_label(text: &str) -> gtk::Label {
+pub(crate) fn field_label(text: &str) -> gtk::Label {
     let label = gtk::Label::builder().label(text).halign(gtk::Align::End).build();
     crate::privacy::mark_ui(&label);
     label
 }
 
 /// A small "Port" caption for the grid's port columns.
-fn port_label(text: &str) -> gtk::Label {
+pub(crate) fn port_label(text: &str) -> gtk::Label {
     let label = gtk::Label::builder().label(text).css_classes(["dim-label"]).build();
     crate::privacy::mark_ui(&label);
     label

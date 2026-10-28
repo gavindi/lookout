@@ -618,6 +618,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         contacts_list_refresh: None,
         contacts_filter_options: crate::contacts_view::ContactsFilterOptions::default(),
         contacts_details_refresh: None,
+        contacts_refresh_all: None,
+        contacts_directory_source: None,
+        contacts_directory_query: String::new(),
+        contacts_directory_results: Vec::new(),
+        contacts_directory_selected: None,
+        contacts_directory_searching: false,
+        contacts_directory_active: false,
+        contacts_directory_generation: 0,
         desktop_contacts: Vec::new(),
         ui_db,
         settings: settings.clone(),
@@ -3959,6 +3967,21 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     contacts_search_row.append(&contacts_search_entry);
     contacts_search_row.append(&contacts_filter_button);
     contacts_right_box.append(&contacts_search_row);
+    // The Directory mode's own search box (item 4.7.8). It replaces the
+    // stored-contact search row above while the rail's Directory row is
+    // selected, so the People search box and the title-bar search keep
+    // filtering stored contacts exactly as before.
+    let contacts_directory_search_entry = gtk::SearchEntry::builder()
+        .search_delay(150)
+        .placeholder_text("Search the directory")
+        .tooltip_text("Search the company directory")
+        .css_classes(["contacts-search-entry"])
+        .build();
+    contacts_directory_search_entry.set_hexpand(true);
+    let contacts_directory_search_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    contacts_directory_search_row.append(&contacts_directory_search_entry);
+    contacts_directory_search_row.set_visible(false);
+    contacts_right_box.append(&contacts_directory_search_row);
     contacts_right_box.append(&contacts_scroller);
 
     let contacts_left_card = card_section(&contacts_left_box);
@@ -5673,10 +5696,26 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // While the People module is active the title-bar search becomes
             // the People search (UX-12, P-06): filter the contacts list in
             // place rather than switching to Mail. An emptied box clears the
-            // filter the same way.
+            // filter the same way. If the live Directory row is active, leave
+            // it for the stored contacts so the filter has something to act
+            // on - the Directory has its own search box (item 4.7.8).
             if current_module.get() == "contacts" {
                 search_debounce.set(search_debounce.get() + 1);
                 state.borrow_mut().contacts_filter = query.to_string();
+                if state.borrow().contacts_directory_active {
+                    let mut st = state.borrow_mut();
+                    st.contacts_directory_active = false;
+                    st.contacts_directory_generation = st.contacts_directory_generation.wrapping_add(1);
+                    drop(st);
+                    // Bind the hook before the `if let`: a temporary `Ref` in
+                    // an `if let` scrutinee would live through the body, and
+                    // the repaint borrows the state mutably.
+                    let show_stored = state.borrow().contacts_refresh_all.clone();
+                    if let Some(refresh) = show_stored {
+                        refresh(None);
+                        return;
+                    }
+                }
                 let refresh = state.borrow().contacts_list_refresh.clone();
                 if let Some(refresh) = refresh {
                     refresh();
@@ -7837,6 +7876,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             })
         };
         let open_uri: Rc<dyn Fn(&str)> = Rc::new(|uri: &str| crate::window::open_uri_in_default_browser(uri));
+        // "Add to contacts" for a live directory hit (item 4.7.8): opens the
+        // create form seeded with the directory's name, address, title and
+        // company, or reports a person already stored as a contact.
+        let add_directory_contact: Rc<dyn Fn(&lookout_graph::DirectoryPerson)> = {
+            let window = window.clone();
+            let state = state.clone();
+            let toast_overlay = toast_overlay.clone();
+            Rc::new(move |person| {
+                crate::contacts_view::show_create_contact_from_directory(&window, &state, &toast_overlay, person);
+            })
+        };
         crate::contacts_details::ContactsDetailsActions {
             send_email,
             schedule_meeting,
@@ -7845,7 +7895,73 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             edit,
             delete,
             open_uri,
+            add_directory_contact,
         }
+    };
+
+    // The People Directory mode's query dispatcher (item 4.7.8). A query
+    // below the directory minimum clears the list and paints the prompt;
+    // otherwise it bumps a generation, shows "Searching…", and asks the
+    // lazily built People source (GAL + LDAP, no desktop books). A late answer
+    // from an older query, or one that lands after the user left Directory
+    // mode, is dropped.
+    let run_directory_search: Rc<dyn Fn(&str)> = {
+        let state = state.clone();
+        let worker = worker.clone();
+        Rc::new(move |query: &str| {
+            let query = query.trim().to_string();
+            let generation = {
+                let mut st = state.borrow_mut();
+                st.contacts_directory_generation = st.contacts_directory_generation.wrapping_add(1);
+                st.contacts_directory_query = query.clone();
+                st.contacts_directory_results.clear();
+                st.contacts_directory_selected = None;
+                st.contacts_directory_searching = false;
+                st.contacts_directory_generation
+            };
+            let repaint = || {
+                let refresh = state.borrow().contacts_list_refresh.clone();
+                if let Some(refresh) = refresh {
+                    refresh();
+                }
+            };
+            if query.chars().count() < crate::directory::DIRECTORY_MIN_CHARS {
+                repaint();
+                return;
+            }
+            let source = {
+                let existing = state.borrow().contacts_directory_source.clone();
+                match existing {
+                    Some(source) => source,
+                    None => {
+                        let source = crate::directory::people_directory_source(&state, worker.clone());
+                        state.borrow_mut().contacts_directory_source = Some(source.clone());
+                        source
+                    }
+                }
+            };
+            state.borrow_mut().contacts_directory_searching = true;
+            repaint();
+            let state_for_answer = state.clone();
+            source.search(
+                &query,
+                Rc::new(move |people| {
+                    {
+                        let mut st = state_for_answer.borrow_mut();
+                        if st.contacts_directory_generation != generation || !st.contacts_directory_active {
+                            return;
+                        }
+                        st.contacts_directory_searching = false;
+                        st.contacts_directory_results = people;
+                        st.contacts_directory_selected = if st.contacts_directory_results.is_empty() { None } else { Some(0) };
+                    }
+                    let refresh = state_for_answer.borrow().contacts_list_refresh.clone();
+                    if let Some(refresh) = refresh {
+                        refresh();
+                    }
+                }),
+            );
+        })
     };
 
     // Repaints the details pane for whichever contact is selected in the
@@ -7863,6 +7979,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             if contacts_details.is_editing() {
                 return;
             }
+            // In Directory mode the middle list holds live `DirectoryPerson`s,
+            // not stored entries (item 4.7.8), so the pane shows the selected
+            // hit through its own renderer.
+            if state.borrow().contacts_directory_active {
+                let person = {
+                    let st = state.borrow();
+                    st.contacts_directory_selected.and_then(|index| st.contacts_directory_results.get(index).cloned())
+                };
+                contacts_details.set_directory_person(person.as_ref(), &actions);
+                return;
+            }
             let entry = contacts_list
                 .selected_row()
                 .and_then(|row| unsafe { row.data::<usize>("contacts-entry-index") })
@@ -7874,7 +8001,19 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     state.borrow_mut().contacts_details_refresh = Some(contacts_details_refresh.clone());
     {
         let contacts_details_refresh = contacts_details_refresh.clone();
-        contacts_list.connect_row_selected(move |_list, _row| contacts_details_refresh());
+        let state = state.clone();
+        contacts_list.connect_row_selected(move |_list, row| {
+            // A Directory result stashes its index in the live results list;
+            // the pane reads `contacts_directory_selected` rather than the
+            // stored-entry index.
+            if let Some(index) = row
+                .and_then(|row| unsafe { row.data::<usize>("contacts-directory-index") })
+                .map(|index| unsafe { *index.as_ref() })
+            {
+                state.borrow_mut().contacts_directory_selected = Some(index);
+            }
+            contacts_details_refresh();
+        });
     }
 
     {
@@ -7886,6 +8025,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let refresh_contacts_actions = refresh_contacts_actions.clone();
         let contacts_details_refresh = contacts_details_refresh.clone();
         let contacts_heading_label = contacts_heading_label.clone();
+        let contacts_search_row = contacts_search_row.clone();
+        let contacts_directory_search_row = contacts_directory_search_row.clone();
+        let contacts_directory_search_entry = contacts_directory_search_entry.clone();
+        let run_directory_search = run_directory_search.clone();
         contacts_category_list.connect_row_selected(move |_list, row| {
             let Some(row) = row else { return };
             // Header rows ("gavindi@outlook.com", "Categories") sit in the
@@ -7895,7 +8038,36 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // `refresh_contacts_category_ui`.
             let Some(idx) = (unsafe { row.data::<usize>("contacts-choice-index") }) else { return };
             let idx = unsafe { *idx.as_ref() };
-            contacts_heading_label.set_label(&contacts_categories.borrow()[idx].label());
+            let (label, is_directory) = {
+                let categories = contacts_categories.borrow();
+                let Some(choice) = categories.get(idx) else { return };
+                (choice.label(), choice.is_directory())
+            };
+            contacts_heading_label.set_label(&label);
+            // Directory mode swaps the People search row for its own live
+            // search box; the stored-contact search is untouched (4.7.8).
+            contacts_search_row.set_visible(!is_directory);
+            contacts_directory_search_row.set_visible(is_directory);
+            if is_directory {
+                // A rail rebuild (a contacts sync, say) re-selects the row
+                // without the query having changed; repaint the existing hits
+                // rather than issuing the same lookup again.
+                if state.borrow().contacts_directory_active {
+                    rebuild_contacts_list_ui(
+                        &contacts_list,
+                        &contacts_categories,
+                        &contacts_entries,
+                        idx as i32,
+                        &state,
+                        &contacts_selected,
+                        &refresh_contacts_actions,
+                        &contacts_details_refresh,
+                    );
+                } else {
+                    run_directory_search(&contacts_directory_search_entry.text());
+                }
+                return;
+            }
             rebuild_contacts_list_ui(
                 &contacts_list,
                 &contacts_categories,
@@ -7925,6 +8097,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_overview_day_list = mail_overview_day_list.clone();
         let reminders_engine = reminders_engine.clone();
         move |selected_index: Option<i32>| {
+            // A background sync calls this with `None`, which normally resets
+            // to "Your Contacts". Keep the live Directory row instead
+            // (4.7.8), so a poll can't kick the user out of an open search;
+            // the title-bar path clears the mode before asking for `None`.
+            let selected_index = selected_index.or_else(|| {
+                if state.borrow().contacts_directory_active {
+                    contacts_categories.borrow().iter().position(ContactsCategoryChoice::is_directory).map(|index| index as i32)
+                } else {
+                    None
+                }
+            });
             refresh_contacts_category_ui(
                 &state,
                 &contacts_category_list,
@@ -7952,6 +8135,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             }
         }
     });
+    // The full-repaint hook the title-bar search uses to leave Directory mode
+    // and land on the stored contacts it filters (item 4.7.8).
+    state.borrow_mut().contacts_refresh_all = Some(refresh_contacts_ui.clone());
     // The contacts repaint hook (P-06): reads the current bucket selection so
     // a filter change repaints the list in place instead of jumping back to
     // the first bucket. Stored on the shared state so the module-aware
@@ -8012,6 +8198,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 refresh();
             }
         });
+    }
+    {
+        // The Directory row's own search box (item 4.7.8). It only exists
+        // while that row is selected, so this handler never mixes with the
+        // stored-contact filter above.
+        let run_directory_search = run_directory_search.clone();
+        contacts_directory_search_entry.connect_search_changed(move |entry| run_directory_search(&entry.text()));
     }
     refresh_contacts_ui(None);
     // The Filter/Sort ▾ menu (UX-65), rebuilt on each open so the category
@@ -9917,6 +10110,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_view_button = mail_view_button.clone();
         let current_calendar_page = current_calendar_page.clone();
         let calendar_view_button = calendar_view_button.clone();
+        let current_contacts_page = current_contacts_page.clone();
+        let contacts_view_button = contacts_view_button.clone();
         let current_tasks_page = current_tasks_page.clone();
         let tasks_view_button = tasks_view_button.clone();
         let current_lookout_page = current_lookout_page.clone();
@@ -9929,6 +10124,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let reminders_engine = reminders_engine.clone();
         let tasks_view = tasks_view.clone();
         let refresh_contacts_ui = refresh_contacts_ui.clone();
+        let run_directory_search = run_directory_search.clone();
         move || {
             let st = state.borrow();
             // The GOA enable/disable list - every account the discoveries
@@ -9981,9 +10177,50 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let signatures_list = st.app_config.borrow().signatures.clone();
             let signature_defaults = st.app_config.borrow().signature_defaults.clone();
             let templates_list = st.app_config.borrow().templates.clone();
+            // Config → People → Directory (item 4.7.9): the Graph-capable
+            // accounts (`graph_pin` is Some only for accounts that own a
+            // Microsoft 365 mailbox) and the configured LDAP entries. Both
+            // lists are snapshots so `refresh_directory` can rebuild its rows
+            // after `st` is released.
+            let directory_accounts: Vec<crate::config_view::DirectoryAccountInfo> = st
+                .accounts
+                .iter()
+                .filter(|(_, handle)| handle.graph_pin.is_some())
+                .map(|(account_id, handle)| crate::config_view::DirectoryAccountInfo {
+                    account_id: account_id.clone(),
+                    display_name: handle.display_name.clone(),
+                    email: handle.email.clone(),
+                    enabled: st.app_config.borrow().directory_enabled_for(account_id),
+                    consented: handle.graph_pin.as_ref().is_some_and(|client| client.consented()),
+                })
+                .collect();
+            let ldap_snapshot = st.app_config.borrow().ldap_directories.clone();
             let goa_unavailable = st.goa_unavailable;
             drop(st);
             mail.sort_by_key(|a| a.email.to_lowercase());
+            let ldap_directories: Vec<crate::config_view::LdapDirectoryInfo> = ldap_snapshot
+                .iter()
+                .map(|directory| {
+                    let account_label = mail
+                        .iter()
+                        .find(|account| account.account_id == directory.account_id.0)
+                        .map(|account| format!("{} <{}>", account.display_name, account.email))
+                        .unwrap_or_else(|| "Account not connected".to_string());
+                    crate::config_view::LdapDirectoryInfo {
+                        id: directory.id.clone(),
+                        display_name: directory.display_name.clone(),
+                        host: directory.host.clone(),
+                        port: directory.port,
+                        tls: directory.tls,
+                        enabled: directory.enabled,
+                        account_label,
+                    }
+                })
+                .collect();
+            let ldap_accounts: Vec<(AccountId, String)> = mail
+                .iter()
+                .map(|account| (AccountId(account.account_id.clone()), format!("{} <{}>", account.display_name, account.email)))
+                .collect();
             let mut calendar: Vec<crate::config_view::CalendarAccountInfo> = calendar_state
                 .borrow()
                 .accounts
@@ -10587,6 +10824,196 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     });
                 })
             };
+            // Config → People → Directory (item 4.7.9). Every change below
+            // drops the People Directory's cached dispatcher (so a newly
+            // enabled GAL/LDAP source is picked up), repaints the People rail
+            // and re-runs an open directory search, then repaints Settings.
+            let refresh_directory_surfaces: Rc<dyn Fn()> = {
+                let state = state.clone();
+                let refresh_hook = refresh_hook.clone();
+                let run_directory_search = run_directory_search.clone();
+                let root_stack = root_stack.clone();
+                let current_contacts_page = current_contacts_page.clone();
+                let contacts_view_button = contacts_view_button.clone();
+                Rc::new(move || {
+                    state.borrow_mut().contacts_directory_source = None;
+                    let contacts_refresh = state.borrow().contacts_refresh.clone();
+                    if let Some(refresh) = contacts_refresh {
+                        refresh();
+                    }
+                    // A directory can make the People screen usable even when
+                    // there are no contacts accounts or desktop books, so move
+                    // it off the "No Contact Accounts" page (and back) as the
+                    // configuration changes.
+                    let has_contacts = {
+                        let st = state.borrow();
+                        !st.contacts_by_account.is_empty() || !st.desktop_contacts.is_empty()
+                    };
+                    let has_directory = crate::directory::directory_configured_for_state(&state.borrow());
+                    let page = if has_contacts || has_directory { "contacts" } else { "contacts-empty" };
+                    current_contacts_page.set(page);
+                    if contacts_view_button.is_active() {
+                        root_stack.set_visible_child_name(page);
+                    }
+                    if state.borrow().contacts_directory_active {
+                        let query = state.borrow().contacts_directory_query.clone();
+                        run_directory_search(&query);
+                    }
+                    let refresh = refresh_hook.borrow().clone();
+                    refresh();
+                })
+            };
+            let toggle_gal: crate::config_view::DirectoryToggle = {
+                let state = state.clone();
+                let toast_overlay = toast_overlay.clone();
+                let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                Rc::new(move |account_id, enabled| {
+                    let account_id = account_id.clone();
+                    if !enabled {
+                        let app_config = state.borrow().app_config.clone();
+                        app_config.borrow_mut().set_directory_enabled(&account_id, false);
+                        crate::app_config::save(&app_config.borrow());
+                        refresh_directory_surfaces();
+                        toast_overlay.add_toast(adw::Toast::new("Company directory search off"));
+                        return;
+                    }
+                    // Enabling needs the directory scopes, which sit outside
+                    // the default Outlook-sync grant: run the interactive flow
+                    // only from this user action, and store the opt-in only
+                    // once it succeeds.
+                    let state = state.clone();
+                    let toast_overlay = toast_overlay.clone();
+                    let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                    glib::spawn_future_local(async move {
+                        let client = crate::graph_directory::GraphDirectoryBackend::new(account_id.clone());
+                        match client.ensure_consent().await {
+                            Ok(()) => {
+                                let app_config = state.borrow().app_config.clone();
+                                app_config.borrow_mut().set_directory_enabled(&account_id, true);
+                                crate::app_config::save(&app_config.borrow());
+                                refresh_directory_surfaces();
+                                toast_overlay.add_toast(adw::Toast::new("Company directory search enabled"));
+                            }
+                            Err(message) => {
+                                let text = glib::markup_escape_text(&format!("Couldn't enable company directory search: {message}"));
+                                toast_overlay.add_toast(adw::Toast::new(&text));
+                                // Nothing was stored; repaint so the switch reverts.
+                                refresh_directory_surfaces();
+                            }
+                        }
+                    });
+                })
+            };
+            let edit_ldap: crate::config_view::LdapDirectoryDialog = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let keyring = keyring.clone();
+                let toast_overlay = toast_overlay.clone();
+                let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                let ldap_accounts = ldap_accounts.clone();
+                Rc::new(move |anchor, id| {
+                    if id.is_none() && ldap_accounts.is_empty() {
+                        toast_overlay.add_toast(adw::Toast::new("Connect a mail account before adding an LDAP directory."));
+                        return;
+                    }
+                    let existing = id.and_then(|id| state.borrow().app_config.borrow().ldap_directories.iter().find(|directory| directory.id == id).cloned());
+                    let app_config = state.borrow().app_config.clone();
+                    let on_saved = {
+                        let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                        Rc::new(move || refresh_directory_surfaces())
+                    };
+                    crate::ldap_directory_view::show_ldap_directory_dialog(anchor, worker.clone(), app_config, keyring.clone(), &ldap_accounts, existing, on_saved);
+                })
+            };
+            let set_ldap_enabled: crate::config_view::LdapDirectoryToggle = {
+                let state = state.clone();
+                let toast_overlay = toast_overlay.clone();
+                let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                Rc::new(move |id, enabled| {
+                    let app_config = state.borrow().app_config.clone();
+                    let changed = {
+                        let mut config = app_config.borrow_mut();
+                        match config.ldap_directories.iter_mut().find(|directory| directory.id == id) {
+                            Some(directory) if directory.enabled != enabled => {
+                                directory.enabled = enabled;
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if !changed {
+                        return;
+                    }
+                    crate::app_config::save(&app_config.borrow());
+                    refresh_directory_surfaces();
+                    toast_overlay.add_toast(adw::Toast::new(if enabled { "LDAP directory enabled" } else { "LDAP directory disabled" }));
+                })
+            };
+            let remove_ldap: crate::config_view::LdapDirectoryRemove = {
+                let state = state.clone();
+                let worker = worker.clone();
+                let keyring = keyring.clone();
+                let window = window.clone();
+                let toast_overlay = toast_overlay.clone();
+                let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                Rc::new(move |_anchor, id| {
+                    let Some(directory) = state.borrow().app_config.borrow().ldap_directories.iter().find(|directory| directory.id == id).cloned() else {
+                        return;
+                    };
+                    let dialog = adw::MessageDialog::builder()
+                        .transient_for(&window)
+                        .modal(true)
+                        .heading("Remove LDAP directory?")
+                        .body(format!(
+                            "Remove \"{}\"? Recipient suggestions and the People Directory will stop using it.",
+                            directory.display_name
+                        ))
+                        .build();
+                    dialog.add_response("cancel", "Cancel");
+                    dialog.add_response("remove", "Remove");
+                    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+                    {
+                        let state = state.clone();
+                        let worker = worker.clone();
+                        let keyring = keyring.clone();
+                        let toast_overlay = toast_overlay.clone();
+                        let refresh_directory_surfaces = refresh_directory_surfaces.clone();
+                        let id = id.to_string();
+                        dialog.connect_response(None, move |dialog, response| {
+                            if response != "remove" {
+                                dialog.close();
+                                return;
+                            }
+                            let app_config = state.borrow().app_config.clone();
+                            app_config.borrow_mut().remove_ldap_directory(&id);
+                            crate::app_config::save(&app_config.borrow());
+                            let keyring = keyring.clone();
+                            let directory_id = AccountId(id.clone());
+                            worker.spawn(async move {
+                                let _ = keyring.delete_account(&directory_id).await;
+                            });
+                            refresh_directory_surfaces();
+                            toast_overlay.add_toast(adw::Toast::new("LDAP directory removed"));
+                            dialog.close();
+                        });
+                    }
+                    dialog.present();
+                })
+            };
+            crate::config_view::refresh_directory(
+                &config_view,
+                &directory_accounts,
+                &ldap_directories,
+                &crate::config_view::DirectorySettingsActions {
+                    toggle_gal,
+                    edit_ldap,
+                    set_ldap_enabled,
+                    remove_ldap,
+                },
+            );
+
             crate::config_view::refresh(
                 &config_view,
                 &goa,

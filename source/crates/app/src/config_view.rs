@@ -159,6 +159,53 @@ pub struct MailAccountInfo {
     pub graph_mail: GraphMailStatus,
 }
 
+/// Plain display data for one Microsoft 365 account's company-directory (GAL)
+/// opt-in (OUTLOOK_PARITY.md item 4.7.9). `enabled` is the stored opt-in;
+/// `consented` says whether the directory scopes are actually granted, so the
+/// row can prompt for Microsoft sign-in when they aren't.
+pub struct DirectoryAccountInfo {
+    pub account_id: AccountId,
+    pub display_name: String,
+    pub email: String,
+    pub enabled: bool,
+    pub consented: bool,
+}
+
+/// Plain display data for one configured LDAP directory (item 4.7.9).
+pub struct LdapDirectoryInfo {
+    pub id: String,
+    pub display_name: String,
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub enabled: bool,
+    /// The display label of the account whose composer and attendee searches
+    /// this directory serves, or "Account not connected".
+    pub account_label: String,
+}
+
+/// The caller's hook for toggling a Microsoft 365 company-directory (GAL)
+/// opt-in (item 4.7.9).
+pub type DirectoryToggle = Rc<dyn Fn(&AccountId, bool)>;
+/// The caller's hook for opening the LDAP directory add/edit dialog: `None`
+/// adds, `Some(id)` edits.
+pub type LdapDirectoryDialog = Rc<dyn Fn(&gtk::Widget, Option<&str>)>;
+/// The caller's hook for switching a stored LDAP directory on or off.
+pub type LdapDirectoryToggle = Rc<dyn Fn(&str, bool)>;
+/// The caller's hook for removing a stored LDAP directory.
+pub type LdapDirectoryRemove = Rc<dyn Fn(&gtk::Widget, &str)>;
+
+/// The caller's hooks for the People → Directory settings (item 4.7.9):
+/// toggling a GAL opt-in (which runs the interactive consent flow), opening
+/// the LDAP add/edit dialog, switching an LDAP entry on or off, and removing
+/// one. Each takes the anchoring widget where a dialog needs one.
+pub struct DirectorySettingsActions {
+    pub toggle_gal: DirectoryToggle,
+    pub edit_ldap: LdapDirectoryDialog,
+    pub set_ldap_enabled: LdapDirectoryToggle,
+    pub remove_ldap: LdapDirectoryRemove,
+}
+
 /// Plain display data for one calendar account.
 pub struct CalendarAccountInfo {
     pub display_name: String,
@@ -434,6 +481,14 @@ pub struct ConfigView {
     /// E1.4), bound to `EDS_ADDRESS_BOOKS`. The caller greys it out when the
     /// desktop has no Evolution Data Server Lookout can reach.
     pub eds_address_books_row: adw::SwitchRow,
+    /// The Microsoft 365 GAL switches (Config → People, item 4.7.9), rebuilt
+    /// by `refresh_directory` because they follow the connected accounts.
+    directory_group: adw::PreferencesGroup,
+    directory_rows: RefCell<Vec<adw::ActionRow>>,
+    /// The configured LDAP directories plus the "Add LDAP directory…" row
+    /// (Config → People, item 4.7.9), rebuilt by `refresh_directory`.
+    ldap_group: adw::PreferencesGroup,
+    ldap_rows: RefCell<Vec<adw::ActionRow>>,
     /// "OAuth client id" row (Config → Google Tasks), exposed so the caller
     /// can wire its `activated` signal to the client-id dialog (and update
     /// the subtitle after a save).
@@ -950,6 +1005,11 @@ pub fn build() -> ConfigView {
         .subtitle(EDS_ADDRESS_BOOKS_SUBTITLE)
         .build();
     contacts_settings_group.add(&eds_address_books_row);
+    // Directory lookup (items 4.7.8–4.7.9): the per-Microsoft-365 GAL opt-in
+    // and the configured LDAP directories. Both lists are dynamic, so their
+    // rows are rebuilt by `refresh_directory` from the caller's snapshots.
+    let directory_group = adw::PreferencesGroup::builder().title("Company directory").build();
+    let ldap_group = adw::PreferencesGroup::builder().title("LDAP directories").build();
 
     // The real "Google Tasks" group (in the "Apps" section's place): the
     // OAuth client id the Tasks integration needs - Google has no public
@@ -1253,7 +1313,13 @@ pub fn build() -> ConfigView {
     add_section(&section_stack, &mut sections, "General", "general", &[&general_group, &keyboard_group]);
     add_section(&section_stack, &mut sections, "Mail", "mail", &[&junk_email_group, &templates_group, &mail_settings_group]);
     add_section(&section_stack, &mut sections, "Calendar", "calendar", &[&calendar_settings_group]);
-    add_section(&section_stack, &mut sections, "People", "people", &[&contacts_settings_group]);
+    add_section(
+        &section_stack,
+        &mut sections,
+        "People",
+        "people",
+        &[&contacts_settings_group, &directory_group, &ldap_group],
+    );
     add_section(&section_stack, &mut sections, "Privacy", "privacy", &[&privacy_group]);
     add_section(&section_stack, &mut sections, "Apps", "apps", &[&google_tasks_group]);
     add_section(&section_stack, &mut sections, "Assistant", "assistant", &[&assistant_group]);
@@ -1384,6 +1450,10 @@ pub fn build() -> ConfigView {
         eds_mirror_details_row,
         contacts_file_as_row,
         eds_address_books_row,
+        directory_group,
+        directory_rows: RefCell::new(Vec::new()),
+        ldap_group,
+        ldap_rows: RefCell::new(Vec::new()),
         google_tasks_client_row,
         assistant_url_entry,
         assistant_token_row,
@@ -1809,6 +1879,104 @@ pub fn refresh_templates(view: &ConfigView, templates: &[lookout_core::MailTempl
         row.add_suffix(&remove_button);
         push_row(&view.templates_group, &view.templates_rows, row);
     }
+}
+
+/// Rebuilds the People → Directory settings (OUTLOOK_PARITY.md item 4.7.9):
+/// one switch per Microsoft 365 account for its company-directory (GAL)
+/// opt-in, and one row per configured LDAP directory plus the "Add LDAP
+/// directory…" action. Rows are wired per refresh, after `active` is set, so a
+/// repaint never fires a consent prompt or a config write for rows it just
+/// created.
+pub fn refresh_directory(view: &ConfigView, accounts: &[DirectoryAccountInfo], ldap: &[LdapDirectoryInfo], actions: &DirectorySettingsActions) {
+    for row in view.directory_rows.borrow_mut().drain(..) {
+        view.directory_group.remove(&row);
+    }
+    for row in view.ldap_rows.borrow_mut().drain(..) {
+        view.ldap_group.remove(&row);
+    }
+
+    if accounts.is_empty() {
+        push_row(&view.directory_group, &view.directory_rows, empty_row("No Microsoft 365 accounts connected"));
+    } else {
+        for info in accounts {
+            let state = if info.enabled {
+                if info.consented {
+                    "Searching this directory"
+                } else {
+                    "Microsoft sign-in needed"
+                }
+            } else {
+                "Off"
+            };
+            let subtitle = format!("{} <{}> · {state}", info.display_name, info.email);
+            let row = adw::SwitchRow::builder()
+                .title("Search the company directory (GAL)")
+                .subtitle(glib::markup_escape_text(&subtitle))
+                .active(info.enabled)
+                .build();
+            // Account name + address: blurred by privacy mode.
+            crate::privacy::mark_row(&row);
+            let toggle = actions.toggle_gal.clone();
+            let account_id = info.account_id.clone();
+            row.connect_active_notify(move |row| toggle(&account_id, row.is_active()));
+            push_row(&view.directory_group, &view.directory_rows, row.upcast());
+        }
+    }
+
+    if ldap.is_empty() {
+        push_row(&view.ldap_group, &view.ldap_rows, empty_row("No LDAP directories configured"));
+    } else {
+        for info in ldap {
+            let subtitle = format!(
+                "{}{}:{} · {} · {}",
+                if info.tls { "TLS · " } else { "" },
+                info.host,
+                info.port,
+                info.account_label,
+                if info.enabled { "On" } else { "Off" }
+            );
+            let row = adw::SwitchRow::builder()
+                .title(glib::markup_escape_text(&info.display_name))
+                .subtitle(glib::markup_escape_text(&subtitle))
+                .active(info.enabled)
+                .build();
+            // Directory display names and account labels are content.
+            crate::privacy::mark_row(&row);
+            let set_enabled = actions.set_ldap_enabled.clone();
+            let id = info.id.clone();
+            row.connect_active_notify(move |row| set_enabled(&id, row.is_active()));
+            let edit_button = gtk::Button::from_icon_name("document-edit-symbolic");
+            edit_button.set_tooltip_text(Some("Edit LDAP directory"));
+            edit_button.add_css_class("flat");
+            let remove_button = gtk::Button::from_icon_name("user-trash-symbolic");
+            remove_button.set_tooltip_text(Some("Remove LDAP directory"));
+            remove_button.add_css_class("flat");
+            {
+                let edit = actions.edit_ldap.clone();
+                let row_widget = row.clone();
+                let id = info.id.clone();
+                edit_button.connect_clicked(move |_| edit(row_widget.upcast_ref::<gtk::Widget>(), Some(&id)));
+            }
+            {
+                let remove = actions.remove_ldap.clone();
+                let row_widget = row.clone();
+                let id = info.id.clone();
+                remove_button.connect_clicked(move |_| remove(row_widget.upcast_ref::<gtk::Widget>(), &id));
+            }
+            row.add_suffix(&edit_button);
+            row.add_suffix(&remove_button);
+            push_row(&view.ldap_group, &view.ldap_rows, row.upcast());
+        }
+    }
+
+    let add = adw::ActionRow::builder().title("Add LDAP directory…").activatable(true).build();
+    add.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
+    {
+        let edit = actions.edit_ldap.clone();
+        let row_widget = add.clone();
+        add.connect_activated(move |_| edit(row_widget.upcast_ref::<gtk::Widget>(), None));
+    }
+    push_row(&view.ldap_group, &view.ldap_rows, add);
 }
 
 /// One per-account default-signature dropdown: title/subtitle for the slot,

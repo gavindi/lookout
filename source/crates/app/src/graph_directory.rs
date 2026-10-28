@@ -87,9 +87,8 @@ impl GraphDirectoryBackend {
     /// Runs the interactive consent flow for the directory scopes
     /// (`User.ReadBasic.All`, `People.Read`), which are outside the default
     /// combined consent. Only ever called from a user-initiated action - the
-    /// opt-in switch (item 4.7.9) - never from [`DirectoryBackend::search`].
-    /// Unused until that switch lands, hence the targeted allow.
-    #[allow(dead_code)]
+    /// Settings → People opt-in switch (item 4.7.9) - never from
+    /// [`DirectoryBackend::search`].
     pub(crate) async fn ensure_consent(&self) -> Result<(), String> {
         self.contacts.ensure_directory_consent().await.map_err(|error| error.to_string())
     }

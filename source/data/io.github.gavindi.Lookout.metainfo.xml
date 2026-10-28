@@ -75,6 +75,12 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.296" date="2026-10-29">
+      <description>
+        <p>The People screen gains Outlook's Directory view. Once a Microsoft 365 company directory (GAL) or an LDAP directory is configured, a Directory row in the People rail runs a live search of that directory, with the person's name, title, company and address in the details pane and Send email and Add to contacts actions. The normal People search and title-bar search keep working on your saved contacts, and the Directory has its own search box.</p>
+        <p>Settings, People now sets this up. Each Microsoft 365 account has a "Search the company directory (GAL)" switch that asks for Microsoft's permission the first time, and an LDAP directories group lets you add, edit, enable and remove LDAP servers with their bind password stored in the keyring. Directory changes take effect in the People screen immediately.</p>
+      </description>
+    </release>
     <release version="0.9.295" date="2026-10-29">
       <description>
         <p>Microsoft 365 calendars gain Outlook's room finder. The event editor's Location row offers a "Find a room" button that lists your organization's bookable rooms with their seats, building and live free/busy for the meeting, and choosing one fills the location and books the room as a resource attendee. Room lookups ask for permission the first time and fall back to the free-text location if your organization does not allow them. CalDAV and webcal calendars are unchanged.</p>
