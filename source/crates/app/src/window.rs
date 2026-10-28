@@ -1134,8 +1134,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         let single_subject = single_label(-1, false);
         single_subject.set_hexpand(true);
+        // The pin keeps its row indicator now that the Flag column (which used
+        // to carry it) is gone; it sits beside the mention glyph.
+        let single_pin_icon = gtk::Image::builder()
+            .icon_name(pin_icon_name(true))
+            .pixel_size(12)
+            .css_classes(["message-pin-icon"])
+            .visible(false)
+            .build();
         let subject_cell = column_cell(MessageColumn::Subject);
         subject_cell.append(&single_mention_icon);
+        subject_cell.append(&single_pin_icon);
         subject_cell.append(&single_subject);
         single_cells.push((MessageColumn::Subject, subject_cell.clone().upcast()));
 
@@ -1151,25 +1160,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let size_cell = column_cell(MessageColumn::Size);
         size_cell.append(&single_size);
         single_cells.push((MessageColumn::Size, size_cell.clone().upcast()));
-
-        let single_categories = single_label(14, false);
-        single_categories.add_css_class("caption");
-        single_categories.add_css_class("message-single-dim");
-        let categories_cell = column_cell(MessageColumn::Categories);
-        categories_cell.append(&single_categories);
-        single_cells.push((MessageColumn::Categories, categories_cell.clone().upcast()));
-
-        let single_pin_icon = gtk::Image::builder()
-            .icon_name(pin_icon_name(true))
-            .pixel_size(12)
-            .css_classes(["message-pin-icon"])
-            .visible(false)
-            .build();
-        let single_flag_icon = gtk::Image::builder().pixel_size(12).visible(false).build();
-        let flag_cell = column_cell(MessageColumn::Flag);
-        flag_cell.append(&single_pin_icon);
-        flag_cell.append(&single_flag_icon);
-        single_cells.push((MessageColumn::Flag, flag_cell.clone().upcast()));
 
         let single_line = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1430,8 +1420,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             .build();
         let thread_single_subject = thread_single_label(-1, false);
         thread_single_subject.set_hexpand(true);
+        // As on a message row, the pin moved here when the Flag column went.
+        let thread_single_pin_icon = gtk::Image::builder()
+            .icon_name(pin_icon_name(true))
+            .pixel_size(12)
+            .css_classes(["message-pin-icon"])
+            .visible(false)
+            .build();
         let cell = column_cell(MessageColumn::Subject);
         cell.append(&thread_single_mention_icon);
+        cell.append(&thread_single_pin_icon);
         cell.append(&thread_single_subject);
         thread_single_cells.push((MessageColumn::Subject, cell.upcast()));
 
@@ -1447,25 +1445,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let cell = column_cell(MessageColumn::Size);
         cell.append(&thread_single_size);
         thread_single_cells.push((MessageColumn::Size, cell.upcast()));
-
-        let thread_single_categories = thread_single_label(14, false);
-        thread_single_categories.add_css_class("caption");
-        thread_single_categories.add_css_class("message-single-dim");
-        let cell = column_cell(MessageColumn::Categories);
-        cell.append(&thread_single_categories);
-        thread_single_cells.push((MessageColumn::Categories, cell.upcast()));
-
-        let thread_single_pin_icon = gtk::Image::builder()
-            .icon_name(pin_icon_name(true))
-            .pixel_size(12)
-            .css_classes(["message-pin-icon"])
-            .visible(false)
-            .build();
-        let thread_single_flag_icon = gtk::Image::builder().pixel_size(12).visible(false).build();
-        let cell = column_cell(MessageColumn::Flag);
-        cell.append(&thread_single_pin_icon);
-        cell.append(&thread_single_flag_icon);
-        thread_single_cells.push((MessageColumn::Flag, cell.upcast()));
 
         let thread_single_line = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1978,13 +1957,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     single_subject,
                     single_date,
                     single_size,
-                    single_categories,
                     single_attachment_icon,
                     single_calendar_icon,
                     single_mention_icon,
                     single_importance_icon,
                     single_pin_icon,
-                    single_flag_icon,
                     thread_three_line: thread_column,
                     thread_single_line_wrapper,
                     thread_single_cells,
@@ -1992,14 +1969,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     thread_single_subject,
                     thread_single_date,
                     thread_single_size,
-                    thread_single_categories,
                     thread_single_to,
                     thread_single_attachment_icon,
                     thread_single_calendar_icon,
                     thread_single_mention_icon,
                     thread_single_importance_icon,
                     thread_single_pin_icon,
-                    thread_single_flag_icon,
                     thread_single_toggle,
                     thread_row,
                     action_box,
@@ -2181,8 +2156,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let to_text = summary.to.first().map(|address| address.display_label()).unwrap_or_default();
                 widgets.single_to.set_label(to_text);
                 widgets.single_size.set_label(&crate::message_columns::format_size(summary.size));
-                let category_names: Vec<&str> = shown.iter().map(|category| category.name.as_str()).collect();
-                widgets.single_categories.set_label(&crate::message_columns::categories_text(&category_names));
                 widgets.single_attachment_icon.set_visible(summary.has_attachment);
                 widgets.single_calendar_icon.set_visible(summary.has_calendar);
                 widgets.single_mention_icon.set_visible(summary.mentions);
@@ -2190,7 +2163,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.single_importance_icon.set_tooltip_text(Some(imp_tip));
                 widgets.single_importance_icon.set_visible(summary.importance != lookout_core::Importance::Normal);
                 widgets.single_pin_icon.set_visible(summary.is_pinned());
-                apply_flag_indicator(&widgets.single_flag_icon, None, follow_up.as_ref());
                 widgets.single_sender.set_css_classes(sender_label_classes(unread));
                 widgets.single_to.set_css_classes(sender_label_classes(unread));
                 widgets
@@ -2280,8 +2252,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let subject = thread.subject.as_deref().unwrap_or("(no subject)");
                 widgets.thread_single_subject.set_label(&format!("{subject} ({})", thread.count));
                 widgets.thread_single_date.set_label(&widgets.thread_date.label());
-                let category_names: Vec<&str> = shown.iter().map(|category| category.name.as_str()).collect();
-                widgets.thread_single_categories.set_label(&crate::message_columns::categories_text(&category_names));
                 widgets.thread_single_to.set_label(&thread.participants.join(", "));
                 widgets.thread_single_size.set_label(&crate::message_columns::format_size(thread.size));
                 widgets.thread_single_attachment_icon.set_visible(thread.has_attachment);
@@ -2291,7 +2261,6 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 widgets.thread_single_importance_icon.set_tooltip_text(Some(imp_tip));
                 widgets.thread_single_importance_icon.set_visible(thread.importance != lookout_core::Importance::Normal);
                 widgets.thread_single_pin_icon.set_visible(thread.has_pinned);
-                apply_flag_indicator(&widgets.thread_single_flag_icon, None, thread.follow_up.as_ref());
                 widgets.thread_single_sender.set_css_classes(sender_label_classes(unread));
                 widgets.thread_single_to.set_css_classes(sender_label_classes(unread));
                 widgets

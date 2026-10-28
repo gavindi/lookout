@@ -28,7 +28,6 @@ use crate::context_menu::{ActionSpec, ContextMenu, Dispatch, MenuDescription};
 use crate::message_columns::{self, MessageColumn, ROW_LEADING_WIDTH};
 use crate::message_list::SortKey;
 use crate::settings::SettingsStore;
-use crate::window::support::themed_icon_name;
 
 /// The list's column configuration, shared by the header and every row.
 ///
@@ -231,12 +230,11 @@ impl ColumnHeader {
         for column in self.parts.state.visible() {
             let caret = gtk::Image::builder().icon_name("pan-down-symbolic").pixel_size(6).visible(false).build();
             let content = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(3).hexpand(column.expands()).build();
-            // The icon-only columns (importance, attachment, flag) use the
-            // same glyphs as the rows; a word would not fit their width.
+            // The icon-only columns (importance, attachment) use the same
+            // glyphs as the rows; a word would not fit their width.
             let icon_name = match column {
                 MessageColumn::Importance => Some("emblem-important-symbolic"),
                 MessageColumn::Attachment => Some("mail-attachment-symbolic"),
-                MessageColumn::Flag => Some(themed_icon_name(&["mail-flag-symbolic", "flag-filled-symbolic", "mail-mark-important-symbolic"])),
                 _ => None,
             };
             if let Some(icon_name) = icon_name {
@@ -473,17 +471,17 @@ mod tests {
         // The default set already fits a wide pane, so the first fit there is
         // a no-op; the fits that matter are the narrowing ones.
         assert!(!state.fit_width(1200));
-        assert!(ids(&state).contains(&"categories"));
+        assert!(ids(&state).contains(&"size"));
         assert!(!state.fit_width(1200), "a width inside the same band is a no-op");
 
-        assert!(state.fit_width(420));
+        assert!(state.fit_width(500));
         let narrow = ids(&state);
         assert!(narrow.contains(&"from"));
         assert!(narrow.contains(&"subject"));
         assert!(narrow.contains(&"received"));
-        assert!(!narrow.contains(&"categories"), "categories are shed before the core");
+        assert!(!narrow.contains(&"size"), "size is shed before the core");
 
         assert!(state.fit_width(1200));
-        assert!(ids(&state).contains(&"categories"), "growing the pane brings the column back");
+        assert!(ids(&state).contains(&"size"), "growing the pane brings the column back");
     }
 }

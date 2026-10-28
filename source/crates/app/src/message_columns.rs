@@ -8,6 +8,12 @@
 //! The widget wiring lives in `window/columns.rs`; the rows read the visible
 //! set from there.
 //!
+//! Categories and Flag are deliberately absent: both are still sorting
+//! choices (Arrange By) and still have their three-line row indicators, but
+//! their single-line cells spent 138 px of a crowded band on information the
+//! category chip strip and the row icons already carry, so the column set
+//! stops at Size.
+//!
 //! Outlook's decorative "Icon" column (the item-type picture) has no
 //! equivalent here: the row already carries the attachment and meeting icons
 //! inline, and `EmailSummary` has no message-class field to sort on. It is
@@ -28,13 +34,11 @@ pub enum MessageColumn {
     Subject,
     Received,
     Size,
-    Categories,
-    Flag,
 }
 
 impl MessageColumn {
     /// Every column, in the order the column chooser lists them.
-    pub const ALL: [MessageColumn; 9] = [
+    pub const ALL: [MessageColumn; 7] = [
         MessageColumn::Importance,
         MessageColumn::Attachment,
         MessageColumn::From,
@@ -42,8 +46,6 @@ impl MessageColumn {
         MessageColumn::Subject,
         MessageColumn::Received,
         MessageColumn::Size,
-        MessageColumn::Categories,
-        MessageColumn::Flag,
     ];
 
     /// The stable id stored in `settings.json` / GSettings and used by the
@@ -58,8 +60,6 @@ impl MessageColumn {
             MessageColumn::Subject => "subject",
             MessageColumn::Received => "received",
             MessageColumn::Size => "size",
-            MessageColumn::Categories => "categories",
-            MessageColumn::Flag => "flag",
         }
     }
 
@@ -73,14 +73,12 @@ impl MessageColumn {
             MessageColumn::Subject => "Subject",
             MessageColumn::Received => "Received",
             MessageColumn::Size => "Size",
-            MessageColumn::Categories => "Categories",
-            MessageColumn::Flag => "Flag",
         }
     }
 
     /// The message-list sort this column drives. The list's names differ a
     /// little from the column headings ("From" is `SortKey::Sender`,
-    /// "Received" is `SortKey::Date`, "Categories" is `SortKey::Category`).
+    /// "Received" is `SortKey::Date`).
     pub fn sort_key(self) -> SortKey {
         match self {
             MessageColumn::Importance => SortKey::Importance,
@@ -90,8 +88,6 @@ impl MessageColumn {
             MessageColumn::Subject => SortKey::Subject,
             MessageColumn::Received => SortKey::Date,
             MessageColumn::Size => SortKey::Size,
-            MessageColumn::Categories => SortKey::Category,
-            MessageColumn::Flag => SortKey::Flag,
         }
     }
 
@@ -106,8 +102,6 @@ impl MessageColumn {
             MessageColumn::Subject => 0,
             MessageColumn::Received => 92,
             MessageColumn::Size => 64,
-            MessageColumn::Categories => 110,
-            MessageColumn::Flag => 28,
         }
     }
 
@@ -123,15 +117,13 @@ impl MessageColumn {
 
 /// Outlook's default single-line columns, in its order. "To" is offered by the
 /// column chooser but hidden by default, as in Outlook.
-pub const DEFAULT_COLUMNS: [MessageColumn; 8] = [
+pub const DEFAULT_COLUMNS: [MessageColumn; 6] = [
     MessageColumn::Importance,
     MessageColumn::Attachment,
     MessageColumn::From,
     MessageColumn::Subject,
     MessageColumn::Received,
     MessageColumn::Size,
-    MessageColumn::Categories,
-    MessageColumn::Flag,
 ];
 
 /// The gutter left of the first column: the unread accent bar (3 px) plus the
@@ -199,8 +191,8 @@ pub fn columns_to_ids(columns: &[MessageColumn]) -> Vec<String> {
 
 /// The columns that fit in `available` pixels, dropping lower-priority cells
 /// before the Subject is starved. From, Subject and Received always survive;
-/// the rest go in this order as the pane narrows: To, Categories, Size,
-/// Attachment, Flag, Importance.
+/// the rest go in this order as the pane narrows: To, Size, Attachment,
+/// Importance.
 ///
 /// Called on every list width change, but only a change in the *returned set*
 /// does any work (see `window::columns`), so resizing within one band costs
@@ -208,14 +200,7 @@ pub fn columns_to_ids(columns: &[MessageColumn]) -> Vec<String> {
 pub fn columns_for_width(configured: &[MessageColumn], available: i32) -> Vec<MessageColumn> {
     let mut columns = configured.to_vec();
     // Priority order of the columns to shed first.
-    const SHED_ORDER: [MessageColumn; 6] = [
-        MessageColumn::To,
-        MessageColumn::Categories,
-        MessageColumn::Size,
-        MessageColumn::Attachment,
-        MessageColumn::Flag,
-        MessageColumn::Importance,
-    ];
+    const SHED_ORDER: [MessageColumn; 4] = [MessageColumn::To, MessageColumn::Size, MessageColumn::Attachment, MessageColumn::Importance];
     // The width each candidate set actually needs - one formula, shared with
     // the automatic layout threshold (`preferred_single_line_width`).
     for column in SHED_ORDER {
@@ -225,12 +210,6 @@ pub fn columns_for_width(configured: &[MessageColumn], available: i32) -> Vec<Me
         columns.retain(|candidate| *candidate != column);
     }
     columns
-}
-
-/// The Categories cell's text: the category names joined with ", ", or an
-/// empty string when the message has none.
-pub fn categories_text(names: &[&str]) -> String {
-    names.join(", ")
 }
 
 /// A human-readable attachment-ish size for the Size column, matching
@@ -266,13 +245,19 @@ mod tests {
     fn every_column_maps_to_an_outlook_sort_key() {
         assert_eq!(MessageColumn::From.sort_key(), SortKey::Sender);
         assert_eq!(MessageColumn::Received.sort_key(), SortKey::Date);
-        assert_eq!(MessageColumn::Categories.sort_key(), SortKey::Category);
         assert_eq!(MessageColumn::Attachment.sort_key(), SortKey::Attachments);
-        assert_eq!(MessageColumn::Flag.sort_key(), SortKey::Flag);
         assert_eq!(MessageColumn::To.sort_key(), SortKey::To);
         assert_eq!(MessageColumn::Importance.sort_key(), SortKey::Importance);
         assert_eq!(MessageColumn::Subject.sort_key(), SortKey::Subject);
         assert_eq!(MessageColumn::Size.sort_key(), SortKey::Size);
+    }
+
+    #[test]
+    fn categories_and_flag_are_no_longer_columns() {
+        // Both remain sort keys (Arrange By) and row indicators; only their
+        // single-line cells are gone.
+        assert_eq!(MessageColumn::from_id("categories"), None);
+        assert_eq!(MessageColumn::from_id("flag"), None);
     }
 
     #[test]
@@ -292,11 +277,14 @@ mod tests {
 
         assert_eq!(parse_columns(&[]), DEFAULT_COLUMNS.to_vec());
         assert_eq!(parse_columns(&["nope".into()]), DEFAULT_COLUMNS.to_vec());
+        // A stored set from before the Categories/Flag columns were removed
+        // loads as the columns that still exist rather than failing.
+        assert_eq!(parse_columns(&["from".into(), "categories".into(), "flag".into()]), vec![MessageColumn::From]);
     }
 
     #[test]
     fn columns_to_ids_round_trips_through_parse() {
-        let columns = vec![MessageColumn::To, MessageColumn::Subject, MessageColumn::Flag];
+        let columns = vec![MessageColumn::To, MessageColumn::Subject, MessageColumn::Size];
         assert_eq!(parse_columns(&columns_to_ids(&columns)), columns);
     }
 
@@ -349,11 +337,5 @@ mod tests {
         assert_eq!(format_size(12 * 1024), "12 KB");
         assert_eq!(format_size(1536 * 1024), "1.5 MB");
         assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
-    }
-
-    #[test]
-    fn categories_join_with_commas_and_empty_stays_empty() {
-        assert_eq!(categories_text(&["Red category", "Blue category"]), "Red category, Blue category");
-        assert_eq!(categories_text(&[]), "");
     }
 }

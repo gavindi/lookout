@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.292" date="2026-10-28">
+      <description>
+        <p>The single-line message list no longer shows the Categories and Flag columns, leaving Importance, Attachment, From, Subject, Received and Size (plus the optional To). Categories and flags are still sortable from Arrange By, the three-line rows keep their category chips and flag icons, and pinned mail still shows its pin beside the subject. The narrower default set also means the list switches to columns in a narrower pane than before.</p>
+      </description>
+    </release>
     <release version="0.9.291" date="2026-10-28">
       <description>
         <p>The message list can now switch between Automatic, Three-line and Single-line from View, Messages. Automatic follows the width of the list pane while the divider is dragged, and no longer gets stuck in the column layout because the columns themselves made the pane too wide to shrink; the pane can now narrow enough to fall back to the three-line rows.</p>

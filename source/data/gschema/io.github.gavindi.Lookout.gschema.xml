@@ -236,7 +236,7 @@
     <key name="mail-list-columns" type="as">
       <default>[]</default>
       <summary>Single-line message list columns</summary>
-      <description>The visible columns of the single-line (wide) message list, in order: importance, attachment, from, to, subject, received, size, categories, flag. Empty shows Outlook's default set.</description>
+      <description>The visible columns of the single-line (wide) message list, in order: importance, attachment, from, to, subject, received, size. Empty shows Outlook's default set.</description>
     </key>
     <key name="mail-list-style" type="s">
       <choices>

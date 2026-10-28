@@ -184,14 +184,12 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) thread_single_subject: gtk::Label,
     pub(crate) thread_single_date: gtk::Label,
     pub(crate) thread_single_size: gtk::Label,
-    pub(crate) thread_single_categories: gtk::Label,
     pub(crate) thread_single_to: gtk::Label,
     pub(crate) thread_single_attachment_icon: gtk::Image,
     pub(crate) thread_single_calendar_icon: gtk::Image,
     pub(crate) thread_single_mention_icon: gtk::Image,
     pub(crate) thread_single_importance_icon: gtk::Image,
     pub(crate) thread_single_pin_icon: gtk::Image,
-    pub(crate) thread_single_flag_icon: gtk::Image,
     pub(crate) thread_single_toggle: gtk::Button,
     /// The `TreeListRow` this conversation header is bound to, so the
     /// single-line layout's own chevron can expand/collapse it (the
@@ -281,13 +279,11 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) single_subject: gtk::Label,
     pub(crate) single_date: gtk::Label,
     pub(crate) single_size: gtk::Label,
-    pub(crate) single_categories: gtk::Label,
     pub(crate) single_attachment_icon: gtk::Image,
     pub(crate) single_calendar_icon: gtk::Image,
     pub(crate) single_mention_icon: gtk::Image,
     pub(crate) single_importance_icon: gtk::Image,
     pub(crate) single_pin_icon: gtk::Image,
-    pub(crate) single_flag_icon: gtk::Image,
     /// The conversation header's body preview (the newest message's snippet),
     /// on the third line of its three-line row.
     pub(crate) thread_preview_label: gtk::Label,
