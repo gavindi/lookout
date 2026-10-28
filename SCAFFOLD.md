@@ -11,12 +11,14 @@ changes; treat them as a starting point for `grep`, not a guarantee.
 ## 1. What Lookout is
 
 A native GNOME mail client written in Rust (GTK4 + libadwaita + WebKitGTK), positioned as a
-reimplementation of Outlook's desktop experience: Mail (IMAP/SMTP), Calendar (CalDAV), People
-(CardDAV), Tasks (CalDAV VTODO + Google Tasks), and a local-data AI assistant ("Lookout" tab).
-Accounts are sourced from **GNOME Online Accounts** (GOA) wherever possible — Lookout holds no
-credentials of its own for GOA accounts, only fetching short-lived tokens/passwords from GOA over
-D-Bus on each (re)connect. Manually-configured ("other") IMAP/SMTP accounts are supported
-alongside GOA ones, with secrets held in the GNOME keyring.
+reimplementation of Outlook's desktop experience: Mail (IMAP/SMTP, with an optional Microsoft
+Graph transport), Calendar (CalDAV and Microsoft Graph), People (CardDAV and Microsoft Graph),
+Tasks (CalDAV VTODO, Google Tasks and Microsoft To Do), and a local-data AI assistant ("Lookout"
+tab). Accounts are sourced from **GNOME Online Accounts** (GOA) wherever possible — Lookout holds
+no credentials of its own for GOA accounts, only fetching short-lived tokens/passwords from GOA
+over D-Bus on each (re)connect. Manually-configured ("other") IMAP/SMTP accounts are supported
+alongside GOA ones, with secrets held in the GNOME keyring. Desktop address books come from
+Evolution Data Server through the separate `lookout-eds` client.
 
 ## 2. Workspace layout and crate dependency graph
 
@@ -27,7 +29,7 @@ source/crates/
 ├── eds/          lookout-eds    — Evolution Data Server client (zbus/D-Bus; EDS_TODO.md) — desktop address books in directory lookups
 ├── mail/         lookout-mail   — IMAP/SMTP account-session actor + SQLite cache
 ├── dav/          lookout-dav    — CalDAV/CardDAV client + iCalendar/RRULE + SQLite caches
-├── graph/        lookout-graph  — Microsoft Graph client (paging, delta, throttling; Phase 5 backend)
+├── graph/        lookout-graph  — Microsoft Graph client and calendar/contacts/To Do/mail backends (paging, delta, throttling)
 ├── imap-proto/   vendored fork of `imap-proto` (one upstream fix, patched via [patch.crates-io])
 ├── async-imap/   vendored fork of `async-imap` (in-place compress upgrade, buffer perf fix)
 └── app/          lookout-app    — the `lookout` binary: GTK4/libadwaita UI
@@ -37,15 +39,18 @@ Dependency direction is strictly one-way and fan-out from `core`:
 
 ```
 lookout-core  (no I/O deps at all — tokio-free, zbus-free, gtk-free)
-   ↑     ↑
-   |     └── lookout-dav   (reqwest, quick-xml, icalendar, rrule, rusqlite)
-   └── lookout-mail        (async-imap[patched], lettre, mail-parser, rusqlite)
-                 ↑              ↑            ↑            ↑
-                 |              |            |            |
-             lookout-goa    lookout-dav   lookout-mail  lookout-graph
-                 \              |            /            /
-                  \             |           /            /
-                        lookout-app (gtk4, libadwaita, webkit6, zbus, ksni, secret-service)
+   ↑       ↑          ↑             ↑
+   |       |          |             └── lookout-dav   (reqwest, quick-xml, icalendar, rrule, rusqlite)
+   |       |          └── lookout-mail                (async-imap[patched], lettre, mail-parser, rusqlite)
+   |       └── lookout-goa                            (zbus/D-Bus)
+   └── lookout-eds                                    (zbus/D-Bus)
+
+lookout-graph  (reqwest)
+   ↑ lookout-core
+   ↑ lookout-mail       (shares the mail cache/outbox and its command/event types)
+
+lookout-app (gtk4, libadwaita, webkit6, zbus, ksni, secret-service)
+   ↑ lookout-core, lookout-goa, lookout-eds, lookout-mail, lookout-dav, lookout-graph
 ```
 
 Both `lookout-mail` and `lookout-dav` are explicitly documented as having **no dependency on
@@ -54,8 +59,12 @@ Both `lookout-mail` and `lookout-dav` are explicitly documented as having **no d
 integration-testable against a real IMAP server via `tests/imap_integration.rs`) without any
 GNOME/D-Bus session present. `lookout-graph` follows the same seam: its `TokenProvider` trait is
 implemented in `lookout-app` against `microsoft_oauth.rs` (`TokenAudience::Graph`), keeping the
-Graph transport free of OAuth/keyring/browser code. `lookout-app` is the only crate that touches
-GOA, GTK, or D-Bus tray integration — it is the composition root.
+Graph transport free of OAuth/keyring/browser code. It sits above `lookout-mail` because the
+Graph mail transport reuses that crate's cache, outbox, command/event protocol and MIME builders;
+there is no cycle, since `lookout-mail` never depends on `lookout-graph`. `lookout-eds` is the
+pure `zbus` client for the desktop's Evolution Data Server, used by the app's directory and
+desktop-address-book code. `lookout-app` is the only crate that touches GOA, GTK, or D-Bus tray
+integration — it is the composition root.
 
 **The mail and calendar engines mirror each other by design.** `lookout-dav`'s own crate doc
 comment calls itself a client "mirroring `lookout-mail`'s IMAP session actor," and this mirroring
@@ -67,7 +76,11 @@ credentials through a trait rather than a concrete GOA dependency.
 ## 3. Domain model — `lookout-core`
 
 Zero I/O dependencies by design (`lib.rs:1-4`) so it can be exercised with plain `cargo test` and
-reused by any future front end. Eight modules, all re-exported flat from `lib.rs`.
+reused by any future front end. The crate is a set of small domain modules, all re-exported flat
+from `lib.rs`: `ids`, `email`, `mailbox`, `thread`, `calendar`, `calendar_protocol`, `vcard`,
+`trust`, `identity`, `signature`, `template`, `text`, `rules`, `quick_step`, `contact_merge`,
+`freebusy`, `automatic_replies`, `holidays`, `tzmap`, and `interop/` (Outlook wire mappings,
+categories, flags, follow-up, junk, snooze, TNEF, mentions and online-meeting detection).
 
 ### 3.1 Opaque identifiers (`ids.rs`)
 
@@ -76,7 +89,7 @@ composite string keys:
 
 | Type | Shape | Notes |
 |---|---|---|
-| `AccountId(String)` | GOA D-Bus object path, or `other:<uuid>` | |
+| `AccountId(String)` | GOA D-Bus object path, `other:<uuid>`, or `shared:<mailbox>` | |
 | `Uid(u32)` | IMAP UID | Unique only within `(MailboxId, UidValidity)` |
 | `UidValidity(u32)` | IMAP UIDVALIDITY | A change invalidates every cached UID for that mailbox |
 | `MailboxId(String)` | `"{account_id}:{folder_path}"` | Synthesized — IMAP has no folder id |
@@ -101,16 +114,18 @@ same types carry Graph identities (`lookout_graph::mail::identity`):
   `message_id`/`in_reply_to`/`references` (threading inputs), `thread_key: ThreadKey` (precomputed
   at sync time), `subject`, `from`/`to`/`cc`, `date`, `flags: BTreeSet<SystemFlagBit>`,
   `keywords: BTreeSet<String>`, `size`, `has_attachment`, `has_calendar`, `preview: Option<String>`,
-  and `structure: Option<Vec<BodyPart>>` (the BODYSTRUCTURE walk, reused later to drive a
+  `mentions`, `importance`, `sensitivity`, `inference_classification` (Focused/Other),
+  `list_id`, and `structure: Option<Vec<BodyPart>>` (the BODYSTRUCTURE walk, reused later to drive a
   partial-fetch body request). `Serialize`/`Deserialize` — this is the JSON payload stored in the
-  cache's `messages` table.
+  cache's `messages` table. The follow-up flag is derived from `keywords` (`follow_up()`), not
+  stored as a separate field.
 - **`EmailBody`** — the fetched-on-open renderable body: `text_body`/`html_body`, `calendar_ics`
   (iMIP payload), `parts: Vec<BodyPart>` (attachment/inline-image metadata only — text parts are
   already merged into `text_body`/`html_body`), `headers`, `auth_results`. Also JSON-serialized,
   as the `bodies` table's BLOB payload.
-- **`BodyPart`** — one MIME leaf: `part_number` (IMAP section path, e.g. `"1.2"`), `content_type`,
-  `charset`, `transfer_encoding`, `filename`, `cid` (for `cid:` resolution), `size`,
-  `is_attachment`.
+- **`BodyPart`** — one MIME leaf: `part_number` (IMAP section path, e.g. `"1.2"`; the Graph
+  attachment id in base64url on the Graph transport), `content_type`, `charset`,
+  `transfer_encoding`, `filename`, `cid` (for `cid:` resolution), `size`, `is_attachment`.
 - **`SystemFlagBit`** — `Seen | Answered | Flagged | Deleted | Draft` (RFC 3501 §2.3.2), excluding
   `\Recent` deliberately (session-scoped, not cacheable).
 - **Categories** are implemented as IMAP custom keywords: `$Lookout-tag-<key>`
@@ -121,6 +136,10 @@ same types carry Graph identities (`lookout_graph::mail::identity`):
   only), `total`/`unread`, `flags`, `subscribed`. `MailboxRole` (`Inbox|Sent|Drafts|Trash|Junk|
   Archive|Custom`) is resolved from IMAP SPECIAL-USE (RFC 6154) with a name-guessing fallback for
   servers that don't advertise it.
+- **`ComposedMessage`** lives in `lookout-mail::send`, not here: the composer's outbound envelope,
+  body, attachments, identity, importance/sensitivity, receipt request, `In-Reply-To`/`References`
+  and iMIP calendar part. The core crate only supplies the pieces that are shared with parsing and
+  display.
 - Auth-results types (`SpfResult`/`DkimResult`/`DmarcResult`/`AuthenticationResults`), read-receipt
   parsing (`parse_disposition_notification_to`, RFC 8098), List-Unsubscribe parsing
   (`ListUnsubscribe`, RFC 2369/8058), and iMIP method/invitation parsing (`ImipMethod`,
@@ -129,17 +148,31 @@ same types carry Graph identities (`lookout_graph::mail::identity`):
 ### 3.3 Calendar types (`calendar.rs`)
 
 - **`CalendarEvent`** — a VEVENT *master* (not an expansion): `uid`, `calendar_id`,
-  `summary`/`description`/`location`, `start`/`end`, `all_day`, `rrule: Option<String>` (kept
-  *raw* — RRULE parsing lives in `lookout-dav`, not here), `recurrence_id`/`recurrence_range`
+  `summary`/`description`/`location`, `start`/`end`, `all_day`, `time_zone`, `rrule: Option<String>`
+  (kept *raw* — RRULE parsing lives in `lookout-dav`, not here), `recurrence_id`/`recurrence_range`
   (override semantics), `exdates`/`rdates`, `href`/`etag` (write targets — `etag` becomes an
-  `If-Match` precondition), `attendees`, `organizer`, `categories`, `sensitivity`,
-  `transparency`, `reminder_minutes_before`, `conference_url`.
+  `If-Match` precondition), `sequence`, `attendees`, `organizer`, `schedule_agent`, `categories`,
+  `sensitivity`, `show_as` (the five-state CDO busy status, with the old `transparency` JSON name
+  as an alias), `status`, `reminder_minutes_before`, `conference_url`, `attachments` and
+  `is_online_meeting` (Graph `isOnlineMeeting` for Teams-link creation).
 - **`EventOccurrence`** — the thinner, renderable expansion of one RRULE instance (or a
   non-recurring event as-is), carrying `master_start`/`master_end`/`master_href`/`master_etag` so
-  the editor can open the true series master without a re-lookup.
-- **`CalendarTask`** — the VTODO mirror of `CalendarEvent`; no recurrence modeled.
+  the editor can open the true series master without a re-lookup. It also carries the master's
+  `rrule`, `recurrence_id`, `exdates`, `sequence`, attendee/scheduling fields and attachments, so
+  an edit from any occurrence can preserve or update the series correctly.
+- **`CalendarTask`** — the VTODO mirror of `CalendarEvent`, including `due`/`start`,
+  `rrule: Option<String>` (raw, expanded by `lookout-dav` for roll-forward), `created`,
+  `completed`, `status`, `priority`, `percent_complete`, `reminder_minutes_before`, `categories`
+  and `href`/`etag`.
+- **`CalendarInfo`** — per-collection metadata: `display_name`, `color`, `href`, `supports_tasks`
+  (VTODO in `supported-calendar-component-set`) and `owner` (Graph shared/delegated calendar).
+- **`EventAttachment`** — one RFC 5545 `ATTACH`: display name, MIME type, size, URI, RFC 8607
+  `MANAGED-ID`, and/or base64 inline contents (`MAX_INLINE_EVENT_ATTACHMENT_BYTES` = 10 MiB).
 - **`WebcalSubscription`** — a fetch-only feed: `{ id, display_name, url }`, surfaced as a
   synthetic `CalendarId("webcal:<id>")`.
+- **`Attendee`/`AttendeeRole`/`AttendeeStatus`**, `EventSensitivity`, `BusyStatus`, `EventStatus`,
+  `ScheduleAgent`, `TaskStatus`, `TaskPriority` and `RecurrenceRange` model the iCalendar/iTIP
+  values the DAV and Graph backends round-trip.
 
 ### 3.4 Threading algorithm (`thread.rs`)
 
@@ -183,18 +216,36 @@ export) and 4.0. `VCard::parse_all` isolates one card's parse failure from the r
 multi-card `.vcf` document. `Birthday { date, omit_year }` distinguishes a recurring yearless
 birthday (`BDAY:--MMDD` or Apple's `X-APPLE-OMIT-YEAR`) from a one-time date.
 
-### 3.7 Identities and signatures (`identity.rs`, `signature.rs`)
+### 3.7 Identities, signatures and templates (`identity.rs`, `signature.rs`, `template.rs`)
 
 `Identity` is purely local SMTP `MAIL FROM` sending-identity config (name, email, reply-to, bcc,
-text/HTML signature) — no server-stored counterpart, unlike e.g. JMAP identities. `Signature` is
-a user-authored rich-text signature, stored globally (not pinned to one account) in `AppConfig`.
+text/HTML signature) — no server-stored counterpart, unlike e.g. JMAP identities. `Signature` and
+`MailTemplate` are user-authored rich-text snippets, stored globally (not pinned to one account)
+in `AppConfig`; the composer inserts them as HTML or plain text.
+
+### 3.8 Rules, automation and Outlook interop (`rules.rs`, `quick_step.rs`, `interop/`)
+
+- **`Rule`/`RuleCondition`/`RuleAction`/`RuleBackend`** — the single rule model executed by the
+  client engine, Sieve and Graph backends. `QuickStep` reuses the same action list as a named,
+  manually-run chain. Keeping both in `lookout-core` means the UI and every backend share one
+  serialization and matching vocabulary.
+- **`AutomaticReplies`**, **`FreeBusyInterval`/`AttendeeAvailability`**, **`HolidayCountry`** and
+  the `contact_merge` model are pure data/transform types used by the app and the DAV/Graph
+  backends.
+- **`interop/`** is the single home for Microsoft wire strings and mappings: importance and
+  sensitivity headers, `X-MICROSOFT-CDO-*` busy status, category colour presets (`preset0`–`24`),
+  follow-up-flag keywords, `$Junk`/`$NotJunk`, snooze keywords, TNEF/RTF decoding, `@mentions`
+  detection, online-meeting URL detection and Focused-Inbox classification. Feature code calls
+  these helpers rather than hard-coding Outlook-specific values.
 
 ### Serde convention
 
 Nearly every domain type derives `Serialize`/`Deserialize`. `EmailSummary` and `EmailBody` are the
-two types actually persisted as JSON (in `lookout-mail`'s cache); their many `#[serde(default)]`
-fields exist specifically so old cached JSON rows keep deserializing as the schema grows.
-`TrustLevel` is the notable exception — encoded manually as `i64` rather than through serde.
+two types actually persisted as JSON in `lookout-mail`'s cache; `CalendarEvent`,
+`EventOccurrence` and `CalendarTask` are persisted as JSON in the DAV caches. Their many
+`#[serde(default)]` fields and aliases exist specifically so old cached JSON rows keep
+deserializing as the schema grows. `TrustLevel` is the notable exception — encoded manually as
+`i64` rather than through serde.
 
 ## 4. Mail engine — `lookout-mail`
 
@@ -207,26 +258,42 @@ emitting `AccountEvent`s over `async_channel`.
 This channel pair is the seam between the mail engine and the UI — the app crate never touches
 IMAP directly, only sends commands and reacts to events.
 
-**`AccountCommand`** (`session.rs`) — every variant: `SyncMailbox`, `FetchBody`,
-`FetchAttachment`, `FetchRawMessage`, `Refresh`, `SendMessage { message, not_before, client_token }`,
-`CancelOutbox`, `RescheduleOutbox`, `WakeSnoozed`, `Reconnect`,
-`SetPrefetchPolicy`, `MoveMessage`/`MoveMessages`/`MoveMessagesTo`, `CopyMessagesTo`/`RevertCopy`, `EmptyMailbox`,
-`SnoozeMessage`/`SnoozeMessages`, `StoreFlags`/`StoreFlagsMany`, `StoreKeywords`/
-`StoreKeywordsMany`, `SetFollowUp`, `ApplyRemoteFollowUps`, `PrefetchBodies`, `SaveDraft`/`DeleteDraft`,
-`SearchMailbox`, `Shutdown`.
+**`AccountCommand`** (`session.rs`) — the enum is the authoritative list; its groups are:
+- sync and reads: `SyncMailbox`, `Refresh`, `Reconnect`, `FetchBody`, `FetchAttachment`,
+  `FetchRawMessage`, `PrefetchBodies`, `SearchMailbox`;
+- outgoing mail and drafts: `SendMessage`, `CancelOutbox`, `RescheduleOutbox`, `SaveDraft`,
+  `DeleteDraft`;
+- message state: `StoreFlags`/`StoreFlagsMany`, `StoreKeywords`/`StoreKeywordsMany`, `SetJunk`,
+  `SetFollowUp`, `SetImportance`, `SetFocused`, `ApplyRemoteMailProperties`,
+  `ApplyInferenceOverrides`, `ClearInferenceOverride`, `ConfigureLocalFocus`;
+- moves, copies and mailbox management: `MoveMessage`/`MoveMessages`/`MoveMessagesTo`,
+  `RevertMove`, `CopyMessagesTo`, `RevertCopy`, `EmptyMailbox`, `MarkMailboxRead`,
+  `CreateMailbox`, `RenameMailbox`, `MoveMailbox`, `DeleteMailbox`;
+- snooze: `SnoozeMessage`/`SnoozeMessages`, `UnsnoozeMessages`, `WakeSnoozed`;
+- server automation: `PutSieveScript`, `FetchSieveCapabilities`;
+- lifecycle: `SetPrefetchPolicy`, `Shutdown`.
 
 Two command channels feed one actor: a background one and an `interactive_commands` one — the
 latter carries user-facing fetches (`FetchBody`/`FetchAttachment`/`FetchRawMessage`) and is
 drained *first* on every wake, so a click never queues behind a sync/search/move already in
 flight.
 
-**`AccountEvent`** — every variant: `ConnectionStateChanged`, `FoldersUpdated`, `MessagesUpdated`,
-`MailboxSyncStarted`, `PrefetchStarted`/`PrefetchFinished`, `NewMessages`, `PreviewsFetched`,
-`BodyFetched`, `PartFetched`/`PartFetchFailed`, `RawMessageFetched`/`RawMessageFetchFailed`,
-`OutboxQueued`/`OutboxSent`/`OutboxFailed`, `OutboxCancelled`/`OutboxCancelFailed`,
-`OutboxContents` (§4.6), `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`,
-`MessageMoved`, `MessageSnoozed`, `FollowUpFailed`, `FollowUpSet`, `FlaggedMessages`, `MailboxExpunged`,
-`SearchResults`, `Error`.
+**`AccountEvent`** — the enum is likewise authoritative; its groups are:
+- connection, folders and message snapshots: `ConnectionStateChanged`, `FoldersUpdated`,
+  `MessagesUpdated`, `MailboxSyncStarted`, `MailboxExpunged`, `NewMessages`, `NewMailArrived`,
+  `PreviewsFetched`;
+- background work: `PrefetchStarted`/`PrefetchFinished`;
+- fetch answers: `BodyFetched`, `PartFetched`/`PartFetchFailed`,
+  `RawMessageFetched`/`RawMessageFetchFailed`;
+- outbox: `OutboxQueued`/`OutboxSent`/`OutboxFailed`, `OutboxCancelled`/`OutboxCancelFailed`,
+  `OutboxContents` (§4.6);
+- mutations and their failures: `MoveFailed`, `StoreFlagsFailed`, `DraftSaved`, `MessageMoved`,
+  `MessageSnoozed`, `FollowUpFailed`, `FollowUpSet`, `CategoriesChanged`, `ImportanceSet`,
+  `FocusedSet`, `FlaggedMessages`;
+- mailbox management: `MailboxCreated`, `MailboxRenamed`, `MailboxDeleted`;
+- search and Sieve: `SearchResults`, `SieveAdvertised`, `SieveScriptUpdated`, `SieveFailed`,
+  `SieveCapabilities`;
+- `Error` for everything else.
 
 ### 4.2 The actor loop
 
@@ -338,7 +405,8 @@ CREATE TABLE mailboxes (mailbox_id TEXT PRIMARY KEY, account_id TEXT NOT NULL, d
 
 CREATE TABLE messages (
     mailbox_id TEXT NOT NULL, uid INTEGER NOT NULL, uidvalidity INTEGER NOT NULL,
-    data TEXT NOT NULL, PRIMARY KEY (mailbox_id, uid)
+    data TEXT NOT NULL, partial INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (mailbox_id, uid)
 );
 CREATE INDEX messages_by_mailbox ON messages (mailbox_id);
 
@@ -346,6 +414,27 @@ CREATE TABLE snoozed (
     mailbox_id TEXT NOT NULL, uid INTEGER NOT NULL, snoozed_until INTEGER NOT NULL,
     PRIMARY KEY (mailbox_id, uid)
 );
+
+CREATE TABLE follow_up_flags (
+    message_key TEXT PRIMARY KEY, status INTEGER NOT NULL, due INTEGER,
+    completed INTEGER, updated_at INTEGER NOT NULL
+);
+
+-- Microsoft 365 property overlays, all keyed by the bare Message-ID
+-- (`message_key`) and holding only non-default values:
+CREATE TABLE message_graph_ids (message_key TEXT PRIMARY KEY, graph_id TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE local_categories (message_key TEXT PRIMARY KEY, category_keys TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE local_importance (message_key TEXT PRIMARY KEY, importance INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE local_inference (message_key TEXT PRIMARY KEY, classification INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE inference_overrides (sender TEXT PRIMARY KEY, classify_as INTEGER NOT NULL, override_id TEXT, updated_at INTEGER NOT NULL);
+CREATE TABLE sent_correspondents (address TEXT PRIMARY KEY, last_seen INTEGER NOT NULL);
+CREATE TABLE graph_delta_cursor (id INTEGER PRIMARY KEY CHECK (id = 1), cursor TEXT NOT NULL, updated_at INTEGER NOT NULL);
+
+CREATE TABLE graph_uids (graph_id TEXT PRIMARY KEY, uid INTEGER NOT NULL UNIQUE);
+CREATE TABLE graph_uid_space (
+    id INTEGER PRIMARY KEY CHECK (id = 1), uidvalidity INTEGER NOT NULL, next_uid INTEGER NOT NULL
+);
+CREATE TABLE graph_folder_cursors (mailbox_id TEXT PRIMARY KEY, cursor TEXT NOT NULL, updated_at INTEGER NOT NULL);
 
 CREATE TABLE bodies (
     mailbox_id TEXT NOT NULL, uid INTEGER NOT NULL, uidvalidity INTEGER NOT NULL,
@@ -364,11 +453,6 @@ CREATE TABLE outbox (
 );
 CREATE INDEX outbox_due ON outbox (state, not_before);
 
-CREATE TABLE graph_uids (graph_id TEXT PRIMARY KEY, uid INTEGER NOT NULL UNIQUE);
-CREATE TABLE graph_uid_space (
-    id INTEGER PRIMARY KEY CHECK (id = 1), uidvalidity INTEGER NOT NULL, next_uid INTEGER NOT NULL
-);
-
 CREATE VIRTUAL TABLE search_fts USING fts5(
     mailbox_id UNINDEXED, uid UNINDEXED, subject, sender, recipients, body,
     tokenize = 'unicode61 remove_diacritics 2'
@@ -376,16 +460,26 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
 ```
 
 - `mailboxes.data`/`messages.data` are JSON text (`Mailbox`/`EmailSummary`); `bodies.data` is a
-  JSON BLOB (`EmailBody`).
+  JSON BLOB (`EmailBody`). `messages.partial` marks a row indexed from a prefetch window rather
+  than a full folder sync: it is searchable but never served as the folder's contents.
 - `addresses` is a deliberately cumulative, capped (20,000 rows) address book feeding the
   composer's recipient autocomplete — entries outlive the envelopes that introduced them; least-
   contacted/oldest rows are pruned once over the cap.
+- `follow_up_flags` is the local fallback for servers whose folders lack `\*` in
+  `PERMANENTFLAGS`; it is keyed by Message-ID so a flag follows a move, and a `NotFlagged` row is
+  a tombstone that masks a stale keyword. Every read path overlays it onto the summaries.
+- `local_categories`, `local_importance`, `local_inference` and `message_graph_ids` are the
+  Microsoft 365 overlays: Exchange IMAP cannot store custom keywords, so the app keeps the
+  non-default values locally and syncs them through Graph. `inference_overrides` holds the
+  per-sender Focused/Other decisions; `sent_correspondents` feeds the local classifier on
+  non-Microsoft accounts.
 - `search_fts` is populated by delete-then-insert (FTS5 has no UPDATE) from `replace_messages`
   (envelope sync) and `store_body`/`store_bodies` (which upgrade the indexed text from
   preview-only to the full decoded body, capped at 256 KiB). Queries are sanitized so every bare
   word becomes a quoted phrase, ANDed — neutralizing FTS5 query-syntax injection.
 - Schema versioning via `PRAGMA user_version` triggers a one-time full wipe of `messages` or
-  `bodies` on a format change (e.g. `EmailBody`'s JSON shape changing).
+  `bodies` on a format change (e.g. `EmailBody`'s JSON shape changing). The overlay and outbox
+  tables are append-only, so they survive an envelope/body wipe.
 - `outbox` is the local outgoing-mail queue (§4.6, item 0.3): `payload` is an opaque JSON BLOB the
   session owns (`send::OutboxMessage`), `not_before` schedules it, and `state`/`attempts` drive the
   retry backoff. Append-only, so it needs no `user_version` wipe.
@@ -394,11 +488,11 @@ CREATE VIRTUAL TABLE search_fts USING fts5(
   reuses this cache as is: a folder delta is stored with `upsert_messages` (the incremental counterpart of
   `replace_messages`) and `delete_messages`, and its Outlook properties through
   `apply_remote_mail_properties`. Its folder ids aren't paths, so the delimiter-based
-  `forget_mailbox_tree`/`rekey_snoozed` don't apply to it. Each folder's
-  `@odata.deltaLink` is persisted in `graph_folder_cursors` (item 5.7.8), so a
-  restart resumes incrementally; an expired cursor is cleared and the folder
-  resnapshots under the same Uids. Switching an account between transports
-  clears its per-account cache: the two folder/Uid spaces can't be merged.
+  `forget_mailbox_tree`/`rekey_snoozed` don't apply to it. `graph_folder_cursors` persists each
+  folder's `@odata.deltaLink` (item 5.7.8), so a restart resumes incrementally; an expired cursor
+  is cleared and the folder resnapshots under the same Uids. `graph_delta_cursor` remains the
+  5.4 property sync's single cursor. Switching an account between transports clears its
+  per-account cache: the two folder/Uid spaces can't be merged.
   Its tests are `crates/graph/tests/graph_mail_cache.rs` (fixtures into the
   cache), `graph_mail_session.rs` (a fake Graph server driving the real
   session) and the ignored, read-only `graph_mail_integration.rs` live-tenant
@@ -477,8 +571,9 @@ one representation. A `NotFlagged` row is a tombstone that masks a stale keyword
 change the session emits `FollowUpSet` (the Message-IDs, for the app's Graph mirror) and re-emits the
 folder; `FollowUpFailed` reports a change stored nowhere. `FlaggedMessages` (`Cache::
 flagged_messages`, every cached flagged message, partial rows included) is emitted at start-up,
-after each sync and after each flag change, for the Tasks view. `ApplyRemoteFollowUps` replaces the
-table with a Graph snapshot (Microsoft 365), keeping rows written after the snapshot was taken.
+after each sync and after each flag change, for the Tasks view. `ApplyRemoteMailProperties`
+replaces the cached Outlook property rows with a Graph snapshot (Microsoft 365), keeping rows
+written after the snapshot was taken.
 
 ### 4.7 Auth and connection (`auth.rs`, `connection.rs`)
 
@@ -496,10 +591,12 @@ whole cache-check-and-refresh — the token cache itself (`cached_exchange`/`cac
 lock, so the primary and IDLE connections reconnecting around the same time (e.g. after a network
 blip) can no longer both miss the cache and both fire a duplicate refresh-token exchange.
 
-## 5. Calendar/contacts engine — `lookout-dav`
+## 5. Calendar, contacts, and Graph engines — `lookout-dav` and `lookout-graph`
 
-Crate doc: "Minimal CalDAV client + iCalendar/RRULE parsing + a `CalendarSession` actor, mirroring
-`lookout-mail`'s IMAP session actor." Same credential-provider-trait convention as `lookout-mail`.
+`lookout-dav` is the "minimal CalDAV client + iCalendar/RRULE parsing + a `CalendarSession` actor,
+mirroring `lookout-mail`'s IMAP session actor." `lookout-graph` layers the Microsoft Graph backends
+on the same shared domain types and actor-style command/event channels. Both take credentials
+through traits rather than a concrete GOA dependency.
 
 ### 5.1 `DavClient` — the low-level HTTP layer (`client.rs`)
 
@@ -513,7 +610,12 @@ time-range filter — tasks may carry only DUE, only DTSTART, or neither),
 deletions), a full-fetch fallback via `addressbook-multiget` (deliberately not `sync-collection`
 nor an empty-filter `addressbook-query` — Google CardDAV treats an empty filter as "match
 nothing"), and `put`/`delete` for both calendar objects and vCards (etag-guarded: `If-Match` on
-update, `If-None-Match: *` on create). A free function `fetch_webcal_ics` does an unauthenticated
+update, `If-None-Match: *` on create).
+
+The same layer also implements the write-discovery operations: MKCALENDAR/PROPPATCH/DELETE for
+task-list and calendar management and colours, `OPTIONS` capability probing for RFC 8607 managed
+attachments, attachment upload/download, a VFREEBUSY `POST` to the schedule outbox (RFC 6638), and
+the addressbook/contact primitives. A free function `fetch_webcal_ics` does an unauthenticated
 GET for public `.ics` documents, capped at 5 MiB.
 
 ### 5.2 `CalendarSession` — the actor (`session.rs`)
@@ -522,13 +624,15 @@ CalDAV has no IMAP-IDLE equivalent, so this is a **fixed-interval poll** (5 minu
 long-poll.
 
 **`CalendarCommand`**: `SyncMonth`, `FetchMonth`, `Refresh`, `Reconnect`,
-`CreateEvent`/`UpdateEvent`/`DeleteEvent`, `SyncTasks`, `CreateTask`/`UpdateTask`/`DeleteTask`,
-`Shutdown`.
+`CreateEvent`/`UpdateEvent`/`DeleteEvent`, `RespondInvitation`, `SyncTasks`,
+`CreateTask`/`UpdateTask`/`DeleteTask`, `CreateCalendar`/`UpdateCalendar`/`SetCalendarColor`/
+`DeleteCalendar`, `SetSharedCalendars`, `FetchFreeBusy`, `FetchEventAttachment`, `Shutdown`.
 
-**`CalendarSessionEvent`**: `ConnectionStateChanged`, `CalendarsUpdated`, `OccurrencesUpdated`,
-`TasksUpdated`, `Error`, and `EventSaveFailed { uid, recurrence_id, message }` — kept distinct from
-plain `Error` so the UI can roll back exactly the occurrence it moved, explicitly mirroring
-`lookout_mail::AccountEvent::MoveFailed`.
+**`CalendarSessionEvent`**: `ConnectionStateChanged`, `CalendarsUpdated`, `SchedulingUpdated`,
+`OccurrencesUpdated`, `TasksUpdated`, `FreeBusyUpdated`/`FreeBusyFailed`, `EventSaveFailed { uid,
+recurrence_id, message }` (kept distinct from plain `Error` so the UI can roll back exactly the
+occurrence it moved, explicitly mirroring `lookout-mail::AccountEvent::MoveFailed`),
+`EventAttachmentFetched`/`EventAttachmentFetchFailed`, and `Error`.
 
 Loop structure mirrors `lookout-mail`'s: an outer reconnect-with-backoff loop (1s doubling to 60s)
 calling an inner `connect_and_run` that discovers calendars, does an initial sync, then loops
@@ -590,12 +694,14 @@ CREATE TABLE contacts (href TEXT PRIMARY KEY, book_href TEXT NOT NULL, etag TEXT
 
 `ContactsCache` is the one DAV cache that **is** authoritative for something: it persists each
 address book's RFC 6578 `sync_token`, so polls can run incremental `sync-collection` REPORTs, and
-it's the baseline the People screen's "Deleted" bucket diffs against across restarts.
-`CalendarCache` is still non-authoritative, but `event_search` is a persisted read index for
-Calendar search (CAL-22): it is derived from `occurrences`, rebuilt from scratch on a
-`user_version` bump, and written by `store_month`, so it never needs its own sync path. Microsoft
-365 months reach it through `spawn_calendar_cache_store` in the app's calendar event loop (the
-Graph actor has no cache of its own).
+it's the baseline the People screen's "Deleted" bucket diffs against across restarts. Microsoft
+365 contacts write the same cache through `upsert_contacts` (and `apply_delta` on the CardDAV
+path), so the People screen has one snapshot shape regardless of backend. `CalendarCache` is
+still non-authoritative, but `event_search` is a persisted read index for Calendar search
+(CAL-22): it is derived from `occurrences`, rebuilt from scratch on a `user_version` bump, and
+written by `store_month`, so it never needs its own sync path. Microsoft 365 months reach it
+through `spawn_calendar_cache_store` in the app's calendar event loop (the Graph calendar actor
+has no cache of its own).
 
 ### 5.6 Synthesized/derived calendars
 
@@ -610,7 +716,30 @@ Graph actor has no cache of its own).
   per-feed `error`, retried on the next poll), and no `sync-collection`/etag tracking — every poll
   is a full re-GET-and-reparse bounded by the 5 MiB cap.
 
-## 6. Account discovery — `lookout-goa`
+### 5.7 `lookout-graph` — Microsoft Graph backends
+
+`lookout-graph` is a `reqwest` client plus four feature modules. `GraphClient` attaches a bearer
+token from a `TokenProvider` (implemented in `lookout-app` over `microsoft_oauth.rs`), follows
+`@odata.nextLink` paging, reads `/delta` cursors, honours `Retry-After`, and exposes typed
+`get`/`post`/`patch`/`delete`, raw-body and binary helpers. `GraphFeature` in `scopes.rs` owns the
+per-feature consent sets, so new scopes are requested incrementally rather than all at once.
+
+- **`calendar`** — `CalendarClient` and `run_calendar_session`, implementing the same
+  `CalendarCommand`/`CalendarSessionEvent` contract as `lookout-dav`: month `calendarView` sync,
+  event CRUD, RRULE mapping, RSVP responses, shared/delegated calendar paths, permissions,
+  free/busy, rooms and event attachments.
+- **`contacts`** — `ContactsClient`: contact folders, per-folder `/delta`, CRUD guarded by
+  `If-Match`, photos, and the directory's `/me/people` and `/users?$search=`.
+- **`todo`** — `TodoClient` and `run_todo_session`, mapping `/me/todo/lists` and tasks into the
+  app's `CalendarTask`/synthetic `todo:<list id>` calendar ids.
+- **`mail`** — the Graph mail transport: `run_graph_mail_session` is a second implementation of
+  `lookout_mail`'s `AccountCommand`/`AccountEvent` seam, reusing that crate's `Cache` and outbox,
+  plus the property and identity mappers (`graph_uids`, categories, flags, importance,
+  Focused/Other) and the MIME send/draft paths.
+
+The Graph crate has no GTK, keyring or OAuth code; the app owns consent and token storage.
+
+## 6. Account and desktop discovery — `lookout-goa` and `lookout-eds`
 
 Talks to GNOME Online Accounts over the session D-Bus (`org.gnome.OnlineAccounts`) via `zbus`
 rather than linking `libgoa-1.0` (no maintained Rust GIR binding exists). **Never caches
@@ -622,6 +751,16 @@ carrying an `AuthMethod`/`CalendarAuthMethod`/`ContactsAuthMethod` (`OAuth2` or
 Microsoft 365 accounts are special-cased (`GoaMailAccount::is_microsoft_365`): GOA's own token for
 them carries only Graph scopes, unusable against Exchange Online IMAP/SMTP, so `lookout-app`
 supplies its own OAuth2 credentials instead (see §8.5, `microsoft_oauth.rs`).
+
+### 6.1 Desktop address books — `lookout-eds`
+
+`lookout-eds` is a pure `zbus` client for Evolution Data Server. `Eds::connect()` never starts
+EDS; it checks whether the source registry and the address-book/calendar factories are running
+or activatable, then `sources()` reads the registry's `GetManagedObjects` into
+`EdsSource { uid, display_name, kind, parent_uid, enabled, backend, goa_account_id }`. The app uses
+it for the People screen's read-only Desktop section and for the `EdsDirectoryBackend` that feeds
+recipient autocomplete and People search. Books belonging to a GOA account Lookout already syncs
+are skipped, so the same contacts do not arrive twice.
 
 ## 7. Vendored IMAP stack — `async-imap`, `imap-proto`
 
@@ -652,10 +791,11 @@ login autostart, and on `activate` builds (or re-presents) the one `adw::Applica
 reactor with a glib main loop without running tokio inside it." One OS thread runs a
 `tokio::runtime::Builder::new_multi_thread()` runtime and blocks forever keeping it alive;
 `Worker::spawn(future)` is the single entry point everything in `window.rs` uses to push
-IMAP/SMTP/CalDAV/GOA-D-Bus I/O off the GTK thread. It is *not* a task-queue/scheduler abstraction —
+IMAP/SMTP/CalDAV/Graph/GOA-D-Bus I/O off the GTK thread. It is *not* a task-queue/scheduler abstraction —
 just a shared runtime handle. Every account session actor (`run_account_session`,
-`run_calendar_session`, the webcal/Google-Tasks pollers) is spawned onto it, and every result/event
-crosses back to the UI thread over an `async_channel`, consumed via `glib::spawn_future_local`.
+`run_calendar_session`, `run_graph_mail_session`, the Graph calendar/contacts/To Do loops, the
+webcal/Google-Tasks pollers) is spawned onto it, and every result/event crosses back to the UI
+thread over an `async_channel`, consumed via `glib::spawn_future_local`.
 
 **`background.rs`** is unrelated to `worker.rs` despite the name — it implements "run without a
 visible window": the XDG Background portal (`org.freedesktop.portal.Background` v2, requesting
@@ -670,47 +810,59 @@ per-domain state blobs rather than one giant struct.
 
 **`UiState`** (mail/reading-pane/session plumbing) groups roughly into:
 - **Account handles & discovery bookkeeping**: `accounts: HashMap<AccountId, AccountHandle>`
-  (per-account `cmd_tx`/`interactive_cmd_tx`, folders, a read-side `Arc<lookout_mail::Cache>` for
-  the composer's autocomplete, an optional `GraphPinClient`), `goa_accounts`, `goa_client`,
+  (per-account background and interactive command channels, folders, a read-side
+  `Arc<lookout_mail::Cache>` for autocomplete, the Graph pin/flag/category/rules/automatic-reply
+  clients, `microsoft_365`, `uses_graph_mail`, `sieve_advertised`), `goa_accounts`, `goa_client`,
   `goa_unavailable`, `contacts_by_account`, `contact_cmd_tx`, `app_config`, `settings`.
 - **Navigation/selection**: `current_account`/`current_mailbox`, `mail_view` (`Single |
   UnifiedInbox | Search`), `pending_message_selection` (deep-link target from an AI chat link),
   `unified_snapshots` (per-mailbox sets merged for "All Inboxes").
 - **Optimistic-update stashes**, one per operation kind so concurrent in-flight ops don't clobber
   each other's rollback snapshot: `pending_optimistic_removals` (delete/archive/junk),
-  `pending_optimistic_flag_changes` (read/unread), `pending_optimistic_pinned_changes`.
+  `pending_optimistic_flag_changes` (read/unread), `pending_optimistic_pinned_changes`;
+  `CalendarUiState` has the equivalent `pending_calendar_moves`.
 - **Reading-pane/body-fetch pipeline**: `pending_body_request`, `pending_attachment`,
-  `pending_raw_message`, `pending_cid` (inline image fetches), `body_cache` (bounded LRU),
-  `rendered_message` (identity of what's on-screen), plus banner state for List-Unsubscribe,
-  iMIP invitations, read receipts, and remote-content trust.
+  `pending_attachment_batch`, `pending_raw_message`, `pending_cid` (inline image fetches),
+  `body_cache` (bounded LRU), `rendered_message`/`rendered_conversation` (identity of what is
+  on-screen), plus banner state for List-Unsubscribe, iMIP invitations, read receipts, snooze and
+  follow-up flags.
 - **Sync/dedup tracking sets**: `syncing: HashSet<MailboxId>` (outstanding `SyncMailbox`
   requests), `prefetching: HashSet<MailboxId>` (kept *separate* from `syncing` so background
   prefetch never wrongly suppresses a real user-triggered sync), `refreshing: HashSet<AccountId>`
   (outstanding `Refresh`), `folder_row_spinners` (live spinner widgets bound to those sets — a
   `Vec` per mailbox because a starred folder has two simultaneous rows).
-- **List display**: `sort_key`/`sort_descending`, `favorites: HashSet<MailboxId>`.
+- **Outbox and server automation**: `outbox: HashMap<AccountId, Vec<OutboxItem>>` plus its banner
+  and dialog handles; `sieve_support`; `automatic_replies` per account and their banner/dialog
+  refresh hooks.
+- **List display**: `sort_key`/`sort_descending`, `favorites: HashSet<MailboxId>`, the message
+  list's `FilterSet`/`FocusedView`, and its single-line column/list-style state.
 - **Composer/identity relay hooks**: late-bound `Rc<dyn Fn()>` callbacks
   (`composer_identities_refresh`, `manage_signatures`, `follow_up_status`/`follow_up_toggle`) —
   late-bound because the row factories that need them exist before the state that drives them
-  does.
-- **Search**: `search_active`/`search_query`/`search_results`/`search_pending`.
+  does. `ribbon_style: Option<RibbonStyle>` and `compose_action_bar: Option<Rc<ComposeActionBar>>`
+  are the shared ribbon/layout and composer-action-bar handles.
+- **Search**: `search_active`/`search_query`/`search_results`/`search_pending`; the ribbon stack
+  handle (`search_ribbon`) restores the contextual Search page.
 
-**`CalendarUiState`** is the calendar-domain sibling: per-CalDAV-account handles
+**`CalendarUiState`** is the calendar-domain sibling: per-CalDAV/Graph-account handles
 (`CalendarAccountHandle`, including a per-month occurrence cache for the dashboard's upcoming-
 events window), `displayed_month`, `checked_calendar_ids` (sidebar checklist), `calendar_colors`,
-webcal subscription handles, a synthesized `birthdays` handle, Google Tasks handles, a local-tasks
-fallback store (`CalendarId("local")`, used when no connected calendar supports VTODO), and its own
-`pending_calendar_moves` optimistic-rollback map for drag-to-reschedule. Event search (CAL-22) adds
+`calendar_groups`/`hidden_calendars`, webcal subscription handles, a synthesized `birthdays`
+handle, Google Tasks and Microsoft To Do handles, a local-tasks fallback store (`CalendarId("local")`,
+used when no connected calendar supports VTODO), and its own `pending_calendar_moves`
+optimistic-rollback map for drag-to-reschedule. Event search (CAL-22) adds
 `calendar_search_active` / `_query` / `_results` / `_previous_view` / `_generation` /
 `_pending` / `_checked_only` / `_backfilled` plus a late-bound `calendar_search_refresh` hook, and
 its orchestration lives in `window/calendar_search.rs` (pure term parsing, cache fan-out, series
-dedupe and the bounded `FetchMonth` backfill).
+dedupe and the bounded `FetchMonth` backfill). `scheduling_pending` and `attachment_requests` are
+the free/busy and event-attachment request ledgers; `my_day_day`/`my_day_pins` mirror the UI-state
+My Day set; `eds_mirror` holds the desktop-calendar mirror pacing state.
 
 ### 8.3 Event dispatch — the uniform actor-consumption pattern
 
-Every session type (mail, CalDAV, webcal, Google Tasks) is consumed the same way: the worker
-thread runs the actor and sends events over a **bounded** `async_channel`; the UI thread runs a
-`glib::spawn_future_local` loop that:
+Every session type — mail, CalDAV, the Graph calendar/contacts/To Do sessions, webcal and Google
+Tasks — is consumed the same way: the worker thread runs the actor and sends events over a
+**bounded** `async_channel`; the UI thread runs a `glib::spawn_future_local` loop that:
 
 1. Blocks on the first event.
 2. **Batch-drains** everything currently queued via `try_recv` — the startup burst (cache replay,
@@ -723,9 +875,9 @@ thread runs the actor and sends events over a **bounded** `async_channel`; the U
    then calling a targeted repaint helper (`rebuild_folder_tree`, `message_list.repopulate`,
    `dashboard_refresh()`, a toast on error) rather than redrawing the whole window.
 
-There are 35 `glib::spawn_future_local` call sites across the window shell (`window/*`) — one per connected-account
-event loop plus assorted one-shot async UI tasks. Command channels, in contrast, are unbounded
-and sent via `send_blocking` straight from the GTK thread.
+There are dozens of `glib::spawn_future_local` call sites across the window shell (`window/*`) —
+one per connected-account event loop plus assorted one-shot async UI tasks. Command channels, in
+contrast, are unbounded and sent via `send_blocking` straight from the GTK thread.
 
 **Startup discovery order** (tail of `build_window`): webcal subscriptions connect first (they
 aren't GOA accounts); manually-configured "other" accounts connect *synchronously* next (reading
@@ -740,8 +892,10 @@ Root page switcher is a plain `gtk::Stack` (`root_stack`, not `adw::ViewStack` �
 sizing deliberately disabled on both axes so a hidden page's async fill-in can't reflow the
 visible one), with named children `"empty"/"mail"`, `"calendar-empty"/"calendar"`,
 `"tasks-empty"/"tasks"`, `"lookout-empty"/"lookout"`, `"contacts-empty"/"contacts"`. A nav rail of
-toggle buttons swaps `root_stack`'s visible child; a separate Home/View ribbon toggle swaps a
-per-module command-toolbar stack alongside it.
+toggle buttons swaps `root_stack`'s visible child. The window also has an `app_stack` for the
+module view versus the **File** Backstage page (`window/file_page.rs`), and a ribbon stack
+(`view_toolbar_stack`) whose pages are the per-module/per-tab command bands (`ribbon.rs`); a
+single shared More/Layout group and overflow controller sit outside the stack.
 
 - **Mail**: three `card_section`-wrapped panes — folder tree (`gtk::TreeListModel` built by
   `folder_tree::build_multi_account_tree_model`), message list (`message_list::MessageListModel`,
@@ -755,27 +909,40 @@ per-module command-toolbar stack alongside it.
   function — `contacts_view.rs` instead supplies pure population/logic functions
   (`rebuild_contacts_list_ui`, `sync_contacts_account`, `show_contact_editor_for`, etc.) that
   operate on window-owned widgets.
-- **Settings**: `config_view::build()` returns its own `ConfigView` struct with an internal
-  `paned`; individual rows are wired in `build_window` with `connect_active_notify`/
-  `connect_value_notify` handlers writing straight through to `SettingsStore`.
+- **Settings**: `window/file_page.rs` owns the Backstage page and embeds `config_view::build()`
+  as its Options section. `ConfigView` is a File-style category pane plus the selected category's
+  settings; its rows are wired in `build_window` with `connect_active_notify`/
+  `connect_value_notify` handlers writing through to `SettingsStore`/`AppConfig`. There is no
+  separate Settings window.
 
 ### 8.5 Feature modules
 
 **`message_list.rs`** — the message list's model layer, factored out to be pure-function-testable
-without a GTK main loop. `SortKey` (`Date|Sender|Subject`, only `Date` produces date-section
-headers), `ListFilter` (`All|Unread|Flagged`), `DateBucket` (`Today|Yesterday|ThisWeek|...|
-Year(i32)|Pinned` — a bucket's identity is fixed forever by embedding the message's own year, so
-collapse-state survives time passing). Thread grouping (`group_threads`) scans newest-first,
-grouping by `(mailbox, thread_key)` — an empty thread key (uncomputed/legacy cache) renders as a
-lone message rather than merging, and a "thread" of exactly one message renders as itself, not a
-header. `MessageListModel::repopulate` stores the full unfiltered set into `truth`, then
-`recompute_and_apply` snapshots it and either computes inline or, above
+without a GTK main loop. `SortKey` is `Date|Sender|Subject|Size|Importance|Flag|Category|To|
+Attachments`; `GroupKey` and `DateBucket` derive section headers for every key (date buckets include
+`Later`, `Today`, `Yesterday`, `ThisWeek`, `LastWeek`, `ThisMonth`, `LastMonth`, `Older` and
+`Year(i32)`; `Year` embeds the message's own year so collapse state survives time passing). The
+list's filters are a bit-set `FilterSet` (`Unread`, `Flagged`, `Pinned`, `HasAttachments`,
+`HighImportance`, `Categorized`, `ToMe`, `Mentions`) plus a separate `FocusedView`
+(`All|Focused|Other`) for the Focused Inbox tabs. Thread grouping (`group_threads`) scans
+newest-first, grouping by `(mailbox, thread_key)` — an empty thread key (uncomputed/legacy cache)
+renders as a lone message rather than merging, and a "thread" of exactly one message renders as
+itself, not a header. `MessageListModel::repopulate` stores the full unfiltered set into `truth`,
+then `recompute_and_apply` snapshots it and either computes inline or, above
 `BACKGROUND_REPOPULATE_THRESHOLD` (5,000 messages — chosen from a release-build timing probe
 against a ~16ms frame budget), dispatches the pure-data `compute_layout` to
 `tokio::task::spawn_blocking` and re-checks a `generation` counter before applying the result, so a
 stale reply from a superseded call is discarded. A `RowDiff`/`TrackedStore` pair finds the common
 prefix/suffix between old and new layouts so only the changed middle range is spliced into the
 live `gio::ListStore`.
+
+`message_columns.rs` is the pure half of the single-line list: the visible `MessageColumn` set
+(`Importance|Attachment|From|To|Subject|Received|Size`; `To` is off by default), its sort-key
+mapping, each column's width, the stored-id parser and the narrow-pane shedding order. `window/sort.rs` owns the `ListStyle`
+(`Auto|ThreeLine|SingleLine`) decision and the shared sort applier; `window/columns.rs` builds the
+header and its column chooser. The three-line row, conversation headers and the column header all
+use the same width/spacing model, so the automatic layout threshold and the drawn row cannot drift
+apart.
 
 `attach_scroller` (called once from `build_ui`, right after the `ScrolledWindow`/`ListView` are
 built; `None` in every test-built model, which simply skips this) hands the model a handle on the
@@ -791,10 +958,11 @@ re-pins via `ListView::scroll_to(0, ListScrollFlags::empty(), None)` *after* `re
 item 0 (surviving the next size-allocate), and empty flags specifically to avoid `FOCUS`/`SELECT`
 moving the highlight along with the scroll position.
 
-**`calendar_view.rs`** — five view modes as `gtk::Stack` children: `workweek`/`week`/`day` (all
-built via a shared time-grid builder), `split` (a `MonthGrid` + `AgendaView` side-by-side pane —
-there's no standalone "agenda" stack entry), and `month` (default). Time-grid views use two
-stacked `gtk::DrawingArea`s (all-day band + scrollable timed canvas) with custom cairo
+**`calendar_view.rs`** — seven view modes as `gtk::Stack` children: `workweek`/`week`/`day` (all
+built via a shared time-grid builder), `split` (a `MonthGrid` + `AgendaView` side-by-side pane),
+`list` (the standalone `AgendaView`, a chronological day-grouped list over a rolling window),
+`schedule` (calendars as rows on a horizontal time axis), and `month` (default). Time-grid views
+use two stacked `gtk::DrawingArea`s (all-day band + scrollable timed canvas) with custom cairo
 `set_draw_func` painting; overlapping same-day events are laid out via a greedy interval-
 partitioning `assign_lanes` algorithm. Data-in/widget-out: `set_anchor`/`set_occurrences` are the
 two inputs, both triggering a full `refresh`. Week start, the Work-week columns, the
@@ -826,20 +994,16 @@ body. Draft autosave runs every 5s, diffing against a snapshot and appending via
 `AccountCommand::SaveDraft` keyed by a stable per-session Message-ID; Send first issues
 `DeleteDraft` (same command channel, so ordering holds) before sending.
 
-To/Cc/Bcc are plain single-line fields (`RecipientEntry::new_plain`, `recipient_entry.rs`) rather
-than the removable-pill/`FlowBox` chip mode `RecipientEntry::new` still provides — the calendar
-event editor's attendees field keeps using chip mode unchanged; `new_plain` is compose-only. A
-plain line has no separate committed-vs-pending text the way chips did, so the inline autocomplete
-popover keys off just the segment currently being typed: `current_segment_start` walks back to the
-last top-level comma/semicolon (sharing `parse_address_tokens`'s quote/angle-bracket awareness) to
-find where that segment starts, and `finish_plain_segment` normalizes a manually typed address into
-a `", "`-separated one on Enter/Tab so the user doesn't have to type their own comma. A "To" button
-leads the row, doubling as the field's label, and opens **`contact_picker::show_contact_picker`**
-— a modal, searchable checkbox multi-select over every connected account's contacts
-(`ContactsAccountSnapshot::suggestions`, the same field autocomplete already uses; that field and
-`contacts_view::dedupe_addresses` are `pub(crate)` so the picker can reuse them), whose "Add"
-button inserts every checked address. Cc/Bcc keep their own smaller reveal-link buttons, trailing
-on the right of the To line.
+To/Cc/Bcc are removable-pill/`FlowBox` chip fields (`RecipientEntry::new`), shared with the
+calendar event editor's attendee field and the iMIP reply composer. A contact list picked from the
+address book renders as one expandable list chip (P-05); removing a chip removes that recipient.
+The separate `RecipientEntry::new_plain` single-line mode is retained for tests and compatibility,
+but compose no longer uses it. A "To" button leads the row, doubling as the field's label, and
+opens **`contact_picker::show_contact_picker`** — a modal, searchable checkbox multi-select over
+every connected account's contacts (`ContactsAccountSnapshot::suggestions`, the same field
+autocomplete already uses; that field and `contacts_view::dedupe_addresses` are `pub(crate)` so the
+picker can reuse them), whose "Add" button inserts every checked address. Cc/Bcc keep their own
+smaller reveal-link buttons, trailing on the right of the To line.
 
 **`contacts_view.rs`** / **`contacts_editor.rs`** — contact account discovery + per-account
 `sync_contacts_account` poll loop, a left category tree (`ContactsBucketKind`:
@@ -860,17 +1024,22 @@ copies. Matching is deliberately per account: a merge never deletes a copy from 
 provider's address book.
 
 **`event_editor.rs`** — the calendar's counterpart to `compose.rs` (a modal form, since Calendar
-has no reading-pane slot). Recurrence UI lives in a separate `recurrence.rs` module
+has no reading-pane slot). `EventEditorPrefill` carries the calendar list, suggested attendees,
+the shared category list, the Scheduling Assistant context and the attachment-download callback;
+`CalendarEvent.attachments` are saved through the owning calendar session, not directly over
+HTTP. Recurrence UI lives in a separate `recurrence.rs` module
 (`RecurrenceRule`/`Frequency`/`RecurrenceEnd`, with `parse_rrule_string`/`to_rrule_string`/
 `describe` round-tripping and humanizing RFC 5545 RRULEs). Edit scope for a recurring series
 (single instance vs. "this and future") is expressed by setting `recurrence_id`/
 `recurrence_range` on the saved `CalendarEvent`.
 
 **`lookout_view.rs`** — see §9 (AI assistant pipeline) for the chat rendering/tool-calling
-architecture; `folder_tree.rs` — see the widget-tree note above (§8.4), data model is `FolderNode`
-(parent/child linking kept as a UI-layer concern, deliberately out of `lookout-core`) and
-`TreeItem` (`Unified|Favorites|Account|Folder|Favorite` — `Favorite` is a second, duplicate row for
-a starred mailbox).
+architecture; `folder_tree.rs` — see the widget-tree note above (§8.4), data model is
+`FolderNode { mailbox, children }` (parent/child linking kept as a UI-layer concern,
+deliberately out of `lookout-core`) and `TreeItem`
+(`Unified(u32)|Favorites|Account|Folder|Favorite|SearchFolders|SearchFolder` — `Favorite` is a
+second, duplicate row for a starred mailbox; the two Search Folders variants are the saved-search
+group and its leaf rows).
 
 **`google_tasks.rs`** — Google's CalDAV is VEVENT-only, so VTODO tasks can't live there; this
 talks to the separate Google Tasks REST API with its own OAuth2 scope via the same public-client
@@ -889,8 +1058,9 @@ explicitly out of scope), since IMAP has no way to reach that property and EWS i
 Microsoft 365 through the `lookout-graph` `GraphClient`, once the account has granted Graph access
 (Config's "Sync pins and flags with Outlook"). Writes follow the session's `FollowUpSet` event (so an
 undo is mirrored too); reads are a snapshot of every flagged and recently completed message, taken on
-connect, every 15 minutes and on F5, and handed to the session as `ApplyRemoteFollowUps`. Due dates
-are written as local midnight in the calendar's display zone.
+connect, every 15 minutes and on F5, and handed to the session as
+`ApplyRemoteMailProperties` (shared with categories, importance and Focused/Other). Due dates are
+written as local midnight in the calendar's display zone.
 
 **`follow_up.rs`** — the Flag menu's presets (Today, Tomorrow, This week, Next week, No date,
 following the calendar's week start and work days), `FlagBucket` (the list's flag groups and the
@@ -898,23 +1068,28 @@ Tasks view's order) and the due/banner/undo wording. The window wires it into th
 button, the row's flag icon and due label, the "Follow up. Due by …" bar and Insert; the Tasks view's
 "Flagged email" section (`tasks_view::set_flagged_mail`) lists open flags from `FlaggedMessages`.
 
-**Smaller modules** (one line each): `contact_picker.rs` — the compose "To" button's modal
-address-book picker (§8.5 above, `compose.rs`), modeled on `identities.rs::show_manage_dialog`'s
-dialog skeleton; `reminders.rs` — VALARM-driven desktop notifications, fire/
-snooze state in `ui_state_db`; `recipient_entry.rs` — composer chip fields, repopulate-from-truth
-like `MessageListModel`; `signatures.rs`/`identities.rs` — Config editors writing through to
-`AppConfig`; `categories.rs` — client-side category definitions (JSON file), applied server-side as
-IMAP keywords; `trusted_senders.rs` — remote-content trust dialog; `task_editor.rs`/
-`tasks_view.rs` — VTODO editor and grouped list; `other_accounts.rs` — manual IMAP/SMTP account
-management, keyring-backed; `theme.rs` — bundled named-color CSS theming; `background_image.rs`
-— window-background image persistence; `shortcuts.rs` — keyboard shortcuts matched by physical
-keycode (layout-independent); `context_menu.rs` — the shared context-menu builder (item 0.5): a
-declarative `MenuDescription` compiled to a `gio::Menu` plus a `SimpleActionGroup` routed through
-one dispatch closure, used by `folder_menu.rs`, `message_menu.rs` and the event/contact menus to
-come; `message_menu.rs` — the message context menu (item 1.17): Outlook's entries and order, the
-enable rules (`message_menu_state`) and the item → `MessageMenuAction` mapping, with
-`window/mail_actions.rs`'s `open_message_menu`/`run_message_menu_action` running each action
-through the ribbon's helpers;
+**Smaller modules** (one line each): `ribbon.rs` — the shared ribbon component: `RibbonBand`/
+`RibbonGroup`, icon+label dressing, Simplified/Classic layouts, `RibbonIcon` live glyphs and the
+`RibbonOverflow` label-drop/More controller used by every module and the composer; `directory.rs` —
+the shared `DirectoryBackend`/`DirectorySource` dispatcher (Graph GAL, LDAP and EDS) with query
+debounce/prefix caching; `file_page.rs` — the File Backstage page and its embedded Options view;
+`contact_picker.rs` — the compose "To" button's modal address-book picker (§8.5 above,
+`compose.rs`), modeled on `identities.rs::show_manage_dialog`'s dialog skeleton; `reminders.rs` —
+VALARM-driven desktop notifications, fire/snooze state in `ui_state_db`; `recipient_entry.rs` —
+composer/attendee chip fields, with a plain-line mode retained for compatibility;
+`signatures.rs`/`identities.rs`/`templates.rs` — Config editors writing through to `AppConfig`;
+`categories.rs` — client-side category definitions (a `settings.json` list), applied server-side
+as IMAP keywords and Graph `masterCategories`; `trusted_senders.rs` — remote-content trust dialog;
+`task_editor.rs`/`tasks_view.rs` — VTODO editor, smart lists and grouped list;
+`other_accounts.rs` — manual IMAP/SMTP account management, keyring-backed; `theme.rs` — bundled
+named-color CSS theming; `background_image.rs` — window-background image persistence;
+`shortcuts.rs` — keyboard shortcuts matched by physical keycode (layout-independent);
+`context_menu.rs` — the shared context-menu builder (item 0.5): a declarative `MenuDescription`
+compiled to a `gio::Menu` plus a `SimpleActionGroup` routed through one dispatch closure, used by
+`folder_menu.rs`, `message_menu.rs` and `event_menu.rs`; `message_menu.rs` — the message context
+menu (item 1.17): Outlook's entries and order, the enable rules (`message_menu_state`) and the
+item → `MessageMenuAction` mapping, with `window/mail_actions.rs`'s
+`open_message_menu`/`run_message_menu_action` running each action through the ribbon's helpers;
 `conversation_view.rs` (+ `conversation_view.js`) — the reading pane's conversation view (item
 1.7): a selected conversation header, or a message inside a conversation, shows every message as a
 card in one WebView, beside the single-message "message" page. Each body is a sandboxed `srcdoc`
@@ -927,22 +1102,22 @@ history (item 0.4): each destructive action records an `UndoEntry { id, descript
 shows a bottom-left toast whose Undo button reverses exactly that entry, and is also undoable with
 Ctrl+Z (`ACTION_UNDO`); entries expire with their toast and are capped by `MAX_UNDO_ENTRIES`.
 
-### 8.6 Four persistence layers, deliberately kept separate
+### 8.6 Five persistence layers, deliberately kept separate
 
 | Layer | File | Holds | Wiped by "Clear all caches"? |
 |---|---|---|---|
-| `lookout_mail::Cache` | `~/.cache/lookout/mail/<account>.sqlite3` | Synced IMAP data — mailboxes, envelopes, bodies, FTS index | Yes — disposable, re-fetchable |
-| `lookout_dav::{CalendarCache,ContactsCache}` | `~/.cache/lookout/{calendar,contacts}/<account>.sqlite3` | Synced CalDAV/CardDAV data | Yes — disposable, re-fetchable |
-| `ui_state_db.rs` | `~/.cache/lookout/ui-state.sqlite` | Starred contacts, reminder fire/snooze state, local-only tasks, trusted-sender decisions | **No** — UI-concern state, not re-fetchable from a server |
-| `app_config.rs` | `~/.config/lookout/settings.json` | Identities, signatures, per-account signature defaults, folder-role overrides, webcal subscriptions, manually-configured accounts | No — user configuration |
-| `settings.rs` | GSettings (`io.github.gavindi.Lookout` schema) | ~35 scalar preferences: theme, layout, sort, prefetch tuning, feature toggles | No — user configuration |
+| `lookout_mail::Cache` | `~/.cache/lookout/mail/<account>.sqlite3` | Synced IMAP/Graph data — mailboxes, envelopes, bodies, property overlays, FTS index, outbox, Graph Uidspace/cursors | Yes — disposable, re-fetchable |
+| `lookout_dav::{CalendarCache,ContactsCache}` | `~/.cache/lookout/{calendar,contacts}/<account>.sqlite3` | Synced CalDAV/CardDAV data, tasks and the derived `event_search` index | Yes — disposable, re-fetchable |
+| `ui_state_db.rs` | `~/.cache/lookout/ui-state.sqlite` | Starred contacts, reminder fire/snooze state, local tasks, trusted and blocked senders, ignored threads, folder expansion/preferences, recent folders/searches and the My Day pin set | **No** — UI-concern state, not re-fetchable from a server |
+| `app_config.rs` | `~/.config/lookout/settings.json` | Structured config: identities, signatures and defaults, templates, rules, Quick Steps, saved searches, categories, automatic replies, folder-role overrides, webcal/other/shared accounts, shared calendars, calendar groups/hidden calendars, local task lists, directory opt-ins and LDAP directories, Graph-mail opt-in | No — user configuration |
+| `settings.rs` | GSettings (`io.github.gavindi.Lookout` schema) | The schema's scalar/list preferences (86 keys at the time of writing): theme, layout, sort, prefetch tuning, ribbon, icon and feature toggles | No — user configuration |
 
 This is the clearest architectural line in the app: a *cache* is disposable and always
 re-derivable from a live server round trip; *state* (`ui_state_db`) and *config*
 (`app_config`/GSettings) are not, and the "Clear all caches" action is scoped precisely to the
-former. `ui_state_db`'s schema version bump wipes only `starred_contacts` — the other three tables
-(reminders, local tasks, trust decisions) are never wiped by a version bump either, since none of
-them are recomputable.
+former. `ui_state_db`'s schema version bump wipes only `starred_contacts`; every other table
+(reminders, local tasks, trust decisions, blocked senders, ignored threads, folder state,
+recent items and My Day) is left untouched because none of it is recomputable.
 
 Secrets never live in any of these files: GOA-account credentials come fresh from GOA per
 connection; "other" accounts' and the AI assistant's API token live in the GNOME keyring via
@@ -962,13 +1137,13 @@ notifications from inside the mail event loop. All three converge on one repaint
 
 **Protocol**: OpenAI-compatible chat completions (`assistant.rs`). The API base URL is a GSettings
 string; the API token lives in the GNOME keyring (never in dconf/settings.json). `chat_completions`
-is one raw `POST {base}/chat/completions` round trip (30s timeout — a request may itself be an
-LLM-internal multi-step answer).
+is one raw `POST {base}/chat/completions` round trip with a five-minute per-round-trip timeout — a
+request may itself be an LLM-internal multi-step answer.
 
 **Tool-calling** (`assistant_tools.rs`) is OpenAI-style function calling over the app's **own local
-data only** — SQLite caches + FTS5 index per mail account, CardDAV contact snapshots, the merged
-task set — no live IMAP/CalDAV traffic is ever triggered by a tool call, and nothing leaves the
-machine beyond the request the prompt itself provokes. Six read-only tools are exposed:
+data only** — SQLite caches + FTS5 index per mail account, CardDAV/Graph contact snapshots, the
+merged task set — no live IMAP/CalDAV/Graph traffic is ever triggered by a tool call, and nothing
+leaves the machine beyond the request the prompt itself provokes. Six read-only tools are exposed:
 `recent_emails`, `search_emails` (FTS over subject/sender/recipients/body), `top_contacts`,
 `list_contacts`, `list_tasks`, `upcoming_events`. **No write/compose/send tool exists** — the
 assistant cannot take action, only answer from local data.
@@ -1019,9 +1194,14 @@ more likely to get mangled by the model than a short delimited pair.
 | Task | Start here |
 |---|---|
 | Add an IMAP command/event | `crates/mail/src/session.rs` — extend `AccountCommand`/`AccountEvent`, dispatch in `connect_and_run`'s `match`, handle in `window/connect.rs`'s account event loop |
-| Add a CalDAV command/event | `crates/dav/src/session.rs`, same pattern via `CalendarCommand`/`CalendarSessionEvent` |
+| Add a CalDAV command/event | `crates/core/src/calendar_protocol.rs` (`CalendarCommand`/`CalendarSessionEvent`), then `crates/dav/src/session.rs` and `window/connect.rs` |
+| Add a Graph command/event | `crates/graph/src/{calendar,contacts,todo,mail}/session.rs` (or the corresponding `*Client`), reusing `lookout_core` types and the actor's channel pair |
 | Add a cached field to a message | `crates/core/src/email.rs` (`EmailSummary`/`EmailBody`, remember `#[serde(default)]`), bump `ENVELOPE_CACHE_VERSION`/`BODY_CACHE_VERSION` in `crates/mail/src/cache.rs` if the shape changes incompatibly |
+| Add a cached field to an event/task | `crates/core/src/calendar.rs`, then bump `CALENDAR_CACHE_VERSION` in `crates/dav/src/cache.rs` if the stored JSON shape changes incompatibly |
 | Add a Settings toggle | `crates/app/src/settings.rs` (GSettings key) + the app's `data/gschema/*.xml` + wire it into `config_view.rs`/`build_window` |
 | Add a UI-persisted (non-cache) preference | `crates/app/src/ui_state_db.rs` if it's per-item state, `app_config.rs` if it's structured config |
+| Add a ribbon control | `crates/app/src/ribbon.rs` (`RibbonBand`/`RibbonGroup`), then dress the already-wired widget in `window.rs` or `compose.rs`; keep the existing handler and let `RibbonOverflow` handle narrowing |
+| Add a directory backend | `crates/app/src/directory.rs` (`DirectoryBackend`/`DirectorySource`) and wire it into the composer, picker and People search |
+| Add an EDS source kind | `crates/eds/src/` and `crates/app/src/eds_directory.rs`; keep `Eds::connect` lazy and failures as "no hits" |
 | Add an AI assistant tool | `crates/app/src/assistant_tools.rs` — `tool_definitions()` + a branch in `execute_tool()`, keep it read-only over local caches |
 | Add a new pane/module to the shell | `crates/app/src/window.rs`'s `build_window` (`root_stack` + nav rail wiring), following the data-in/widget-out convention (`calendar_view.rs`/`folder_tree.rs`/`config_view.rs` are the cleanest examples) |
