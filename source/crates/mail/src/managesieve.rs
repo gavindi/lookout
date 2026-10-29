@@ -350,6 +350,27 @@ pub async fn connect(host: &str, port: u16, security: SieveSecurity) -> Result<M
     }
 }
 
+/// Connects with STARTTLS (the RFC 5804 default on port 4190). A server that
+/// refuses the upgrade is an error, not a cue to retry in cleartext: an
+/// on-path attacker can strip `STARTTLS` from the capability list, and the
+/// next step is `AUTHENTICATE PLAIN` with the account password. Only a
+/// loopback host (a local test or development server) may fall back to
+/// [`SieveSecurity::Plain`].
+pub async fn connect_starttls(host: &str, port: u16) -> Result<ManageSieveClient> {
+    match connect(host, port, SieveSecurity::StartTls).await {
+        Ok(client) => Ok(client),
+        Err(_) if plaintext_fallback_allowed(host) => connect(host, port, SieveSecurity::Plain).await,
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `host` is loopback, the only place a cleartext ManageSieve
+/// connection can't be read or downgraded by anyone else on the network.
+pub fn plaintext_fallback_allowed(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +468,40 @@ mod tests {
         client.read_greeting().await.unwrap();
         let result = client.authenticate_plain("user", "wrong").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn only_loopback_hosts_may_fall_back_to_plaintext() {
+        for host in ["localhost", "LOCALHOST", "127.0.0.1", "127.8.9.1", "::1", "[::1]"] {
+            assert!(plaintext_fallback_allowed(host), "{host} is loopback");
+        }
+        for host in ["mail.example.com", "10.0.0.1", "192.168.1.5", "::ffff:10.0.0.1", "localhost.example.com", ""] {
+            assert!(!plaintext_fallback_allowed(host), "{host} is not loopback");
+        }
+    }
+
+    /// A server that doesn't advertise STARTTLS (or had it stripped by an
+    /// attacker) is refused before anything is sent, so no credentials can
+    /// follow on the cleartext connection.
+    #[tokio::test]
+    async fn starttls_refuses_a_server_without_the_upgrade() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            reader
+                .get_mut()
+                .write_all(b"\"IMPLEMENTATION\" \"Test\"\r\n\"SASL\" \"PLAIN\"\r\nOK \"ready\"\r\n")
+                .await
+                .unwrap();
+            let mut line = String::new();
+            let read = reader.read_line(&mut line).await.unwrap_or(0);
+            assert_eq!(read, 0, "the client sent {line:?} after a greeting without STARTTLS");
+        });
+        let result = connect("127.0.0.1", port, SieveSecurity::StartTls).await;
+        assert!(matches!(result, Err(Error::Sieve(ref message)) if message.contains("STARTTLS")));
+        drop(result);
+        server.await.unwrap();
     }
 }

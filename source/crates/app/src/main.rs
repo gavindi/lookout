@@ -69,6 +69,7 @@ mod message_menu;
 mod message_window;
 mod microsoft_oauth;
 mod my_day;
+mod oauth_loopback;
 mod online_accounts;
 mod other_accounts;
 mod privacy;

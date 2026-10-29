@@ -266,11 +266,11 @@ impl GraphClient {
     }
 
     async fn send_request(&self, method: Method, path: &str, body: Option<RequestBody<'_>>, headers: &[(&str, &str)]) -> Result<reqwest::Response> {
-        let url = self.absolute(path);
+        let url = self.checked_url(path)?;
         let mut attempt = 0u32;
         loop {
             let token = self.tokens.graph_token().await?;
-            let mut request = self.http.request(method.clone(), &url).bearer_auth(token);
+            let mut request = self.http.request(method.clone(), url.clone()).bearer_auth(token);
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
@@ -328,6 +328,27 @@ impl GraphClient {
             format!("{}/{}", self.base_url, url.trim_start_matches('/'))
         }
     }
+
+    /// [`Self::absolute`], refusing any URL whose origin differs from the
+    /// service root's: the result gets the bearer token, and an absolute URL
+    /// can come from a server response or the on-disk cache. The path may
+    /// differ (`/beta` on the same host is fine).
+    fn checked_url(&self, path: &str) -> Result<reqwest::Url> {
+        let resolved = self.absolute(path);
+        let untrusted = || GraphError::UntrustedUrl(truncate(resolved.clone(), 200));
+        let url = reqwest::Url::parse(&resolved).map_err(|_| untrusted())?;
+        let base = reqwest::Url::parse(&self.base_url).map_err(|_| untrusted())?;
+        if same_origin(&url, &base) {
+            Ok(url)
+        } else {
+            Err(untrusted())
+        }
+    }
+}
+
+/// Whether two URLs share scheme, host and (effective) port.
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme() && a.host_str().is_some() && a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
 }
 
 /// The `value` array of a Graph collection response (empty for non-collection
@@ -428,6 +449,45 @@ mod tests {
         assert_eq!(client.absolute("me/messages"), "https://graph.microsoft.com/v1.0/me/messages");
         assert_eq!(client.absolute("/me/messages"), "https://graph.microsoft.com/v1.0/me/messages");
         assert_eq!(client.absolute("https://graph.microsoft.com/beta/me"), "https://graph.microsoft.com/beta/me");
+    }
+
+    #[test]
+    fn the_token_only_goes_to_the_service_roots_origin() {
+        let client = GraphClient::with_base_url(Arc::new(StubTokens), "https://graph.microsoft.com/v1.0");
+        for allowed in [
+            "me/messages",
+            "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=x",
+            "https://graph.microsoft.com/beta/me",
+            "https://graph.microsoft.com:443/v1.0/me",
+            "https://GRAPH.microsoft.com/v1.0/me",
+        ] {
+            assert!(client.checked_url(allowed).is_ok(), "{allowed} should be allowed");
+        }
+        for refused in [
+            "https://evil.example/v1.0/me",
+            "http://graph.microsoft.com/v1.0/me",
+            "https://graph.microsoft.com@evil.example/v1.0/me",
+            "https://graph.microsoft.com.evil.example/v1.0/me",
+            "https://graph.microsoft.com:8443/v1.0/me",
+        ] {
+            assert!(matches!(client.checked_url(refused), Err(GraphError::UntrustedUrl(_))), "{refused} should be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_next_link_to_another_host_is_not_followed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [{"id": "1"}],
+                "@odata.nextLink": "https://evil.example/v1.0/messages-page-2"
+            })))
+            .mount(&server)
+            .await;
+
+        let result = client(&server).get_all("me/messages", 100).await;
+        assert!(matches!(result, Err(GraphError::UntrustedUrl(ref url)) if url.contains("evil.example")), "got {result:?}");
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gtk::{gio, glib};
-use lookout_core::text::{base64url_encode, parse_query, percent_encode};
+use lookout_core::text::{base64url_encode, percent_encode};
 use lookout_core::{CalendarId, CalendarTask, TaskPriority, TaskStatus, TaskUid};
 
 /// The scope the Tasks API requires. `offline_access` makes the token
@@ -214,7 +214,7 @@ impl GoogleTasksOAuth {
         open_browser(&authorize_url)?;
         tracing::info!("opened a browser for Google Tasks authorization; waiting for the redirect to {redirect_uri}");
 
-        let code = tokio::time::timeout(AUTH_TIMEOUT, receive_auth_code(listener, &state))
+        let code = tokio::time::timeout(AUTH_TIMEOUT, crate::oauth_loopback::receive_auth_code(listener, &state, "Google"))
             .await
             .map_err(|_| format!("timed out waiting for Google Tasks authorization (browser was opened to {authorize_url})"))??;
 
@@ -810,69 +810,6 @@ fn api_error_string(e: ApiError) -> String {
 // ---------------------------------------------------------------------------
 // Shared OAuth plumbing (mirrors microsoft_oauth.rs)
 // ---------------------------------------------------------------------------
-
-async fn receive_auth_code(listener: tokio::net::TcpListener, state: &str) -> Result<String, String> {
-    loop {
-        let (mut sock, _) = listener.accept().await.map_err(|e| e.to_string())?;
-        let request = match read_request_until_headers(&mut sock).await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let path = request.split_whitespace().nth(1).unwrap_or("/");
-        let Some(query) = path.split_once('?').map(|(_, q)| q) else {
-            let _ = respond_html(&mut sock, "No authorization code received; close this window.").await;
-            continue;
-        };
-        let params = parse_query(query);
-
-        if let Some(received_state) = params.get("state") {
-            if received_state != state {
-                let _ = respond_html(&mut sock, "Authorization state mismatch; close this window and try again.").await;
-                continue;
-            }
-        }
-        if let Some(error) = params.get("error") {
-            let _ = respond_html(&mut sock, "Google sign-in was cancelled or failed.").await;
-            return Err(format!("Google authorization failed: {error}"));
-        }
-        if let Some(code) = params.get("code") {
-            let _ = respond_html(&mut sock, "Authorization complete - you can close this window and return to Lookout.").await;
-            return Ok(code.clone());
-        }
-        let _ = respond_html(&mut sock, "No authorization code received; close this window.").await;
-    }
-}
-
-async fn read_request_until_headers(sock: &mut tokio::net::TcpStream) -> Result<String, String> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 1024];
-    loop {
-        let n = sock.read(&mut chunk).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16384 {
-            break;
-        }
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-async fn respond_html(sock: &mut tokio::net::TcpStream, message: &str) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body \
-         style=\"font-family:sans-serif;margin:3rem;font-size:1.1rem\"><p>{message}</p></body></html>"
-    );
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    sock.write_all(resp.as_bytes()).await
-}
 
 fn open_browser(url: &str) -> Result<(), String> {
     gio::AppInfo::launch_default_for_uri(url, None::<&gio::AppLaunchContext>).map_err(|e| format!("couldn't open a browser to authorize Google Tasks: {e}"))

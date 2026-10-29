@@ -29,22 +29,25 @@ Line numbers are as of `b081c24` on `dev`.
 
 ## Tier 1 — Security
 
-1. ✔ **ManageSieve falls back to plaintext and sends the password.** [session.rs:6030-6058](source/crates/mail/src/session.rs#L6030-L6058).
+1. ✔ **Fixed** — **ManageSieve falls back to plaintext and sends the password.** [session.rs:6030-6058](source/crates/mail/src/session.rs#L6030-L6058).
    - **Code:** `upload_sieve_script` and `fetch_sieve_capabilities` both do `connect(.., StartTls)`, and on *any* error retry `connect(.., Plain)`, then `authenticate_plain(username, password)`.
    - **Failure:** an on-path attacker only has to strip `STARTTLS` from the capability list ([managesieve.rs:337](source/crates/mail/src/managesieve.rs#L337) then errors with "server does not offer STARTTLS"). The client reconnects in cleartext and sends the account's IMAP password in base64.
    - **Triggers:** this runs on every rule save and every automatic-replies settings open ([graph_sync.rs:759](source/crates/app/src/window/graph_sync.rs#L759)).
    - **Fix:** never fall back to `Plain` for a non-loopback host. Make `Plain` reachable only from tests or `localhost`, and surface "server does not offer STARTTLS" as a `SieveFailed`. If a user really needs it, add an explicit per-account opt-in rather than a silent fallback.
+   - **Fixed (0.9.297):** both callers use the new `managesieve::connect_starttls`, which falls back to `Plain` only when `plaintext_fallback_allowed(host)` (localhost or a loopback IP). A server without STARTTLS now fails with `SieveFailed`. Covered by `only_loopback_hosts_may_fall_back_to_plaintext` and `starttls_refuses_a_server_without_the_upgrade`.
 
-2. ✔ **OAuth loopback accepts a code with no `state`.** [microsoft_oauth.rs:635-640](source/crates/app/src/microsoft_oauth.rs#L635-L640), [google_tasks.rs:828-833](source/crates/app/src/google_tasks.rs#L828-L833).
+2. ✔ **Fixed** — **OAuth loopback accepts a code with no `state`.** [microsoft_oauth.rs:635-640](source/crates/app/src/microsoft_oauth.rs#L635-L640), [google_tasks.rs:828-833](source/crates/app/src/google_tasks.rs#L828-L833).
    - **Code:** `if let Some(received_state) = params.get("state") { if received_state != state { … } }`. A request that omits `state` skips the check entirely and its `code` is accepted. An `error=` without `state` aborts the flow.
    - **Failure:** any local process that finds the ephemeral port, or a page that makes the browser hit it, can inject its own authorization code (login CSRF: the account gets bound to the attacker's tenant/mailbox) or cancel a sign-in.
    - **Fix:** require `params.get("state") == Some(state)` before looking at `code` or `error`, and ignore everything else.
    - **Hardening:** `read_request_until_headers` ([microsoft_oauth.rs:653](source/crates/app/src/microsoft_oauth.rs#L653)) has no per-connection read timeout. A connection that sends nothing stalls the single accept loop until `AUTH_TIMEOUT`. Wrap each read in a short `tokio::time::timeout`.
+   - **Fixed (0.9.297):** the two copies are now one `app/src/oauth_loopback.rs`. `classify_redirect` requires the exact `state` before it looks at `code` or `error`, and each request read is bounded at 10 s. Covered by the module's six tests.
 
-3. ✔ **Graph bearer token goes to any absolute URL.** [client.rs:319-326](source/crates/graph/src/client.rs#L319-L326).
+3. ✔ **Fixed** — **Graph bearer token goes to any absolute URL.** [client.rs:319-326](source/crates/graph/src/client.rs#L319-L326).
    - **Code:** `absolute()` passes any `http(s)://` URL through, and `send_request` attaches `bearer_auth(token)` to it. Next/delta links persisted in the mail cache (`graph_delta_cursor`, `graph_folder_cursors`) are fed back through this path.
    - **Failure:** a tampered cache file, or a malicious redirect target, gets the user's Graph token.
    - **Fix:** only attach the token when the URL's origin equals `base_url`'s (`graph.microsoft.com`). Reject any other host.
+   - **Fixed (0.9.297):** `send_request` resolves every URL through `checked_url`, which returns the new `GraphError::UntrustedUrl` unless scheme, host and port match the service root (a different path on the same host is fine). Covered by `the_token_only_goes_to_the_service_roots_origin` and `a_next_link_to_another_host_is_not_followed`.
 
 ## Tier 2 — Correctness: duplicate sends, lost edits, deleted mail
 

@@ -40,6 +40,11 @@ pub enum GraphError {
     /// without recurrence (the editor normally catches this first).
     #[error("Microsoft 365 can't store this recurrence rule: {0}")]
     UnsupportedRecurrence(String),
+    /// A request URL - usually a server-supplied `@odata.nextLink` /
+    /// `@odata.deltaLink`, or one read back from the cache - points outside
+    /// this client's service root, so the bearer token is not sent there.
+    #[error("refusing to send Microsoft credentials to {0}")]
+    UntrustedUrl(String),
 }
 
 impl GraphError {

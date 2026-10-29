@@ -6024,15 +6024,12 @@ struct ServerCapabilities {
 }
 
 /// Uploads a compiled Sieve script to the account's ManageSieve server
-/// (item 2.5), making it Lookout's own active script. Tries STARTTLS first
-/// (the RFC 5804 default on port 4190) and falls back to a plain connection
-/// for servers that don't offer the upgrade.
+/// (item 2.5), making it Lookout's own active script. Requires STARTTLS
+/// (see [`crate::managesieve::connect_starttls`]): a server that doesn't offer
+/// the upgrade fails the upload rather than receiving the password in clear.
 async fn upload_sieve_script(host: &str, username: &str, password: &str, script: &str) -> Result<()> {
-    use crate::managesieve::{self, SieveSecurity};
-    let mut client = match managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::StartTls).await {
-        Ok(client) => client,
-        Err(_) => managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::Plain).await?,
-    };
+    use crate::managesieve;
+    let mut client = managesieve::connect_starttls(host, managesieve::DEFAULT_PORT).await?;
     client.authenticate_plain(username, password).await?;
     client.check_script(script).await?;
     client.put_script(crate::sieve::SCRIPT_NAME, script).await?;
@@ -6042,14 +6039,11 @@ async fn upload_sieve_script(host: &str, username: &str, password: &str, script:
 }
 
 /// Asks the account's ManageSieve server which extensions it supports
-/// (item 2.11's capability probe), on the same STARTTLS-then-plain connection
+/// (item 2.11's capability probe), on the same STARTTLS-only connection
 /// [`upload_sieve_script`] uses.
 async fn fetch_sieve_capabilities(host: &str, username: &str, password: &str) -> Result<crate::managesieve::SieveCapabilities> {
-    use crate::managesieve::{self, SieveSecurity};
-    let mut client = match managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::StartTls).await {
-        Ok(client) => client,
-        Err(_) => managesieve::connect(host, managesieve::DEFAULT_PORT, SieveSecurity::Plain).await?,
-    };
+    use crate::managesieve;
+    let mut client = managesieve::connect_starttls(host, managesieve::DEFAULT_PORT).await?;
     client.authenticate_plain(username, password).await?;
     let capabilities = client.capabilities().await?;
     let _ = client.logout().await;
