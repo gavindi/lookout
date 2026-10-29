@@ -1711,6 +1711,9 @@ pub(crate) struct UiState {
     /// cursor per account (see `GraphPropertySyncs`). Forgotten on account
     /// removal.
     pub(crate) graph_property_syncs: super::graph_sync::GraphPropertySyncs,
+    /// Outlook rules pulls+pushes in flight, one per account (see
+    /// `GraphRuleSyncs`). Forgotten on account removal.
+    pub(crate) graph_rule_syncs: super::graph_sync::GraphRuleSyncs,
     /// How the message list is ordered, set from the list header's sort
     /// controls. Applied in `repopulate_message_list` - the single choke point
     /// every list rebuild passes through - so the order is uniform no matter

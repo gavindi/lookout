@@ -268,6 +268,12 @@ impl GraphClient {
     async fn send_request(&self, method: Method, path: &str, body: Option<RequestBody<'_>>, headers: &[(&str, &str)]) -> Result<reqwest::Response> {
         let url = self.checked_url(path)?;
         let mut attempt = 0u32;
+        // A 401 means the cached access token was rejected (expired while the
+        // machine slept, revoked, or issued for the wrong audience). Evict it
+        // and retry exactly once with a freshly refreshed token; a second 401
+        // is a real authorization failure. Kept separate from the throttle
+        // counter so one does not consume the other's budget.
+        let mut reauthorized = false;
         loop {
             let token = self.tokens.graph_token().await?;
             let mut request = self.http.request(method.clone(), url.clone()).bearer_auth(token);
@@ -287,11 +293,29 @@ impl GraphClient {
                 return Ok(response);
             }
 
+            if status == StatusCode::UNAUTHORIZED && !reauthorized {
+                reauthorized = true;
+                self.tokens.invalidate().await;
+                continue;
+            }
+
             if is_throttled(status) {
                 let retry_after = retry_after(response.headers());
+                // `Retry-After` is a server hint, not a command: never block
+                // this (serial) session actor for longer than the cap. When
+                // the server asks for more than we will wait, give up now and
+                // let the caller reschedule instead of sleeping inside the
+                // actor - a 1-hour `Retry-After` used to freeze every queued
+                // move, send and body fetch behind it.
+                if retry_after.is_some_and(|delay| delay > MAX_RETRY_DELAY) {
+                    return Err(GraphError::Throttled {
+                        attempts: attempt + 1,
+                        retry_after,
+                    });
+                }
                 if attempt < self.max_retries {
                     attempt += 1;
-                    let delay = retry_after.unwrap_or_else(|| backoff(attempt));
+                    let delay = retry_after.unwrap_or_else(|| backoff(attempt)).min(MAX_RETRY_DELAY);
                     tracing::debug!(%url, attempt, ?delay, "Graph throttled; retrying");
                     tokio::time::sleep(delay).await;
                     continue;
@@ -399,7 +423,9 @@ fn truncate(mut text: String, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Instant;
 
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -420,6 +446,27 @@ mod tests {
         }
         async fn ensure_scopes(&self, _scopes: &[&str]) -> Result<()> {
             Ok(())
+        }
+    }
+
+    /// A provider whose cached token starts out rejected: `graph_token` hands
+    /// out `stale-token` until `invalidate` is called, then `fresh-token`.
+    /// Counts invalidations so a test can pin "exactly once".
+    struct ReauthTokens {
+        invalidations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TokenProvider for ReauthTokens {
+        async fn graph_token(&self) -> Result<String> {
+            let token = if self.invalidations.load(Ordering::SeqCst) == 0 { "stale-token" } else { "fresh-token" };
+            Ok(token.to_string())
+        }
+        async fn ensure_scopes(&self, _scopes: &[&str]) -> Result<()> {
+            Ok(())
+        }
+        async fn invalidate(&self) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -575,6 +622,72 @@ mod tests {
 
         let error = client(&server).with_max_retries(2).get("me/messages").await.unwrap_err();
         assert!(matches!(error, GraphError::Throttled { attempts: 3, .. }), "got {error:?}");
+    }
+
+    /// A `Retry-After` longer than the cap must not be slept inside the
+    /// session actor: the request gives up immediately so the caller can
+    /// reschedule.
+    #[tokio::test]
+    async fn an_over_cap_retry_after_gives_up_without_sleeping() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "3600"))
+            .mount(&server)
+            .await;
+
+        let started = Instant::now();
+        let error = client(&server).get("me/messages").await.unwrap_err();
+        assert!(
+            matches!(error, GraphError::Throttled { attempts: 1, retry_after: Some(delay) } if delay == Duration::from_secs(3600)),
+            "got {error:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2), "the client slept instead of rescheduling");
+    }
+
+    /// A 401 evicts the cached access token and retries exactly once with the
+    /// refreshed one.
+    #[tokio::test]
+    async fn a_401_evicts_the_token_and_retries_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages"))
+            .and(header("Authorization", "Bearer stale-token"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages"))
+            .and(header("Authorization", "Bearer fresh-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [] })))
+            .mount(&server)
+            .await;
+
+        let tokens = Arc::new(ReauthTokens {
+            invalidations: AtomicUsize::new(0),
+        });
+        let client = GraphClient::with_base_url(tokens.clone(), format!("{}/v1.0", server.uri()));
+        client.get("me/messages").await.unwrap();
+        assert_eq!(tokens.invalidations.load(Ordering::SeqCst), 1, "the stale token is evicted once");
+    }
+
+    /// A second 401 is a real authorization failure, not another refresh.
+    #[tokio::test]
+    async fn a_second_401_is_reported_as_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/messages"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let tokens = Arc::new(ReauthTokens {
+            invalidations: AtomicUsize::new(0),
+        });
+        let client = GraphClient::with_base_url(tokens.clone(), format!("{}/v1.0", server.uri()));
+        assert!(matches!(client.get("me/messages").await.unwrap_err(), GraphError::Unauthorized));
+        assert_eq!(tokens.invalidations.load(Ordering::SeqCst), 1, "only the first 401 triggers a refresh");
     }
 
     #[tokio::test]

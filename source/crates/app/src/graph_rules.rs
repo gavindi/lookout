@@ -394,6 +394,7 @@ pub fn rule_from_graph(value: &Value, folders: &[GraphFolder], account: &Account
         conditions: conditions_from_graph(value.get("conditions"), folders),
         exceptions: conditions_from_graph(value.get("exceptions"), folders),
         actions: actions_from_graph(value.get("actions"), folders),
+        synced: None,
     })
 }
 

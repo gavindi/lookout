@@ -58,7 +58,7 @@ pub use interop::{
 pub use interop::{snooze_keyword, snooze_keywords, snooze_until_from_keyword, snooze_until_from_keywords, SCHEDULED_FOLDER_NAME, SNOOZE_KEYWORD_PREFIX};
 pub use mailbox::{display_name, display_name_for, role_display_name, Mailbox, MailboxRole};
 pub use quick_step::{default_quick_steps, QuickStep};
-pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleTarget, SizeComparison};
+pub use rules::{Rule, RuleAction, RuleBackend, RuleCondition, RuleContext, RuleSync, RuleTarget, SizeComparison};
 pub use signature::Signature;
 pub use template::MailTemplate;
 pub use thread::{ThreadGroup, ThreadKey};

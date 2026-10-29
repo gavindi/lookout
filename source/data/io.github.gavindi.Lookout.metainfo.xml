@@ -75,6 +75,12 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.298" date="2026-10-30">
+      <description>
+        <p>Correctness fixes. Sending a message twice quickly no longer sends it twice, and closing a rich-text draft within the five-second autosave window no longer loses the last edits. Once your mail server accepts a message, Lookout now removes it from the outbox before archiving the Sent copy, so quitting or losing the network in between cannot resend it on the next start.</p>
+        <p>Emptying a folder now deletes only the messages that were there when you confirmed, so mail that arrives during the operation is kept. Outlook inbox rules stay in step in both directions: a rule deleted in Outlook is no longer brought back, and an edit made in Lookout is pushed instead of being overwritten. Microsoft 365 sign-ins recover immediately after the computer wakes from sleep, and a long server throttling request no longer freezes mail actions.</p>
+      </description>
+    </release>
     <release version="0.9.297" date="2026-10-30">
       <description>
         <p>Security fixes. Uploading mail rules to a ManageSieve server now requires an encrypted (STARTTLS) connection and no longer falls back to sending your password in clear text; a server without encryption now reports an error instead. Microsoft and Google sign-in only accept a browser redirect that carries the exact sign-in request token, so another program on your computer can't slip in its own account or cancel the sign-in. Microsoft 365 requests only ever send your sign-in token to Microsoft Graph itself, never to a link pointing elsewhere.</p>

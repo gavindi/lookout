@@ -1004,8 +1004,9 @@ pub enum AccountEvent {
     FlaggedMessages {
         messages: Vec<EmailSummary>,
     },
-    /// The answer to an `AccountCommand::EmptyMailbox`: every message is gone
-    /// from the server. `role` is the emptied mailbox's role (Trash/Junk),
+    /// The answer to an `AccountCommand::EmptyMailbox`: every message the
+    /// search snapshot saw is gone from the server (mail delivered after that
+    /// snapshot survives). `role` is the emptied mailbox's role (Trash/Junk),
     /// so the UI can name the confirmation toast.
     MailboxExpunged {
         role: MailboxRole,
@@ -1074,6 +1075,12 @@ pub enum AccountEvent {
 pub trait CredentialProvider: Send + Sync {
     async fn imap_credential(&self) -> std::result::Result<Credential, String>;
     async fn smtp_credential(&self) -> std::result::Result<Credential, String>;
+
+    /// Drops a cached access token after the server rejected it
+    /// (`AUTHENTICATE`/`AUTH` failed). The next credential fetch then refreshes
+    /// instead of replaying the same stale token through the reconnect
+    /// backoff. Defaulted to a no-op for password and GOA providers.
+    async fn invalidate_credential(&self) {}
 }
 
 /// The session's optional on-disk cache, shared with the blocking thread pool.
@@ -1585,7 +1592,17 @@ async fn connect_and_run(
     copy_ledger: &mut MoveLedger,
 ) -> Result<ShutdownReason> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, caps) = login(config, credential).await?;
+    let (mut session, caps) = match login(config, credential).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // A rejected token must not be replayed from the cache through
+            // every backoff attempt: drop it so the reconnect refreshes.
+            if matches!(error, Error::AuthRejected(_)) {
+                credentials.invalidate_credential().await;
+            }
+            return Err(error);
+        }
+    };
     // `has_idle` isn't consulted here - the primary connection's own IDLE
     // wait is unconditional, as before. It's only used by the dedicated
     // IDLE-only connection's own `login()` (see `run_idle_supervisor`) to
@@ -1776,6 +1793,12 @@ async fn connect_and_run(
             .await
             .and_then(|r| r.ok())
             .unwrap_or_default();
+            // Post-send work is deferred until the whole due batch is done:
+            // one Sent resync and one reselect for N messages instead of N of
+            // each. `selection_moved` tracks a draft delete leaving the
+            // session SELECTed on Drafts.
+            let mut sent_to_sync: Option<MailboxId> = None;
+            let mut selection_moved = false;
             for entry in due {
                 let id = entry.id;
                 let attempts = entry.attempts;
@@ -1793,94 +1816,34 @@ async fn connect_and_run(
                 };
                 match sent {
                     Ok(()) => {
-                        // Archive the sent copy (best-effort: the message *was*
-                        // sent), then delete the draft it replaces so a queued
-                        // send leaves drafts in place until it actually lands.
-                        let sent_mailbox = archive_sent_message(&mut session, &folders, &account_id, &raw).await;
+                        // The transport accepted the message, so the row has
+                        // done its job: delete it *before* the archive and
+                        // draft round trips. A crash, quit or lost network in
+                        // between must not leave a `pending` row that sends
+                        // the message again on the next start.
+                        cache_op(cache, move |c| c.delete_outbox(id)).await;
+                        let _ = events.send(AccountEvent::OutboxSent { id }).await;
+
+                        // Everything below is best-effort: the message *was*
+                        // sent. Archive the sent copy, then delete the draft
+                        // it replaces so a queued send leaves drafts in place
+                        // until it actually lands.
+                        if let Some(sent_id) = archive_sent_message(&mut session, &folders, &account_id, &raw).await {
+                            sent_to_sync.get_or_insert(sent_id);
+                        }
                         if let Some(draft_id) = message.draft_message_id.as_deref() {
                             if let Err(e) = delete_draft(&mut session, &folders, &account_id, draft_id, has_uidplus).await {
                                 tracing::warn!("message sent but deleting its draft failed: {e}");
                             }
-                        }
-                        cache_op(cache, move |c| c.delete_outbox(id)).await;
-                        let _ = events.send(AccountEvent::OutboxSent { id }).await;
-
-                        // Resync Sent so the archived copy isn't hidden behind
-                        // the cache-hit shortcut in `SyncMailbox`, then restore
-                        // the open folder. (Moved here from the old synchronous
-                        // `SendMessage` handler.)
-                        if let Some(sent_id) = sent_mailbox {
-                            if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
-                                let mut ids = vec![sent_id.clone()];
-                                if sent_id != current_mailbox_id {
-                                    ids.push(current_mailbox_id.clone());
-                                }
-                                let open_changed = refresh_folders_targeted(
-                                    &mut session,
-                                    &mut folders,
-                                    &account_id,
-                                    &ids,
-                                    &current_mailbox_id,
-                                    condstore,
-                                    cache,
-                                    events,
-                                    &mut dirty_mailboxes,
-                                )
-                                .await;
-                                sync_mailbox(
-                                    &mut session,
-                                    &account_id,
-                                    &path,
-                                    &sent_id,
-                                    events,
-                                    cache,
-                                    &mut folders,
-                                    interactive_commands,
-                                    Some(&session_selected),
-                                    condstore,
-                                    qresync,
-                                    local_focus,
-                                )
-                                .await?;
-                                dirty_mailboxes.remove(&sent_id);
-                                session_selected = sent_id.clone();
-                                if session_selected != current_mailbox_id {
-                                    session.select(&current_mailbox_name).await?;
-                                    session_selected = current_mailbox_id.clone();
-                                }
-                                // The re-list's LIST-STATUS counts said the
-                                // open folder changed and the Sent sync above
-                                // didn't cover it - resync so the sidebar and
-                                // the list on screen agree.
-                                if open_changed && sent_id != current_mailbox_id {
-                                    sync_mailbox(
-                                        &mut session,
-                                        &account_id,
-                                        &current_mailbox_name,
-                                        &current_mailbox_id,
-                                        events,
-                                        cache,
-                                        &mut folders,
-                                        interactive_commands,
-                                        Some(&session_selected),
-                                        condstore,
-                                        qresync,
-                                        local_focus,
-                                    )
-                                    .await?;
-                                    dirty_mailboxes.remove(&current_mailbox_id);
-                                    session_selected = current_mailbox_id.clone();
-                                }
-                            }
-                        } else if message.draft_message_id.is_some() {
-                            // `delete_draft` left the session SELECTed on
-                            // Drafts and there's no Sent resync to restore the
-                            // user's folder, so do it here.
-                            session.select(&current_mailbox_name).await?;
-                            session_selected = current_mailbox_id.clone();
+                            selection_moved = true;
                         }
                     }
                     Err(e) => {
+                        if matches!(&e, Error::AuthRejected(_)) {
+                            // SMTP rejected the token itself: evict it so the
+                            // retry refreshes instead of replaying a stale one.
+                            credentials.invalidate_credential().await;
+                        }
                         let retry_at = chrono::Utc::now() + outbox_retry_delay(attempts + 1);
                         let state = cache_op(cache, move |c| c.outbox_attempt_failed(id, retry_at, MAX_OUTBOX_ATTEMPTS)).await;
                         match state {
@@ -1903,6 +1866,81 @@ async fn connect_and_run(
                         }
                     }
                 }
+            }
+            // One Sent resync for the whole drained batch, then restore the
+            // user's folder. (Moved here from the old synchronous
+            // `SendMessage` handler; batching keeps an N-message offline
+            // outbox from costing N Sent syncs and N reselects.)
+            let mut selection_restored = false;
+            if let Some(sent_id) = sent_to_sync {
+                if let Some(path) = sent_id.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) {
+                    let mut ids = vec![sent_id.clone()];
+                    if sent_id != current_mailbox_id {
+                        ids.push(current_mailbox_id.clone());
+                    }
+                    let open_changed = refresh_folders_targeted(
+                        &mut session,
+                        &mut folders,
+                        &account_id,
+                        &ids,
+                        &current_mailbox_id,
+                        condstore,
+                        cache,
+                        events,
+                        &mut dirty_mailboxes,
+                    )
+                    .await;
+                    sync_mailbox(
+                        &mut session,
+                        &account_id,
+                        &path,
+                        &sent_id,
+                        events,
+                        cache,
+                        &mut folders,
+                        interactive_commands,
+                        Some(&session_selected),
+                        condstore,
+                        qresync,
+                        local_focus,
+                    )
+                    .await?;
+                    dirty_mailboxes.remove(&sent_id);
+                    session_selected = sent_id.clone();
+                    if session_selected != current_mailbox_id {
+                        session.select(&current_mailbox_name).await?;
+                        session_selected = current_mailbox_id.clone();
+                    }
+                    // The re-list's LIST-STATUS counts said the open folder
+                    // changed and the Sent sync above didn't cover it - resync
+                    // so the sidebar and the list on screen agree.
+                    if open_changed && sent_id != current_mailbox_id {
+                        sync_mailbox(
+                            &mut session,
+                            &account_id,
+                            &current_mailbox_name,
+                            &current_mailbox_id,
+                            events,
+                            cache,
+                            &mut folders,
+                            interactive_commands,
+                            Some(&session_selected),
+                            condstore,
+                            qresync,
+                            local_focus,
+                        )
+                        .await?;
+                        dirty_mailboxes.remove(&current_mailbox_id);
+                        session_selected = current_mailbox_id.clone();
+                    }
+                    selection_restored = true;
+                }
+            }
+            if !selection_restored && selection_moved {
+                // A draft delete left the session SELECTed on Drafts and
+                // there's no Sent resync to restore the user's folder.
+                session.select(&current_mailbox_name).await?;
+                session_selected = current_mailbox_id.clone();
             }
             next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
             emit_outbox_contents(cache, events).await;
@@ -3369,20 +3407,21 @@ async fn connect_and_run(
                         session_selected = mailbox.clone();
                     }
                     match empty_mailbox(&mut session, has_uidplus).await {
-                        Ok(count) => {
+                        Ok(uids) => {
                             let role = folders.iter().find(|m| m.id == mailbox).map(|m| m.role).unwrap_or(MailboxRole::Custom);
                             let _ = events.send(AccountEvent::MailboxExpunged { role }).await;
-                            if count > 0 {
-                                if let Some(folder) = folders.iter().find(|m| m.id == mailbox) {
-                                    let uidvalidity = folder.uidvalidity;
-                                    if let Some(Err(e)) = cache_op(cache, {
-                                        let mailbox = mailbox.clone();
-                                        move |c| c.replace_messages(&mailbox, uidvalidity, &[])
-                                    })
-                                    .await
-                                    {
-                                        tracing::warn!("failed to clear emptied mailbox from cache: {e}");
-                                    }
+                            if !uids.is_empty() {
+                                // Delete exactly what was expunged, not the
+                                // whole cached folder: a message that arrived
+                                // after the search was never deleted on the
+                                // server and must stay visible here too.
+                                if let Some(Err(e)) = cache_op(cache, {
+                                    let mailbox = mailbox.clone();
+                                    move |c| c.delete_messages(&mailbox, &uids)
+                                })
+                                .await
+                                {
+                                    tracing::warn!("failed to clear emptied mailbox from cache: {e}");
                                 }
                             }
                             refresh_folders_targeted(
@@ -5037,7 +5076,17 @@ async fn run_idle_connection(
     idle_notify: &async_channel::Sender<MailboxId>,
 ) -> Result<IdleConnectionOutcome> {
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
-    let (mut session, caps) = login(config, credential).await?;
+    let (mut session, caps) = match login(config, credential).await {
+        Ok(connected) => connected,
+        Err(error) => {
+            // Same rule as the primary connection: a rejected token is
+            // evicted so the supervisor's next probe refreshes it.
+            if matches!(error, Error::AuthRejected(_)) {
+                credentials.invalidate_credential().await;
+            }
+            return Err(error);
+        }
+    };
     if !caps.has_idle {
         return Ok(IdleConnectionOutcome::NoIdleCapability);
     }
@@ -5859,27 +5908,35 @@ async fn mark_mailbox_read(session: &mut Session<SessionStream>) -> Result<u32> 
 /// Permanently removes every message in the *currently selected* mailbox -
 /// the server side of `AccountCommand::EmptyMailbox`. `UID SEARCH ALL` +
 /// STORE `\Deleted` + EXPUNGE, reusing the same wire pattern as
-/// `purge_by_message_id`; the whole-mailbox `\Deleted` caveat from
-/// `move_uids_to_path` is exactly the intent here, since nothing else in this
-/// crate sets `\Deleted` inside the folder being emptied. Returns how many
-/// messages were removed (0 when the folder is already empty, with no round
-/// trips beyond the search).
-async fn empty_mailbox(session: &mut Session<SessionStream>, has_uidplus: bool) -> Result<u32> {
-    let uids = session.uid_search("ALL").await?;
-    let count = uids.len() as u32;
+/// `purge_by_message_id`. Returns the UIDs that were flagged and expunged
+/// (empty when the folder is already empty, with no round trips beyond the
+/// search).
+///
+/// Only the *searched* set is flagged, never the whole mailbox (`1:*`): a
+/// message delivered between the search and the STORE - exactly the misfiled
+/// legitimate mail a "Empty Junk" confirmation is likely to race - must not
+/// be deleted unseen. The snapshot is compressed into UID ranges with
+/// [`uid_set_chunks`], so a big folder stays inside the server's command-line
+/// limit without reaching past the snapshot. On a non-UIDPLUS server the
+/// whole-mailbox `EXPUNGE` is still safe: only the snapshot's UIDs carry
+/// `\Deleted`.
+async fn empty_mailbox(session: &mut Session<SessionStream>, has_uidplus: bool) -> Result<Vec<Uid>> {
+    let uids: Vec<Uid> = session.uid_search("ALL").await?.into_iter().map(Uid).collect();
     if uids.is_empty() {
-        return Ok(count);
+        return Ok(uids);
     }
-    // `UID STORE 1:*` covers the whole selected mailbox in one short command
-    // (RFC 3501 §6.4.8: `*` is the largest UID in use), where spelling out
-    // every uid could exceed the server's command-line limit on a big folder.
-    let _: Vec<_> = session.uid_store("1:*", "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    let chunks = uid_set_chunks(&uids);
+    for uid_set in &chunks {
+        let _: Vec<_> = session.uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)").await?.try_collect().await?;
+    }
     if has_uidplus {
-        let _: Vec<_> = session.uid_expunge("1:*").await?.try_collect().await?;
+        for uid_set in &chunks {
+            let _: Vec<_> = session.uid_expunge(uid_set).await?.try_collect().await?;
+        }
     } else {
         let _: Vec<_> = session.expunge().await?.try_collect().await?;
     }
-    Ok(count)
+    Ok(uids)
 }
 
 /// Permanently removes every message in the *currently selected* mailbox
@@ -6050,6 +6107,16 @@ async fn fetch_sieve_capabilities(host: &str, username: &str, password: &str) ->
     Ok(capabilities)
 }
 
+/// Whether an `AUTHENTICATE`/`LOGIN` failure was the server rejecting the
+/// credential (rather than a network or protocol failure), so the cached
+/// access token should be evicted before the next attempt.
+fn is_authentication_rejection(error: &async_imap::error::Error) -> bool {
+    matches!(
+        error,
+        async_imap::error::Error::Bad(_) | async_imap::error::Error::No(_) | async_imap::error::Error::Parse(async_imap::error::ParseError::Authentication(..))
+    )
+}
+
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
     let stream = connect_tls(&config.imap.host, config.imap.port).await?;
     tracing::debug!("login: creating client, reading greeting");
@@ -6066,7 +6133,11 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
         Credential::Password(password) => client.login(&config.imap.username, password).await,
     };
     tracing::debug!("login: auth attempt complete, ok = {}", session.is_ok());
-    let mut session = session.map_err(|(e, _client)| Error::Imap(e))?;
+    let mut session = match session {
+        Ok(session) => session,
+        Err((error, _client)) if is_authentication_rejection(&error) => return Err(Error::AuthRejected(error.to_string())),
+        Err((error, _client)) => return Err(Error::Imap(error)),
+    };
 
     // Capabilities are stable for the connection's lifetime; read them once
     // after auth so every move batch doesn't re-issue a `CAPABILITY` round
@@ -8238,6 +8309,31 @@ mod tests {
     #[test]
     fn uid_set_chunks_sparse_uids_stay_comma_joined() {
         assert_eq!(uid_set_chunks(&[Uid(1), Uid(3), Uid(5)]), vec!["1,3,5"]);
+    }
+
+    /// "Empty folder" flags and expunges only the UIDs its `SEARCH ALL`
+    /// returned. A message that arrives after the snapshot has a higher UID
+    /// and must not turn up in any generated set - that is what stops the
+    /// operation deleting mail the user never saw.
+    #[test]
+    fn an_empty_folder_set_covers_the_search_snapshot_only() {
+        let searched = [Uid(1), Uid(2), Uid(3), Uid(40), Uid(41)];
+        let chunks = uid_set_chunks(&searched);
+        assert_eq!(chunks, vec!["1:3,40:41"]);
+        let covered: Vec<u32> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.split(','))
+            .flat_map(|part| match part.split_once(':') {
+                Some((start, end)) => {
+                    let start: u32 = start.parse().unwrap();
+                    let end: u32 = end.parse().unwrap();
+                    (start..=end).collect()
+                }
+                None => vec![part.parse().unwrap()],
+            })
+            .collect();
+        assert_eq!(covered, vec![1, 2, 3, 40, 41]);
+        assert!(!covered.contains(&42), "a message delivered after the search must survive");
     }
 
     #[test]

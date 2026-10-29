@@ -18,6 +18,8 @@ pub enum Error {
     InvalidServerName(String),
     #[error("login failed: {0}")]
     LoginFailed(String),
+    #[error("authentication rejected: {0}")]
+    AuthRejected(String),
     #[error("no {0:?} folder found")]
     NoSuchFolder(lookout_core::MailboxRole),
     #[error("ManageSieve error: {0}")]

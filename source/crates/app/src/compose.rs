@@ -2479,6 +2479,11 @@ pub fn build_compose_view(
     // Set when the composer closes (Send, Cancel, or being unrooted) so the
     // autosave timer can't fire against a torn-down page.
     let closed = Rc::new(Cell::new(false));
+    // Set from the moment Send is accepted until the composer closes. The
+    // send path awaits the rich editor (and possibly an attachment dialog),
+    // so without this a double-click - or a click plus the ribbon's Send -
+    // queues `SendMessage` twice and the recipient gets the message twice.
+    let sending = Rc::new(Cell::new(false));
     let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
     crate::privacy::mark_ui(&status_label);
     // A reopened draft keeps the saved message's own Message-ID (bare, no
@@ -2687,14 +2692,26 @@ pub fn build_compose_view(
     {
         // Close keeps the draft (its tooltip says so): one last save, then
         // teardown. Distinct from Discard, which deletes the autosaved copy.
+        // The save is awaited *before* `on_done` tears the composer down: the
+        // rich editor can only be read while it is still parented, and the
+        // final edits may land while an autosave tick is already in flight
+        // (`flush` waits that out rather than letting `attempt` bail).
         let on_done = on_done.clone();
         let autosave = autosave.clone();
         let closed = closed.clone();
         close_button.connect_clicked(move |_| {
+            // `closed` only stops the autosave tick here; teardown happens in
+            // `on_done` after the flush. Setting it first also makes a second
+            // Close click a no-op rather than starting a parallel save.
+            if closed.replace(true) {
+                return;
+            }
             let autosave = autosave.clone();
-            glib::spawn_future_local(async move { autosave.attempt().await });
-            closed.set(true);
-            on_done();
+            let on_done = on_done.clone();
+            glib::spawn_future_local(async move {
+                autosave.flush().await;
+                on_done();
+            });
         });
     }
     {
@@ -2726,6 +2743,17 @@ pub fn build_compose_view(
             if to.is_empty() {
                 return;
             }
+            // One send per composer. Everything below can await (the editor
+            // read, the attachment-reminder dialog), and GTK's `emit_by_name`
+            // can fire `clicked` on an insensitive button, so the guard - not
+            // the button's sensitivity - is what actually prevents a double
+            // queue. Cleared only on the "Don't Send" path (or a panic-free
+            // early return); on success the composer closes with it still set.
+            if sending.get() {
+                return;
+            }
+            sending.set(true);
+            send_button_for_reminder.set_sensitive(false);
             let cc = cc_row.addresses();
             let bcc = bcc_row.addresses();
             // Everything from here on has to await the editor read, so the
@@ -2753,6 +2781,7 @@ pub fn build_compose_view(
             let references = references.clone();
             let calendar_part = calendar_part.clone();
             let closed = closed.clone();
+            let sending = sending.clone();
             let on_done = on_done.clone();
             let on_send_started = on_send_started.clone();
             let on_schedule_send = on_schedule_send.clone();
@@ -2817,6 +2846,11 @@ pub fn build_compose_view(
                     let anchor = send_button_for_dialog.root().and_downcast::<gtk::Window>();
                     dialog.present(anchor.as_ref());
                     if !matches!(respond_rx.recv().await, Ok(true)) {
+                        // "Don't Send" leaves the composer open: release the
+                        // in-flight marker so the user can fix the message and
+                        // send it for real.
+                        sending.set(false);
+                        send_button_for_dialog.set_sensitive(true);
                         return;
                     }
                 }

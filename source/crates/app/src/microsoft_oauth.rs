@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use gtk::{gio, glib};
 use lookout_core::text::{base64url_encode, percent_encode};
@@ -242,8 +242,8 @@ impl std::fmt::Display for GraphAuthError {
 /// on-disk refresh token once both have been consented.
 pub struct MicrosoftOAuth {
     account_id: AccountId,
-    cached_exchange: Mutex<Option<(String, Instant)>>,
-    cached_graph: Mutex<Option<(String, Instant)>>,
+    cached_exchange: Mutex<Option<(String, SystemTime)>>,
+    cached_graph: Mutex<Option<(String, SystemTime)>>,
     // Serializes `access_token`/`graph_access_token` per audience so two
     // callers racing on an expired token (the mail session's primary
     // connection and its dedicated IDLE connection can now both reconnect
@@ -269,7 +269,7 @@ impl MicrosoftOAuth {
         }
     }
 
-    fn cache_slot(&self, audience: TokenAudience) -> &Mutex<Option<(String, Instant)>> {
+    fn cache_slot(&self, audience: TokenAudience) -> &Mutex<Option<(String, SystemTime)>> {
         match audience {
             TokenAudience::Exchange => &self.cached_exchange,
             TokenAudience::Graph => &self.cached_graph,
@@ -292,7 +292,7 @@ impl MicrosoftOAuth {
     pub async fn access_token(&self) -> Result<String, String> {
         let _serialize = self.refresh_lock(TokenAudience::Exchange).lock().await;
         if let Some((token, expires_at)) = self.cache_slot(TokenAudience::Exchange).lock().unwrap().clone() {
-            if Instant::now() < expires_at {
+            if SystemTime::now() < expires_at {
                 return Ok(token);
             }
         }
@@ -321,7 +321,7 @@ impl MicrosoftOAuth {
     pub async fn graph_access_token(&self) -> Result<String, GraphAuthError> {
         let _serialize = self.refresh_lock(TokenAudience::Graph).lock().await;
         if let Some((token, expires_at)) = self.cache_slot(TokenAudience::Graph).lock().unwrap().clone() {
-            if Instant::now() < expires_at {
+            if SystemTime::now() < expires_at {
                 return Ok(token);
             }
         }
@@ -520,8 +520,25 @@ impl MicrosoftOAuth {
     }
 
     fn cache(&self, audience: TokenAudience, token: String, expires_in: u64) {
-        let expires_at = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60));
+        // Wall-clock, not `Instant`: the monotonic clock does not advance
+        // while the machine is suspended, so an `Instant`-based expiry still
+        // looked valid for up to an hour after a laptop resumed past the
+        // token's lifetime.
+        let expires_at = SystemTime::now() + Duration::from_secs(expires_in.saturating_sub(60));
         *self.cache_slot(audience).lock().unwrap() = Some((token, expires_at));
+    }
+
+    /// Drops the cached Exchange-audience token after IMAP/SMTP rejected it,
+    /// so the next credential fetch refreshes instead of replaying the same
+    /// stale token.
+    pub async fn invalidate_exchange_token(&self) {
+        *self.cached_exchange.lock().unwrap() = None;
+    }
+
+    /// Drops the cached Graph-audience token after a `401`, so the next
+    /// `graph_token()` refreshes from the stored refresh token.
+    pub async fn invalidate_graph_token(&self) {
+        *self.cached_graph.lock().unwrap() = None;
     }
 }
 
@@ -549,6 +566,10 @@ impl lookout_graph::TokenProvider for MicrosoftOAuth {
         }
         self.ensure_graph_consent_for(&requested).await.map_err(lookout_graph::GraphError::Token)
     }
+
+    async fn invalidate(&self) {
+        self.invalidate_graph_token().await;
+    }
 }
 
 /// Bridges the OAuth2 flow to `lookout-mail`'s `CredentialProvider` trait.
@@ -575,6 +596,10 @@ impl CredentialProvider for MicrosoftCredentialProvider {
 
     async fn smtp_credential(&self) -> Result<Credential, String> {
         Ok(Credential::OAuth2AccessToken(self.oauth.access_token().await?))
+    }
+
+    async fn invalidate_credential(&self) {
+        self.oauth.invalidate_exchange_token().await;
     }
 }
 
@@ -659,6 +684,18 @@ mod tests {
         let dir = oauth_dir();
         assert_eq!(dir, glib::user_data_dir().join("lookout/oauth"));
         assert!(!dir.starts_with(std::env::temp_dir()));
+    }
+
+    /// The cache stores wall-clock expiry, and a rejected token is evicted so
+    /// the next lookup refreshes. (Suspend cannot be simulated in a unit test;
+    /// this pins the invalidation half and the `SystemTime` type.)
+    #[tokio::test]
+    async fn invalidating_the_graph_token_evicts_the_cached_access_token() {
+        let oauth = MicrosoftOAuth::new(AccountId("acct".to_string()));
+        *oauth.cached_graph.lock().unwrap() = Some(("stale-token".to_string(), SystemTime::now() + Duration::from_secs(3600)));
+        assert!(oauth.cached_graph.lock().unwrap().is_some());
+        oauth.invalidate_graph_token().await;
+        assert!(oauth.cached_graph.lock().unwrap().is_none());
     }
 
     #[test]

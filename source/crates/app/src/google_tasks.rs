@@ -24,7 +24,7 @@
 /// Software released under the GPL3 license
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use gtk::{gio, glib};
@@ -122,7 +122,7 @@ enum RefreshOutcome {
 /// first connect, refresh-token exchange afterwards.
 pub struct GoogleTasksOAuth {
     email: String,
-    cached: Mutex<Option<(String, Instant)>>,
+    cached: Mutex<Option<(String, SystemTime)>>,
 }
 
 impl GoogleTasksOAuth {
@@ -148,7 +148,7 @@ impl GoogleTasksOAuth {
     /// caller must not open a browser from a background poll.
     pub async fn try_access_token(&self) -> Result<Option<String>, String> {
         if let Some((token, expires_at)) = self.cached.lock().unwrap().clone() {
-            if Instant::now() < expires_at {
+            if SystemTime::now() < expires_at {
                 return Ok(Some(token));
             }
         }
@@ -234,7 +234,10 @@ impl GoogleTasksOAuth {
     }
 
     fn cache(&self, token: String, expires_in: u64) {
-        let expires_at = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60));
+        // Wall-clock: `Instant` stops advancing while the machine is
+        // suspended, which would keep an expired access token "fresh" for up
+        // to its remaining monotonic time after resume.
+        let expires_at = SystemTime::now() + Duration::from_secs(expires_in.saturating_sub(60));
         *self.cached.lock().unwrap() = Some((token, expires_at));
     }
 }

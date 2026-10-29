@@ -55,6 +55,7 @@ Line numbers are as of `b081c24` on `dev`.
    - **Code:** `send_composed` spawns a task that awaits `read_content(&rich_web_view)` (a WebKit round trip), and possibly the attachment-reminder dialog, before it queues `SendMessage`. `closed` and `on_done()` are set only at the end of that task, deliberately (see the comment at 2731-2735). Nothing disables the Send button or marks a send in flight.
    - **Failure:** a second click, or a click plus the ribbon's Send ([compose.rs:2678](source/crates/app/src/compose.rs#L2678)), during that window starts a second task. Both queue `SendMessage`, so the recipient gets the message twice.
    - **Fix:** a `Rc<Cell<bool>> sending` checked and set at the top of `send_composed`, plus `send_button.set_sensitive(false)`. Clear it on the "Don't Send" path and on early returns.
+   - **Fixed (0.9.298):** the guard is checked and set synchronously before the editor read, disables the split button, and is released on "Don't Send". GTK's programmatic `emit_by_name` path is blocked by the guard, not by sensitivity.
 
 5. ◐ **Close can drop the final draft save.** [compose.rs:2687-2700](source/crates/app/src/compose.rs#L2687-L2700).
    - **Code:** Close spawns `autosave.attempt()` and then immediately sets `closed` and calls `on_done()`.
@@ -62,6 +63,7 @@ Line numbers are as of `b081c24` on `dev`.
    - **Failure, part 2:** the spawned future first runs after `on_done()` has torn the page down. In rich-text mode `snapshot()` then has to read a WebView that the send path's own comment says must still be parented. If `read_content` returns `None`, nothing is saved.
    - **Check:** close a rich-text composer within 5 s of typing, then look in Drafts.
    - **Fix:** `close_button` should `await autosave.flush()` *before* `closed.set(true); on_done()`, in the same task. The send path already does this.
+   - **Fixed (0.9.298):** Close sets `closed` idempotently, then awaits `autosave.flush()` in the same task and only then calls `on_done()`, so an in-flight tick is waited out and the rich editor is read while still parented.
 
 6. ✔ **Outbox row deleted only after more network round trips, so a crash resends.**
    - **Where:** [session.rs:1793-1806](source/crates/mail/src/session.rs#L1793-L1806) (IMAP) and [graph/src/mail/session.rs:840-847](source/crates/graph/src/mail/session.rs#L840-L847) (Graph).
@@ -69,11 +71,13 @@ Line numbers are as of `b081c24` on `dev`.
    - **Failure:** quitting, crashing, losing the network or suspending in that window leaves the row `pending`, and the next session start sends the message again.
    - **Fix:** delete the row, or mark it `sent` so a later cleanup can archive it, immediately after the transport accepts the message. Then do the best-effort archive and draft cleanup.
    - **Same pass:** batch the post-send work. Today every sent entry triggers its own `refresh_folders_targeted` + full Sent `sync_mailbox` + reselect (IMAP), or a Sent `sync_mailbox` (Graph). Draining an offline outbox of N messages costs N Sent resyncs, where one after the loop would do.
+   - **Fixed (0.9.298):** both drains delete the row and emit `OutboxSent` immediately after the transport accepts the message, then do the best-effort archive and draft cleanup. IMAP and Graph both do one Sent resync (and one IMAP reselect) after the whole due batch.
 
 7. ✔ **"Empty folder" deletes mail that arrived after the user confirmed.** [session.rs:5867-5883](source/crates/mail/src/session.rs#L5867-L5883).
    - **Code:** `empty_mailbox` runs `UID SEARCH ALL` and then `UID STORE 1:* +FLAGS (\Deleted)` + `UID EXPUNGE 1:*`.
    - **Failure:** a message delivered between the user confirming "Empty Junk (12 messages)" and the STORE, or between the SEARCH and the STORE, is permanently deleted unseen. The returned `count` is also wrong then. This matters for Junk, where a misfiled legitimate message is exactly what lands mid-operation.
    - **Fix:** STORE and EXPUNGE the searched set, compressed into ranges (`1:40,42,57:90`) so the command-line-length concern in the comment still holds. Better still, have the UI pass the UID set it showed.
+   - **Fixed (0.9.298):** `empty_mailbox` flags and expunges only the `SEARCH ALL` UIDs, compressed with `uid_set_chunks`; the caller drops exactly those UIDs from the cache instead of clearing the folder. The snapshot-boundary test lives in `mail/src/session.rs`.
 
 8. ✔ **Rules deleted in Outlook come back from Lookout, and the push still races the pull.** [graph_sync.rs:436-552](source/crates/app/src/window/graph_sync.rs#L436-L552).
    - **Resurrection:** `sync_rules_from_graph` only adds and updates; a rule missing remotely is never removed locally. `push_rules_to_graph` then treats any local Graph-backed rule whose id isn't in `remote_ids` as new and calls `client.create`. Deleting a rule in Outlook on the web is undone at the next connect.
@@ -82,6 +86,7 @@ Line numbers are as of `b081c24` on `dev`.
    - **Fix:**
      - Run pull then push sequentially in one future, for that account only, behind a per-account in-flight set (the `GraphPropertySyncs` shape).
      - Keep a per-rule "last pushed" fingerprint or remote id. A rule that has a Graph id and is missing remotely was deleted remotely, so delete it locally. Only rules without a Graph id are created.
+   - **Fixed (0.9.298):** `Rule.synced { account, fingerprint }` is persisted in `settings.json`, and the new pure `reconcile_rules` runs pull then push sequentially, per account, behind a `GraphRuleSyncs` in-flight set. A remote-deleted rule is removed locally and not re-created; a pending local edit is pushed instead of overwritten; unchanged rules adopt Outlook's copy; new remote rules import once; non-UUID ids with no marker are migrated as already pushed. Fingerprints come from the content actually sent, so an edit made during the request stays dirty.
 
 9. ✔ **OAuth access-token expiry uses `Instant`, so it is stale after suspend.** [microsoft_oauth.rs:522-525](source/crates/app/src/microsoft_oauth.rs#L522-L525), [google_tasks.rs:236-239](source/crates/app/src/google_tasks.rs#L236-L239).
    - **Cause:** `Instant` is `CLOCK_MONOTONIC` on Linux, which does not advance while the machine is suspended. After a laptop sleeps past the token's ~60-90 min lifetime, the cache still believes the token is valid for up to its remaining monotonic time.
@@ -91,11 +96,13 @@ Line numbers are as of `b081c24` on `dev`.
      - Store the expiry as wall-clock time (`SystemTime`/`chrono::Utc`).
      - On a 401, evict the cached access token for that audience and retry once (add `TokenProvider::invalidate`).
      - Do the same for the IMAP session's reconnect after an `AUTHENTICATE` failure.
+   - **Fixed (0.9.298):** both Microsoft and Google access-token caches use `SystemTime`; `TokenProvider::invalidate`/`CredentialProvider::invalidate_credential` evict the cached token, `GraphClient` retries once on a 401, and rejected IMAP `AUTHENTICATE`/`LOGIN` (primary and IDLE connections) and SMTP `AUTH` failures evict the Exchange token (new `Error::AuthRejected`).
 
 10. ✔ **Graph `Retry-After` is uncapped, and it stalls the whole session actor.** [client.rs:17-22, 291-297](source/crates/graph/src/client.rs#L291-L297).
     - **Code:** the doc comment says `MAX_RETRY_DELAY` (120 s) is the "ceiling on any single retry wait", but only the fallback backoff is clamped; a server `Retry-After` is slept verbatim, up to 5 times.
     - **Failure:** the Graph mail session handles commands serially, so one throttled delta or page fetch blocks user moves, sends and body fetches for the whole duration.
     - **Fix:** `retry_after.map(|d| d.min(MAX_RETRY_DELAY))`. For background calls, prefer giving up after the cap and rescheduling over sleeping inside the actor.
+    - **Fixed (0.9.298):** retry waits are clamped to `MAX_RETRY_DELAY`, and a `Retry-After` longer than the cap returns `GraphError::Throttled` immediately instead of sleeping inside the session actor. Pinned by `an_over_cap_retry_after_gives_up_without_sleeping`.
 
 ## Tier 3 — Races and TOCTOU (stale or overwritten state)
 

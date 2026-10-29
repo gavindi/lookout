@@ -21,4 +21,10 @@ pub trait TokenProvider: Send + Sync {
     /// Called once before a feature's first request; an implementation may
     /// request a superset of what it already holds.
     async fn ensure_scopes(&self, scopes: &[&str]) -> Result<()>;
+
+    /// Drops the cached Graph access token after the service rejected it
+    /// (`401`). The next [`Self::graph_token`] call then refreshes from the
+    /// stored refresh token. Defaulted to a no-op so test doubles and
+    /// providers without an access-token cache need no change.
+    async fn invalidate(&self) {}
 }

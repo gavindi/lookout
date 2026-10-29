@@ -817,6 +817,8 @@ impl GraphMailSession {
         .await
         .and_then(|r| r.ok())
         .unwrap_or_default();
+        // One Sent resync for the whole batch rather than one per message.
+        let mut sync_sent = false;
         for entry in due {
             let id = entry.id;
             let attempts = entry.attempts;
@@ -838,21 +840,19 @@ impl GraphMailSession {
             let raw = with_bcc_header(raw, &message.bcc);
             match self.client.send_mime(&raw).await {
                 Ok(()) => {
+                    // Delete the row as soon as the transport accepted the
+                    // message, before the draft cleanup and Sent sync: a crash
+                    // or quit in between must not resend it on the next start.
+                    cache_op(&self.cache, move |cache| cache.delete_outbox(id)).await;
+                    let _ = self.events.send(AccountEvent::OutboxSent { id }).await;
                     if let Some(draft_id) = message.draft_message_id.as_deref() {
                         if let Err(e) = self.delete_draft(draft_id).await {
                             tracing::warn!("message sent but deleting its draft failed: {e}");
                         }
                     }
-                    cache_op(&self.cache, move |cache| cache.delete_outbox(id)).await;
-                    let _ = self.events.send(AccountEvent::OutboxSent { id }).await;
                     // Exchange files the sent copy in Sent Items; sync it so
-                    // the cache isn't a message behind.
-                    if let Some(sent) = self.folder_id(MailboxRole::Sent) {
-                        self.sync_mailbox(&sent, false).await;
-                        if self.current.as_ref() == Some(&sent) {
-                            self.emit_mailbox(&sent, false).await;
-                        }
-                    }
+                    // the cache isn't a message behind - once after the loop.
+                    sync_sent = true;
                 }
                 Err(e) => {
                     let retry_at = Utc::now() + outbox_retry_delay(attempts + 1);
@@ -871,6 +871,14 @@ impl GraphMailSession {
                                 .await;
                         }
                     }
+                }
+            }
+        }
+        if sync_sent {
+            if let Some(sent) = self.folder_id(MailboxRole::Sent) {
+                self.sync_mailbox(&sent, false).await;
+                if self.current.as_ref() == Some(&sent) {
+                    self.emit_mailbox(&sent, false).await;
                 }
             }
         }

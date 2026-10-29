@@ -545,7 +545,7 @@ Files: `OUTLOOK_PARITY.md`, `SCAFFOLD.md`, `CHANGELOG.md`, packaging/version fil
   - add `attachment_preview.rs`, `pdf_preview.rs` and optional `office_preview.rs`;
   - add `pending_attachment_preview` / `attachment_preview` to the `UiState` pipeline;
   - note the Poppler/LibreOffice dependency in the build section.
-- Add a **v0.9.297** `CHANGELOG.md` entry in the existing style, citing **M-32, X-03;
+- Add the next release's `CHANGELOG.md` entry in the existing style, citing **M-32, X-03;
   roadmap 7.3**.
 - Bump the workspace version and lockfile, `source/snapcraft.yaml`, the AppStream metainfo and
   the release workflow's tag example.

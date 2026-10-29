@@ -228,6 +228,23 @@ impl RuleAction {
     }
 }
 
+/// Where a rule was last accepted by a server, and what it looked like then.
+///
+/// `Rule::synced` is `None` for a rule the current account has never pushed
+/// (including Client/Sieve rules). For a Graph-backed rule it is the marker
+/// that distinguishes "never created in Outlook" from "created there and
+/// deleted since": only the latter has a marker whose id is missing remotely,
+/// and only that one is removed locally instead of being re-created.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleSync {
+    /// The mailbox that accepted the rule. A rule re-scoped to another
+    /// account has no sync marker for that account yet, so it is created
+    /// rather than deleted when its old id is absent.
+    pub account: crate::ids::AccountId,
+    /// [`Rule::sync_fingerprint`] as of the last successful pull or push.
+    pub fingerprint: String,
+}
+
 /// A single rule.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Rule {
@@ -251,6 +268,11 @@ pub struct Rule {
     pub exceptions: Vec<RuleCondition>,
     /// Executed in order.
     pub actions: Vec<RuleAction>,
+    /// Server-side sync state: absent for a rule this account has never
+    /// pushed. `skip_serializing_if` keeps Client/Sieve rules and old files
+    /// free of the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synced: Option<RuleSync>,
 }
 
 impl Rule {
@@ -265,7 +287,21 @@ impl Rule {
             conditions: Vec::new(),
             exceptions: Vec::new(),
             actions: Vec::new(),
+            synced: None,
         }
+    }
+
+    /// A stable digest of everything that defines this rule's *behaviour*,
+    /// excluding its id and its sync marker. A local rule whose fingerprint
+    /// still matches `synced.fingerprint` has not been edited since the last
+    /// server round trip; a difference means a local edit is waiting to be
+    /// pushed. Deterministic because serialisation walks the struct fields in
+    /// declaration order.
+    pub fn sync_fingerprint(&self) -> String {
+        let mut probe = self.clone();
+        probe.id.clear();
+        probe.synced = None;
+        serde_json::to_string(&probe).unwrap_or_default()
     }
 
     /// Whether the rule applies to `message` from `account`: enabled, scoped
@@ -505,6 +541,7 @@ mod tests {
             ],
             exceptions: Vec::new(),
             actions: vec![RuleAction::StopProcessing],
+            synced: None,
         };
         assert!(rule.matches(&summary(), &context(&owner())));
         assert!(rule.stops_processing());
@@ -543,9 +580,31 @@ mod tests {
                 RuleAction::MarkRead(true),
                 RuleAction::Move(RuleTarget::Role(MailboxRole::Archive)),
             ],
+            synced: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let back: Rule = serde_json::from_str(&json).unwrap();
         assert_eq!(rule, back);
+    }
+
+    /// The fingerprint tracks behaviour, not identity or sync bookkeeping: a
+    /// create rewrites the id, and the marker itself must not feed back into
+    /// the value it stores.
+    #[test]
+    fn sync_fingerprint_ignores_the_id_and_the_marker() {
+        let mut original = Rule::new("local-uuid", "Newsletters");
+        original.conditions = vec![RuleCondition::From("news@example.com".into())];
+
+        let mut renamed_id = original.clone();
+        renamed_id.id = "graph-rule-1".to_string();
+        renamed_id.synced = Some(crate::RuleSync {
+            account: crate::ids::AccountId("acct".into()),
+            fingerprint: "whatever".to_string(),
+        });
+        assert_eq!(original.sync_fingerprint(), renamed_id.sync_fingerprint());
+
+        let mut edited = original.clone();
+        edited.name = "Different".to_string();
+        assert_ne!(original.sync_fingerprint(), edited.sync_fingerprint());
     }
 }

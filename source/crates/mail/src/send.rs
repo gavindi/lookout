@@ -584,7 +584,9 @@ async fn send_smtp_with_delivery_receipt(endpoint: &EndpointConfig, credential: 
     };
     if let Err(e) = connection.auth(&mechanisms, &credentials).await {
         connection.abort().await;
-        return Err(Error::LoginFailed(format!("SMTP authentication failed: {e}")));
+        // Distinct from a message-level send failure: the credential itself
+        // was rejected, so the session should evict its cached token.
+        return Err(Error::AuthRejected(format!("SMTP authentication failed: {e}")));
     }
 
     // lettre's `ServerInfo` only records the ESMTP keywords it models, and

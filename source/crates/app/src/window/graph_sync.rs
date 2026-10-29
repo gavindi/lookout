@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gtk::glib;
-use lookout_core::{AccountId, EmailAddress, EmailSummary, Importance, InferenceClassification};
+use lookout_core::{AccountId, EmailAddress, EmailSummary, Importance, InferenceClassification, Rule, RuleBackend, RuleSync};
 use lookout_mail::session::AccountCommand;
 
 use crate::message_list::MessageListModel;
@@ -430,123 +430,273 @@ pub(crate) fn sync_categories_from_graph(state: &Rc<RefCell<UiState>>, message_l
     });
 }
 
-/// Pulls a Microsoft 365 account's Outlook inbox rules into `AppConfig::rules`
-/// (item 2.5 / M-14), adding any rule the user doesn't have locally yet (by
-/// Graph id). A no-op for other accounts and before Graph access is granted.
-/// Best effort: a failure is logged and the next sync reconciles.
-pub(crate) fn sync_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
-    let Some(client) = state.borrow().accounts.get(account_id).and_then(|h| h.graph_rules.clone()) else {
+/// Per-account bookkeeping for the Outlook rules sync: one pull+push in
+/// flight per account. Without it, the connect timer, F5 and the consent
+/// paths can each start a sync, and the push would create a rule again before
+/// another sync has written its Graph id back.
+#[derive(Default)]
+pub(crate) struct GraphRuleSyncs {
+    in_flight: HashSet<AccountId>,
+}
+
+impl GraphRuleSyncs {
+    /// `false` when a sync is already running for `id` (the caller skips).
+    pub(crate) fn try_begin(&mut self, id: &AccountId) -> bool {
+        self.in_flight.insert(id.clone())
+    }
+
+    pub(crate) fn finish(&mut self, id: &AccountId) {
+        self.in_flight.remove(id);
+    }
+
+    /// Drops the in-flight mark for a removed account.
+    pub(crate) fn forget(&mut self, id: &AccountId) {
+        self.in_flight.remove(id);
+    }
+}
+
+/// Releases an account's `GraphRuleSyncs` mark when a sync ends, on every
+/// path out of it (including an early return on error).
+struct RuleSyncGuard {
+    state: Rc<RefCell<UiState>>,
+    account_id: AccountId,
+}
+
+impl Drop for RuleSyncGuard {
+    fn drop(&mut self) {
+        self.state.borrow_mut().graph_rule_syncs.finish(&self.account_id);
+    }
+}
+
+/// What the reconciliation decided must go to Outlook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RulePush {
+    /// A rule this account has never accepted: create it remotely and write
+    /// the returned Graph id back.
+    Create(String),
+    /// A rule with a pending local edit: update its remote copy.
+    Update(String),
+}
+
+/// Rules created by the editor use a UUID
+/// (`rules_view::new_rule_id`); Graph `messageRule` ids are opaque strings in
+/// a different shape. Used only to migrate settings written before
+/// `Rule::synced` existed: a non-UUID id found remotely was already pushed.
+fn looks_like_local_rule_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok()
+}
+
+/// Reconciles this account's local Graph rules with Outlook's list, in place.
+///
+/// Returns the remote writes to perform and whether `local` changed. The
+/// rules:
+///
+/// * A rule whose local fingerprint still matches `synced.fingerprint` has no
+///   pending edit, so Outlook's copy wins (it may have been edited there, or
+///   normalised by Graph).
+/// * A rule whose fingerprint differs has a local edit; it is kept and marked
+///   for `Update`, so the next push wins instead of the pull overwriting it.
+/// * A rule with a sync marker for this account whose id is missing remotely
+///   was deleted in Outlook and is removed locally - it must not be re-created
+///   by the next push.
+/// * A rule with no marker for this account (new, or re-scoped from another
+///   account) is `Create`d.
+fn reconcile_rules(local: &mut Vec<Rule>, remote: Vec<Rule>, account: &AccountId) -> (Vec<RulePush>, bool) {
+    let remote_ids: HashSet<String> = remote.iter().map(|rule| rule.id.clone()).collect();
+    let mut remote_by_id: HashMap<String, Rule> = remote.into_iter().map(|rule| (rule.id.clone(), rule)).collect();
+    let mut pushes = Vec::new();
+    let mut doomed: HashSet<String> = HashSet::new();
+    let mut changed = false;
+
+    for rule in local.iter_mut().filter(|rule| rule.backend == RuleBackend::Graph && rule.account.as_ref() == Some(account)) {
+        // Migration: an older build wrote the Graph id straight into `id` and
+        // never stored a marker. A non-UUID id was therefore pushed at least
+        // once: if it is still remote, treat the current content as the
+        // baseline; if it is gone, Outlook deleted it. A UUID id is a local
+        // rule the old push never completed, so it is created below.
+        if rule.synced.is_none() && !looks_like_local_rule_id(&rule.id) {
+            if remote_ids.contains(&rule.id) {
+                rule.synced = Some(RuleSync {
+                    account: account.clone(),
+                    fingerprint: rule.sync_fingerprint(),
+                });
+                changed = true;
+            } else {
+                doomed.insert(rule.id.clone());
+                continue;
+            }
+        }
+
+        let Some(mut remote_rule) = remote_by_id.remove(&rule.id) else {
+            if rule.synced.as_ref().is_some_and(|sync| &sync.account == account) {
+                // It has a marker for this mailbox, but Outlook no longer has
+                // it: deleted there while we were away. Remove it locally
+                // instead of letting the push resurrect it.
+                doomed.insert(rule.id.clone());
+            } else {
+                pushes.push(RulePush::Create(rule.id.clone()));
+            }
+            continue;
+        };
+
+        let unchanged = rule
+            .synced
+            .as_ref()
+            .is_some_and(|sync| &sync.account == account && sync.fingerprint == rule.sync_fingerprint());
+        if unchanged {
+            remote_rule.synced = Some(RuleSync {
+                account: account.clone(),
+                fingerprint: remote_rule.sync_fingerprint(),
+            });
+            if *rule != remote_rule {
+                *rule = remote_rule;
+                changed = true;
+            }
+        } else {
+            // A local edit is waiting: keep it; the push below writes it to
+            // Outlook instead of the pull clobbering it.
+            pushes.push(RulePush::Update(rule.id.clone()));
+        }
+    }
+
+    // A remote rule no local rule matched is new to this account.
+    for mut remote_rule in remote_by_id.into_values() {
+        remote_rule.synced = Some(RuleSync {
+            account: account.clone(),
+            fingerprint: remote_rule.sync_fingerprint(),
+        });
+        local.push(remote_rule);
+        changed = true;
+    }
+
+    if !doomed.is_empty() {
+        local.retain(|rule| !(rule.backend == RuleBackend::Graph && rule.account.as_ref() == Some(account) && doomed.contains(&rule.id)));
+        changed = true;
+    }
+
+    (pushes, changed)
+}
+
+/// Pulls then pushes a Microsoft 365 account's Graph rules (item 2.5),
+/// reconciling the two directions for that account only. One future, one
+/// in-flight slot: the pull and push cannot race each other, and two accounts
+/// no longer push concurrently. A no-op for other accounts and before Graph
+/// access is granted; best effort, so a failure is logged and the next sync
+/// reconciles.
+pub(crate) fn sync_and_push_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    let Some(client) = state.borrow().accounts.get(account_id).and_then(|handle| handle.graph_rules.clone()) else {
         return;
     };
     if !client.consented() {
         return;
     }
-    let state = state.clone();
-    glib::spawn_future_local(async move {
-        match client.list().await {
-            Ok(remote) => {
-                let app_config = state.borrow().app_config.clone();
-                let mut changed = false;
-                {
-                    let mut config = app_config.borrow_mut();
-                    for rule in remote {
-                        match config.rules.iter_mut().find(|r| r.id == rule.id) {
-                            Some(existing) => {
-                                if *existing != rule {
-                                    *existing = rule;
-                                    changed = true;
-                                }
-                            }
-                            None => {
-                                config.rules.push(rule);
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-                if changed {
-                    crate::app_config::save(&app_config.borrow());
-                }
-            }
-            Err(e) => tracing::warn!("couldn't read Outlook's rules: {e}"),
-        }
-    });
-}
-
-/// Pushes every local `Graph`-backend rule to its Microsoft 365 account
-/// (item 2.5 / M-14): an existing Outlook rule is updated in place, a new one
-/// is created and its Graph id written back. A rule Outlook can't express
-/// (see `graph_rules`) is left alone as a client rule. Best effort.
-pub(crate) fn push_rules_to_graph(state: &Rc<RefCell<UiState>>) {
-    let clients: Vec<(AccountId, Rc<crate::graph_rules::GraphRulesClient>)> = {
-        let st = state.borrow();
-        st.accounts
-            .iter()
-            .filter_map(|(account_id, handle)| handle.graph_rules.clone().filter(|client| client.consented()).map(|client| (account_id.clone(), client)))
-            .collect()
-    };
-    if clients.is_empty() {
+    if !state.borrow_mut().graph_rule_syncs.try_begin(account_id) {
+        tracing::debug!(%account_id, "Outlook rules sync already in flight, skipping");
         return;
     }
     let state = state.clone();
+    let account_id = account_id.clone();
     glib::spawn_future_local(async move {
-        for (account_id, client) in clients {
-            let local: Vec<lookout_core::Rule> = {
-                let st = state.borrow();
-                let rules = st
-                    .app_config
-                    .borrow()
-                    .rules
-                    .iter()
-                    .filter(|rule| rule.backend == lookout_core::RuleBackend::Graph && rule.account.as_ref() == Some(&account_id))
-                    .cloned()
-                    .collect();
-                rules
-            };
-            if local.is_empty() {
-                continue;
+        let _guard = RuleSyncGuard {
+            state: state.clone(),
+            account_id: account_id.clone(),
+        };
+        let remote = match client.list().await {
+            Ok(remote) => remote,
+            Err(e) => {
+                tracing::warn!("couldn't read Outlook's rules: {e}");
+                return;
             }
-            let remote = match client.list().await {
-                Ok(remote) => remote,
-                Err(e) => {
-                    tracing::warn!("couldn't read Outlook's rules before pushing: {e}");
-                    continue;
-                }
+        };
+
+        // Reconcile in one short borrow, then release it before any await.
+        let (pushes, changed) = {
+            let app_config = state.borrow().app_config.clone();
+            let mut config = app_config.borrow_mut();
+            let (pushes, changed) = reconcile_rules(&mut config.rules, remote, &account_id);
+            drop(config);
+            if changed {
+                crate::app_config::save(&app_config.borrow());
+            }
+            (pushes, changed)
+        };
+        if changed {
+            tracing::debug!(%account_id, "reconciled Outlook rules with settings");
+        }
+
+        for push in pushes {
+            let Some(rule) = state
+                .borrow()
+                .app_config
+                .borrow()
+                .rules
+                .iter()
+                .find(|rule| {
+                    rule.account.as_ref() == Some(&account_id)
+                        && rule.backend == RuleBackend::Graph
+                        && match &push {
+                            RulePush::Create(id) | RulePush::Update(id) => &rule.id == id,
+                        }
+                })
+                .cloned()
+            else {
+                continue;
             };
-            let remote_ids: Vec<String> = remote.iter().map(|rule| rule.id.clone()).collect();
-            for rule in local {
-                if remote_ids.contains(&rule.id) {
-                    if let Err(e) = client.update(&rule).await {
-                        tracing::warn!("couldn't update Outlook rule '{}': {e}", rule.name);
-                    }
-                } else {
-                    match client.create(&rule).await {
-                        Ok(new_id) if !new_id.is_empty() => {
-                            let app_config = state.borrow().app_config.clone();
-                            if let Some(stored) = app_config
-                                .borrow_mut()
-                                .rules
-                                .iter_mut()
-                                .find(|r| r.id == rule.id && r.account.as_ref() == Some(&account_id))
-                            {
-                                stored.id = new_id;
+            // Fingerprint of exactly what goes over the wire. If the rule is
+            // edited again while the request is in flight, the stored content
+            // no longer matches this and the next sync pushes the newer edit
+            // instead of treating it as already synced.
+            let sent_fingerprint = rule.sync_fingerprint();
+            match push {
+                RulePush::Create(local_id) => match client.create(&rule).await {
+                    Ok(new_id) if !new_id.is_empty() => {
+                        let app_config = state.borrow().app_config.clone();
+                        let updated = {
+                            let mut config = app_config.borrow_mut();
+                            match config.rules.iter_mut().find(|stored| stored.id == local_id && stored.account.as_ref() == Some(&account_id)) {
+                                Some(stored) => {
+                                    stored.id = new_id;
+                                    stored.synced = Some(RuleSync {
+                                        account: account_id.clone(),
+                                        fingerprint: sent_fingerprint,
+                                    });
+                                    true
+                                }
+                                None => false,
                             }
+                        };
+                        if updated {
                             crate::app_config::save(&app_config.borrow());
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("couldn't create Outlook rule '{}': {e}", rule.name),
                     }
-                }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("couldn't create Outlook rule '{}': {e}", rule.name),
+                },
+                RulePush::Update(local_id) => match client.update(&rule).await {
+                    Ok(()) => {
+                        let app_config = state.borrow().app_config.clone();
+                        let updated = {
+                            let mut config = app_config.borrow_mut();
+                            match config.rules.iter_mut().find(|stored| stored.id == local_id && stored.account.as_ref() == Some(&account_id)) {
+                                Some(stored) => {
+                                    stored.synced = Some(RuleSync {
+                                        account: account_id.clone(),
+                                        fingerprint: sent_fingerprint,
+                                    });
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if updated {
+                            crate::app_config::save(&app_config.borrow());
+                        }
+                    }
+                    Err(e) => tracing::warn!("couldn't update Outlook rule '{}': {e}", rule.name),
+                },
             }
         }
     });
-}
-
-/// Pulls then pushes a Microsoft 365 account's Graph rules (item 2.5),
-/// reconciling the two directions.
-pub(crate) fn sync_and_push_rules_from_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
-    sync_rules_from_graph(state, account_id);
-    push_rules_to_graph(state);
 }
 
 /// Pulls a Microsoft 365 account's automatic replies from Graph (item 2.11 /
@@ -832,5 +982,134 @@ mod tests {
         syncs.record_cursor(&a, "c1".to_string());
         syncs.forget(&a);
         assert_eq!(syncs.try_begin(&a), Some(None));
+    }
+
+    fn graph_rule(account: &AccountId, id: &str, name: &str) -> Rule {
+        let mut rule = Rule::new(id, name);
+        rule.backend = RuleBackend::Graph;
+        rule.account = Some(account.clone());
+        rule
+    }
+
+    /// Mark `rule` as already accepted by `account`, with a fingerprint of
+    /// its current content.
+    fn mark_synced(mut rule: Rule, account: &AccountId) -> Rule {
+        rule.synced = Some(RuleSync {
+            account: account.clone(),
+            fingerprint: rule.sync_fingerprint(),
+        });
+        rule
+    }
+
+    #[test]
+    fn rule_sync_runs_once_per_account_at_a_time() {
+        let a = AccountId("a".into());
+        let b = AccountId("b".into());
+        let mut syncs = GraphRuleSyncs::default();
+        assert!(syncs.try_begin(&a));
+        assert!(!syncs.try_begin(&a));
+        assert!(syncs.try_begin(&b));
+        syncs.finish(&a);
+        assert!(syncs.try_begin(&a));
+        syncs.forget(&b);
+        assert!(syncs.try_begin(&b));
+    }
+
+    #[test]
+    fn a_rule_deleted_in_outlook_is_removed_locally_and_not_recreated() {
+        let account = AccountId("a".into());
+        let local = mark_synced(graph_rule(&account, "graph-rule-1", "Newsletters"), &account);
+        let mut rules = vec![local];
+        let (pushes, changed) = reconcile_rules(&mut rules, Vec::new(), &account);
+        assert!(pushes.is_empty(), "a remotely deleted rule must not be created again: {pushes:?}");
+        assert!(changed);
+        assert!(rules.is_empty(), "the local copy should be gone");
+    }
+
+    #[test]
+    fn an_unpushed_local_rule_is_created() {
+        let account = AccountId("a".into());
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut rules = vec![graph_rule(&account, &id, "New rule")];
+        let (pushes, changed) = reconcile_rules(&mut rules, Vec::new(), &account);
+        assert_eq!(pushes, vec![RulePush::Create(id.clone())]);
+        assert!(!changed, "nothing about the local rule changed");
+        assert_eq!(rules.len(), 1, "the rule stays until the push returns its id");
+    }
+
+    #[test]
+    fn a_pending_local_edit_is_pushed_instead_of_overwritten() {
+        let account = AccountId("a".into());
+        let mut local = mark_synced(graph_rule(&account, "graph-rule-1", "Original"), &account);
+        local.name = "Edited locally".to_string();
+        let remote = graph_rule(&account, "graph-rule-1", "Changed in Outlook");
+        let mut rules = vec![local];
+        let (pushes, _) = reconcile_rules(&mut rules, vec![remote], &account);
+        assert_eq!(pushes, vec![RulePush::Update("graph-rule-1".to_string())]);
+        assert_eq!(rules[0].name, "Edited locally", "the pull must not clobber a pending edit");
+    }
+
+    #[test]
+    fn an_unchanged_local_rule_adopts_outlooks_copy() {
+        let account = AccountId("a".into());
+        let local = mark_synced(graph_rule(&account, "graph-rule-1", "Original"), &account);
+        let remote = graph_rule(&account, "graph-rule-1", "Changed in Outlook");
+        let mut rules = vec![local];
+        let (pushes, changed) = reconcile_rules(&mut rules, vec![remote], &account);
+        assert!(pushes.is_empty());
+        assert!(changed);
+        assert_eq!(rules[0].name, "Changed in Outlook");
+        assert!(rules[0].synced.is_some());
+    }
+
+    #[test]
+    fn a_new_remote_rule_is_imported_once() {
+        let account = AccountId("a".into());
+        let mut rules = Vec::new();
+        let (pushes, changed) = reconcile_rules(&mut rules, vec![graph_rule(&account, "graph-rule-1", "From Outlook")], &account);
+        assert!(pushes.is_empty());
+        assert!(changed);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "graph-rule-1");
+        assert!(rules[0].synced.is_some());
+    }
+
+    #[test]
+    fn a_legacy_rule_id_is_migrated_to_a_sync_marker() {
+        let account = AccountId("a".into());
+        // An older build stored the Graph id in `id` and no marker: present
+        // remotely means pushed, so a later remote edit is adopted.
+        let local = graph_rule(&account, "graph-rule-1", "Original");
+        let remote = graph_rule(&account, "graph-rule-1", "Changed in Outlook");
+        let mut rules = vec![local];
+        let (pushes, changed) = reconcile_rules(&mut rules, vec![remote], &account);
+        assert!(pushes.is_empty());
+        assert!(changed);
+        assert_eq!(rules[0].name, "Changed in Outlook");
+        assert!(rules[0].synced.as_ref().is_some_and(|sync| sync.account == account));
+    }
+
+    #[test]
+    fn a_legacy_rule_deleted_remotely_is_not_resurrected() {
+        let account = AccountId("a".into());
+        let mut rules = vec![graph_rule(&account, "graph-rule-1", "Original")];
+        let (pushes, _) = reconcile_rules(&mut rules, Vec::new(), &account);
+        // With no marker there is no way to tell "never pushed" from "pushed
+        // by an old build": the id shape is the migration heuristic. A
+        // non-UUID id absent remotely is treated as remote-deleted.
+        assert!(pushes.is_empty());
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn a_rule_re_scoped_to_another_account_is_created_there() {
+        let account = AccountId("b".into());
+        let old_account = AccountId("a".into());
+        let mut rule = mark_synced(graph_rule(&old_account, "graph-rule-1", "Newsletters"), &old_account);
+        rule.account = Some(account.clone());
+        let mut rules = vec![rule];
+        let (pushes, _) = reconcile_rules(&mut rules, Vec::new(), &account);
+        assert_eq!(pushes, vec![RulePush::Create("graph-rule-1".to_string())]);
+        assert_eq!(rules.len(), 1, "the rule is not deleted just because it left the old account");
     }
 }

@@ -820,6 +820,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         folder_row_spinners: HashMap::new(),
         refreshing: HashSet::new(),
         graph_property_syncs: Default::default(),
+        graph_rule_syncs: Default::default(),
         sort_key: SortKey::Date,
         sort_descending: true,
         favorites: Vec::new(),
