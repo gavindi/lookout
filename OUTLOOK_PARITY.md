@@ -432,17 +432,17 @@ On the optional Graph mail transport (items 5.7.2–5.7.10; close-out 5.7.10), t
 
 | ID | Outlook feature | Lookout today | Status | Gap |
 |---|---|---|---|---|
-| UI-01 | Ribbon (simplified / classic) | Ribbon-style toolbar | 🟡 | Add a View tab: layout, reading pane, conversations, density, preview lines, zoom |
+| UI-01 | Ribbon (simplified / classic) | Shared `app/src/ribbon.rs` across Mail, Calendar, People and Tasks: icon+label groups, split buttons, Simplified / Classic layouts (switchable from the ribbon and Settings → Appearance), adaptive label drop into a trailing **More** overflow, and Ctrl+F1 collapse. Mail carries Home, Send / Receive, Folder, View and Help tabs (File opens the Backstage); the other modules use one band each | 🟡 | Outlook's tab set is Mail-only: add View tabs to Calendar, People and Tasks (UX-54/66/74) and the composer's Message / Insert / Format text / Options tabs (UX-40) |
 | UI-02 | Themes / dark mode | System / Flat Dark / Flat Light, accent | ✅ | — |
-| UI-03 | Remappable shortcuts | `shortcuts.rs` (19 actions) | ✅ | — |
+| UI-03 | Remappable shortcuts | `shortcuts.rs` (32 actions, remappable from Settings → General → Keyboard shortcuts) | ✅ | — |
 | UI-04 | Outlook keyboard preset | — | ❌ | §4.7 |
-| UI-05 | Tray / badge / notifications | `tray.rs`, `launcher_entry.rs` | ✅ | — |
-| UI-06 | Settings breadth | `app/src/config_view.rs` ("Privacy" is a placeholder) | 🟡 | Calendar, People, Tasks, Reading and Compose sections |
+| UI-05 | Tray / badge / notifications | `tray.rs` (SNI tray with unread badge), `launcher_entry.rs` (dock badge) and `mail_notifications.rs` / `reminders.rs` desktop notifications | ✅ | — |
+| UI-06 | Settings breadth | `app/src/config_view.rs`: File ▸ Options with a category pane - Accounts, Calendar accounts, Webcal subscriptions, Appearance, General, Mail, Calendar, People, Privacy, Apps, Assistant and Advanced - and File-style grouped pages; Privacy now documents the desktop calendar mirror rather than being a placeholder | 🟡 | Fold the extra top-level categories into Outlook's set and split Mail and Calendar into Outlook's sub-pages (U.10); no Tasks page or Customize actions |
 | X-01 | Notes (sticky) | — | ❌ | *classic-only*; optional |
 | X-02 | PST import | — | ❌ | §4.6 |
-| X-03 | Attachment preview | See M-32 | 🟡 | |
-| X-04 | Translate / Immersive Reader | See M-36/M-37 | ❌ | |
-| X-05 | Copilot (summarise, draft, coach) | `assistant.rs` chat with 6 read-only tools, dashboard only | 🟡 | Summarise thread in the reading pane; draft reply; rewrite selection in compose; action tools with confirmation |
+| X-03 | Attachment preview | Attachment rows with Open / Open with / Save, plus Save all / Download as zip; no in-app preview | 🟡 | Preview pane for images, PDF and text, with Preview as the default click (M-32; 7.3) |
+| X-04 | Translate / Immersive Reader | Zoom only (Ctrl+scroll, Ctrl+±) on the reading pane, message window and composer; no Translate or Immersive Reader | ❌ | Translate provider and reader mode (M-36/M-37; 7.4–7.5) |
+| X-05 | Copilot (summarise, draft, coach) | `assistant.rs` / `assistant_tools.rs`: OpenAI-compatible chat with six read-only tools over cached mail, contacts, tasks and events; dashboard only | 🟡 | Summarise thread in the reading pane; draft reply; rewrite selection in compose; action tools with confirmation (7.6) |
 | X-06 | Lookout dashboard | `app/src/lookout_view.rs` | ✅ | No Outlook equivalent (keep) |
 
 ---
