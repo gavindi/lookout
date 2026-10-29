@@ -609,6 +609,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // see `other_accounts.rs`. Cloned into the add-account dialog, the
     // startup connect loop, and the Config view's edit/remove actions.
     let keyring = crate::other_accounts::SecretServiceKeyring::new();
+    // Read the relational config before the state is built. A file that
+    // couldn't be parsed has already been moved aside by `load`; keep the
+    // backup path so the toast below can tell the user where it went.
+    let loaded_app_config = crate::app_config::load();
+    let mut corrupt_backups = crate::app_config::take_corrupt_backups();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
         contacts_by_account: HashMap::new(),
@@ -629,7 +634,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         desktop_contacts: Vec::new(),
         ui_db,
         settings: settings.clone(),
-        app_config: Rc::new(RefCell::new(crate::app_config::load())),
+        app_config: Rc::new(RefCell::new(loaded_app_config)),
         categories: Rc::new(RefCell::new(crate::categories::CategorySet::default())),
         deleted_contacts: HashMap::new(),
         contact_cmd_tx: HashMap::new(),
@@ -708,6 +713,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         refreshing: HashSet::new(),
         graph_property_syncs: Default::default(),
         graph_rule_syncs: Default::default(),
+        graph_mirror: Default::default(),
         sort_key: SortKey::from_action_state(&settings.get_string(crate::settings::SORT_KEY)).unwrap_or(SortKey::Date),
         sort_descending: settings.get_bool(crate::settings::SORT_DESCENDING),
         favorites: crate::folder_menu::dedup_in_order(settings.get_strv(crate::settings::MAIL_FAVORITES).into_iter().map(MailboxId)),
@@ -7062,11 +7068,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .inspect_err(|e| tracing::warn!("local tasks won't persist: {e}"))
         .ok();
     let local_tasks = local_tasks_db.as_ref().and_then(|db| db.borrow().load_local_tasks().ok()).unwrap_or_default();
+    let loaded_calendar_colors = calendar_colors::load();
+    corrupt_backups.extend(calendar_colors::take_corrupt_backups());
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
         accounts: HashMap::new(),
+        calendar_cache_slots: HashMap::new(),
         displayed_month: current_month_start(),
         checked_calendar_ids: HashSet::new(),
-        calendar_colors: calendar_colors::load(),
+        calendar_colors: loaded_calendar_colors,
         webcal_cmd_tx: None,
         webcal_subscriptions: Vec::new(),
         webcal_handles: HashMap::new(),
@@ -7107,6 +7116,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         attachment_next_id: 0,
         eds_mirror: Default::default(),
     }));
+    // A settings file that couldn't be parsed was preserved rather than
+    // replaced by defaults; tell the user where the copy is, so the loss is
+    // visible and the file can be repaired by hand.
+    for backup in corrupt_backups {
+        let name = backup
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| backup.display().to_string());
+        toast_overlay.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!(
+            "A settings file couldn't be read; a copy was saved as {name}"
+        ))));
+    }
     // The calendar handle `render_body` reaches for when an incoming iMIP
     // REPLY arrives (item 3.6): stored on `UiState` so the reply can be
     // applied without every render path carrying a calendar reference.
@@ -10414,8 +10435,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             // closes its command channel, which
                             // `run_account_session` treats as a clean
                             // shutdown request.
-                            state.borrow_mut().accounts.remove(&AccountId(account_id.to_string()));
-                            let Some(account) = state.borrow().app_config.borrow().other_account(account_id) else {
+                            let account_id = AccountId(account_id.to_string());
+                            {
+                                let mut st = state.borrow_mut();
+                                st.accounts.remove(&account_id);
+                                st.forget_account_bodies(&account_id);
+                            }
+                            let Some(account) = state.borrow().app_config.borrow().other_account(&account_id.0) else {
                                 return;
                             };
                             connect_other_account(
@@ -10452,12 +10478,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let calendar_state = calendar_state.clone();
                 Rc::new(move |_anchor, account_id: &str| {
                     let account_id = AccountId(account_id.to_string());
-                    state.borrow_mut().accounts.remove(&account_id);
+                    {
+                        let mut st = state.borrow_mut();
+                        st.accounts.remove(&account_id);
+                        st.forget_account_bodies(&account_id);
+                    }
                     {
                         let app_config = state.borrow().app_config.clone();
                         app_config.borrow_mut().other_accounts.retain(|a| a.id != account_id.0);
                         crate::app_config::save(&app_config.borrow());
                     }
+                    calendar_state.borrow_mut().calendar_cache_slots.remove(&account_id);
                     // The account is gone for good (unlike a Config disable,
                     // which keeps the on-disk state for a re-enable), so prune
                     // its folder-pane expansion rows too - the mailbox ids
@@ -11573,6 +11604,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // refill it from scratch (EDS_TODO.md E2.4).
             crate::eds_mirror::clear_mirror_file();
             crate::eds_mirror::request_sync(&calendar_state, &worker, None);
+            // The shared slots hold open connections to the files just
+            // unlinked; drop them so later searches open the rebuilt cache
+            // instead of reading the deleted inode.
+            calendar_state.borrow_mut().calendar_cache_slots.clear();
             let month = calendar_state.borrow().displayed_month;
             for handle in calendar_state.borrow_mut().accounts.values_mut() {
                 handle.last_occurrences.clear();

@@ -203,14 +203,17 @@ impl DirectorySource {
     /// without querying.
     pub(crate) fn search(&self, prefix: &str, complete: Rc<dyn Fn(Vec<DirectoryPerson>)>) {
         let Some(query) = directory_query(prefix) else {
+            self.cancel_pending();
             complete(Vec::new());
             return;
         };
         if let Some(cached) = self.cache.borrow().get(&query) {
+            self.cancel_pending();
             complete(cached);
             return;
         }
         if self.backends.is_empty() {
+            self.cancel_pending();
             complete(Vec::new());
             return;
         }
@@ -226,6 +229,20 @@ impl DirectorySource {
             this.dispatch();
         });
         self.timer.set(Some(id));
+    }
+
+    /// Drops any debounced or in-flight lookup because this `search` answered
+    /// without needing one (a cached prefix, a too-short prefix, or no
+    /// configured backends). Bumping the generation makes a reply already on
+    /// its way stale, and clearing `pending`/`timer` stops a debounce that
+    /// hasn't fired yet - otherwise the older query still costs a GAL/LDAP
+    /// round trip and its `complete` callback still runs.
+    fn cancel_pending(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.pending.borrow_mut().take();
+        if let Some(id) = self.timer.take() {
+            id.remove();
+        }
     }
 
     /// Wraps this source as a [`DirectoryLookup`] for the recipient picker
@@ -500,6 +517,33 @@ mod tests {
         let got_for_cb = got.clone();
         source.search("grace", Rc::new(move |hits| *got_for_cb.borrow_mut() = Some(hits)));
         assert_eq!(got.borrow().as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_cached_or_short_prefix_cancels_the_pending_lookup() {
+        let source = DirectorySource::new(Vec::new(), Rc::new(Worker::new()));
+        source.cache.borrow_mut().put("grace".to_string(), Vec::new());
+
+        // Simulate a debounced lookup the user has already typed past.
+        let arm = |generation: u64| {
+            source.generation.set(generation);
+            *source.pending.borrow_mut() = Some(Pending {
+                query: "grace".into(),
+                generation,
+                complete: Rc::new(|_| {}),
+            });
+        };
+
+        arm(7);
+        source.search("grace", Rc::new(|_| {}));
+        assert!(source.generation.get() > 7, "the cached answer invalidates the older lookup");
+        assert!(source.pending.borrow().is_none(), "the debounced query is dropped");
+        assert!(source.timer.take().is_none());
+
+        // A prefix below the minimum has the same effect.
+        arm(source.generation.get() + 1);
+        source.search("ab", Rc::new(|_| {}));
+        assert!(source.pending.borrow().is_none());
     }
 
     fn ldap(id: &str, account: &str, enabled: bool) -> LdapDirectory {

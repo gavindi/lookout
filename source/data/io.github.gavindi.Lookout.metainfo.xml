@@ -75,6 +75,12 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.299" date="2026-10-30">
+      <description>
+        <p>Reliability fixes for mail, calendar search and settings. Changes to a message's Outlook flag, categories, importance or pin are now written in the order you made them, so a quick flag and unflag can no longer leave Outlook showing the older state. Opening a mailbox no longer risks the background cache cleanup deleting an attachment or saved message that had just been downloaded, and a mailbox's local files are removed only after the cache change is safely recorded.</p>
+        <p>Calendar search keeps one open index per account instead of reopening it on every keystroke, and a refresh can no longer leave an older month indexed over a newer one. Recreated mailboxes, such as after a server-side index rebuild, can no longer show a cached body that belongs to a different message, and removed accounts leave nothing behind in memory. A settings file that cannot be read is preserved as a dated copy before defaults are written, with a notification naming the copy, and both settings files are written atomically so a crash cannot truncate them. Cached directory suggestions also no longer leave an unnecessary company-directory lookup running.</p>
+      </description>
+    </release>
     <release version="0.9.298" date="2026-10-30">
       <description>
         <p>Correctness fixes. Sending a message twice quickly no longer sends it twice, and closing a rich-text draft within the five-second autosave window no longer loses the last edits. Once your mail server accepts a message, Lookout now removes it from the outbox before archiving the Sent copy, so quitting or losing the network in between cannot resend it on the next start.</p>

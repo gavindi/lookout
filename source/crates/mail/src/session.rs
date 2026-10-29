@@ -1424,16 +1424,26 @@ pub async fn run_account_session(
         }
     });
 
-    // Same fire-and-forget shape for cache housekeeping: sweeping attachment
-    // `.bin`/`.eml` flat files that have no matching `messages` row, and the
-    // incremental-vacuum migration/reclaim (see `Cache::run_maintenance`).
-    // Off the connect path for the same reason as the backfill above - a
-    // large existing cache must never delay login.
-    let maintenance_cache = cache.clone();
+    // Cache housekeeping is split in two. The correctness half - sweeping
+    // attachment `.bin`/`.eml` flat files that have no matching `messages`
+    // row, and pruning `graph_uids` - is *awaited before the first sync*, the
+    // way the Graph session already does it: run concurrently with a sync, the
+    // sweep could delete a freshly-synced message's file between its write and
+    // the walk that reaches it (or one a user-triggered fetch just wrote).
+    // The expensive one-time `auto_vacuum` migration/reclaim stays on the
+    // blocking pool without awaiting, so a large existing cache never delays
+    // login (same reasoning as the search-index backfill above).
+    let cleanup_cache = cache.clone();
+    match tokio::task::spawn_blocking(move || cleanup_cache.as_ref().as_ref().map(|c| c.run_startup_cleanup()).transpose()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!("failed to run cache cleanup: {e}"),
+        Err(e) => tracing::warn!("cache cleanup task failed: {e}"),
+    }
+    let reclaim_cache = cache.clone();
     tokio::task::spawn_blocking(move || {
-        if let Some(c) = maintenance_cache.as_ref() {
-            if let Err(e) = c.run_maintenance() {
-                tracing::warn!("failed to run cache maintenance: {e}");
+        if let Some(c) = reclaim_cache.as_ref() {
+            if let Err(e) = c.run_space_reclaim() {
+                tracing::warn!("failed to run cache space reclaim: {e}");
             }
         }
     });

@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use chrono::{Datelike, Months, NaiveDate};
@@ -196,11 +197,27 @@ pub(crate) fn backfill_calendar_search(calendar_state: &Rc<RefCell<CalendarUiSta
     let months = Rc::new(search_backfill_months());
     let calendar_main = calendar_main.clone();
     let worker = worker.clone();
+    // Resolve each account's shared cache slot while `calendar_state` is still
+    // reachable; the future below only needs the cheap `Arc`s.
+    let slots: HashMap<AccountId, Arc<CalendarCacheSlot>> = targets
+        .iter()
+        .filter_map(|target| target.account_id.clone())
+        .map(|account_id| {
+            let slot = calendar_cache_slot(calendar_state, &account_id);
+            (account_id, slot)
+        })
+        .collect();
     glib::spawn_future_local(async move {
         let mut pending: Vec<(BackfillSource, Vec<NaiveDate>)> = Vec::new();
         for target in targets {
             let missing = if let Some(account_id) = target.account_id {
-                spawn_calendar_cache_missing_months(&worker, account_id, (*months).clone()).recv().await.unwrap_or_default()
+                match slots.get(&account_id).cloned() {
+                    Some(slot) => spawn_calendar_cache_missing_months(&worker, slot, account_id, (*months).clone())
+                        .recv()
+                        .await
+                        .unwrap_or_default(),
+                    None => (*months).clone(),
+                }
             } else {
                 (*months).clone()
             };
@@ -304,7 +321,13 @@ fn run_calendar_search(calendar_state: &Rc<RefCell<CalendarUiState>>, worker: &R
         return;
     }
 
-    let receivers: Vec<async_channel::Receiver<Vec<CachedEventHit>>> = sources.iter().map(|source| spawn_calendar_cache_search(worker, source.clone(), terms.clone())).collect();
+    let receivers: Vec<async_channel::Receiver<Vec<CachedEventHit>>> = sources
+        .iter()
+        .map(|source| {
+            let slot = calendar_cache_slot(calendar_state, source);
+            spawn_calendar_cache_search(worker, slot, source.clone(), terms.clone())
+        })
+        .collect();
 
     let calendar_state = calendar_state.clone();
     let calendar_main = calendar_main.clone();

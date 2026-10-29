@@ -9,7 +9,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use lookout_core::calendar_protocol::{CalendarCommand, CalendarSessionEvent, ConnectionState as CalConnectionState};
-use lookout_core::{AccountId, CalendarId, CalendarInfo, MailboxId, MailboxRole, SchedulingInfo, Uid};
+use lookout_core::{AccountId, CalendarId, CalendarInfo, Mailbox, MailboxId, MailboxRole, SchedulingInfo, Uid};
 use lookout_dav::subscription::SubscriptionSessionEvent;
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
@@ -27,6 +27,17 @@ use crate::microsoft_oauth::MicrosoftCredentialProvider;
 use crate::worker::Worker;
 
 use super::*;
+
+/// The mailbox ids whose `uidvalidity` differs between two folder listings.
+/// A change means the mailbox was recreated (RFC 3501 §2.3.1.1), so cached
+/// UIDs no longer name the same messages and the body cache must drop them.
+pub(crate) fn uidvalidity_changes(previous: &[Mailbox], next: &[Mailbox]) -> Vec<MailboxId> {
+    let previous: HashMap<&MailboxId, u32> = previous.iter().map(|mailbox| (&mailbox.id, mailbox.uidvalidity.0)).collect();
+    next.iter()
+        .filter(|mailbox| previous.get(&mailbox.id).is_some_and(|validity| *validity != mailbox.uidvalidity.0))
+        .map(|mailbox| mailbox.id.clone())
+        .collect()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_account_discovery(
@@ -567,10 +578,25 @@ pub(crate) fn spawn_account_event_loop(
                     }
                     AccountEvent::ConnectionStateChanged(_) => {}
                     AccountEvent::FoldersUpdated(folders) => {
-                        {
+                        let reset_mailboxes = {
                             let mut st = state.borrow_mut();
+                            let reset = st
+                                .accounts
+                                .get(&account_id)
+                                .map(|handle| uidvalidity_changes(&handle.folders, &folders))
+                                .unwrap_or_default();
                             if let Some(handle) = st.accounts.get_mut(&account_id) {
                                 handle.folders = folders;
+                            }
+                            reset
+                        };
+                        if !reset_mailboxes.is_empty() {
+                            // A UIDVALIDITY reset renumbers the mailbox: the
+                            // cached bodies for these ids belong to different
+                            // messages now, so never serve them by UID again.
+                            let mut st = state.borrow_mut();
+                            for mailbox in &reset_mailboxes {
+                                st.body_cache.remove_mailbox(mailbox);
                             }
                         }
                         // Fresh folder list means the account just (re)connected;
@@ -1642,6 +1668,7 @@ pub(crate) fn teardown_mail_account(
     let open_mailbox_was_this_account = {
         let mut st = state.borrow_mut();
         st.accounts.remove(account_id);
+        st.forget_account_bodies(account_id);
         st.refreshing.remove(account_id);
         st.graph_property_syncs.forget(account_id);
         st.graph_rule_syncs.forget(account_id);
@@ -1711,6 +1738,7 @@ pub(crate) fn teardown_goa_account(
     {
         let mut st = calendar_state.borrow_mut();
         st.accounts.remove(account_id);
+        st.calendar_cache_slots.remove(account_id);
         // Calendar ids embed their account's id as a prefix; drop every
         // checked entry belonging to the disabled account.
         let prefix = format!("{}:", account_id.0);
@@ -2591,7 +2619,8 @@ pub(crate) fn connect_calendar_account(
                             insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, occurrences.clone());
                         }
                         if graph_account {
-                            spawn_calendar_cache_store(&cache_worker, account_id.clone(), month, occurrences.clone());
+                            let slot = calendar_cache_slot(&calendar_state, &account_id);
+                            spawn_calendar_cache_store(&cache_worker, slot, account_id.clone(), month, occurrences.clone());
                         }
                         let search_refresh = calendar_state.borrow().calendar_search_refresh.clone();
                         if let Some(refresh) = search_refresh {

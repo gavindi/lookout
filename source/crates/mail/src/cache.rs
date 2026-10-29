@@ -1149,11 +1149,16 @@ impl Cache {
                 purged.insert((uid, stored_validity));
             }
         }
+        drop(upsert);
+        tx.commit()?;
+        // Delete the flat files only after the rows are committed, and outside
+        // the connection mutex: a failed commit must never leave surviving
+        // rows whose files are already gone, and the whole-directory `read_dir`
+        // must not block every other cache read for its duration.
+        drop(conn);
         // One flat-file sweep covering the whole purge set (see that method):
         // a whole-mailbox clear removes every stored row.
         self.purge_message_files(mailbox_id, &purged);
-        drop(upsert);
-        tx.commit()?;
         tracing::debug!(mailbox = %mailbox_id.0, rows = messages.len(), "replace_messages committed");
         Ok(())
     }
@@ -1281,8 +1286,9 @@ impl Cache {
                 purged.insert((uid, stored_validity));
             }
         }
-        self.purge_message_files(mailbox_id, &purged);
         tx.commit()?;
+        drop(conn);
+        self.purge_message_files(mailbox_id, &purged);
         Ok(())
     }
 
@@ -1659,8 +1665,24 @@ impl Cache {
     /// file so the OS can reclaim them - no full-file rewrite. It also drops
     /// Graph Uid mappings no cached message uses (`prune_graph_uids`).
     pub fn run_maintenance(&self) -> Result<()> {
+        self.run_startup_cleanup()?;
+        self.run_space_reclaim()
+    }
+
+    /// The correctness half of [`Self::run_maintenance`]: the flat-file sweep
+    /// and `graph_uids` prune. The session awaits this before its first sync
+    /// (never concurrently with live attachment/raw-message writes), because a
+    /// sweep that races a fresh message's files can delete them just after
+    /// they're written.
+    pub fn run_startup_cleanup(&self) -> Result<()> {
         self.sweep_orphaned_files();
-        self.prune_graph_uids()?;
+        self.prune_graph_uids().map(|_| ())
+    }
+
+    /// The housekeeping half: the one-time `auto_vacuum` migration and the
+    /// cheap `incremental_vacuum` reclaim. Expensive only on the first launch
+    /// after the migration, so callers keep it off the login path.
+    pub fn run_space_reclaim(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         const INCREMENTAL: i64 = 2;
         let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
@@ -2289,8 +2311,9 @@ impl Cache {
                 fts.execute(rusqlite::params![mailbox_id.0, uid.0])?;
             }
         }
-        self.purge_message_files(mailbox_id, &purged);
         tx.commit()?;
+        drop(conn);
+        self.purge_message_files(mailbox_id, &purged);
         Ok(())
     }
 

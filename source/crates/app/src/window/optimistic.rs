@@ -336,28 +336,17 @@ pub(crate) fn mirror_pin_to_graph(state: &Rc<RefCell<UiState>>, mailbox: &Mailbo
     let Some(client) = state.borrow().accounts.get(&account_id).and_then(|h| h.graph_pin.clone()) else {
         return;
     };
+    let target = MirrorTarget::Pin(client);
     for m in before {
         let Some(message_id) = m.message_id.clone() else { continue };
-        let client = client.clone();
-        let original_date = m.date;
-        glib::spawn_future_local(async move {
-            if let Err(e) = client.set_pinned(&message_id, original_date, pinned).await {
-                match e {
-                    // Expected for most Microsoft 365 accounts (sync isn't
-                    // enabled) or a message Graph hasn't indexed yet - quiet
-                    // on purpose, never surfaced as a pin failure.
-                    crate::graph_pin::GraphPinError::ConsentRequired => {
-                        tracing::debug!("skipping Outlook pin mirror for {message_id}: Graph pin sync isn't enabled for this account");
-                    }
-                    crate::graph_pin::GraphPinError::MessageNotFound => {
-                        tracing::debug!("skipping Outlook pin mirror for {message_id}: no matching Graph message found");
-                    }
-                    crate::graph_pin::GraphPinError::Http(msg) => {
-                        tracing::warn!("Outlook pin mirror failed for {message_id}: {msg}");
-                    }
-                }
-            }
-        });
+        enqueue_mirror(
+            state,
+            &account_id,
+            message_id,
+            MirrorKind::Pin,
+            MirrorOp::Pin { original_date: m.date, pinned },
+            target.clone(),
+        );
     }
 }
 

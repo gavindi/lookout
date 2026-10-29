@@ -6,7 +6,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -1164,6 +1165,20 @@ impl BodyCache {
             self.entries.pop_back();
         }
     }
+
+    /// Drops every body cached for `mailbox`. Called when the session reports
+    /// a new UIDVALIDITY: the cached UIDs no longer name the same messages, so
+    /// a hit could otherwise show one message's body under another's UID.
+    pub(crate) fn remove_mailbox(&mut self, mailbox: &MailboxId) {
+        self.entries.retain(|(cached, _, _)| cached != mailbox);
+    }
+
+    /// Drops every entry whose mailbox doesn't satisfy `keep` - the account
+    /// teardown path, where a removed (or transport-switched) account's
+    /// bodies must not linger in memory.
+    pub(crate) fn retain(&mut self, keep: impl Fn(&MailboxId) -> bool) {
+        self.entries.retain(|(mailbox, _, _)| keep(mailbox));
+    }
 }
 
 /// One account's ManageSieve capability answer (item 2.11 / M-24), from
@@ -1714,6 +1729,10 @@ pub(crate) struct UiState {
     /// Outlook rules pulls+pushes in flight, one per account (see
     /// `GraphRuleSyncs`). Forgotten on account removal.
     pub(crate) graph_rule_syncs: super::graph_sync::GraphRuleSyncs,
+    /// Latest-wins queues for Outlook property mirror writes, one worker per
+    /// (account, message, property) - see `GraphMirrorQueue`. Without them two
+    /// quick edits raced and Outlook could keep the older state.
+    pub(crate) graph_mirror: super::graph_sync::GraphMirrorQueue,
     /// How the message list is ordered, set from the list header's sort
     /// controls. Applied in `repopulate_message_list` - the single choke point
     /// every list rebuild passes through - so the order is uniform no matter
@@ -1985,6 +2004,15 @@ impl UiState {
         self.body_cache.get(mailbox, &uid)
     }
 
+    /// Drops every body cached for `account_id`'s mailboxes. Called whenever
+    /// the account's handle is torn down (remove, disable, transport switch,
+    /// edit), so a removed account's bodies don't stay resident and a
+    /// reconnected account can't serve a body fetched under the old session.
+    pub(crate) fn forget_account_bodies(&mut self, account_id: &AccountId) {
+        let prefix = format!("{}:", account_id.0);
+        self.body_cache.retain(|mailbox| !mailbox.0.starts_with(&prefix));
+    }
+
     /// Config → Mail → "Rich text": the body-mode default new composers open
     /// with. Read by the pop-out window's reply/forward actions, which open
     /// the composer from outside `build_window`'s scope.
@@ -2197,8 +2225,112 @@ pub(crate) struct GraphTodoHandle {
 /// handed to the `ReminderEngine`'s `sync_tasks` on each Tasks-view repaint.
 pub(crate) type TaskRemindersRefresh = Rc<dyn Fn(&[(AccountId, CalendarTask)])>;
 
+/// One account's shared calendar search cache plus the ordering state that
+/// keeps concurrent month stores safe.
+///
+/// The cache used to be opened afresh by every search, backfill check and
+/// month write - a file open, the WAL pragmas, the DDL and the schema check on
+/// every keystroke. It is now opened once per account and shared.
+///
+/// Stores are ordered by generation: `begin_store` records the newest request
+/// for a month on the GTK thread (cheap), and `store_if_newest` writes under
+/// `store_lock` only if no newer request for that month exists. Two refreshes
+/// of the same month therefore can never commit out of order and leave the
+/// older snapshot indexed.
+pub(crate) struct CalendarCacheSlot {
+    cache: OnceLock<Arc<lookout_dav::CalendarCache>>,
+    next_store: AtomicU64,
+    /// The newest generation requested per `YYYY-MM`.
+    latest: Mutex<HashMap<String, u64>>,
+    /// Serialises the writes; `latest` is only held for the compare.
+    store_lock: Mutex<()>,
+}
+
+impl Default for CalendarCacheSlot {
+    fn default() -> Self {
+        CalendarCacheSlot {
+            cache: OnceLock::new(),
+            next_store: AtomicU64::new(0),
+            latest: Mutex::new(HashMap::new()),
+            store_lock: Mutex::new(()),
+        }
+    }
+}
+
+fn calendar_month_key(month: chrono::NaiveDate) -> String {
+    month.format("%Y-%m").to_string()
+}
+
+impl CalendarCacheSlot {
+    /// The account's cache, opened on first use. Called from blocking threads;
+    /// a racing opener that loses `set` still returns the stored instance, so
+    /// every caller shares one connection (and one set of pragmas/DDL).
+    pub(crate) fn open(&self, account_id: &AccountId) -> Option<Arc<lookout_dav::CalendarCache>> {
+        if let Some(cache) = self.cache.get() {
+            return Some(cache.clone());
+        }
+        match lookout_dav::CalendarCache::open(account_id) {
+            Ok(cache) => {
+                let _ = self.cache.set(Arc::new(cache));
+                self.cache.get().cloned()
+            }
+            Err(e) => {
+                tracing::warn!(account = %account_id.0, "couldn't open the calendar cache: {e}");
+                None
+            }
+        }
+    }
+
+    /// Records the newest store request for `month` and returns its
+    /// generation. Cheap enough for the GTK thread: one atomic and one short
+    /// map lock, never a network or SQLite call.
+    pub(crate) fn begin_store(&self, month: chrono::NaiveDate) -> u64 {
+        let generation = self.next_store.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut latest = self.latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        latest.insert(calendar_month_key(month), generation);
+        generation
+    }
+
+    /// Writes `occurrences` only if `generation` is still the newest request
+    /// for `month`. Returns `Ok(false)` for a superseded snapshot.
+    pub(crate) fn store_if_newest(
+        &self,
+        cache: &lookout_dav::CalendarCache,
+        month: chrono::NaiveDate,
+        generation: u64,
+        occurrences: &[lookout_core::EventOccurrence],
+    ) -> std::result::Result<bool, String> {
+        // The write lock is only ever taken by blocking threads; holding it
+        // across the commit is what makes the order deterministic.
+        let _write = self.store_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&calendar_month_key(month))
+            .copied();
+        if current != Some(generation) {
+            return Ok(false);
+        }
+        cache.store_month(month, occurrences).map(|()| true).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_newest(&self, month: chrono::NaiveDate, generation: u64) -> bool {
+        self.latest
+            .lock()
+            .map(|latest| latest.get(&calendar_month_key(month)).copied() == Some(generation))
+            .unwrap_or(false)
+    }
+}
+
 pub(crate) struct CalendarUiState {
     pub(crate) accounts: HashMap<AccountId, CalendarAccountHandle>,
+    /// Lazily opened, per-account calendar search caches shared by search, the
+    /// backfill check and the app-side month writer (see
+    /// [`CalendarCacheSlot`]). Dropped when the account is removed and on
+    /// "Clear all caches", since the slot keeps a connection to the file.
+    pub(crate) calendar_cache_slots: HashMap<AccountId, Arc<CalendarCacheSlot>>,
     pub(crate) displayed_month: chrono::NaiveDate,
     /// Which calendars (by id) are currently shown - unioned in
     /// `refresh_displayed_calendar_view`, toggled from the sidebar's "My

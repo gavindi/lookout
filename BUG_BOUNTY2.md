@@ -110,6 +110,7 @@ Line numbers are as of `b081c24` on `dev`.
     - **Code:** `mirror_follow_up_to_graph` and `mirror_categories_to_graph` (and the pin mirror) each spawn an independent `spawn_future_local` per change. Each one runs `resolve_message_id` and then `PATCH`.
     - **Failure:** flag → unflag, or two quick category edits, are two concurrent PATCH chains whose completion order is up to the network. Outlook can end up with the *older* state, and the next delta pull then copies that older state back over the newer local one.
     - **Fix:** a per-(account, message) serial queue, or a "latest wins" slot. Keep the newest pending value per message and have one worker drain it.
+    - **Fixed (0.9.299):** `GraphMirrorQueue` keeps the newest pending value per `(account, Message-ID, property)` and runs one drain worker per key, so flag→unflag and quick category edits are sent in order while distinct properties stay independent; the pin mirror uses the same queue. Covered by the queue's latest-wins bookkeeping test.
 
 12. ✔ **The flat-file sweep races live writes in the IMAP session.**
     - **Where:** the sweep is in [cache.rs:1608-1650](source/crates/mail/src/cache.rs#L1608-L1650) and is started from [session.rs:1418-1433](source/crates/mail/src/session.rs#L1418-L1433).
@@ -118,26 +119,31 @@ Line numbers are as of `b081c24` on `dev`.
     - **Comparison:** the Graph session already *awaits* maintenance before its first sync for the analogous `graph_uids` race ([graph/src/mail/session.rs:133-158](source/crates/graph/src/mail/session.rs#L133-L158)).
     - **Fix:** await `run_maintenance` before the first sync on IMAP too. Alternatively, skip files whose mtime is newer than the snapshot.
     - **Related:** `purge_message_files` runs *before* `tx.commit()` in `replace_messages` and its siblings ([cache.rs:1154, 1284, 2292](source/crates/mail/src/cache.rs#L1154)). A failed commit leaves rows whose files are gone, and the `read_dir` over the whole attachments directory runs while holding the connection mutex. Move it after the commit and outside the lock.
+    - **Fixed (0.9.299):** `run_maintenance` is split into `run_startup_cleanup` (sweep + `graph_uids` prune), which the IMAP session awaits before its first sync, and `run_space_reclaim` (the one-time vacuum), which stays fire-and-forget. `purge_message_files` now runs after `tx.commit()` and after dropping the connection mutex in `replace_messages`, `store_partial_messages` and `delete_messages`.
 
 13. ✔ **Calendar search index: concurrent month stores, plus a fresh connection per call.** [support.rs:528-600](source/crates/app/src/window/support.rs#L528-L600).
     - **Race:** `spawn_calendar_cache_store` (Graph months) spawns an unordered blocking write per update. Two refreshes of the same month can commit out of order, which leaves the *older* snapshot indexed until the next refresh.
     - **Cost:** store, search and missing-months each call `CalendarCache::open`, which opens a new SQLite connection and re-runs the `PRAGMA`s, the DDL and the `user_version` check per call. That happens per search keystroke and per account.
     - **Fix:** keep one `Arc<CalendarCache>` per account on `CalendarUiState`, and serialise stores per account (one worker channel), or stamp each store with a generation and drop older ones.
+    - **Fixed (0.9.299):** a `CalendarCacheSlot` on `CalendarUiState` lazily opens one `Arc<CalendarCache>` per account and shares it across search, the backfill check and the month writer. Stores are generation-stamped on the GTK thread and only the newest request for a month is written under a per-slot write lock; slots are dropped on account removal and cleared with "Clear all caches". Covered by the store-generation test.
 
 14. ✔ **`BodyCache` is never invalidated.** [state.rs:1131-1156](source/crates/app/src/window/state.rs#L1131-L1156).
     - **Code:** it is keyed by `(MailboxId, Uid)` only, and nothing in the app ever calls `remove`, `retain` or `clear` on it.
     - **Failure:** after a UIDVALIDITY reset (a Dovecot index rebuild, a server migration), the reading pane can show a cached body for a *different* message that now has the same UID. Bodies of removed accounts also stay in memory.
     - **Fix:** include `uidvalidity` in the key, or clear a mailbox's entries when the session reports a validity change, and purge an account's entries on removal.
+    - **Fixed (0.9.299):** `BodyCache` gained `remove_mailbox` and `retain`; the `FoldersUpdated` handler compares each mailbox's `UIDVALIDITY` and drops a recreated mailbox's bodies, and account teardown, edit, transport switch and removal call `forget_account_bodies`. Covered by the body-cache invalidation and `uidvalidity_changes` tests.
 
 15. ✔ **Settings files: a corrupt read becomes defaults, and the next save makes the loss permanent.** [app_config.rs:742-767](source/crates/app/src/app_config.rs#L742-L767), [calendar_colors.rs:55-84](source/crates/app/src/calendar_colors.rs#L55-L84).
     - **Code:** `load_at` turns an unparseable `settings.json` into `AppConfig::default()` with only a warning. The first later `save` then overwrites the file non-atomically with those defaults (BUG_BOUNTY1 #4, still open).
     - **Failure:** a half-written file from a crash, or one hand-edit typo, silently destroys every rule, identity, signature and template.
     - **Fix:** alongside the atomic writer, rename an unparseable file to `settings.json.corrupt-<timestamp>` before falling back, and toast the user. The same applies to `calendar-colors.json`.
+    - **Fixed (0.9.299):** a new `fsutil` module provides `write_atomic` (unique `create_new` temp file, `sync_all`, rename, existing mode preserved) and `backup_corrupt`. `settings.json` and `calendar-colors.json` now keep a `.corrupt-<timestamp>` copy before falling back to defaults, show a startup toast naming it, and are written atomically. Covered by the backup and concurrent-writer tests.
 
 16. ◐ **Directory source: a cache hit or short prefix doesn't cancel the pending lookup.** [directory.rs:204-282](source/crates/app/src/directory.rs#L204-L282).
     - **Code:** `search()` returns early for a cached prefix or one below the minimum length, without bumping `generation` or removing the debounce timer. A query already debounced or in flight therefore still fires, and its `complete` runs with a generation that still matches.
     - **Impact:** both current callers re-check their own generation (`RecipientEntry::apply_suggestions`, the People directory handler), so nothing stale is shown today. It still wastes a GAL/LDAP round trip, and any new caller inherits the bug.
     - **Fix:** in both early-return paths, bump `generation`, `take()` and remove the timer, and clear `pending`.
+    - **Fixed (0.9.299):** `cancel_pending` bumps the generation, clears `pending` and removes the debounce timer on the too-short, cache-hit and no-backends paths. Covered by the cancellation test.
 
 ## Tier 4 — Inefficiency (CPU, I/O, main thread)
 

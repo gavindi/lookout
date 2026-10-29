@@ -511,48 +511,65 @@ pub(crate) fn spawn_cache_read<T: Send + 'static>(
     reply_rx
 }
 
-/// Opens a mail account's address-book cache on the `Worker`'s blocking
-/// thread pool instead of synchronously on the GTK thread - the schema DDL
-/// (`CREATE TABLE IF NOT EXISTS` etc.) is cheap in steady state but is still
-/// a blocking file-open + SQLite call sequence, and `connect_account`/
-/// `connect_other_account` don't need the result before they can proceed
-/// (see `AccountHandle::address_cache`'s doc comment: "a failure here only
-/// costs suggestions"). Mirrors `spawn_cache_read`'s shape, except there's no
-/// existing `Cache` to query - this is what produces one in the first place.
+/// The account's shared calendar-cache slot, created lazily. Cheap: the cache
+/// itself is only opened on the worker's blocking pool when a helper below
+/// actually needs it.
+pub(crate) fn calendar_cache_slot(state: &Rc<RefCell<CalendarUiState>>, account_id: &AccountId) -> Arc<CalendarCacheSlot> {
+    state.borrow_mut().calendar_cache_slots.entry(account_id.clone()).or_default().clone()
+}
+
 /// Writes one month of a non-CalDAV backend's occurrences into the calendar
 /// cache, so event search (CAL-22) sees Microsoft 365 and any other
 /// app-supplied source. CalDAV and webcal sessions write their own cache in
 /// `sync_month`; this is the app-side path for Graph, whose session has no
 /// cache of its own. Best-effort: a failure only costs search coverage for
-/// that month, never the live view.
-pub(crate) fn spawn_calendar_cache_store(worker: &Worker, account_id: AccountId, month: chrono::NaiveDate, occurrences: Vec<lookout_core::EventOccurrence>) {
+/// that month, never the live view. A store superseded by a newer refresh of
+/// the same month is dropped, so the older snapshot can never be the one left
+/// indexed (see `CalendarCacheSlot`).
+pub(crate) fn spawn_calendar_cache_store(
+    worker: &Worker,
+    slot: Arc<CalendarCacheSlot>,
+    account_id: AccountId,
+    month: chrono::NaiveDate,
+    occurrences: Vec<lookout_core::EventOccurrence>,
+) {
+    // The generation is taken here, on the GTK thread, so call order is the
+    // order that decides which snapshot wins - not whichever blocking task
+    // happens to acquire the write lock first.
+    let generation = slot.begin_store(month);
     worker.spawn(async move {
         let warn_id = account_id.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let cache = lookout_dav::CalendarCache::open(&account_id)?;
-            cache.store_month(month, &occurrences)
+        let result = tokio::task::spawn_blocking(move || match slot.open(&account_id) {
+            Some(cache) => slot.store_if_newest(&cache, month, generation, &occurrences),
+            None => Ok(false),
         })
         .await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => tracing::debug!("skipping a superseded calendar cache store for {warn_id} {month}"),
             Ok(Err(e)) => tracing::warn!("failed to cache {warn_id}'s calendar month {month} for search: {e}"),
             Err(e) => tracing::warn!("calendar cache write for {warn_id} panicked: {e}"),
         }
     });
 }
 
-/// Opens a calendar cache's index on the `Worker`'s blocking thread pool and
-/// returns the matching occurrences - the calendar counterpart of
-/// [`spawn_cache_read`]. The cache is opened per query: SQLite connections are
-/// cheap, and this avoids the app holding a second long-lived handle to a
-/// file the account session already owns.
-pub(crate) fn spawn_calendar_cache_search(worker: &Worker, account_id: AccountId, terms: Vec<String>) -> async_channel::Receiver<Vec<lookout_dav::CachedEventHit>> {
+/// Searches the account's shared calendar cache on the `Worker`'s blocking
+/// thread pool and returns the matching occurrences - the calendar
+/// counterpart of [`spawn_cache_read`]. Reuses the slot's already-open
+/// connection rather than opening the database (WAL pragmas, DDL and the
+/// schema check) on every keystroke.
+pub(crate) fn spawn_calendar_cache_search(
+    worker: &Worker,
+    slot: Arc<CalendarCacheSlot>,
+    account_id: AccountId,
+    terms: Vec<String>,
+) -> async_channel::Receiver<Vec<lookout_dav::CachedEventHit>> {
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     let warn_id = account_id.clone();
     worker.spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let cache = lookout_dav::CalendarCache::open(&account_id)?;
-            cache.search_events(&terms, CALENDAR_SEARCH_ROW_LIMIT)
+        let result = tokio::task::spawn_blocking(move || match slot.open(&account_id) {
+            Some(cache) => cache.search_events(&terms, CALENDAR_SEARCH_ROW_LIMIT),
+            None => Ok(Vec::new()),
         })
         .await;
         let hits = match result {
@@ -573,14 +590,19 @@ pub(crate) fn spawn_calendar_cache_search(worker: &Worker, account_id: AccountId
 
 /// The months in `months` a calendar cache has never stored - the backfill's
 /// "don't re-fetch what we already indexed" check, run off the GTK thread.
-pub(crate) fn spawn_calendar_cache_missing_months(worker: &Worker, account_id: AccountId, months: Vec<chrono::NaiveDate>) -> async_channel::Receiver<Vec<chrono::NaiveDate>> {
+pub(crate) fn spawn_calendar_cache_missing_months(
+    worker: &Worker,
+    slot: Arc<CalendarCacheSlot>,
+    account_id: AccountId,
+    months: Vec<chrono::NaiveDate>,
+) -> async_channel::Receiver<Vec<chrono::NaiveDate>> {
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     let warn_id = account_id.clone();
     worker.spawn(async move {
         let fallback = months.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let cache = lookout_dav::CalendarCache::open(&account_id)?;
-            cache.missing_months(&months)
+        let result = tokio::task::spawn_blocking(move || match slot.open(&account_id) {
+            Some(cache) => cache.missing_months(&months),
+            None => Ok(months),
         })
         .await;
         let missing = match result {
@@ -607,6 +629,14 @@ pub(crate) const CALENDAR_SEARCH_ROW_LIMIT: usize = 2000;
 /// Results shown after dedupe (one per series).
 pub(crate) const CALENDAR_SEARCH_RESULT_LIMIT: usize = 200;
 
+/// Opens a mail account's address-book cache on the `Worker`'s blocking
+/// thread pool instead of synchronously on the GTK thread - the schema DDL
+/// (`CREATE TABLE IF NOT EXISTS` etc.) is cheap in steady state but is still
+/// a blocking file-open + SQLite call sequence, and `connect_account`/
+/// `connect_other_account` don't need the result before they can proceed
+/// (see `AccountHandle::address_cache`'s doc comment: "a failure here only
+/// costs suggestions"). Mirrors `spawn_cache_read`'s shape, except there's no
+/// existing `Cache` to query - this is what produces one in the first place.
 pub(crate) fn spawn_cache_open(worker: &Worker, account_id: AccountId) -> async_channel::Receiver<Option<Arc<lookout_mail::Cache>>> {
     let (reply_tx, reply_rx) = async_channel::bounded(1);
     worker.spawn(async move {

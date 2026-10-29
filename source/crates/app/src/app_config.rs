@@ -10,11 +10,15 @@
 //! on-disk contract it will fill in. Other accounts are created by the
 //! add-account dialog (`other_accounts.rs`); their passwords live in the
 //! GNOME keyring, never in this file. Best-effort like `last_view.rs`: a
-//! missing or broken file reads back as defaults, never an error.
+//! missing file reads back as defaults, never an error. A file that exists but
+//! cannot be parsed is moved aside first (`settings.json.corrupt-<timestamp>`),
+//! so the defaults the next save writes never destroy the only copy of the
+//! user's rules, identities or templates.
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use lookout_core::{AccountId, CalendarId, Identity, MailboxRole, QuickStep, Rule, Signature, WebcalSubscription};
 use serde::{Deserialize, Serialize};
@@ -739,17 +743,41 @@ pub fn save(config: &AppConfig) {
     save_at(&config_path(), config);
 }
 
-fn load_at(path: &std::path::Path) -> AppConfig {
+/// Backups created by [`load_at`] for files it couldn't parse. Drained by the
+/// window once it has a toast overlay, so the user learns where their settings
+/// went instead of silently starting from defaults.
+static CORRUPT_BACKUPS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Takes the backup paths recorded since the last call (normally one at
+/// startup). A poisoned lock yields an empty list: a missing notification must
+/// never cost the user the app.
+pub(crate) fn take_corrupt_backups() -> Vec<PathBuf> {
+    CORRUPT_BACKUPS.lock().map(|mut backups| std::mem::take(&mut *backups)).unwrap_or_default()
+}
+
+fn load_at(path: &Path) -> AppConfig {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!(path = %path.display(), "ignoring unreadable settings.json: {e}");
-            AppConfig::default()
-        }),
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "unreadable settings.json: {e}");
+                match crate::fsutil::backup_corrupt(path) {
+                    Ok(backup) => {
+                        tracing::warn!(path = %path.display(), backup = %backup.display(), "kept a copy of the unreadable settings.json");
+                        if let Ok(mut backups) = CORRUPT_BACKUPS.lock() {
+                            backups.push(backup);
+                        }
+                    }
+                    Err(e) => tracing::error!(path = %path.display(), "could not back up the unreadable settings.json: {e}"),
+                }
+                AppConfig::default()
+            }
+        },
         Err(_) => AppConfig::default(),
     }
 }
 
-fn save_at(path: &std::path::Path, config: &AppConfig) {
+fn save_at(path: &Path, config: &AppConfig) {
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
             tracing::warn!(path = %path.display(), "could not create config dir: {e}");
@@ -758,7 +786,7 @@ fn save_at(path: &std::path::Path, config: &AppConfig) {
     }
     match serde_json::to_string_pretty(config) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(path, text) {
+            if let Err(e) = crate::fsutil::write_atomic(path, text.as_bytes(), 0o600) {
                 tracing::warn!(path = %path.display(), "could not save settings.json: {e}");
             }
         }
@@ -776,6 +804,9 @@ mod tests {
     #[test]
     fn config_round_trip_and_tolerance() {
         let dir = std::env::temp_dir().join(format!("lookout-app-config-test-{}", std::process::id()));
+        // A previous run's backup files would otherwise make the corruption
+        // assertions below ambiguous (the directory name is pid-based).
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
 
@@ -863,9 +894,20 @@ mod tests {
         save_at(&path, &config);
         assert_eq!(load_at(&path), config);
 
-        // A broken file also reads back as defaults, never an error.
+        // A broken file also reads back as defaults, never an error - but it
+        // is preserved first, so the defaults the next save writes can't
+        // destroy the user's only copy.
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(load_at(&path), AppConfig::default());
+        assert!(!path.exists(), "the unparseable file is moved out of the way");
+        let backups: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().is_some_and(|name| name.to_string_lossy().contains(".corrupt-")))
+            .collect();
+        assert_eq!(backups.len(), 1, "one corrupt copy was kept");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "not json");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

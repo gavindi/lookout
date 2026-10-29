@@ -6,10 +6,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use chrono::{DateTime, Utc};
 use gtk::glib;
-use lookout_core::{AccountId, EmailAddress, EmailSummary, Importance, InferenceClassification, Rule, RuleBackend, RuleSync};
+use lookout_core::{AccountId, EmailAddress, EmailSummary, FollowUpFlag, Importance, InferenceClassification, Rule, RuleBackend, RuleSync};
 use lookout_mail::session::AccountCommand;
 
+use crate::graph_mail::GraphMailClient;
+use crate::graph_pin::GraphPinClient;
 use crate::message_list::MessageListModel;
 
 use super::*;
@@ -98,27 +101,212 @@ fn display_zone_tz() -> Option<chrono_tz::Tz> {
     crate::calendar_tz::display_zone().tz()
 }
 
-/// Mirrors a stored flag change to Outlook through Graph (item 1.16 / item
-/// 5.4). Best effort: a failure is logged, and the next delta pull reconciles
-/// the two.
-pub(crate) fn mirror_follow_up_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message_ids: Vec<String>, flag: lookout_core::FollowUpFlag) {
-    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
-        return;
+/// Which Outlook property a queued mirror write changes. Kept separate from
+/// [`MirrorKey`] so an edit to one property can never replace a pending edit
+/// to another on the same message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MirrorKind {
+    FollowUp,
+    Categories,
+    Importance,
+    Focused,
+    Pin,
+}
+
+impl MirrorKind {
+    fn label(self) -> &'static str {
+        match self {
+            MirrorKind::FollowUp => "flag",
+            MirrorKind::Categories => "category",
+            MirrorKind::Importance => "importance",
+            MirrorKind::Focused => "Focused/Other",
+            MirrorKind::Pin => "pin",
+        }
+    }
+}
+
+/// One message's pending write, keyed by account + `Message-ID` + property.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct MirrorKey {
+    pub(crate) account_id: AccountId,
+    pub(crate) message_id: String,
+    pub(crate) kind: MirrorKind,
+}
+
+/// The value of a queued write. Only the newest value per key is kept.
+pub(crate) enum MirrorOp {
+    FollowUp(FollowUpFlag),
+    Categories(Vec<String>),
+    Importance(Importance),
+    Focused(InferenceClassification),
+    Pin { original_date: DateTime<Utc>, pinned: bool },
+}
+
+/// The Graph client a queued write goes through. Mail properties share
+/// [`GraphMailClient`]; pins use their own extended-properties client.
+#[derive(Clone)]
+pub(crate) enum MirrorTarget {
+    Mail(Rc<GraphMailClient>),
+    Pin(Rc<GraphPinClient>),
+}
+
+/// Latest-wins slots for Outlook mirror writes, plus the set of keys that
+/// currently have a worker draining them.
+///
+/// Each user action used to spawn its own future, so a flag→unflag (or two
+/// quick category edits) were two concurrent `PATCH` chains whose completion
+/// order was whatever the network decided - Outlook could end up with the
+/// *older* state, which the next delta pull then copied back over the newer
+/// local one. One worker per (account, message, property) sends the values in
+/// order and coalesces everything still waiting into the newest one.
+#[derive(Default)]
+pub(crate) struct GraphMirrorQueue {
+    pending: HashMap<MirrorKey, MirrorOp>,
+    active: HashSet<MirrorKey>,
+}
+
+impl GraphMirrorQueue {
+    /// Stores `op`, replacing an older value not yet sent. Returns `true` when
+    /// the caller must spawn the key's drain worker.
+    pub(crate) fn enqueue(&mut self, key: MirrorKey, op: MirrorOp) -> bool {
+        self.pending.insert(key.clone(), op);
+        self.active.insert(key)
+    }
+
+    pub(crate) fn take(&mut self, key: &MirrorKey) -> Option<MirrorOp> {
+        self.pending.remove(key)
+    }
+
+    /// Releases `key`'s worker slot. Returns `true` when a value arrived in the
+    /// meantime, so the worker must loop again instead of exiting.
+    pub(crate) fn finish(&mut self, key: &MirrorKey) -> bool {
+        if self.pending.contains_key(key) {
+            return true;
+        }
+        self.active.remove(key);
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// Queues one Outlook write for `message_id` and starts its worker if this is
+/// the first pending write for that key.
+pub(crate) fn enqueue_mirror(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message_id: String, kind: MirrorKind, op: MirrorOp, target: MirrorTarget) {
+    let key = MirrorKey {
+        account_id: account_id.clone(),
+        message_id,
+        kind,
     };
-    let zone = display_zone_tz();
+    let spawn = state.borrow_mut().graph_mirror.enqueue(key.clone(), op);
+    if spawn {
+        spawn_mirror_worker(state, key, target);
+    }
+}
+
+/// One drain worker for one key: sends the newest pending value, then any
+/// value that arrived while the request was in flight. The `RefCell` is never
+/// borrowed across an `.await`.
+fn spawn_mirror_worker(state: &Rc<RefCell<UiState>>, key: MirrorKey, target: MirrorTarget) {
+    let state = state.clone();
     glib::spawn_future_local(async move {
-        for message_id in message_ids {
-            match client.resolve_message_id(&message_id).await {
-                Ok(Some(graph_id)) => {
-                    if let Err(e) = client.set_follow_up(&graph_id, &flag, zone).await {
-                        tracing::warn!("Outlook flag mirror failed for {message_id}: {e}");
+        loop {
+            let op = { state.borrow_mut().graph_mirror.take(&key) };
+            match op {
+                Some(op) => perform_mirror(&target, &key, op).await,
+                None => {
+                    // `finish` and the take above run in the same GTK-thread
+                    // turn with no await between them, so a concurrent
+                    // `enqueue` either lands before the take (and is sent
+                    // next) or after `finish` (and starts a fresh worker).
+                    let more = { state.borrow_mut().graph_mirror.finish(&key) };
+                    if !more {
+                        break;
                     }
                 }
-                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the flag mirror"),
-                Err(e) => tracing::warn!("Outlook flag mirror lookup failed for {message_id}: {e}"),
             }
         }
     });
+}
+
+async fn perform_mirror(target: &MirrorTarget, key: &MirrorKey, op: MirrorOp) {
+    match target {
+        MirrorTarget::Mail(client) => {
+            let graph_id = match client.resolve_message_id(&key.message_id).await {
+                Ok(Some(graph_id)) => graph_id,
+                Ok(None) => {
+                    tracing::debug!("no Graph message for {}; skipping the {} mirror", key.message_id, key.kind.label());
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("Outlook {} mirror lookup failed for {}: {e}", key.kind.label(), key.message_id);
+                    return;
+                }
+            };
+            match op {
+                MirrorOp::FollowUp(flag) => {
+                    if let Err(e) = client.set_follow_up(&graph_id, &flag, display_zone_tz()).await {
+                        tracing::warn!("Outlook flag mirror failed for {}: {e}", key.message_id);
+                    }
+                }
+                MirrorOp::Categories(names) => {
+                    if let Err(e) = client.set_categories(&graph_id, &names).await {
+                        tracing::warn!("Outlook category mirror failed for {}: {e}", key.message_id);
+                    }
+                }
+                MirrorOp::Importance(importance) => {
+                    if let Err(e) = client.set_importance(&graph_id, importance).await {
+                        tracing::warn!("Outlook importance mirror failed for {}: {e}", key.message_id);
+                    }
+                }
+                MirrorOp::Focused(classification) => {
+                    if let Err(e) = client.set_inference_classification(&graph_id, classification).await {
+                        tracing::warn!("Outlook Focused/Other mirror failed for {}: {e}", key.message_id);
+                    }
+                }
+                // Pin writes belong to `MirrorTarget::Pin`; a mail target never
+                // sees one because the kind is part of the queue key.
+                MirrorOp::Pin { .. } => {}
+            }
+        }
+        MirrorTarget::Pin(client) => {
+            let MirrorOp::Pin { original_date, pinned } = op else {
+                return;
+            };
+            if let Err(e) = client.set_pinned(&key.message_id, original_date, pinned).await {
+                match e {
+                    // Expected for most Microsoft 365 accounts (sync isn't
+                    // enabled) or a message Graph hasn't indexed yet - quiet
+                    // on purpose, never surfaced as a pin failure.
+                    crate::graph_pin::GraphPinError::ConsentRequired => {
+                        tracing::debug!("skipping Outlook pin mirror for {}: Graph pin sync isn't enabled for this account", key.message_id);
+                    }
+                    crate::graph_pin::GraphPinError::MessageNotFound => {
+                        tracing::debug!("skipping Outlook pin mirror for {}: no matching Graph message found", key.message_id);
+                    }
+                    crate::graph_pin::GraphPinError::Http(msg) => {
+                        tracing::warn!("Outlook pin mirror failed for {}: {msg}", key.message_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mirrors a stored flag change to Outlook through Graph (item 1.16 / item
+/// 5.4). Best effort: a failure is logged, and the next delta pull reconciles
+/// the two.
+pub(crate) fn mirror_follow_up_to_graph(state: &Rc<RefCell<UiState>>, account_id: &AccountId, message_ids: Vec<String>, flag: FollowUpFlag) {
+    let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
+        return;
+    };
+    let target = MirrorTarget::Mail(client);
+    for message_id in message_ids {
+        enqueue_mirror(state, account_id, message_id, MirrorKind::FollowUp, MirrorOp::FollowUp(flag.clone()), target.clone());
+    }
 }
 
 /// Mirrors a stored category change to Outlook through Graph (item 5.4 /
@@ -132,6 +320,7 @@ pub(crate) fn mirror_categories_to_graph(state: &Rc<RefCell<UiState>>, account_i
     let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
         return;
     };
+    let target = MirrorTarget::Mail(client);
     let names_by_key: HashMap<String, String> = state
         .borrow()
         .categories
@@ -140,20 +329,10 @@ pub(crate) fn mirror_categories_to_graph(state: &Rc<RefCell<UiState>>, account_i
         .iter()
         .map(|def| (def.key.clone(), def.name.clone()))
         .collect();
-    glib::spawn_future_local(async move {
-        for (message_id, keys) in updates {
-            let names: Vec<String> = keys.iter().filter_map(|key| names_by_key.get(key).cloned()).collect();
-            match client.resolve_message_id(&message_id).await {
-                Ok(Some(graph_id)) => {
-                    if let Err(e) = client.set_categories(&graph_id, &names).await {
-                        tracing::warn!("Outlook category mirror failed for {message_id}: {e}");
-                    }
-                }
-                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the category mirror"),
-                Err(e) => tracing::warn!("Outlook category mirror lookup failed for {message_id}: {e}"),
-            }
-        }
-    });
+    for (message_id, keys) in updates {
+        let names: Vec<String> = keys.iter().filter_map(|key| names_by_key.get(key).cloned()).collect();
+        enqueue_mirror(state, account_id, message_id, MirrorKind::Categories, MirrorOp::Categories(names), target.clone());
+    }
 }
 
 /// Mirrors an importance change to Outlook through Graph (item 5.4 / M-12).
@@ -161,19 +340,10 @@ pub(crate) fn mirror_importance_to_graph(state: &Rc<RefCell<UiState>>, account_i
     let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
         return;
     };
-    glib::spawn_future_local(async move {
-        for message_id in message_ids {
-            match client.resolve_message_id(&message_id).await {
-                Ok(Some(graph_id)) => {
-                    if let Err(e) = client.set_importance(&graph_id, importance).await {
-                        tracing::warn!("Outlook importance mirror failed for {message_id}: {e}");
-                    }
-                }
-                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the importance mirror"),
-                Err(e) => tracing::warn!("Outlook importance mirror lookup failed for {message_id}: {e}"),
-            }
-        }
-    });
+    let target = MirrorTarget::Mail(client);
+    for message_id in message_ids {
+        enqueue_mirror(state, account_id, message_id, MirrorKind::Importance, MirrorOp::Importance(importance), target.clone());
+    }
 }
 
 /// Mirrors a Focused/Other change to Outlook through Graph (item 5.4 / M-03):
@@ -189,24 +359,19 @@ pub(crate) fn mirror_focused_to_graph(
     let Some(client) = consented_graph_mail(&state.borrow(), account_id) else {
         return;
     };
-    glib::spawn_future_local(async move {
-        for message_id in message_ids {
-            match client.resolve_message_id(&message_id).await {
-                Ok(Some(graph_id)) => {
-                    if let Err(e) = client.set_inference_classification(&graph_id, classification).await {
-                        tracing::warn!("Outlook Focused/Other mirror failed for {message_id}: {e}");
-                    }
-                }
-                Ok(None) => tracing::debug!("no Graph message for {message_id}; skipping the Focused/Other mirror"),
-                Err(e) => tracing::warn!("Outlook Focused/Other mirror lookup failed for {message_id}: {e}"),
-            }
-        }
-        if let Some(sender) = sender {
+    let target = MirrorTarget::Mail(client.clone());
+    for message_id in message_ids {
+        enqueue_mirror(state, account_id, message_id, MirrorKind::Focused, MirrorOp::Focused(classification), target.clone());
+    }
+    // The sender override is a separate collection, not an ordering step for
+    // the per-message classifications, so it can run on its own.
+    if let Some(sender) = sender {
+        glib::spawn_future_local(async move {
             if let Err(e) = client.create_override(classification, &sender).await {
                 tracing::warn!("Outlook Focused/Other override failed for {}: {e}", sender.address);
             }
-        }
-    });
+        });
+    }
 }
 
 /// Maps Outlook category names to Lookout keys through the shared master list

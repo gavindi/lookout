@@ -821,6 +821,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         refreshing: HashSet::new(),
         graph_property_syncs: Default::default(),
         graph_rule_syncs: Default::default(),
+        graph_mirror: Default::default(),
         sort_key: SortKey::Date,
         sort_descending: true,
         favorites: Vec::new(),
@@ -2727,6 +2728,105 @@ fn body_cache_shares_bodies_and_evicts_lru() {
     cache.insert(inbox.clone(), Uid(1), Rc::clone(&replacement));
     assert_eq!(cache.entries.len(), 2, "re-inserting replaces, never duplicates");
     assert!(Rc::ptr_eq(&cache.get(&inbox, &Uid(1)).unwrap(), &replacement));
+}
+
+/// A UIDVALIDITY reset drops that mailbox's cached bodies only; account
+/// teardown drops every mailbox belonging to the account.
+#[test]
+fn body_cache_invalidates_a_recreated_mailbox_and_a_removed_account() {
+    let inbox = MailboxId("acct:INBOX".into());
+    let archive = MailboxId("acct:Archive".into());
+    let other = MailboxId("other:INBOX".into());
+    let mut cache = BodyCache::new(8);
+    cache.insert(inbox.clone(), Uid(1), cached_body_for(1));
+    cache.insert(archive.clone(), Uid(2), cached_body_for(2));
+    cache.insert(other.clone(), Uid(3), cached_body_for(3));
+
+    cache.remove_mailbox(&inbox);
+    assert!(!cache.contains(&inbox, &Uid(1)));
+    assert!(cache.contains(&archive, &Uid(2)));
+    assert!(cache.contains(&other, &Uid(3)));
+
+    cache.retain(|mailbox| !mailbox.0.starts_with("acct:"));
+    assert!(cache.entries.is_empty());
+}
+
+/// A second edit replaces an unsent one for the same message+property, while
+/// a different property (or message) keeps its own pending value - so a
+/// category edit can never swallow a queued flag change.
+#[test]
+fn graph_mirror_queue_keeps_the_newest_value_per_property() {
+    let account = AccountId("acct".into());
+    let key = |kind| MirrorKey {
+        account_id: account.clone(),
+        message_id: "msg".into(),
+        kind,
+    };
+    let mut queue = GraphMirrorQueue::default();
+
+    assert!(queue.enqueue(key(MirrorKind::FollowUp), MirrorOp::FollowUp(lookout_core::FollowUpFlag::default())));
+    assert!(!queue.enqueue(key(MirrorKind::FollowUp), MirrorOp::FollowUp(lookout_core::FollowUpFlag::default())));
+    assert_eq!(queue.pending_len(), 1, "a newer value replaces the unsent one");
+    assert!(queue.enqueue(key(MirrorKind::Categories), MirrorOp::Categories(vec!["Work".into()])));
+    assert_eq!(queue.pending_len(), 2, "a different property is independent");
+
+    assert!(matches!(queue.take(&key(MirrorKind::FollowUp)), Some(MirrorOp::FollowUp(_))));
+    assert!(!queue.finish(&key(MirrorKind::FollowUp)), "nothing arrived while sending, so the worker exits");
+
+    // A value enqueued between `take` and `finish` must keep the worker alive.
+    assert!(queue.take(&key(MirrorKind::Categories)).is_some());
+    assert!(!queue.enqueue(key(MirrorKind::Categories), MirrorOp::Categories(vec!["Home".into()])));
+    assert!(queue.finish(&key(MirrorKind::Categories)));
+    assert!(queue.take(&key(MirrorKind::Categories)).is_some());
+    assert!(!queue.finish(&key(MirrorKind::Categories)));
+}
+
+/// A newer store request for the same month supersedes an older one, while a
+/// different month keeps its own newest generation - so a refresh always
+/// leaves the newer snapshot indexed regardless of which blocking task runs
+/// first.
+#[test]
+fn calendar_cache_store_generations_make_the_newest_snapshot_win() {
+    let slot = CalendarCacheSlot::default();
+    let month = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let other_month = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+
+    let first = slot.begin_store(month);
+    assert!(slot.is_newest(month, first));
+    let second = slot.begin_store(month);
+    assert!(!slot.is_newest(month, first), "the older snapshot is superseded");
+    assert!(slot.is_newest(month, second));
+
+    let third = slot.begin_store(other_month);
+    assert!(slot.is_newest(other_month, third));
+    assert!(slot.is_newest(month, second), "another month doesn't supersede this one");
+}
+
+fn mailbox(id: &str, validity: u32) -> lookout_core::Mailbox {
+    lookout_core::Mailbox {
+        id: MailboxId(id.into()),
+        account_id: AccountId("acct".into()),
+        name: id.into(),
+        parent: None,
+        delimiter: '/',
+        role: lookout_core::MailboxRole::Custom,
+        uidvalidity: UidValidity(validity),
+        uidnext: 1,
+        highest_modseq: None,
+        total: 0,
+        unread: 0,
+        flags: Vec::new(),
+        subscribed: true,
+    }
+}
+
+#[test]
+fn uidvalidity_changes_lists_only_recreated_mailboxes() {
+    let old = [mailbox("acct:INBOX", 1), mailbox("acct:Archive", 5)];
+    let new = [mailbox("acct:INBOX", 2), mailbox("acct:Archive", 5)];
+    assert_eq!(uidvalidity_changes(&old, &new), vec![MailboxId("acct:INBOX".into())]);
+    assert!(uidvalidity_changes(&old, &old).is_empty());
+    assert!(uidvalidity_changes(&[], &new).is_empty(), "a first listing has no previous validity to invalidate");
 }
 
 // --- Message-row bind (BUG_BOUNTY1.md, Tier 4 #20). ---

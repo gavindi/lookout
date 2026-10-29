@@ -16,6 +16,7 @@
 /// Software released under the GPL3 license
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use lookout_core::{CalendarId, CalendarInfo};
 
@@ -49,32 +50,54 @@ pub fn colors_path() -> PathBuf {
     config_dir().join("lookout").join("calendar-colors.json")
 }
 
-/// Loads the saved `CalendarId` -> colour map. Any failure (missing file, bad
-/// JSON, unreadable dir) yields an empty map - colours are cosmetic, so a
-/// broken file should never take the app down.
+/// Backups created by [`load_at`] for a file it couldn't parse, drained by the
+/// window so the user hears about the preserved copy.
+static CORRUPT_BACKUPS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Takes the backup paths recorded since the last call.
+pub(crate) fn take_corrupt_backups() -> Vec<PathBuf> {
+    CORRUPT_BACKUPS.lock().map(|mut backups| std::mem::take(&mut *backups)).unwrap_or_default()
+}
+
+/// Loads the saved `CalendarId` -> colour map. A missing file yields an empty
+/// map; an unreadable one is moved aside first, so the next save never
+/// overwrites the only copy.
 pub fn load() -> CalendarColorMap {
-    match std::fs::read_to_string(colors_path()) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-            tracing::warn!(path = %colors_path().display(), "ignoring unreadable calendar-colors.json: {e}");
-            CalendarColorMap::new()
-        }),
+    load_at(&colors_path())
+}
+
+fn load_at(path: &std::path::Path) -> CalendarColorMap {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "unreadable calendar-colors.json: {e}");
+                match crate::fsutil::backup_corrupt(path) {
+                    Ok(backup) => {
+                        tracing::warn!(path = %path.display(), backup = %backup.display(), "kept a copy of the unreadable calendar-colors.json");
+                        if let Ok(mut backups) = CORRUPT_BACKUPS.lock() {
+                            backups.push(backup);
+                        }
+                    }
+                    Err(e) => tracing::error!(path = %path.display(), "could not back up the unreadable calendar-colors.json: {e}"),
+                }
+                CalendarColorMap::new()
+            }
+        },
         Err(_) => CalendarColorMap::new(),
     }
 }
 
-/// Writes the map out (creating the directory as needed). Best-effort: a
-/// read-only home or disk error only logs a warning.
+/// Writes the map out atomically (creating the directory as needed).
+/// Best-effort: a read-only home or disk error only logs a warning.
 pub fn save(map: &CalendarColorMap) {
-    let path = colors_path();
-    if let Some(dir) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!(path = %path.display(), "could not create config dir: {e}");
-            return;
-        }
-    }
+    save_at(&colors_path(), map);
+}
+
+fn save_at(path: &std::path::Path, map: &CalendarColorMap) {
     match serde_json::to_string_pretty(map) {
         Ok(text) => {
-            if let Err(e) = std::fs::write(&path, text) {
+            if let Err(e) = crate::fsutil::write_atomic(path, text.as_bytes(), 0o600) {
                 tracing::warn!(path = %path.display(), "could not save calendar colours: {e}");
             }
         }
@@ -232,6 +255,31 @@ mod tests {
         assert_eq!(automatic_color(None, 1), CALENDAR_PALETTE[1]);
         // The palette wraps for an index past its end (a long calendar list).
         assert_eq!(automatic_color(None, CALENDAR_PALETTE.len()), CALENDAR_PALETTE[0]);
+    }
+
+    #[test]
+    fn an_unreadable_colour_file_is_preserved_before_defaults_take_over() {
+        let dir = std::env::temp_dir().join(format!("lookout-colors-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calendar-colors.json");
+        std::fs::write(&path, "not json").unwrap();
+
+        assert!(load_at(&path).is_empty());
+        assert!(!path.exists(), "the unparseable file is moved out of the way");
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().contains(".corrupt-")))
+            .expect("a corrupt copy was kept");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "not json");
+
+        // A good file still round-trips through the atomic writer.
+        let mut map = CalendarColorMap::new();
+        map.insert(CalendarId("cal".into()), "#3584e4".into());
+        save_at(&path, &map);
+        assert_eq!(load_at(&path), map);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
