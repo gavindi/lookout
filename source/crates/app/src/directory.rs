@@ -207,7 +207,8 @@ impl DirectorySource {
             complete(Vec::new());
             return;
         };
-        if let Some(cached) = self.cache.borrow().get(&query) {
+        let cached = self.cache.borrow().get(&query);
+        if let Some(cached) = cached {
             self.cancel_pending();
             complete(cached);
             return;

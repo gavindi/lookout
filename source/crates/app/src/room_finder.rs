@@ -425,7 +425,8 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
                         Err(RoomLookupError::Unavailable(message)) => *failure.borrow_mut() = Some(format!("Couldn't load rooms: {message}")),
                     }
                     rebuild();
-                    if let Some(refresh) = availability_refresh.borrow().as_ref() {
+                    let refresh = availability_refresh.borrow().clone();
+                    if let Some(refresh) = refresh {
                         refresh();
                     }
                 }),

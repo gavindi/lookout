@@ -336,7 +336,8 @@ fn build_month_grid(week_start: chrono::Weekday, on_context: &PendingContext) ->
                 if *selected_day.borrow() == Some(date) {
                     *selected_day.borrow_mut() = None;
                     click_target.remove_css_class("calendar-selected-cell");
-                    if let Some(callback) = on_day_activate.borrow().as_ref() {
+                    let callback = on_day_activate.borrow().clone();
+                    if let Some(callback) = callback {
                         callback(date);
                     }
                 } else {
@@ -404,7 +405,8 @@ fn attach_month_context(grid: &gtk::Grid, chip_events: &Rc<RefCell<HashMap<gtk::
                 current = w.parent();
             }
             let (Some(occ), Some(chip)) = (occ, current) else { return };
-            if let Some(callback) = on_context.borrow().as_ref() {
+            let callback = on_context.borrow().clone();
+            if let Some(callback) = callback {
                 callback(occ, chip, None);
             }
         });
@@ -730,7 +732,8 @@ fn attach_month_drag(
                 // A double-click opens the editor now; a single click is
                 // queued as a peek in case a second click follows.
                 if d.n_press >= 2 {
-                    if let Some(callback) = on_activate.borrow().as_ref() {
+                    let callback = on_activate.borrow().clone();
+                    if let Some(callback) = callback {
                         callback(d.occ);
                     }
                     return;
@@ -747,7 +750,8 @@ fn attach_month_drag(
                     if anchor.parent().is_none() {
                         return;
                     }
-                    if let Some(callback) = on_peek.borrow().as_ref() {
+                    let callback = on_peek.borrow().clone();
+                    if let Some(callback) = callback {
                         callback(occ, anchor);
                     }
                 });
@@ -759,7 +763,8 @@ fn attach_month_drag(
             let shift = (d.to_date - d.from_date).num_days();
             let new_start = d.occ.start + chrono::Duration::days(shift);
             let new_end = d.occ.end + chrono::Duration::days(shift);
-            if let Some(callback) = on_drag.borrow().as_ref() {
+            let callback = on_drag.borrow().clone();
+            if let Some(callback) = callback {
                 callback(d.occ, new_start, new_end, d.copy);
             }
         });
@@ -1496,7 +1501,8 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                     release_data.occurrences.borrow().get(occurrence_index).cloned()
                 };
                 if let Some(occ) = occ {
-                    if let Some(callback) = on_activate.borrow().as_ref() {
+                    let callback = on_activate.borrow().clone();
+                    if let Some(callback) = callback {
                         callback(occ);
                     }
                 }
@@ -1514,7 +1520,8 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                 };
                 let Some(occ) = occ else { return };
                 let (new_start, new_end) = drag_times(&drag, &occ);
-                if let Some(callback) = on_drag.borrow().as_ref() {
+                let callback = on_drag.borrow().clone();
+                if let Some(callback) = callback {
                     callback(occ, new_start, new_end, release_data.drag_copy.get());
                 }
                 release_canvas.queue_draw();
@@ -1536,7 +1543,8 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
                 let range = release_data.selection.borrow_mut().take();
                 release_canvas.queue_draw();
                 if let Some(range) = range {
-                    if let Some(callback) = on_slot_activate.borrow().as_ref() {
+                    let callback = on_slot_activate.borrow().clone();
+                    if let Some(callback) = callback {
                         callback(range.start_date, range.start_minutes, range.end_date, range.end_minutes);
                     }
                 }
@@ -1567,7 +1575,8 @@ fn attach_time_grid_context(canvas: &gtk::DrawingArea, band: bool, data: &TimeGr
                     .and_then(|chip| data.occurrences.borrow().get(chip.occurrence).cloned())
             };
             let Some(occ) = occ else { return };
-            if let Some(callback) = on_context.borrow().as_ref() {
+            let callback = on_context.borrow().clone();
+            if let Some(callback) = callback {
                 callback(occ, canvas_widget.clone().upcast(), Some((x, y)));
             }
         });
@@ -2905,7 +2914,8 @@ pub fn set_agenda(
 
             // The row is a clickable button when an editor is wired up, so the
             // agenda can open an event too. A plain box otherwise.
-            if let Some(callback) = a.on_activate.borrow().as_ref() {
+            let callback = a.on_activate.borrow().clone();
+            if let Some(callback) = callback {
                 let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
                 // Event text is content: blurred by privacy mode.
                 crate::privacy::mark_content(&button);
@@ -3078,7 +3088,8 @@ fn build_schedule_view(prefs: &crate::settings::CalendarPreferences, on_context:
             let hit = schedule_block_at(&state.borrow(), width, x, y);
             if let Some((lane, block)) = hit {
                 let occ = state.borrow().lanes[lane].blocks[block].occ.clone();
-                if let Some(callback) = on_activate.borrow().as_ref() {
+                let callback = on_activate.borrow().clone();
+                if let Some(callback) = callback {
                     callback(occ);
                 }
             }
@@ -3099,7 +3110,8 @@ fn build_schedule_view(prefs: &crate::settings::CalendarPreferences, on_context:
             let hit = schedule_block_at(&state.borrow(), width, x, y);
             let Some((lane, block)) = hit else { return };
             let occ = state.borrow().lanes[lane].blocks[block].occ.clone();
-            if let Some(callback) = on_context.borrow().as_ref() {
+            let callback = on_context.borrow().clone();
+            if let Some(callback) = callback {
                 callback(occ, canvas_widget.clone().upcast(), Some((x, y)));
             }
         });

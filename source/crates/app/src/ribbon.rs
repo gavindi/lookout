@@ -837,7 +837,8 @@ impl OverflowInner {
         self.restore_all();
         let Some(active) = self.active_band(stack) else {
             // A composer toolbar (or any non-ribbon page) is showing.
-            if let Some(layout) = self.layout.borrow().as_ref().and_then(|l| l.root.upgrade()) {
+            let root = self.layout.borrow().as_ref().and_then(|l| l.root.upgrade());
+            if let Some(layout) = root {
                 layout.set_visible(true);
             }
             self.sync_sections();
@@ -943,7 +944,8 @@ impl OverflowInner {
         for band in self.bands.borrow().iter() {
             restore_band(band, mode);
         }
-        if let Some(layout) = self.layout.borrow().clone() {
+        let layout = self.layout.borrow().clone();
+        if let Some(layout) = layout {
             restore_band(&layout, mode);
             if let Some(root) = layout.root.upgrade() {
                 root.set_visible(true);

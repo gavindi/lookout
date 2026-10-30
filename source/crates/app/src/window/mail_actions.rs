@@ -1863,7 +1863,8 @@ pub(crate) fn select_mailbox(
             refresh_message_loading_state(&state, &message_list, &message_list_stack);
             // Consume a pending `app.open-message` selection (an AI Chat
             // link click) now that this mailbox's data has actually landed.
-            if let Some((pending_mailbox, pending_uid)) = state.borrow_mut().pending_message_selection.take() {
+            let pending_selection = state.borrow_mut().pending_message_selection.take();
+            if let Some((pending_mailbox, pending_uid)) = pending_selection {
                 if pending_mailbox == mailbox_id {
                     message_list.select_uid(&pending_mailbox, pending_uid);
                 }

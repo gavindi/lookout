@@ -118,7 +118,8 @@ pub fn show_manage_shared_mailboxes(anchor: &gtk::Widget, app_config: Rc<RefCell
                         }
                         row.set_visible(false);
                         on_changed();
-                        if let Some(rebuild) = rebuild.borrow().clone() {
+                        let rebuild_hook = rebuild.borrow().clone();
+                        if let Some(rebuild) = rebuild_hook {
                             rebuild();
                         }
                     }
@@ -160,7 +161,8 @@ pub fn show_manage_shared_mailboxes(anchor: &gtk::Widget, app_config: Rc<RefCell
             }
             address_entry.set_text("");
             on_changed();
-            if let Some(rebuild) = rebuild.borrow().clone() {
+            let rebuild_hook = rebuild.borrow().clone();
+            if let Some(rebuild) = rebuild_hook {
                 rebuild();
             }
         }
@@ -175,7 +177,8 @@ pub fn show_manage_shared_mailboxes(anchor: &gtk::Widget, app_config: Rc<RefCell
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     dialog.set_child(Some(&scroller));
-    if let Some(rebuild) = rebuild.borrow().clone() {
+    let rebuild_hook = rebuild.borrow().clone();
+    if let Some(rebuild) = rebuild_hook {
         rebuild();
     }
     dialog.present();

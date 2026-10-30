@@ -85,7 +85,8 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                             config.search_folders.retain(|f| f.id != id);
                             crate::app_config::save(&config);
                         }
-                        if let Some(refresh) = &state.borrow().folder_tree_refresh {
+                        let folder_tree_refresh = state.borrow().folder_tree_refresh.clone();
+                        if let Some(refresh) = folder_tree_refresh {
                             refresh();
                         }
                         (rebuild_handle.borrow())();
@@ -128,7 +129,8 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
             }
             name_entry.set_text("");
             query_entry.set_text("");
-            if let Some(refresh) = &state.borrow().folder_tree_refresh {
+            let folder_tree_refresh = state.borrow().folder_tree_refresh.clone();
+            if let Some(refresh) = folder_tree_refresh {
                 refresh();
             }
             (rebuild_handle.borrow())();

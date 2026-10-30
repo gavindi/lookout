@@ -399,7 +399,8 @@ impl RecipientEntry {
     }
 
     fn notify_changed(&self) {
-        if let Some(changed) = self.changed.borrow().as_ref() {
+        let changed = self.changed.borrow().clone();
+        if let Some(changed) = changed {
             changed();
         }
     }
@@ -729,7 +730,8 @@ impl RecipientEntry {
         chip.append(&remove);
         // The profile-card trigger (Phase 4.2 / UX-67), when a caller installed
         // one: hovering or clicking the chip's name opens the person's card.
-        if let Some(hook) = self.person_card.borrow().as_ref() {
+        let person_card = self.person_card.borrow().clone();
+        if let Some(hook) = person_card {
             if is_plausible_address(token) {
                 hook(
                     &label,

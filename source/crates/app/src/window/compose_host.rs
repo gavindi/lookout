@@ -342,8 +342,9 @@ pub(crate) fn show_composer_in_reading_pane_full(
         // unless this composer's toolbar no longer owns the slot (it
         // finished while popped out, or a newer composer took the bar
         // over), which `restore` checks for.
-        if let (Some(bar), Some(toolbar)) = (compose_action_bar_for_done.as_ref(), compose_toolbar_for_done.borrow().as_ref()) {
-            bar.restore(toolbar);
+        let toolbar = compose_toolbar_for_done.borrow().clone();
+        if let (Some(bar), Some(toolbar)) = (compose_action_bar_for_done.as_ref(), toolbar) {
+            bar.restore(&toolbar);
         }
         if !popped.get() {
             // Switch away from the composer's page before removing it, not

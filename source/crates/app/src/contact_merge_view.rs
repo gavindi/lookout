@@ -608,7 +608,8 @@ fn apply_merge(dialog: &adw::Window, state: &Rc<RefCell<UiState>>, toast_overlay
                     }
                 }
                 transfer_favourites(&state, &keeper_old_key, &keeper_new_key, &deleted);
-                if let Some(refresh) = state.borrow().contacts_refresh.clone() {
+                let contacts_refresh = state.borrow().contacts_refresh.clone();
+                if let Some(refresh) = contacts_refresh {
                     refresh();
                 }
                 let merged = deleted.len() + 1;

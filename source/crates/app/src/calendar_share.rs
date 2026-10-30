@@ -130,7 +130,8 @@ pub(crate) fn show_share_calendar_dialog(window: &adw::ApplicationWindow, calend
                     Ok(_) => {
                         email_entry.set_text("");
                         toast_overlay.add_toast(adw::Toast::new(&format!("Shared with {address}")));
-                        if let Some(reload) = reload.borrow().clone() {
+                        let reload_hook = reload.borrow().clone();
+                        if let Some(reload) = reload_hook {
                             reload();
                         }
                     }
@@ -180,7 +181,8 @@ pub(crate) fn show_share_calendar_dialog(window: &adw::ApplicationWindow, calend
     dialog.present();
 
     if client.consented() {
-        if let Some(reload) = reload.borrow().clone() {
+        let reload_hook = reload.borrow().clone();
+        if let Some(reload) = reload_hook {
             reload();
         }
     }
@@ -225,7 +227,8 @@ fn permission_row(
                 match client.delete_permission(&calendar, &permission_id).await {
                     Ok(()) => {
                         toast_overlay.add_toast(adw::Toast::new("Sharing removed"));
-                        if let Some(reload) = reload.borrow().clone() {
+                        let reload_hook = reload.borrow().clone();
+                        if let Some(reload) = reload_hook {
                             reload();
                         }
                     }

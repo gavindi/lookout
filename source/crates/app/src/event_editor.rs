@@ -135,14 +135,16 @@ impl SchedulingHandle {
 
     /// Delivers a free/busy answer for `generation`.
     pub fn deliver(&self, generation: u64, availabilities: Vec<AttendeeAvailability>) {
-        if let Some(listener) = self.listener.borrow().as_ref() {
+        let listener = self.listener.borrow().clone();
+        if let Some(listener) = listener {
             listener(generation, availabilities, None);
         }
     }
 
     /// Reports that a lookup couldn't be answered (no backend, server error).
     pub fn fail(&self, generation: u64, message: String) {
-        if let Some(listener) = self.listener.borrow().as_ref() {
+        let listener = self.listener.borrow().clone();
+        if let Some(listener) = listener {
             listener(generation, Vec::new(), Some(message));
         }
     }
@@ -986,7 +988,8 @@ pub fn show_event_editor(
                 end_hour.set_value(f64::from(end.hour()));
                 end_minute.set_value(f64::from(end.minute()));
                 refresh_preview();
-                if let Some(refresh) = refresh_rows_holder.borrow().as_ref() {
+                let refresh = refresh_rows_holder.borrow().clone();
+                if let Some(refresh) = refresh {
                     refresh();
                 }
             })
@@ -3118,5 +3121,26 @@ mod tests {
         assert_eq!(event.attendees[0].role, AttendeeRole::Resource, "a booked room is a resource, not a guest");
         assert_eq!(event.attendees[0].address.name.as_deref(), Some("Room 4"));
         assert_eq!(event.attendees[1].role, AttendeeRole::Required, "a person from the same form stays required");
+    }
+
+    #[test]
+    fn a_listener_may_replace_itself_while_being_delivered_to() {
+        // The listener is called with its slot no longer borrowed, so one
+        // that re-registers (a reopened editor) can't hit a BorrowMutError.
+        let handle = SchedulingHandle::new();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        {
+            let inner = handle.clone();
+            let calls = calls.clone();
+            handle.set_listener(move |_, _, _| {
+                calls.set(calls.get() + 1);
+                let calls = calls.clone();
+                inner.set_listener(move |_, _, _| calls.set(calls.get() + 10));
+            });
+        }
+        handle.deliver(1, Vec::new());
+        assert_eq!(calls.get(), 1);
+        handle.fail(2, "offline".to_string());
+        assert_eq!(calls.get(), 11, "the replacement listener receives the next answer");
     }
 }

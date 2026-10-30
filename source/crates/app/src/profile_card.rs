@@ -529,7 +529,8 @@ pub fn show_person_card_at(context: ContextProvider, anchor: &impl IsA<gtk::Widg
         static DETACHED_CARD: RefCell<Option<gtk::Popover>> = const { RefCell::new(None) };
     }
     DETACHED_CARD.with(|slot| {
-        if let Some(previous) = slot.borrow_mut().take() {
+        let previous = slot.borrow_mut().take();
+        if let Some(previous) = previous {
             previous.popdown();
             previous.unparent();
         }

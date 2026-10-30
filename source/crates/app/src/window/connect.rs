@@ -2688,12 +2688,14 @@ pub(crate) fn connect_calendar_account(
                         refresh_tasks_view(&calendar_state, &tasks_view);
                     }
                     CalendarSessionEvent::FreeBusyUpdated { request_id, availabilities } => {
-                        if let Some((handle, generation)) = calendar_state.borrow_mut().scheduling_pending.remove(&request_id) {
+                        let pending = calendar_state.borrow_mut().scheduling_pending.remove(&request_id);
+                        if let Some((handle, generation)) = pending {
                             handle.deliver(generation, availabilities);
                         }
                     }
                     CalendarSessionEvent::FreeBusyFailed { request_id, message } => {
-                        if let Some((handle, generation)) = calendar_state.borrow_mut().scheduling_pending.remove(&request_id) {
+                        let pending = calendar_state.borrow_mut().scheduling_pending.remove(&request_id);
+                        if let Some((handle, generation)) = pending {
                             handle.fail(generation, message);
                         }
                     }

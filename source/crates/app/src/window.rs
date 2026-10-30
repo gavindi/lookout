@@ -5502,7 +5502,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 ribbon_tabs.set_sensitive(false);
                 // People may have been popped out into their own window -
                 // bring that to the front instead of the in-stack placeholder.
-                if let Some(win) = contacts_window.borrow().as_ref() {
+                let win = contacts_window.borrow().clone();
+                if let Some(win) = win {
                     win.present();
                 }
             }
@@ -5593,7 +5594,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let contacts_view_button = contacts_view_button.clone();
         let contacts_window = contacts_window.clone();
         open_contacts_window_button.connect_clicked(move |_| {
-            if let Some(existing) = contacts_window.borrow().as_ref() {
+            let existing = contacts_window.borrow().clone();
+            if let Some(existing) = existing {
                 existing.present();
                 return;
             }
@@ -7862,7 +7864,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     move |card: lookout_core::VCard| {
                         crate::contacts_view::save_contact_entry(&state, &toast, &entry, card);
                         details.show_details();
-                        if let Some(refresh) = state.borrow().contacts_details_refresh.clone() {
+                        let contacts_details_refresh = state.borrow().contacts_details_refresh.clone();
+                        if let Some(refresh) = contacts_details_refresh {
                             refresh();
                         }
                     }
@@ -7875,7 +7878,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     move || {
                         delete_contact_entries(&state, &toast, std::slice::from_ref(&entry));
                         details.show_details();
-                        if let Some(refresh) = state.borrow().contacts_details_refresh.clone() {
+                        let contacts_details_refresh = state.borrow().contacts_details_refresh.clone();
+                        if let Some(refresh) = contacts_details_refresh {
                             refresh();
                         }
                     }
@@ -7892,7 +7896,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             let toast_overlay = toast_overlay.clone();
             Rc::new(move |entry: &ContactsListEntry| {
                 delete_contact_entries(&state, &toast_overlay, std::slice::from_ref(entry));
-                if let Some(refresh) = state.borrow().contacts_details_refresh.clone() {
+                let contacts_details_refresh = state.borrow().contacts_details_refresh.clone();
+                if let Some(refresh) = contacts_details_refresh {
                     refresh();
                 }
             })
@@ -10019,7 +10024,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         controller.connect_key_pressed(move |_controller, keyval, keycode, state_modifiers| {
             if file_mode.get() {
                 if keyval == gtk::gdk::Key::Escape && (state_modifiers & crate::shortcuts::MODIFIER_MASK).is_empty() {
-                    if let Some(close) = file_mode_close.borrow().as_ref() {
+                    let close = file_mode_close.borrow().clone();
+                    if let Some(close) = close {
                         close();
                     }
                     return glib::Propagation::Stop;
@@ -10046,7 +10052,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let Some(display) = &display else {
                     return glib::Propagation::Stop;
                 };
-                match shortcuts.borrow_mut().set_chord(&shortcut_settings, display, action, keycode, state_modifiers) {
+                // Bound first: a `match` scrutinee's `RefMut` would live
+                // through the arms, and `Ok` borrows `shortcuts` again.
+                let recorded = shortcuts.borrow_mut().set_chord(&shortcut_settings, display, action, keycode, state_modifiers);
+                match recorded {
                     Ok(_) => {
                         shortcuts.borrow_mut().capturing = false;
                         *capture_action.borrow_mut() = None;
@@ -10081,7 +10090,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
                 return glib::Propagation::Proceed;
             };
-            if let Some(run) = dispatch.borrow().get(action) {
+            let run = dispatch.borrow().get(action).cloned();
+            if let Some(run) = run {
                 run();
                 glib::Propagation::Stop
             } else {
@@ -10300,7 +10310,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             // Any open composer's From dropdown re-reads its
                             // identities live, so a change made in Config
                             // while composing lands in the open list too.
-                            if let Some(refresh) = state.borrow().composer_identities_refresh.clone() {
+                            let composer_identities_refresh = state.borrow().composer_identities_refresh.clone();
+                            if let Some(refresh) = composer_identities_refresh {
                                 refresh();
                             }
                             refresh_hook();
@@ -11422,7 +11433,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let open_settings_forward: OpenSettingsFn = {
             let settings_hook = settings_hook.clone();
             Rc::new(move |section: &str| {
-                if let Some(open) = settings_hook.borrow().as_ref() {
+                let open = settings_hook.borrow().clone();
+                if let Some(open) = open {
                     open(section);
                 }
             })

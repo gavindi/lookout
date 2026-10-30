@@ -223,7 +223,8 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
             let snapped = (minutes / SLOT_MINUTES) * SLOT_MINUTES;
             let date = click_state.borrow().date;
             let naive = date.and_hms_opt(0, 0, 0).unwrap() + Duration::minutes(snapped);
-            if let Some(callback) = on_time_picked.borrow().as_ref() {
+            let callback = on_time_picked.borrow().clone();
+            if let Some(callback) = callback {
                 callback(naive);
             }
         });
@@ -238,7 +239,8 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
             let date = state.borrow().date - Duration::days(1);
             state.borrow_mut().date = date;
             header_label.set_label(&format_date(date));
-            if let Some(callback) = on_date_changed.borrow().as_ref() {
+            let callback = on_date_changed.borrow().clone();
+            if let Some(callback) = callback {
                 callback(date);
             }
         });
@@ -251,7 +253,8 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
             let date = state.borrow().date + Duration::days(1);
             state.borrow_mut().date = date;
             header_label.set_label(&format_date(date));
-            if let Some(callback) = on_date_changed.borrow().as_ref() {
+            let callback = on_date_changed.borrow().clone();
+            if let Some(callback) = callback {
                 callback(date);
             }
         });
@@ -264,7 +267,8 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
             let date = chrono::Utc::now().date_naive();
             state.borrow_mut().date = date;
             header_label.set_label(&format_date(date));
-            if let Some(callback) = on_date_changed.borrow().as_ref() {
+            let callback = on_date_changed.borrow().clone();
+            if let Some(callback) = callback {
                 callback(date);
             }
         });
@@ -272,7 +276,8 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
     {
         let on_refresh = on_refresh.clone();
         refresh.connect_clicked(move |_| {
-            if let Some(callback) = on_refresh.borrow().as_ref() {
+            let callback = on_refresh.borrow().clone();
+            if let Some(callback) = callback {
                 callback();
             }
         });

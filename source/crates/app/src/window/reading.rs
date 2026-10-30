@@ -1326,7 +1326,8 @@ pub(crate) fn render_body(
         if let Some(invitation) = reply {
             let first = state.borrow_mut().imip_replies_applied.insert((mailbox.clone(), uid));
             if first {
-                if let Some(calendar_state) = state.borrow().calendar_state.clone() {
+                let calendar_state = state.borrow().calendar_state.clone();
+                if let Some(calendar_state) = calendar_state {
                     apply_incoming_imip_reply(state, &calendar_state, &invitation);
                 }
             }

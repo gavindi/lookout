@@ -216,7 +216,7 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
 
 ## Tier 5 — Latent hazards
 
-27. **P2** ✔ **Edition-2021 `if let … = x.borrow()…` keeps the `Ref` alive across a callback** (BUG_BOUNTY1 #26, widened).
+27. **P2** ✔ **Fixed** — **Edition-2021 `if let … = x.borrow()…` keeps the `Ref` alive across a callback** (BUG_BOUNTY1 #26, widened).
     - **Scope:** 86 sites in `app/src` match `if let … = <rc>.borrow()… {` with a body that calls out.
     - **Highest risk:** the sites that invoke *hooks* while `state` is borrowed:
       - `state.borrow().contacts_refresh` at [contact_merge_view.rs:611](source/crates/app/src/contact_merge_view.rs#L611)
@@ -226,10 +226,13 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
       - `apply_incoming_imip_reply` at [reading.rs:1329](source/crates/app/src/window/reading.rs#L1329)
     - **Status:** these hooks currently take only shared borrows of `state`, so nothing panics today. The first `state.borrow_mut()` added anywhere inside them becomes an abort in a GTK trampoline.
     - **Fix:** bind the clone with `let hook = …;` first. Alternatively, moving the workspace to edition 2024 shortens these temporaries' lifetimes and fixes all 86 at once.
+    - **Correction:** edition 2024 does *not* fix these. Its `if let` rescope drops the scrutinee's temporaries before the `else` block only, and the then-block still holds them, because its bindings may borrow from them. Every site here calls out from the then-block. `match` scrutinees keep their temporaries through every arm in both editions. The real count is also higher: 154 single-line `if let`/`while let` sites plus 18 `match` sites, most of them plain field reads and writes.
+    - **Fixed (0.9.301):** 57 sites now bind the scrutinee with a statement-level `let` first, following the existing idiom at `window.rs`'s `contacts_refresh` and `calendar_glue.rs`'s `dashboard_refresh`. That covers every hook listed above, the `Rc<dyn Fn>` callback slots that called through `slot.borrow().as_ref()` (calendar view, schedule grid, `SchedulingHandle`, recipient entry, room finder, the window's key dispatch, file-mode close and settings hooks), `folder_tree_refresh`, the directory's cached-prefix `complete`, and three `borrow_mut()` scrutinees that called out (the free/busy `deliver`/`fail`, a pending selection's `select_uid`, and the profile card's `popdown`). One site was a **live crash**, not a latent hazard: `match shortcuts.borrow_mut().set_chord(..)` kept its `RefMut` alive into the `Ok` arm, which calls `shortcuts.borrow_mut()` again, so successfully recording a custom keyboard shortcut panicked inside the key handler. The remaining sites (field writes, `send_blocking`, cairo painting, toast-only bodies) are left alone, and so are the `(rebuild.borrow())()` self-rebuild statements, whose slot is only mutably borrowed once at setup. `clippy::significant_drop_in_scrutinee` does not flag `RefCell` guards, so it can't serve as a regression check. Covered by `a_listener_may_replace_itself_while_being_delivered_to`, which fails with `BorrowMutError` on the old `deliver`.
 
-28. **P4** ✔ **Orphaned doc comment.** [support.rs:514-527](source/crates/app/src/window/support.rs#L514-L527).
+28. **P4** ✔ **Fixed** — **Orphaned doc comment.** [support.rs:514-527](source/crates/app/src/window/support.rs#L514-L527).
     - **Problem:** the "Opens a mail account's address-book cache…" doc meant for `spawn_cache_open` (line 610) is glued onto `spawn_calendar_cache_store`, so both functions are mis-documented.
     - **Fix:** move it to `spawn_cache_open`.
+    - **Fixed (0.9.299):** Tier 3's `CalendarCacheSlot` rewrite of `support.rs` gave `spawn_calendar_cache_store` its own doc and put the address-book text back on `spawn_cache_open`; re-checked for 0.9.301.
 
 ## Tier 6 — Duplicated code
 
@@ -304,7 +307,7 @@ Rows 2 and 4 are kept for traceability because they were closed by work in this 
 | 16 | P3 | ICS/vCard import read synchronously, `file.path()` only | Open ([calendar_glue.rs:3208](source/crates/app/src/window/calendar_glue.rs#L3208), [contacts_view.rs:1050](source/crates/app/src/contacts_view.rs#L1050)) |
 | 17 | P3 | Blocking contacts SQLite inside async tasks | Open; see #18 |
 | 25 | P4 | `undo_stack.remove(0)` | Open ([mail_actions.rs:2772](source/crates/app/src/window/mail_actions.rs#L2772)) |
-| 26 | P2 | Edition-2021 borrow temporaries | Open; see #27 |
+| 26 | P2 | Edition-2021 borrow temporaries | Addressed by #27 (0.9.301) |
 | 27 | P2 | `lock().unwrap()` poisoning cascade | Open (85 in the mail cache, 12 in the dav cache) |
 | 28 | P3 | `DefaultHasher` for on-disk names | Open ([cache.rs:120-124](source/crates/mail/src/cache.rs#L120-L124)); the doc comment calls it "fixed-seed", but the algorithm itself is not stable across Rust releases |
 | 29–30 | P3 | Shared helpers / app duplicates | Open; expanded in Tier 6 |
@@ -335,7 +338,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 7. **#22 + BUG_BOUNTY1 #5/#6 + #32/#33:** one shared per-account OAuth/Graph account with cached consent flags, so the consent cache is written once.
 8. **#25:** `spawn_blocking` around `Cache::open`.
 9. **#20:** the generated `date` column and `(partial, date)` index.
-10. **#27 + BUG_BOUNTY1 #26:** bind the hook clone before calling it (or move to edition 2024), which fixes all 86 sites at once.
+10. ~~**#27 + BUG_BOUNTY1 #26:** bind the hook clone before calling it.~~ ✔ Fixed (0.9.301).
 11. **BUG_BOUNTY1 #8:** ICS import duplicating UIDs outside the loaded months.
 
 **P3 — do with the area open**
@@ -348,7 +351,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 
 **P4 — opportunistic**
 
-17. **#19 (b), #24 (b), #26 (rest), #28, #35**, plus BUG_BOUNTY1 #25 and #31.
+17. **#19 (b), #24 (b), #26 (rest), #35**, plus BUG_BOUNTY1 #25 and #31 (#28 is fixed).
 
 ## Verification
 - `cargo fmt --all -- --check`

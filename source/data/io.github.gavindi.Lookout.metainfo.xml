@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.301" date="2026-10-30">
+      <description>
+        <p>Stability fix. Recording a new keyboard shortcut in Settings no longer crashes Lookout once the chord is accepted. Beyond that, a set of internal callbacks (calendar clicks and drags, the scheduling assistant, contact refreshes, the ribbon, search folders and directory suggestions) now run only after Lookout has finished reading the state they were looked up from, which closes off a whole class of crash that future changes could otherwise have introduced.</p>
+      </description>
+    </release>
     <release version="0.9.300" date="2026-10-30">
       <description>
         <p>Contacts fix. When an address book or Microsoft 365 contact folder is deleted on the server, Lookout now forgets it properly the first time it notices. Before, the deleted book kept being rediscovered as empty on every sync, so each contact check re-read and re-parsed the whole address book in the background for as long as the app stayed open. The contacts still leave the People screen exactly as they did before, just without the repeated work.</p>

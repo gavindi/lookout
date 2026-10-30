@@ -623,7 +623,8 @@ pub(crate) fn install_calendar_sidebar_actions(
                 &mail_overview_day_list,
             );
             refresh_tasks_view(&calendar_state, &tasks_view);
-            if let Some(hook) = calendar_state.borrow().dashboard_refresh.clone() {
+            let dashboard_refresh = calendar_state.borrow().dashboard_refresh.clone();
+            if let Some(hook) = dashboard_refresh {
                 hook();
             }
         }
@@ -2475,7 +2476,8 @@ pub(crate) fn refresh_tasks_view(calendar_state: &Rc<RefCell<CalendarUiState>>, 
     // Keep the reminder engine's task snapshot in step with the one the view
     // just painted (T-05). The hook is installed by the window once the engine
     // exists; before that this is a no-op.
-    if let Some(hook) = calendar_state.borrow().task_reminders_refresh.clone() {
+    let task_reminders_refresh = calendar_state.borrow().task_reminders_refresh.clone();
+    if let Some(hook) = task_reminders_refresh {
         hook(&merged_tasks_with_accounts(calendar_state));
     }
     // Every task change funnels through here (CalDAV and Google Tasks
@@ -3033,7 +3035,8 @@ pub(crate) fn show_calendar_dialog(
             let _ = lookout_dav::remove_subscription_cache(&id);
             reload_session();
             refresh_ui();
-            if let Some(rebuild) = rebuild_manage.borrow().clone() {
+            let rebuild = rebuild_manage.borrow().clone();
+            if let Some(rebuild) = rebuild {
                 rebuild();
             }
             toast_overlay.add_toast(adw::Toast::new("Subscription removed"));
@@ -3111,7 +3114,8 @@ pub(crate) fn show_calendar_dialog(
             }
             reload_session();
             refresh_ui();
-            if let Some(rebuild) = rebuild_manage.borrow().clone() {
+            let rebuild = rebuild_manage.borrow().clone();
+            if let Some(rebuild) = rebuild {
                 rebuild();
             }
         }
@@ -3485,7 +3489,8 @@ pub(crate) fn show_calendar_dialog(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     dialog.set_content(Some(&scroller));
-    if let Some(rebuild) = rebuild_manage.borrow().clone() {
+    let rebuild = rebuild_manage.borrow().clone();
+    if let Some(rebuild) = rebuild {
         rebuild();
     }
     dialog.present();

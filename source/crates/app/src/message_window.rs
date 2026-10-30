@@ -86,7 +86,8 @@ pub(crate) struct MessageWindowState {
 /// reply handlers.
 pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, main_reading_stack: &gtk::Stack, summary: &EmailSummary) {
     let key = (summary.mailbox.clone(), summary.uid);
-    if let Some(existing) = state.borrow().message_windows.get(&key).cloned() {
+    let existing = state.borrow().message_windows.get(&key).cloned();
+    if let Some(existing) = existing {
         existing.borrow().window.present();
         return;
     }
