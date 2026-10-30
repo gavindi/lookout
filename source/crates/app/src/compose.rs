@@ -612,14 +612,10 @@ fn text_to_html(text: &str) -> String {
     out
 }
 
-/// Wraps the editor's body HTML in a full document for `WebView::load_html`,
-/// with a minimal stylesheet so quoted text stays visually distinct while
-/// composing. The page follows the light/dark scheme (with the reading pane's
-/// dark colours) and leaves its background to the pane behind it, unless the
-/// composer's "View in Light Mode" puts [`LIGHT_VIEW_CLASS`] on the root; none
-/// of this is sent, since `read_content` reads only the body's contents.
-/// The editor page's root class while the composer is viewed in light mode.
-const LIGHT_VIEW_CLASS: &str = "lookout-light-view";
+/// The id of the editor page's dark-view `<style>` element: the reading
+/// pane's "Switch message theme" override, which "View in Light Mode"
+/// disables.
+const DARK_VIEW_STYLE_ID: &str = "lookout-dark-view";
 
 /// Shows the rich editor's page in light mode (`true`: black text on a white
 /// page, as most recipients will see it) or following the app's scheme over
@@ -631,27 +627,56 @@ fn set_light_view(web_view: &webkit::WebView, light: bool) {
         gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.0)
     };
     web_view.set_background_color(&canvas);
-    let script = format!("document.documentElement.classList.toggle('{LIGHT_VIEW_CLASS}', {light});");
+    let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) el.disabled = {light};");
     let web_view = web_view.clone();
     glib::spawn_future_local(async move {
         let _ = web_view.evaluate_javascript_future(&script, None, None).await;
     });
 }
 
-fn html_document(body: &str) -> String {
+/// Whether the rich editor sits on a dark surface, judged from the GTK
+/// foreground colour its neighbours' text is drawn in (light text means a
+/// dark surface). WebKit's own `prefers-color-scheme` can't be used: under
+/// libadwaita it stays `light` even when the app is dark.
+fn on_dark_surface(widget: &impl IsA<gtk::Widget>) -> bool {
+    let fg = widget.as_ref().color();
+    0.2126 * fg.red() + 0.7152 * fg.green() + 0.0722 * fg.blue() > 0.5
+}
+
+/// Arms the editor page's dark view to match [`on_dark_surface`]. Run when
+/// the page finishes loading, whenever the editor is mapped (including after
+/// popping out or back in) and when the app's scheme flips. "View in Light
+/// Mode" sits on top of this, via the element's `disabled`.
+fn sync_dark_view(web_view: &webkit::WebView) {
+    let media = if on_dark_surface(web_view) { "all" } else { "not all" };
+    let script = format!("var el = document.getElementById('{DARK_VIEW_STYLE_ID}'); if (el) el.media = '{media}';");
+    let web_view = web_view.clone();
+    glib::spawn_future_local(async move {
+        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+    });
+}
+
+/// Wraps the editor's body HTML in a full document for `WebView::load_html`,
+/// with a minimal stylesheet so quoted text stays visually distinct while
+/// composing. The page is laid out in the light scheme over a transparent
+/// background; on a dark surface (`dark`, later kept current by
+/// [`sync_dark_view`]) the reading pane's message-theme override
+/// ([`crate::window::MESSAGE_THEME_OVERRIDE_CSS`]) inverts it, so typed text
+/// and forwarded HTML, signatures and pasted text with their own dark inline
+/// colours turn light exactly as they do in the reading pane. "View in Light
+/// Mode" disables that override (see [`set_light_view`]). None of this is
+/// sent, since `read_content` reads only the body's contents.
+fn html_document(body: &str, dark: bool) -> String {
+    let dark_view = crate::window::MESSAGE_THEME_OVERRIDE_CSS;
+    let media = if dark { "all" } else { "not all" };
     format!(
         r#"<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-:root {{ color-scheme: light dark; }}
-:root.{LIGHT_VIEW_CLASS} {{ color-scheme: light; }}
+:root {{ color-scheme: light; }}
 html, body {{ background: transparent; }}
 body {{ font-family: system-ui, sans-serif; font-size: 12pt; margin: 8px; }}
 blockquote {{ margin: 4px 0 4px 16px; padding-left: 8px; border-left: 2px solid #999; color: #555; }}
-@media (prefers-color-scheme: dark) {{
-:root:not(.{LIGHT_VIEW_CLASS}) body {{ color: #f0f0f2; }}
-:root:not(.{LIGHT_VIEW_CLASS}) blockquote {{ color: #a0a0a8; border-left-color: #6b6b70; }}
-:root:not(.{LIGHT_VIEW_CLASS}) a {{ color: #78aeed; }}
-}}
-</style></head><body>{body}</body></html>"#
+</style><style id="{DARK_VIEW_STYLE_ID}" media="{media}">
+{dark_view}</style></head><body>{body}</body></html>"#
     )
 }
 
@@ -1274,7 +1299,25 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
     }
 
     let initial_body = if initial_html.trim().is_empty() { "<p><br></p>".to_string() } else { initial_html };
-    web_view.load_html(&html_document(&initial_body), None);
+    // A first guess before the editor is placed in the window; `map` and the
+    // finished load correct it against the surface it actually lands on.
+    web_view.load_html(&html_document(&initial_body, on_dark_surface(web_view.as_ref())), None);
+    web_view.connect_map(sync_dark_view);
+    {
+        let weak = web_view.downgrade();
+        let style_manager = adw::StyleManager::default();
+        let handler = style_manager.connect_dark_notify(move |_| {
+            if let Some(view) = weak.upgrade() {
+                sync_dark_view(&view);
+            }
+        });
+        let handler = Cell::new(Some(handler));
+        web_view.connect_destroy(move |_| {
+            if let Some(handler) = handler.take() {
+                style_manager.disconnect(handler);
+            }
+        });
+    }
 
     // A pasted image becomes an inline `data:` <img> (extracted back out to
     // a `cid:` attachment at read time - see `read_content`). WebKitGTK's
@@ -1291,6 +1334,7 @@ pub(crate) fn build_rich_editor(initial_html: String) -> (Rc<webkit::WebView>, F
             if event != webkit::LoadEvent::Finished {
                 return;
             }
+            sync_dark_view(view);
             const PASTE_SCRIPT: &str = r#"(function () {
                 if (window.__lookoutPasteHandlerInstalled) return;
                 window.__lookoutPasteHandlerInstalled = true;
@@ -3073,16 +3117,26 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_page_follows_the_scheme_and_leaves_its_background_to_the_pane() {
-        let doc = html_document("<p>Hi</p>");
-        assert!(doc.contains(":root { color-scheme: light dark; }"));
+    fn the_editor_page_uses_the_reading_panes_dark_theme_and_leaves_its_background_to_the_pane() {
+        let doc = html_document("<p>Hi</p>", true);
+        // Laid out light, so the dark override's inversion turns the default
+        // black text (and any dark inline colour) light.
+        assert!(doc.contains(":root { color-scheme: light; }"));
         assert!(doc.contains("html, body { background: transparent; }"));
-        assert!(doc.contains("@media (prefers-color-scheme: dark)"));
-        // "View in Light Mode" forces the light scheme and switches the dark
-        // colours off.
-        assert!(doc.contains(&format!(":root.{LIGHT_VIEW_CLASS} {{ color-scheme: light; }}")));
-        assert!(doc.contains(&format!(":root:not(.{LIGHT_VIEW_CLASS}) body")));
+        // The dark view is the reading pane's own override, armed by the app
+        // (WebKit's `prefers-color-scheme` doesn't follow libadwaita), in an
+        // element "View in Light Mode" can disable.
+        let dark_open = format!(r#"<style id="{DARK_VIEW_STYLE_ID}" media="all">"#);
+        let start = doc.find(&dark_open).expect("the dark-view style element");
+        let dark = &doc[start..];
+        assert!(dark[..dark.find("</style>").unwrap()].contains(crate::window::MESSAGE_THEME_OVERRIDE_CSS));
+        assert!(!doc.contains("prefers-color-scheme"));
+        // No fixed light text colour that a dark inline colour would override.
+        assert!(!doc.contains("#f0f0f2"));
         assert!(doc.contains("<body><p>Hi</p></body>"));
+        // On a light surface the override is present but inert.
+        let light = html_document("<p>Hi</p>", false);
+        assert!(light.contains(&format!(r#"<style id="{DARK_VIEW_STYLE_ID}" media="not all">"#)));
     }
 
     #[test]

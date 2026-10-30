@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.302" date="2026-10-31">
+      <description>
+        <p>Composer fix. In dark mode, the rich-text composer (and the signature and template editors) used to draw what you type in black against the dark background. Text is now light, in the composer and when it is popped out, and it is shown the same way the reading pane's dark view shows mail, so forwarded messages, HTML signatures and pasted text with their own dark colours turn light too, while pictures still look normal. "View in Light Mode" still shows the message as most recipients will see it, and what you send is unchanged.</p>
+      </description>
+    </release>
     <release version="0.9.301" date="2026-10-30">
       <description>
         <p>Stability fix. Recording a new keyboard shortcut in Settings no longer crashes Lookout once the chord is accepted. Beyond that, a set of internal callbacks (calendar clicks and drags, the scheduling assistant, contact refreshes, the ribbon, search folders and directory suggestions) now run only after Lookout has finished reading the state they were looked up from, which closes off a whole class of crash that future changes could otherwise have introduced.</p>
