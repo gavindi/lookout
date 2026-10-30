@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.304" date="2026-10-31">
+      <description>
+        <p>Smoother saving of your view settings. Starred contacts, trusted and blocked senders, folder colours and expansion, recent folders and searches, reminder state, local tasks and My Day are now saved in the background instead of pausing the window, and Lookout opens that database once instead of three times. Switching to Fluent icons now builds the icon pack next to the old one and swaps it in whole, so another open Lookout window never sees a half-written pack.</p>
+      </description>
+    </release>
     <release version="0.9.303" date="2026-10-31">
       <description>
         <p>Draft saving fix. The composer now saves your draft every 30 seconds instead of every 5, and only when something has actually changed since you opened it, so a reply, forward or reopened draft you leave untouched is no longer saved again, and typing in a message with a large attachment no longer uploads that attachment over and over. Close, Send and Schedule Send still save your latest changes first, and Save Draft stores the message even if you haven't edited it.</p>

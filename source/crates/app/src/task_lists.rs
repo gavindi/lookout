@@ -424,7 +424,7 @@ fn delete_local_list(state: &Rc<RefCell<UiState>>, calendar_state: &Rc<RefCell<C
         let doomed: Vec<String> = st.local_tasks.iter().filter(|t| t.calendar_id == removed_calendar).map(|t| t.uid.0.clone()).collect();
         if let Some(db) = &st.local_tasks_db {
             for uid in &doomed {
-                let _ = db.borrow().delete_local_task(uid);
+                db.delete_local_task(uid);
             }
         }
         st.local_tasks.retain(|t| t.calendar_id != removed_calendar);

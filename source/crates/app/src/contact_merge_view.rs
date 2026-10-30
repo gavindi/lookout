@@ -672,14 +672,14 @@ fn transfer_favourites(state: &Rc<RefCell<UiState>>, keeper_old_key: &(AccountId
     }
     if let Some(db) = db {
         if star_new {
-            let _ = db.set_starred(&keeper_new_key.0, &keeper_new_key.1, true);
+            db.set_starred(&keeper_new_key.0, &keeper_new_key.1, true);
         }
         if keeper_old_key != keeper_new_key {
-            let _ = db.set_starred(&keeper_old_key.0, &keeper_old_key.1, false);
+            db.set_starred(&keeper_old_key.0, &keeper_old_key.1, false);
         }
         for key in &deleted_keys {
             if key != keeper_new_key {
-                let _ = db.set_starred(&key.0, &key.1, false);
+                db.set_starred(&key.0, &key.1, false);
             }
         }
     }

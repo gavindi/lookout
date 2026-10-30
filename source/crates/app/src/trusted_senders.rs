@@ -142,7 +142,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                         move |picked| {
                             state.borrow_mut().trusted_senders.insert((account.clone(), entry.clone()), picked);
                             if let Some(db) = &state.borrow().ui_db {
-                                let _ = db.set_trusted_sender(&account, &entry, picked);
+                                db.set_trusted_sender(&account, &entry, picked);
                             }
                         }
                     });
@@ -158,7 +158,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                         move |_| {
                             state.borrow_mut().trusted_senders.remove(&(account.clone(), entry.clone()));
                             if let Some(db) = &state.borrow().ui_db {
-                                let _ = db.remove_trusted_sender(&account, &entry);
+                                db.remove_trusted_sender(&account, &entry);
                             }
                             (rebuild_handle.borrow())();
                         }
@@ -208,7 +208,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                         let level = dropdown_level(&add_dropdown);
                         state.borrow_mut().trusted_senders.insert((account.clone(), entry.clone()), level);
                         if let Some(db) = &state.borrow().ui_db {
-                            let _ = db.set_trusted_sender(&account, &entry, level);
+                            db.set_trusted_sender(&account, &entry, level);
                         }
                         entry_field.set_text("");
                         (rebuild_handle.borrow())();

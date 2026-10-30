@@ -26,7 +26,6 @@ use crate::folder_tree::TreeItem;
 use crate::google_tasks::GoogleTasksCommand;
 use crate::last_view::{self};
 use crate::message_list::{format_row_date, Filter, FilterSet, MessageItem, MessageListModel, ReadingTarget, SelectionKind, SortKey, ThreadId};
-use crate::ui_state_db::UiStateDb;
 use crate::util::card_section;
 use crate::window::columns::column_cell;
 use crate::worker::Worker;
@@ -563,13 +562,15 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // GSettings-backed store (see `settings`), so the session starts where
     // the last one ended. The store falls back to its schema defaults when
     // no schema is available, which is exactly these old values.
-    let ui_db = crate::ui_state_db::UiStateDb::open()
+    // The one UI-state handle: `UiState`, the calendar's local tasks and My
+    // Day, and the reminder engine all share it (and its writer thread).
+    let ui_db = crate::ui_state_db::UiStateStore::open()
         .map(Rc::new)
-        .inspect_err(|e| tracing::warn!("starred contacts and sender trust/block lists won't persist: {e}"))
+        .inspect_err(|e| tracing::warn!("starred contacts, sender lists, local tasks and reminder state won't persist: {e}"))
         .ok();
     let starred_contacts: HashSet<(AccountId, String)> = ui_db
         .as_ref()
-        .and_then(|db| db.load_starred().ok())
+        .and_then(|db| db.reader().load_starred().ok())
         .into_iter()
         .flat_map(|by_account| {
             by_account
@@ -579,7 +580,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         .collect();
     let trusted_senders: HashMap<(AccountId, String), lookout_core::TrustLevel> = ui_db
         .as_ref()
-        .and_then(|db| db.load_trusted_senders().ok())
+        .and_then(|db| db.reader().load_trusted_senders().ok())
         .into_iter()
         .flatten()
         .map(|(account, entry, level)| ((account, entry), level))
@@ -587,12 +588,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // The blocked-sender list (item 2.9 / M-17): addressed entered from the
     // message menu's Block sender / Block domain. Enforced by the client rule
     // path on arrival; the load-policy's safe list reuses `trusted_senders`.
-    let blocked_senders: HashSet<(AccountId, String)> = ui_db.as_ref().and_then(|db| db.load_blocked_senders().ok()).into_iter().flatten().collect();
+    let blocked_senders: HashSet<(AccountId, String)> = ui_db.as_ref().and_then(|db| db.reader().load_blocked_senders().ok()).into_iter().flatten().collect();
     // Ignored conversations (item 2.8 / M-20): thread keys entered from the
     // message menu's Ignore; new mail in one is moved to Deleted on arrival.
     let ignored_threads: HashSet<(AccountId, String)> = ui_db
         .as_ref()
-        .and_then(|db| db.load_ignored_threads().ok())
+        .and_then(|db| db.reader().load_ignored_threads().ok())
         .into_iter()
         .flatten()
         .map(|(account, thread, _label)| (account, thread))
@@ -601,10 +602,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // expanded and which account groups collapsed. Loaded from the same
     // UI-state database so the first `rebuild_folder_tree` of a fresh session
     // can re-seed the pane's collapse state instead of starting all-default.
-    let (expanded_folders, collapsed_groups) = ui_db.as_ref().and_then(|db| db.load_folder_expansion().ok()).unwrap_or_default();
-    let folder_prefs = ui_db.as_ref().and_then(|db| db.load_folder_prefs().ok()).unwrap_or_default();
-    let recent_folders = ui_db.as_ref().and_then(|db| db.load_recent_folders().ok()).unwrap_or_default();
-    let recent_searches = ui_db.as_ref().and_then(|db| db.load_recent_searches().ok()).unwrap_or_default();
+    let (expanded_folders, collapsed_groups) = ui_db.as_ref().and_then(|db| db.reader().load_folder_expansion().ok()).unwrap_or_default();
+    let folder_prefs = ui_db.as_ref().and_then(|db| db.reader().load_folder_prefs().ok()).unwrap_or_default();
+    let recent_folders = ui_db.as_ref().and_then(|db| db.reader().load_recent_folders().ok()).unwrap_or_default();
+    let recent_searches = ui_db.as_ref().and_then(|db| db.reader().load_recent_searches().ok()).unwrap_or_default();
     // Shared keyring handle for manually-added ("other") IMAP/SMTP accounts -
     // see `other_accounts.rs`. Cloned into the add-account dialog, the
     // startup connect loop, and the Config view's edit/remove actions.
@@ -3605,7 +3606,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         };
                         if let Some((account, sender)) = st.rendered_trust_sender.clone() {
                             if let Some(db) = &st.ui_db {
-                                let _ = db.set_trusted_sender(&account, &sender, level);
+                                db.set_trusted_sender(&account, &sender, level);
                             }
                             st.trusted_senders.insert((account, sender), level);
                         }
@@ -6242,12 +6243,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // and write it out. Shared by the two flush points below (window
         // close and app quit). The merge is a no-op when the pane has no
         // model, so a flush before the first build can't wipe anything.
+        // UI-state writes are queued to a writer thread, so this also waits
+        // for the queue to drain: the process may exit right after.
         let flush_folder_expansion = {
             let state = state.clone();
             let folder_selection = folder_selection.clone();
             move || {
                 merge_folder_expansion(&state, &folder_selection);
                 persist_folder_expansion(&state);
+                let db = state.borrow().ui_db.clone();
+                if let Some(db) = db {
+                    db.flush();
+                }
             }
         };
         window.connect_close_request({
@@ -7065,11 +7072,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // The UI-state database also holds local-only tasks - best-effort, like
     // the contacts code's handle: a failed open means local tasks live in
     // memory for this session only.
-    let local_tasks_db = UiStateDb::open()
-        .map(|db| Rc::new(RefCell::new(db)))
-        .inspect_err(|e| tracing::warn!("local tasks won't persist: {e}"))
-        .ok();
-    let local_tasks = local_tasks_db.as_ref().and_then(|db| db.borrow().load_local_tasks().ok()).unwrap_or_default();
+    let local_tasks_db = state.borrow().ui_db.clone();
+    let local_tasks = local_tasks_db.as_ref().and_then(|db| db.reader().load_local_tasks().ok()).unwrap_or_default();
     let loaded_calendar_colors = calendar_colors::load();
     corrupt_backups.extend(calendar_colors::take_corrupt_backups());
     let calendar_state = Rc::new(RefCell::new(CalendarUiState {
@@ -7148,9 +7152,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // across the body, panicking on the `borrow_mut` below.
         let local_tasks_db = calendar_state.borrow().local_tasks_db.clone();
         if let Some(db) = local_tasks_db {
-            let db = db.borrow();
-            let _ = db.prune_my_day(&day);
-            if let Ok(pins) = db.load_my_day(&day) {
+            // The prune is queued; the load only reads `day` itself, which
+            // the prune (`day < today`) never touches.
+            db.prune_my_day(&day);
+            if let Ok(pins) = db.reader().load_my_day(&day) {
                 calendar_state.borrow_mut().my_day_pins = pins;
             }
         }
@@ -7424,15 +7429,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // the sessions report (via `connect_calendar_account`'s ingest) and the
     // loop fires `Gio.Notification`s for due alerts, with Open / Snooze /
     // Dismiss actions; `open_event` lands on the shared event editor. The
-    // persistence handle is a second best-effort open of the UI-state
-    // database (the one in `UiState` is owned by the contacts code) - a
-    // failed open just means fire-once state doesn't survive restarts.
-    let reminders_engine = Rc::new(RefCell::new(crate::reminders::ReminderEngine::new(
-        crate::ui_state_db::UiStateDb::open()
-            .map(|db| Rc::new(RefCell::new(db)))
-            .inspect_err(|e| tracing::warn!("reminder state won't persist: {e}"))
-            .ok(),
-    )));
+    // persistence handle is the shared UI-state store - a failed open just
+    // means fire-once state doesn't survive restarts.
+    let reminders_engine = Rc::new(RefCell::new(crate::reminders::ReminderEngine::new(state.borrow().ui_db.clone())));
     // Task reminders (T-05): the Tasks view's refresh funnel feeds the engine
     // once the engine exists; seed it with the current snapshot so an alert
     // due at launch fires without waiting for the first repaint.
@@ -10505,9 +10504,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // its folder-pane expansion rows too - the mailbox ids
                     // would otherwise linger forever in the UI-state DB.
                     if let Some(db) = state.borrow().ui_db.clone() {
-                        if let Err(e) = db.remove_account_folder_expansion(&account_id) {
-                            tracing::warn!("could not prune folder expansion for removed account {account_id}: {e}");
-                        }
+                        db.remove_account_folder_expansion(&account_id);
                     }
                     let keyring = keyring.clone();
                     let account_id_for_worker = account_id.clone();
@@ -12921,7 +12918,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     st.my_day_pins.clone()
                 };
                 if let Some(db) = calendar_state.borrow().local_tasks_db.clone() {
-                    let _ = db.borrow().set_my_day(&day, &pins);
+                    db.set_my_day(&day, &pins);
                 }
                 refresh_tasks_view(&calendar_state, &tasks_view_for_my_day);
             }),

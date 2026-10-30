@@ -2502,9 +2502,8 @@ fn reload_my_day_if_needed(calendar_state: &Rc<RefCell<CalendarUiState>>) {
         .local_tasks_db
         .clone()
         .and_then(|db| {
-            let db = db.borrow();
-            let _ = db.prune_my_day(&day);
-            db.load_my_day(&day).ok()
+            db.prune_my_day(&day);
+            db.reader().load_my_day(&day).ok()
         })
         .unwrap_or_default();
     let mut st = calendar_state.borrow_mut();

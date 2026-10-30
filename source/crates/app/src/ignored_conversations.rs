@@ -55,7 +55,16 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
             groups.borrow_mut().clear();
             let (ignored, accounts) = {
                 let st = state.borrow();
-                let ignored: Vec<(AccountId, String, String)> = st.ui_db.as_ref().and_then(|db| db.load_ignored_threads().ok()).unwrap_or_default();
+                // Flushed first: an Ignore made a moment ago may still be
+                // queued on the writer thread.
+                let ignored: Vec<(AccountId, String, String)> = st
+                    .ui_db
+                    .as_ref()
+                    .and_then(|db| {
+                        db.flush();
+                        db.reader().load_ignored_threads().ok()
+                    })
+                    .unwrap_or_default();
                 let mut accounts: Vec<(AccountId, String)> = st
                     .accounts
                     .iter()
@@ -106,7 +115,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                             let mut st = state.borrow_mut();
                             st.ignored_threads.remove(&(account.clone(), thread.clone()));
                             if let Some(db) = &st.ui_db {
-                                let _ = db.remove_ignored_thread(&account, &thread);
+                                db.remove_ignored_thread(&account, &thread);
                             }
                         }
                         (rebuild_handle.borrow())();

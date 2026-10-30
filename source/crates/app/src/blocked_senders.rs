@@ -109,7 +109,7 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                         move |_| {
                             state.borrow_mut().blocked_senders.remove(&(account.clone(), entry.clone()));
                             if let Some(db) = &state.borrow().ui_db {
-                                let _ = db.remove_blocked_sender(&account, &entry);
+                                db.remove_blocked_sender(&account, &entry);
                             }
                             (rebuild_handle.borrow())();
                         }
@@ -166,11 +166,11 @@ pub fn show_manage_dialog(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>) {
                         for trusted_entry in conflicting {
                             st.trusted_senders.remove(&(account.clone(), trusted_entry.clone()));
                             if let Some(db) = &st.ui_db {
-                                let _ = db.remove_trusted_sender(&account, &trusted_entry);
+                                db.remove_trusted_sender(&account, &trusted_entry);
                             }
                         }
                         if let Some(db) = &st.ui_db {
-                            let _ = db.set_blocked_sender(&account, &entry);
+                            db.set_blocked_sender(&account, &entry);
                         }
                         drop(st);
                         entry_field.set_text("");

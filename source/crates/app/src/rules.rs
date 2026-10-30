@@ -159,7 +159,7 @@ pub(crate) fn ignore_thread(state: &Rc<RefCell<UiState>>, account: &AccountId, t
     let mut st = state.borrow_mut();
     st.ignored_threads.insert((account.clone(), thread.to_string()));
     if let Some(db) = &st.ui_db {
-        let _ = db.set_ignored_thread(account, thread, label);
+        db.set_ignored_thread(account, thread, label);
     }
 }
 
@@ -168,7 +168,7 @@ pub(crate) fn unignore_thread(state: &Rc<RefCell<UiState>>, account: &AccountId,
     let mut st = state.borrow_mut();
     st.ignored_threads.remove(&(account.clone(), thread.to_string()));
     if let Some(db) = &st.ui_db {
-        let _ = db.remove_ignored_thread(account, thread);
+        db.remove_ignored_thread(account, thread);
     }
 }
 

@@ -200,10 +200,11 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
       - Pass `Rc`/`Arc<[u8]>` into `Attachment` so the copy is shared.
     - **Fixed (0.9.303):** the tick is a fixed 30 s for every composer, attachments or not. Change detection now starts from a baseline snapshot taken when the composer opens (straight away for the plain editor, on the rich editor's first load), so an untouched reply, forward or reopened draft is never autosaved and a reopened draft's attachments are not re-uploaded unchanged. Save Draft and schedule send force one save when nothing is stored yet; Close still flushes but stores nothing for an untouched composer. `lookout_mail::Attachment.bytes` is `Arc<[u8]>`, shared with the composer's `PendingAttachment` and borrowed by `build_raw_message`, so a save copies no attachment bytes (the Graph path keeps one copy into `OutgoingAttachment`). Covered by the `should_save` baseline/force tests and `a_draft_save_shares_attachment_bytes_instead_of_copying_them`.
 
-24. **P1** (a) / **P4** (b) ✔ **Synchronous SQLite and file I/O on the GTK thread** (beyond BUG_BOUNTY1 #16 and #17).
+24. **P1** (a) / **P4** (b) ✔ **Fixed** — **Synchronous SQLite and file I/O on the GTK thread** (beyond BUG_BOUNTY1 #16 and #17).
     - **What:** `UiStateDb` writes (`set_starred`, `set_recent_folders`, `set_folder_expansion`, reminder state, My Day, local tasks: about 40 call sites) run on the main thread with the default `synchronous=FULL` (one fsync per write) and a 5 s `busy_timeout` ([ui_state_db.rs:147-156](source/crates/app/src/ui_state_db.rs#L147-L156)).
     - **Fix:** set `synchronous=NORMAL` (WAL makes that safe), and move bulk writers such as `set_recent_folders` and reminder sync off the main thread.
     - **Same pattern:** `icon_style::materialise` ([icon_style.rs:175-209](source/crates/app/src/icon_style.rs#L175-L209)) `remove_dir_all`s and rewrites the whole icon pack synchronously on every switch. GTK can also scan the half-written directory in between. Write it to a sibling directory and rename it into place.
+    - **Fixed (0.9.304):** `UiStateDb::open` sets `synchronous=NORMAL`. The three startup opens are now one `UiStateStore`, shared by `UiState`, the calendar's local tasks and My Day, and the reminder engine. Its UI-thread `reader()` serves the loads, and every write is queued in FIFO order to a dedicated `ui-state-db` writer thread with its own connection. `flush()` is the barrier before the Ignored-conversations dialog reads its list and at close and quit, and dropping the store drains the queue. The Fluent pack is built in a hidden `.Lookout-Fluent.tmp-*` sibling and renamed into place, the old copy is retired the same way and restored if the install fails, and stale leftovers are swept. Covered by the store's ordering, drop and pragma tests and the two `write_theme` tests.
 
 25. **P2** ✔ **The Graph mail session opens its cache synchronously on the async runtime.** [graph/src/mail/session.rs:122](source/crates/graph/src/mail/session.rs#L122).
     - **Code:** `Cache::open` (file open, `PRAGMA`s, DDL, migrations) runs inline on the tokio worker. Everything else in the session goes through `cache_op` and `spawn_blocking`.
@@ -328,7 +329,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 **P1 — next: small diffs, no schema work**
 
 1. **#26 (weak ETags):** one line, and it unblocks every edit or delete against a weak-validator DAV server.
-2. **#24 (a):** `UiStateDb` `synchronous=NORMAL` plus the icon-pack sibling-dir rename — the two biggest GTK stalls in the tier.
+2. ~~**#24 (a):** `UiStateDb` `synchronous=NORMAL` plus the icon-pack sibling-dir rename — the two biggest GTK stalls in the tier.~~ ✔ Fixed (0.9.304).
 3. **#17:** `ContactsCache::remove_book`, which stops an unbounded per-poll re-parse.
 4. ~~**#23 (a):** autosave interval backoff / save-on-idle.~~ ✔ Fixed (0.9.303).
 5. **#31:** the shared `fsutil::write_atomic`, which also closes BUG_BOUNTY1 #9 and #12.
@@ -352,7 +353,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 
 **P4 — opportunistic**
 
-17. **#19 (b), #24 (b), #26 (rest), #35**, plus BUG_BOUNTY1 #25 and #31 (#28 is fixed).
+17. **#19 (b), #26 (rest), #35**, plus BUG_BOUNTY1 #25 and #31 (#28 is fixed). ~~#24 (b)~~ ✔ Fixed (0.9.304).
 
 ## Verification
 - `cargo fmt --all -- --check`

@@ -392,9 +392,7 @@ pub(crate) fn install_folder_menu_handler(
 pub(crate) fn persist_folder_prefs(state: &Rc<RefCell<UiState>>) {
     let st = state.borrow();
     if let Some(db) = &st.ui_db {
-        if let Err(e) = db.set_folder_prefs(&st.folder_prefs) {
-            tracing::warn!("folder colours and count modes won't persist: {e}");
-        }
+        db.set_folder_prefs(&st.folder_prefs);
     }
 }
 
@@ -449,9 +447,7 @@ pub(crate) fn persist_recent_folders(state: &Rc<RefCell<UiState>>, folder: &Mail
     let st = state.borrow();
     if let Some(db) = &st.ui_db {
         let recent = st.recent_folders.get(&account_id).cloned().unwrap_or_default();
-        if let Err(e) = db.set_recent_folders(&account_id, &recent) {
-            tracing::warn!("recent folders won't persist: {e}");
-        }
+        db.set_recent_folders(&account_id, &recent);
     }
 }
 
@@ -660,9 +656,7 @@ pub(crate) fn persist_folder_expansion(state: &Rc<RefCell<UiState>>) {
         (st.ui_db.clone(), st.expanded_folders.clone(), st.collapsed_groups.clone())
     };
     if let Some(db) = db {
-        if let Err(e) = db.set_folder_expansion(&expanded, &collapsed) {
-            tracing::warn!("folder expansion state won't persist: {e}");
-        }
+        db.set_folder_expansion(&expanded, &collapsed);
     }
 }
 

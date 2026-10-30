@@ -21,9 +21,10 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use gtk::{gio, glib};
 
@@ -37,6 +38,19 @@ const RESOURCE_ICON_DIR: &str = "/io/github/gavindi/Lookout/icons/Lookout-Fluent
 /// Whether Fluent glyphs are in force. Used by the two-state icons whose
 /// artwork is not symbolic (`window::support::pin_icon_name`).
 static FLUENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Names the staging and retired directories of a theme swap uniquely within
+/// this process (the pid separates processes), as `fsutil::write_atomic` does.
+static SWAP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The prefix of a swap's staging (`tmp-`) and retired (`old-`) siblings of
+/// the theme directory. Hidden, so GTK never takes one for a theme.
+const SWAP_PREFIX: &str = ".Lookout-Fluent.";
+
+/// A staging or retired sibling older than this is a crash's leftover (a swap
+/// takes milliseconds), so it is safe to delete even if another Lookout
+/// instance shares the cache.
+const LEFTOVER_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// Which icon pack is in force (`icon-style` in GSettings).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,24 +183,68 @@ impl IconStyleState {
 }
 
 /// Write the bundled aliases and an `index.theme` into the cache, and return
-/// the theme directory (the search path is its parent). Everything is
-/// rewritten on every switch: the pack is small, and this keeps a regenerated
-/// icon or a changed desktop theme from leaving a stale cache behind.
+/// the theme directory (the search path is its parent). The whole pack is
+/// rebuilt on every switch - it is small, and this keeps a regenerated icon,
+/// a removed alias or a changed desktop theme from leaving a stale cache
+/// behind - but never in place: see [`write_theme`].
 fn materialise(inherited_theme: &str) -> Result<PathBuf, String> {
-    let root = glib::user_cache_dir().join("lookout").join("fluent-icons");
-    let theme = root.join(THEME_NAME);
-    let actions = theme.join("scalable").join("actions");
-    // Drop the previous materialisation so an alias removed from the manifest
-    // cannot linger in the live theme.
-    let _ = std::fs::remove_dir_all(&actions);
-    std::fs::create_dir_all(&actions).map_err(|error| format!("could not create {}: {error}", actions.display()))?;
-
     let names = gio::resources_enumerate_children(RESOURCE_ICON_DIR, gio::ResourceLookupFlags::NONE)
         .map_err(|error| format!("Fluent icons are missing from the resource bundle: {error}"))?;
+    let mut icons = Vec::with_capacity(names.len());
     for name in names {
         let resource = format!("{RESOURCE_ICON_DIR}/{name}");
         let bytes = gio::resources_lookup_data(&resource, gio::ResourceLookupFlags::NONE).map_err(|error| format!("could not read {resource}: {error}"))?;
-        let target = actions.join(name.as_str());
+        icons.push((name.to_string(), bytes));
+    }
+    write_theme(&glib::user_cache_dir().join("lookout").join("fluent-icons"), inherited_theme, &icons)
+}
+
+/// Builds the theme in a hidden sibling of `root/Lookout-Fluent`, then
+/// renames it into place (retiring the previous copy the same way), so GTK -
+/// in this process or in another running Lookout - only ever scans a
+/// complete theme, never a half-deleted or half-written one. If the swap
+/// fails, the previous theme is put back.
+fn write_theme(root: &Path, inherited_theme: &str, icons: &[(String, glib::Bytes)]) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root).map_err(|error| format!("could not create {}: {error}", root.display()))?;
+    sweep_leftovers(root, LEFTOVER_MAX_AGE);
+
+    let suffix = format!("{}-{}", std::process::id(), SWAP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let staging = root.join(format!("{SWAP_PREFIX}tmp-{suffix}"));
+    if let Err(error) = build_theme(&staging, inherited_theme, icons) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    let theme = root.join(THEME_NAME);
+    let retired = root.join(format!("{SWAP_PREFIX}old-{suffix}"));
+    let had_previous = match std::fs::rename(&theme, &retired) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("could not retire {}: {error}", theme.display()));
+        }
+    };
+    if let Err(error) = std::fs::rename(&staging, &theme) {
+        if had_previous {
+            let _ = std::fs::rename(&retired, &theme);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("could not install {}: {error}", theme.display()));
+    }
+    if had_previous {
+        let _ = std::fs::remove_dir_all(&retired);
+    }
+    Ok(theme)
+}
+
+/// Writes a complete theme (`scalable/actions/*` plus `index.theme`) into
+/// the empty directory `dir`.
+fn build_theme(dir: &Path, inherited_theme: &str, icons: &[(String, glib::Bytes)]) -> Result<(), String> {
+    let actions = dir.join("scalable").join("actions");
+    std::fs::create_dir_all(&actions).map_err(|error| format!("could not create {}: {error}", actions.display()))?;
+    for (name, bytes) in icons {
+        let target = actions.join(name);
         std::fs::write(&target, bytes.as_ref()).map_err(|error| format!("could not write {}: {error}", target.display()))?;
     }
 
@@ -204,9 +262,28 @@ fn materialise(inherited_theme: &str) -> Result<PathBuf, String> {
          MinSize=8\n\
          MaxSize=512\n"
     );
-    let index_path = theme.join("index.theme");
-    std::fs::write(&index_path, index).map_err(|error| format!("could not write {}: {error}", index_path.display()))?;
-    Ok(theme)
+    let index_path = dir.join("index.theme");
+    std::fs::write(&index_path, index).map_err(|error| format!("could not write {}: {error}", index_path.display()))
+}
+
+/// Deletes the staging and retired siblings a crashed swap left in `root`,
+/// once they are older than `max_age`. Best-effort.
+fn sweep_leftovers(root: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(SWAP_PREFIX) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= max_age);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +299,52 @@ mod tests {
         assert_eq!(IconStyle::from_code(""), IconStyle::Gnome);
         assert_eq!(IconStyle::from_code("Fluent"), IconStyle::Fluent);
         assert_eq!(IconStyle::from_code("something-else"), IconStyle::Gnome);
+    }
+
+    fn icons(names: &[&str]) -> Vec<(String, glib::Bytes)> {
+        names.iter().map(|name| (name.to_string(), glib::Bytes::from(name.as_bytes()))).collect()
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn write_theme_replaces_the_pack_and_leaves_no_staging_dirs() {
+        let root = std::env::temp_dir().join(format!("lookout-icon-style-test-{}", std::process::id())).join("replace");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let theme = write_theme(&root, "Yaru", &icons(&["a-symbolic.svg", "b-symbolic.svg"])).expect("first write");
+        assert_eq!(theme, root.join(THEME_NAME));
+        assert_eq!(entries(&theme.join("scalable").join("actions")), ["a-symbolic.svg", "b-symbolic.svg"]);
+
+        let theme = write_theme(&root, "Adwaita-dark", &icons(&["a-symbolic.svg"])).expect("second write");
+        assert_eq!(entries(&theme.join("scalable").join("actions")), ["a-symbolic.svg"], "a dropped alias must not linger");
+        let index = std::fs::read_to_string(theme.join("index.theme")).unwrap();
+        assert!(index.contains("Inherits=Adwaita-dark,Adwaita,hicolor"), "{index}");
+        assert_eq!(entries(&root), [THEME_NAME], "no staging or retired directory is left behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_theme_sweeps_a_crashed_swaps_leftovers() {
+        let root = std::env::temp_dir().join(format!("lookout-icon-style-test-{}", std::process::id())).join("sweep");
+        let _ = std::fs::remove_dir_all(&root);
+        let leftover = root.join(format!("{SWAP_PREFIX}tmp-1-0")).join("scalable");
+        std::fs::create_dir_all(&leftover).unwrap();
+
+        // Fresh leftovers may belong to another instance mid-swap: kept.
+        sweep_leftovers(&root, LEFTOVER_MAX_AGE);
+        assert_eq!(entries(&root), [format!("{SWAP_PREFIX}tmp-1-0")]);
+        // Old enough ones are a crash's, and go.
+        sweep_leftovers(&root, Duration::ZERO);
+        assert!(entries(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

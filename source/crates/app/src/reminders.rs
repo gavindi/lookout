@@ -8,7 +8,7 @@
 //! has come, which hasn't already been shown, snoozed-past or dismissed. The
 //! notification carries Open / Snooze 5 min / Dismiss actions routed through
 //! app-level `GSimpleAction`s; fire-once and snooze state persists in the
-//! UI-state database (`UiStateDb::load_reminder_state` / `set_reminder_state`),
+//! UI-state database (`UiStateStore`'s `load_reminder_state` / `set_reminder_state`),
 //! so a restart never re-fires an alert the user already saw. Alerts only fire
 //! while the app is running - reminders while Lookout is closed are out of
 //! scope.
@@ -104,17 +104,17 @@ pub struct ReminderEngine {
     /// refresh, so completed/deleted tasks disappear without stale alerts.
     task_index: std::collections::HashMap<String, (AccountId, CalendarTask)>,
     store: std::collections::HashMap<String, (String, Option<String>)>,
-    ui_db: Option<Rc<RefCell<crate::ui_state_db::UiStateDb>>>,
+    ui_db: Option<Rc<crate::ui_state_db::UiStateStore>>,
 }
 
 impl ReminderEngine {
     /// Opens the persisted state from `store` (best-effort: a `None` handle
     /// or an unreadable database just means no fire-once memory this
     /// session - alerts still fire, they re-fire after a restart).
-    pub fn new(store: Option<Rc<RefCell<crate::ui_state_db::UiStateDb>>>) -> Self {
+    pub fn new(store: Option<Rc<crate::ui_state_db::UiStateStore>>) -> Self {
         let mut loaded = std::collections::HashMap::new();
         if let Some(db) = &store {
-            match db.borrow().load_reminder_state() {
+            match db.reader().load_reminder_state() {
                 Ok(rows) => {
                     for row in rows {
                         let key = format!("{}|{}|{}", row.calendar_id, row.uid, row.start_utc);
@@ -358,9 +358,7 @@ impl ReminderEngine {
     fn write_state(&self, occ: &EventOccurrence, state: &str, snooze_until_utc: Option<&str>) {
         let start_utc = occ.start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         if let Some(db) = &self.ui_db {
-            if let Err(e) = db.borrow().set_reminder_state(&occ.calendar_id.0, &occ.uid.0, &start_utc, state, snooze_until_utc) {
-                tracing::warn!(key = alert_key(occ), "could not persist reminder state: {e}");
-            }
+            db.set_reminder_state(&occ.calendar_id.0, &occ.uid.0, &start_utc, state, snooze_until_utc);
         }
     }
 
@@ -370,9 +368,7 @@ impl ReminderEngine {
     fn clear_db_row(&self, occ: &EventOccurrence) {
         let start_utc = occ.start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         if let Some(db) = &self.ui_db {
-            if let Err(e) = db.borrow().clear_reminder(&occ.calendar_id.0, &occ.uid.0, &start_utc) {
-                tracing::warn!(key = alert_key(occ), "could not clear reminder state: {e}");
-            }
+            db.clear_reminder(&occ.calendar_id.0, &occ.uid.0, &start_utc);
         }
     }
 
@@ -384,9 +380,7 @@ impl ReminderEngine {
         let due_utc = due.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let uid = format!("task:{}", task.uid.0);
         if let Some(db) = &self.ui_db {
-            if let Err(e) = db.borrow().set_reminder_state(&task.calendar_id.0, &uid, &due_utc, state, snooze_until_utc) {
-                tracing::warn!(key = task_alert_key(task), "could not persist task reminder state: {e}");
-            }
+            db.set_reminder_state(&task.calendar_id.0, &uid, &due_utc, state, snooze_until_utc);
         }
     }
 
@@ -396,9 +390,7 @@ impl ReminderEngine {
         let due_utc = due.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let uid = format!("task:{}", task.uid.0);
         if let Some(db) = &self.ui_db {
-            if let Err(e) = db.borrow().clear_reminder(&task.calendar_id.0, &uid, &due_utc) {
-                tracing::warn!(key = task_alert_key(task), "could not clear task reminder state: {e}");
-            }
+            db.clear_reminder(&task.calendar_id.0, &uid, &due_utc);
         }
     }
 
@@ -631,12 +623,12 @@ pub fn spawn_reminder_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui_state_db::UiStateDb;
+    use crate::ui_state_db::UiStateStore;
     use chrono::{DateTime, Duration, Utc};
     use lookout_core::{CalendarId, EventUid};
 
     // A helper to build a minimal occurrence (big struct, many fields):
-    // shared by several tests. The engine's UiStateDb is isolated in a temp
+    // shared by several tests. The engine's UiStateStore is isolated in a temp
     // dir (see `engine_with` below for the env-var convention).
     #[track_caller]
     fn occ(uid: &str, start: &str, minutes: Option<i64>) -> EventOccurrence {
@@ -674,22 +666,22 @@ mod tests {
         }
     }
 
-    // A fresh engine over a real UiStateDb, pre-ingested with `occurrences`.
-    // The db handle is returned too, so tests can check what the engine
-    // persisted.
+    // A fresh engine over a real UiStateStore, pre-ingested with
+    // `occurrences`. The store is returned too, so tests can check what the
+    // engine persisted (`persisted_row` flushes the writer first).
     //
-    // `UiStateDb::open()` derives its path from the process-global
+    // `UiStateStore::open()` derives its path from the process-global
     // `XDG_CACHE_HOME`, which `ui_state_db`'s tests also set - so the
     // set-env-then-open window is serialized across both modules by the
     // shared `ui_state_db::CACHE_HOME_LOCK` (each test still gets its own
     // pid-scoped subdirectory).
     #[track_caller]
-    fn engine_with(test_name: &str, occurrences: &[EventOccurrence]) -> (ReminderEngine, Rc<RefCell<UiStateDb>>) {
+    fn engine_with(test_name: &str, occurrences: &[EventOccurrence]) -> (ReminderEngine, Rc<UiStateStore>) {
         let dir = std::env::temp_dir().join(format!("lookout-reminders-test-{}", std::process::id())).join(test_name);
         let _guard = crate::ui_state_db::CACHE_HOME_LOCK.lock().unwrap();
         std::env::set_var("XDG_CACHE_HOME", &dir);
         let _ = std::fs::remove_dir_all(&dir);
-        let db = Rc::new(RefCell::new(UiStateDb::open().expect("fresh database should open")));
+        let db = Rc::new(UiStateStore::open().expect("fresh database should open"));
         drop(_guard);
         let mut engine = ReminderEngine::new(Some(db.clone()));
         engine.ingest(&AccountId("test-account".into()), occurrences);
@@ -697,9 +689,11 @@ mod tests {
     }
 
     // The persisted row for exactly `event`'s key, if the engine wrote one.
-    fn persisted_row(db: &UiStateDb, occ: &EventOccurrence) -> Option<crate::ui_state_db::ReminderStateRow> {
+    fn persisted_row(db: &UiStateStore, occ: &EventOccurrence) -> Option<crate::ui_state_db::ReminderStateRow> {
         let key = alert_key(occ);
-        db.load_reminder_state()
+        db.flush();
+        db.reader()
+            .load_reminder_state()
             .expect("test database should read")
             .into_iter()
             .find(|r| format!("{}|{}|{}", r.calendar_id, r.uid, r.start_utc) == key)
@@ -737,7 +731,7 @@ mod tests {
         // Fired once means never again.
         assert!(engine.tick(now + Duration::minutes(25)).is_empty());
         // And the fire is persisted as a "fired" row with no deadline.
-        let row = persisted_row(&db.borrow(), &due[0].occurrence).expect("the fired alert must be persisted");
+        let row = persisted_row(&db, &due[0].occurrence).expect("the fired alert must be persisted");
         assert_eq!(row.state, "fired");
         assert_eq!(row.snooze_until_utc, None);
     }
@@ -754,7 +748,7 @@ mod tests {
         assert!(engine.tick(now).is_empty());
         assert!(engine.tick(now + Duration::minutes(40)).is_empty());
         // Skipped ticks persist nothing for this event.
-        assert!(persisted_row(&db.borrow(), &event).is_none());
+        assert!(persisted_row(&db, &event).is_none());
     }
 
     #[test]
@@ -767,7 +761,7 @@ mod tests {
         let (mut engine, db) = engine_with("started", std::slice::from_ref(&event));
 
         assert!(engine.tick(now).is_empty());
-        assert!(persisted_row(&db.borrow(), &event).is_none());
+        assert!(persisted_row(&db, &event).is_none());
     }
 
     #[test]
@@ -786,7 +780,7 @@ mod tests {
         // SNOOZE_MINUTES out (wall-clock based, so assert the window, not
         // the exact instant).
         engine.snooze(&due[0].occurrence);
-        let row = persisted_row(&db.borrow(), &due[0].occurrence).expect("the snoozed alert must be persisted");
+        let row = persisted_row(&db, &due[0].occurrence).expect("the snoozed alert must be persisted");
         assert_eq!(row.state, "snoozed");
         let snooze_until = row.snooze_until_utc.as_deref().expect("snoozed row carries a deadline").parse::<DateTime<Utc>>().unwrap();
         assert!(snooze_until > now.with_timezone(&Utc));
@@ -799,7 +793,7 @@ mod tests {
         let due = engine.tick(now + Duration::minutes(7));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].occurrence.uid.0, "snoozed");
-        let row = persisted_row(&db.borrow(), &due[0].occurrence).expect("the re-fired alert must be persisted");
+        let row = persisted_row(&db, &due[0].occurrence).expect("the re-fired alert must be persisted");
         assert_eq!(row.state, "fired");
     }
 
@@ -817,7 +811,7 @@ mod tests {
         // A dismissal is permanent, however far past the alert instant.
         assert!(engine.tick(now + Duration::minutes(20)).is_empty());
         assert!(engine.tick(now + Duration::minutes(25)).is_empty());
-        let row = persisted_row(&db.borrow(), &due[0].occurrence).expect("the dismissed alert must stay persisted");
+        let row = persisted_row(&db, &due[0].occurrence).expect("the dismissed alert must stay persisted");
         assert_eq!(row.state, "fired");
         assert_eq!(row.snooze_until_utc, None);
     }
@@ -833,7 +827,7 @@ mod tests {
         // A previous session had fired the stale alert; its row must not
         // survive the prune.
         let stale_start = stale.start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        db.borrow().set_reminder_state("cal-test", "stale", &stale_start, "fired", None).unwrap();
+        db.set_reminder_state("cal-test", "stale", &stale_start, "fired", None);
 
         assert!(engine.tick(now).is_empty());
         // The stale occurrence is gone from the index and the store; the
@@ -843,8 +837,8 @@ mod tests {
         assert!(!engine.index.contains_key(&alert_key(&stale)));
         assert!(!engine.store.contains_key(&alert_key(&stale)));
         // And its persisted row is cleared from the database.
-        assert!(persisted_row(&db.borrow(), &stale).is_none());
-        assert!(persisted_row(&db.borrow(), &fresh).is_none());
+        assert!(persisted_row(&db, &stale).is_none());
+        assert!(persisted_row(&db, &fresh).is_none());
     }
 
     #[test]
@@ -857,7 +851,7 @@ mod tests {
         // A previous session had fired the disabled account's alert; its
         // persisted row must not survive the teardown.
         let event_start = event.start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        db.borrow().set_reminder_state("cal-test", "removed", &event_start, "fired", None).unwrap();
+        db.set_reminder_state("cal-test", "removed", &event_start, "fired", None);
 
         engine.remove_account(&AccountId("test-account".into()));
 
@@ -866,7 +860,7 @@ mod tests {
         assert!(engine.index.contains_key(&alert_key(&other)));
         assert!(!engine.index.contains_key(&alert_key(&event)));
         assert!(!engine.store.contains_key(&alert_key(&event)));
-        assert!(persisted_row(&db.borrow(), &event).is_none());
+        assert!(persisted_row(&db, &event).is_none());
         // The other account's alert still fires normally; the removed one
         // never does.
         let due = engine.tick(now + Duration::minutes(16));
@@ -896,9 +890,11 @@ mod tests {
         }
     }
 
-    fn persisted_task_row(db: &UiStateDb, task: &CalendarTask) -> Option<crate::ui_state_db::ReminderStateRow> {
+    fn persisted_task_row(db: &UiStateStore, task: &CalendarTask) -> Option<crate::ui_state_db::ReminderStateRow> {
         let key = task_alert_key(task);
-        db.load_reminder_state()
+        db.flush();
+        db.reader()
+            .load_reminder_state()
             .expect("test database should read")
             .into_iter()
             .find(|r| format!("{}|{}|{}", r.calendar_id, r.uid, r.start_utc) == key)
@@ -921,7 +917,7 @@ mod tests {
         assert!(!due[0].overdue);
         // Fired once means never again, and the row is persisted.
         assert!(engine.tick_tasks(now + Duration::minutes(25)).is_empty());
-        let row = persisted_task_row(&db.borrow(), &task).expect("the fired task alert must be persisted");
+        let row = persisted_task_row(&db, &task).expect("the fired task alert must be persisted");
         assert_eq!(row.state, "fired");
         assert!(row.uid.starts_with("task:"));
     }
@@ -968,13 +964,13 @@ mod tests {
         let due = engine.tick_tasks(now + Duration::minutes(1));
         assert_eq!(due.len(), 1);
         engine.snooze_task(&due[0].task);
-        let row = persisted_task_row(&db.borrow(), &task).expect("the snoozed task alert must be persisted");
+        let row = persisted_task_row(&db, &task).expect("the snoozed task alert must be persisted");
         assert_eq!(row.state, "snoozed");
 
         assert!(engine.tick_tasks(now + Duration::minutes(2)).is_empty());
         let due = engine.tick_tasks(now + Duration::minutes(7));
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].task.uid.0, "task-snoozed");
-        assert!(persisted_task_row(&db.borrow(), &task).is_some_and(|row| row.state == "fired"));
+        assert!(persisted_task_row(&db, &task).is_some_and(|row| row.state == "fired"));
     }
 }

@@ -512,9 +512,7 @@ pub(crate) fn start_search(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, me
         let db = state.borrow().ui_db.clone();
         let recent = state.borrow().recent_searches.clone();
         if let Some(db) = db {
-            if let Err(e) = db.set_recent_searches(&recent) {
-                tracing::warn!("failed to persist recent searches: {e}");
-            }
+            db.set_recent_searches(&recent);
         }
     }
     refresh_search_refiners(state, list_header);

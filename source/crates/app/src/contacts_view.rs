@@ -2037,7 +2037,7 @@ pub fn rebuild_contacts_list_ui(
                 // favourites survive restarts; a failing database is already
                 // logged at open time and only costs persistence.
                 if let Some(db) = state.borrow().ui_db.clone() {
-                    let _ = db.set_starred(&account_id, &identity, btn.is_active());
+                    db.set_starred(&account_id, &identity, btn.is_active());
                 }
                 rebuild_contacts_list_ui(
                     &contact_list,

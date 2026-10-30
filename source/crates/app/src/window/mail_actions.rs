@@ -188,7 +188,7 @@ pub(crate) fn route_task_save(calendar_state: &Rc<RefCell<CalendarUiState>>, tas
             None => st.local_tasks.push(task.clone()),
         }
         if let Some(db) = &st.local_tasks_db {
-            let _ = db.borrow().save_local_task(&task);
+            db.save_local_task(&task);
         }
         drop(st);
         refresh_tasks_view(calendar_state, tasks_view);
@@ -259,7 +259,7 @@ pub(crate) fn route_task_delete(
     if is_local_task_calendar(&calendar_id) {
         let mut st = calendar_state.borrow_mut();
         if let Some(db) = &st.local_tasks_db {
-            let _ = db.borrow().delete_local_task(&uid.0);
+            db.delete_local_task(&uid.0);
         }
         st.local_tasks.retain(|t| t.uid != uid);
         drop(st);
@@ -2217,11 +2217,11 @@ pub(crate) fn block_sender_selection(state: &Rc<RefCell<UiState>>, message_list:
         for trusted_entry in conflicting {
             st.trusted_senders.remove(&(account.clone(), trusted_entry.clone()));
             if let Some(db) = &st.ui_db {
-                let _ = db.remove_trusted_sender(&account, &trusted_entry);
+                db.remove_trusted_sender(&account, &trusted_entry);
             }
         }
         if let Some(db) = &st.ui_db {
-            let _ = db.set_blocked_sender(&account, &entry);
+            db.set_blocked_sender(&account, &entry);
         }
     }
     set_junk_selection(state, message_list, targets, true);
@@ -2248,7 +2248,7 @@ pub(crate) fn unblock_sender_selection(state: &Rc<RefCell<UiState>>, summary: &E
         for entry in matches {
             st.blocked_senders.remove(&(account.clone(), entry.clone()));
             if let Some(db) = &st.ui_db {
-                let _ = db.remove_blocked_sender(&account, &entry);
+                db.remove_blocked_sender(&account, &entry);
             }
             removed = true;
         }
@@ -2486,9 +2486,7 @@ pub(crate) fn record_recent_folder(state: &Rc<RefCell<UiState>>, folder: &Mailbo
     crate::message_menu::push_recent_folder(recent, folder.clone());
     let recent = recent.clone();
     if let Some(db) = &st.ui_db {
-        if let Err(e) = db.set_recent_folders(&account_id, &recent) {
-            tracing::warn!("recent folders won't persist: {e}");
-        }
+        db.set_recent_folders(&account_id, &recent);
     }
 }
 

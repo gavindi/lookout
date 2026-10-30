@@ -41,6 +41,12 @@
 //! two sets `rebuild_folder_tree` already carries across rebuilds, so
 //! persisting is a straight capture of the session's expansion state.
 //!
+//! The app opens it once, as a [`UiStateStore`]: reads stay synchronous on the
+//! UI thread (they happen at startup and in a few dialogs), while every write
+//! is queued, in order, to a dedicated `ui-state-db` thread so a commit or a
+//! lock wait never stalls the GTK main loop. [`UiStateStore::flush`] is the
+//! barrier for the rare read that must see a write just made, and for quit.
+//!
 //! Best-effort like the rest of the config modules: an unreadable or
 //! unwritable database just means favourites don't persist and reminders can
 //! fire again.
@@ -80,8 +86,9 @@ pub fn db_path() -> PathBuf {
     cache_dir().join("lookout").join("ui-state.sqlite")
 }
 
-/// The UI-state database. Owned by the UI thread (GTK is single-threaded),
-/// like the app's read-side mail `Cache` handle.
+/// One connection to the UI-state database. The app holds a
+/// [`UiStateStore`], which owns two of these: one the UI thread reads
+/// through, and one its writer thread commits through.
 pub struct UiStateDb {
     conn: Connection,
 }
@@ -150,9 +157,12 @@ impl UiStateDb {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path)?;
-        // WAL + a busy timeout so a background writer never collides with the
-        // UI thread's reads, matching the mail cache's choice.
+        // WAL + a busy timeout so the store's writer thread never collides with
+        // the UI thread's reads, matching the mail cache's choice. WAL makes
+        // `synchronous=NORMAL` crash-safe (a commit may roll back on power
+        // loss, never corrupt), and it drops the per-commit fsync.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "
@@ -594,6 +604,215 @@ impl UiStateDb {
     }
 }
 
+/// How long [`UiStateStore::flush`] waits for the writer to catch up before
+/// giving up. The queue only ever holds a handful of small transactions, so
+/// this is only reached when the disk itself is stuck.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+type WriteOp = Box<dyn FnOnce(&UiStateDb) -> rusqlite::Result<()> + Send>;
+
+enum Job {
+    /// A write, and the warning to log (with the error) if it fails.
+    Write { what: &'static str, op: WriteOp },
+    /// Answered once every job queued before it has run.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// The UI-state database as the app holds it: a read connection the UI
+/// thread queries directly, and a writer thread that applies every change in
+/// the order it was made. Writes are fire-and-forget - a failure is logged on
+/// the writer thread, as the call sites used to - so the GTK main loop never
+/// waits on a commit, a WAL checkpoint or another connection's lock.
+///
+/// One instance is shared (`Rc<UiStateStore>`) by `UiState`, the calendar's
+/// local tasks and My Day, and the reminder engine.
+pub struct UiStateStore {
+    reader: UiStateDb,
+    tx: Option<std::sync::mpsc::Sender<Job>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UiStateStore {
+    /// Opens the read connection and the writer's connection (both here, on
+    /// the calling thread, so they resolve the same path) and starts the
+    /// writer thread. Either failing is an error; callers treat it as
+    /// "nothing persists this session".
+    pub fn open() -> Result<Self, Box<dyn std::error::Error>> {
+        let reader = UiStateDb::open()?;
+        let writer = UiStateDb::open()?;
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let worker = std::thread::Builder::new().name("ui-state-db".into()).spawn(move || {
+            for job in rx {
+                match job {
+                    Job::Write { what, op } => {
+                        if let Err(e) = op(&writer) {
+                            tracing::warn!("{what}: {e}");
+                        }
+                    }
+                    Job::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        })?;
+        Ok(UiStateStore {
+            reader,
+            tx: Some(tx),
+            worker: Some(worker),
+        })
+    }
+
+    /// The UI thread's read connection. Reads see every write the writer has
+    /// committed; call [`Self::flush`] first if one was only just queued.
+    pub fn reader(&self) -> &UiStateDb {
+        &self.reader
+    }
+
+    /// Waits (up to [`FLUSH_TIMEOUT`]) until every write queued so far has
+    /// been committed. Returns at once if the writer thread is gone.
+    pub fn flush(&self) {
+        let Some(tx) = &self.tx else { return };
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        if tx.send(Job::Flush(done_tx)).is_err() {
+            return;
+        }
+        if done_rx.recv_timeout(FLUSH_TIMEOUT).is_err() {
+            tracing::warn!("UI-state writes still pending after {FLUSH_TIMEOUT:?}");
+        }
+    }
+
+    fn queue(&self, what: &'static str, op: impl FnOnce(&UiStateDb) -> rusqlite::Result<()> + Send + 'static) {
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(Job::Write { what, op: Box::new(op) }).is_ok());
+        if !sent {
+            tracing::warn!("{what}: the UI-state writer has stopped");
+        }
+    }
+
+    /// Queues [`UiStateDb::set_starred`].
+    pub fn set_starred(&self, account: &AccountId, identity: &str, starred: bool) {
+        let (account, identity) = (account.clone(), identity.to_string());
+        self.queue("starred contact won't persist", move |db| db.set_starred(&account, &identity, starred));
+    }
+
+    /// Queues [`UiStateDb::set_trusted_sender`].
+    pub fn set_trusted_sender(&self, account: &AccountId, entry: &str, level: lookout_core::TrustLevel) {
+        let (account, entry) = (account.clone(), entry.to_string());
+        self.queue("trusted sender won't persist", move |db| db.set_trusted_sender(&account, &entry, level));
+    }
+
+    /// Queues [`UiStateDb::remove_trusted_sender`].
+    pub fn remove_trusted_sender(&self, account: &AccountId, entry: &str) {
+        let (account, entry) = (account.clone(), entry.to_string());
+        self.queue("trusted sender removal won't persist", move |db| db.remove_trusted_sender(&account, &entry));
+    }
+
+    /// Queues [`UiStateDb::set_blocked_sender`].
+    pub fn set_blocked_sender(&self, account: &AccountId, entry: &str) {
+        let (account, entry) = (account.clone(), entry.to_string());
+        self.queue("blocked sender won't persist", move |db| db.set_blocked_sender(&account, &entry));
+    }
+
+    /// Queues [`UiStateDb::remove_blocked_sender`].
+    pub fn remove_blocked_sender(&self, account: &AccountId, entry: &str) {
+        let (account, entry) = (account.clone(), entry.to_string());
+        self.queue("blocked sender removal won't persist", move |db| db.remove_blocked_sender(&account, &entry));
+    }
+
+    /// Queues [`UiStateDb::set_ignored_thread`].
+    pub fn set_ignored_thread(&self, account: &AccountId, thread: &str, label: &str) {
+        let (account, thread, label) = (account.clone(), thread.to_string(), label.to_string());
+        self.queue("ignored conversation won't persist", move |db| db.set_ignored_thread(&account, &thread, &label));
+    }
+
+    /// Queues [`UiStateDb::remove_ignored_thread`].
+    pub fn remove_ignored_thread(&self, account: &AccountId, thread: &str) {
+        let (account, thread) = (account.clone(), thread.to_string());
+        self.queue("ignored conversation removal won't persist", move |db| db.remove_ignored_thread(&account, &thread));
+    }
+
+    /// Queues [`UiStateDb::set_folder_expansion`].
+    pub fn set_folder_expansion(&self, expanded: &HashSet<MailboxId>, collapsed: &HashSet<AccountId>) {
+        let (expanded, collapsed) = (expanded.clone(), collapsed.clone());
+        self.queue("folder expansion state won't persist", move |db| db.set_folder_expansion(&expanded, &collapsed));
+    }
+
+    /// Queues [`UiStateDb::set_folder_prefs`].
+    pub fn set_folder_prefs(&self, prefs: &HashMap<MailboxId, FolderPrefs>) {
+        let prefs = prefs.clone();
+        self.queue("folder colours and count modes won't persist", move |db| db.set_folder_prefs(&prefs));
+    }
+
+    /// Queues [`UiStateDb::set_recent_folders`].
+    pub fn set_recent_folders(&self, account: &AccountId, folders: &[MailboxId]) {
+        let (account, folders) = (account.clone(), folders.to_vec());
+        self.queue("recent folders won't persist", move |db| db.set_recent_folders(&account, &folders));
+    }
+
+    /// Queues [`UiStateDb::set_recent_searches`].
+    pub fn set_recent_searches(&self, queries: &[String]) {
+        let queries = queries.to_vec();
+        self.queue("failed to persist recent searches", move |db| db.set_recent_searches(&queries));
+    }
+
+    /// Queues [`UiStateDb::remove_account_folder_expansion`].
+    pub fn remove_account_folder_expansion(&self, account: &AccountId) {
+        let account = account.clone();
+        self.queue("failed to prune the removed account's folder expansion state", move |db| {
+            db.remove_account_folder_expansion(&account)
+        });
+    }
+
+    /// Queues [`UiStateDb::set_reminder_state`].
+    pub fn set_reminder_state(&self, calendar_id: &str, uid: &str, start_utc: &str, state: &str, snooze_until_utc: Option<&str>) {
+        let (calendar_id, uid, start_utc, state) = (calendar_id.to_string(), uid.to_string(), start_utc.to_string(), state.to_string());
+        let snooze_until_utc = snooze_until_utc.map(str::to_string);
+        self.queue("could not persist reminder state", move |db| {
+            db.set_reminder_state(&calendar_id, &uid, &start_utc, &state, snooze_until_utc.as_deref())
+        });
+    }
+
+    /// Queues [`UiStateDb::clear_reminder`].
+    pub fn clear_reminder(&self, calendar_id: &str, uid: &str, start_utc: &str) {
+        let (calendar_id, uid, start_utc) = (calendar_id.to_string(), uid.to_string(), start_utc.to_string());
+        self.queue("could not clear reminder state", move |db| db.clear_reminder(&calendar_id, &uid, &start_utc));
+    }
+
+    /// Queues [`UiStateDb::save_local_task`].
+    pub fn save_local_task(&self, task: &lookout_core::CalendarTask) {
+        let task = task.clone();
+        self.queue("local task won't persist", move |db| db.save_local_task(&task));
+    }
+
+    /// Queues [`UiStateDb::delete_local_task`].
+    pub fn delete_local_task(&self, uid: &str) {
+        let uid = uid.to_string();
+        self.queue("local task deletion won't persist", move |db| db.delete_local_task(&uid));
+    }
+
+    /// Queues [`UiStateDb::set_my_day`].
+    pub fn set_my_day(&self, day: &str, keys: &[(String, String)]) {
+        let (day, keys) = (day.to_string(), keys.to_vec());
+        self.queue("My Day pins won't persist", move |db| db.set_my_day(&day, &keys));
+    }
+
+    /// Queues [`UiStateDb::prune_my_day`].
+    pub fn prune_my_day(&self, day: &str) {
+        let day = day.to_string();
+        self.queue("could not prune old My Day pins", move |db| db.prune_my_day(&day));
+    }
+}
+
+impl Drop for UiStateStore {
+    /// Closes the queue and waits for the writer to drain it, so a normal
+    /// teardown never loses a queued write.
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// `XDG_CACHE_HOME` is process-global, so every test that touches it - this
 /// module's and `reminders`'s (which opens a `UiStateDb` of its own) - must
 /// take this lock first: a unique directory per test alone doesn't stop one
@@ -617,6 +836,58 @@ mod tests {
     // A single test owns `XDG_CACHE_HOME`: the env var is process-global and
     // parallel test threads would race over it otherwise (the same rule as
     // the `XDG_CONFIG_HOME` tests in `background_image`/`tags`).
+    #[test]
+    fn open_uses_wal_and_normal_sync() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("pragmas");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = UiStateDb::open().expect("fresh database should open");
+        let journal: String = db.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let synchronous: i64 = db.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(synchronous, 1, "NORMAL: WAL commits without an fsync each");
+    }
+
+    #[test]
+    fn store_writes_land_in_order_after_flush() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("store-order");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = UiStateStore::open().expect("fresh store should open");
+        let account = AccountId("acc".into());
+        store.set_starred(&account, "ada", true);
+        store.set_starred(&account, "grace", true);
+        store.set_starred(&account, "ada", false);
+        store.set_recent_folders(&account, &[MailboxId("acc:Old".into())]);
+        store.set_recent_folders(&account, &[MailboxId("acc:New".into()), MailboxId("acc:Old".into())]);
+        store.flush();
+
+        let starred = store.reader().load_starred().unwrap();
+        assert_eq!(starred[&account], HashSet::from(["grace".to_string()]), "the unstar queued after the star wins");
+        assert_eq!(
+            store.reader().load_recent_folders().unwrap()[&account],
+            [MailboxId("acc:New".into()), MailboxId("acc:Old".into())],
+            "the later wholesale replace wins"
+        );
+    }
+
+    #[test]
+    fn dropping_the_store_commits_queued_writes() {
+        let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("lookout-ui-state-test-{}", std::process::id())).join("store-drop");
+        std::env::set_var("XDG_CACHE_HOME", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let store = UiStateStore::open().expect("fresh store should open");
+        store.set_recent_searches(&["from:ada".to_string()]);
+        drop(store);
+        assert_eq!(UiStateDb::open().unwrap().load_recent_searches().unwrap(), ["from:ada"]);
+    }
+
     #[test]
     fn folder_prefs_round_trip_and_skip_defaults() {
         let _guard = CACHE_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());

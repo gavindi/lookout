@@ -26,7 +26,7 @@ use crate::contacts_view::{find_contact_by_address, ContactCommand, ContactsAcco
 use crate::google_tasks::{GoogleTasksCommand, TaskList};
 use crate::last_view::LastSelection;
 use crate::message_list::{SortKey, ThreadId};
-use crate::ui_state_db::UiStateDb;
+use crate::ui_state_db::UiStateStore;
 
 use super::*;
 
@@ -1295,10 +1295,12 @@ pub(crate) struct UiState {
     /// `desktop_contacts::reload`; empty when the feature is off or the
     /// desktop has no Evolution Data Server.
     pub(crate) desktop_contacts: Vec<crate::eds_directory::DesktopBook>,
-    /// The UI-state database backing `starred_contacts`, opened best-effort
-    /// at startup. `None` when the database couldn't be opened - favourites
-    /// then fall back to session-only, never an error.
-    pub(crate) ui_db: Option<Rc<crate::ui_state_db::UiStateDb>>,
+    /// The UI-state database backing `starred_contacts` (and the sender
+    /// lists, folder memory and recent searches), opened best-effort at
+    /// startup. Shared with `CalendarUiState::local_tasks_db` and the
+    /// reminder engine. `None` when the database couldn't be opened -
+    /// favourites then fall back to session-only, never an error.
+    pub(crate) ui_db: Option<Rc<UiStateStore>>,
     /// The GSettings-backed preference store (see `settings`), resolved once
     /// in `build_window` and written through on every preference change.
     pub(crate) settings: Rc<crate::settings::SettingsStore>,
@@ -2374,9 +2376,10 @@ pub(crate) struct CalendarUiState {
     /// `(account, task)` snapshot on each `refresh_tasks_view`. `None` before
     /// then, so an early repaint is a no-op.
     pub(crate) task_reminders_refresh: Option<TaskRemindersRefresh>,
-    /// Best-effort handle on the UI-state database for local-task writes;
-    /// `None` when it couldn't open (local tasks then live in memory only).
-    pub(crate) local_tasks_db: Option<Rc<RefCell<UiStateDb>>>,
+    /// The UI-state database for local tasks and My Day (the same handle as
+    /// `UiState::ui_db`); `None` when it couldn't open (local tasks then live
+    /// in memory only).
+    pub(crate) local_tasks_db: Option<Rc<UiStateStore>>,
     /// The local on-device task lists (item 4.8 / T-01), mirrored from
     /// `AppConfig::local_task_lists` so the Tasks navigation pane and the task
     /// editor (which only see this state) can offer and route them. The
