@@ -576,6 +576,7 @@ impl ContactsCache {
                 etag TEXT,
                 card TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS contacts_book_href ON contacts(book_href);
             ",
         )?;
         Ok(ContactsCache { conn: Mutex::new(conn) })
@@ -690,6 +691,23 @@ impl ContactsCache {
              ON CONFLICT(href) DO UPDATE SET sync_token = excluded.sync_token",
             rusqlite::params![book_href, new_token],
         )?;
+        Ok(())
+    }
+
+    /// Removes a book that vanished server-side, together with its members.
+    ///
+    /// Unlike [`Self::apply_delta`], this does not keep an `address_books` row:
+    /// re-upserting the book (as an empty full-fetch delta does) is what made
+    /// the next poll find it stale again and re-parse the account's whole
+    /// contact set, forever. Deleting the row means the vanished book is
+    /// pruned once; if the server later re-creates it, discovery stores it
+    /// again and it is refetched from scratch.
+    pub fn remove_book(&self, book_href: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM contacts WHERE book_href = ?1", [book_href])?;
+        tx.execute("DELETE FROM address_books WHERE href = ?1", [book_href])?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -839,6 +857,117 @@ mod contacts_tests {
         // A fallback full refetch starts from "no token".
         cache.apply_delta("/addressbooks/alice/personal/", None, &[], &[]).unwrap();
         assert_eq!(cache.load_address_books().unwrap()[0].sync_token, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_book_drops_the_book_and_its_members() {
+        let account_id = temp_account_id();
+        let path = temp_path(&account_id);
+        let cache = ContactsCache::open(&account_id).unwrap();
+
+        let personal = "/addressbooks/alice/personal/";
+        let work = "/addressbooks/alice/work/";
+        cache
+            .apply_delta(
+                personal,
+                Some("token-personal".to_string()),
+                &[
+                    crate::ContactRecord {
+                        href: "/addressbooks/alice/personal/alice.vcf".to_string(),
+                        etag: Some("\"a1\"".to_string()),
+                        card: sample_card("alice", "alice@example.com"),
+                    },
+                    crate::ContactRecord {
+                        href: "/addressbooks/alice/personal/bob.vcf".to_string(),
+                        etag: Some("\"b1\"".to_string()),
+                        card: sample_card("bob", "bob@example.com"),
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
+        cache
+            .apply_delta(
+                work,
+                Some("token-work".to_string()),
+                &[crate::ContactRecord {
+                    href: "/addressbooks/alice/work/carol.vcf".to_string(),
+                    etag: Some("\"c1\"".to_string()),
+                    card: sample_card("carol", "carol@example.com"),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        cache.remove_book(personal).unwrap();
+
+        let books = cache.load_address_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].href, work);
+        assert_eq!(books[0].sync_token.as_deref(), Some("token-work"));
+        let contacts = cache.load_contacts().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].href, "/addressbooks/alice/work/carol.vcf");
+        assert_eq!(cache.sync_token(personal).unwrap(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_removed_book_stays_removed_across_reopen() {
+        let account_id = temp_account_id();
+        let path = temp_path(&account_id);
+        let cache = ContactsCache::open(&account_id).unwrap();
+        let book_href = "/addressbooks/alice/personal/";
+        cache
+            .apply_delta(
+                book_href,
+                Some("token-1".to_string()),
+                &[crate::ContactRecord {
+                    href: "/addressbooks/alice/personal/alice.vcf".to_string(),
+                    etag: Some("\"a1\"".to_string()),
+                    card: sample_card("alice", "alice@example.com"),
+                }],
+                &[],
+            )
+            .unwrap();
+
+        cache.remove_book(book_href).unwrap();
+        assert!(cache.load_address_books().unwrap().is_empty());
+        assert!(cache.load_contacts().unwrap().is_empty());
+
+        // `apply_delta` re-upserted the book row, so the next poll found the
+        // vanished book stale again and re-parsed every cached vCard. The
+        // removal has to survive a fresh connection (next launch).
+        drop(cache);
+        let reopened = ContactsCache::open(&account_id).unwrap();
+        assert!(reopened.load_address_books().unwrap().is_empty());
+        assert!(reopened.load_contacts().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remove_book_of_an_unknown_href_keeps_the_others() {
+        let account_id = temp_account_id();
+        let path = temp_path(&account_id);
+        let cache = ContactsCache::open(&account_id).unwrap();
+        let book_href = "/addressbooks/alice/personal/";
+        cache
+            .store_address_books(&[crate::AddressBookInfo {
+                account_id: account_id.clone(),
+                display_name: "Personal".to_string(),
+                href: book_href.to_string(),
+            }])
+            .unwrap();
+
+        cache.remove_book("/addressbooks/alice/never-existed/").unwrap();
+
+        let books = cache.load_address_books().unwrap();
+        assert_eq!(books.len(), 1);
+        assert_eq!(books[0].href, book_href);
 
         let _ = std::fs::remove_file(&path);
     }

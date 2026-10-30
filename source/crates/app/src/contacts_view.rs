@@ -2739,12 +2739,9 @@ async fn fetch_carddav_contacts(goa_client: GoaClient, account: GoaContactsAccou
         let live_hrefs: HashSet<&str> = books.iter().map(|b| b.href.as_str()).collect();
         if let Ok(cached_books) = cache.load_address_books() {
             for stale in cached_books.iter().filter(|b| !live_hrefs.contains(b.href.as_str())) {
-                let gone: Vec<String> = cache
-                    .load_contacts()
-                    .ok()
-                    .map(|contacts| contacts.iter().filter(|c| c.book_href == stale.href).map(|c| c.href.clone()).collect())
-                    .unwrap_or_default();
-                let _ = cache.apply_delta(&stale.href, None, &[], &gone);
+                if let Err(e) = cache.remove_book(&stale.href) {
+                    tracing::warn!("failed to drop vanished CardDAV addressbook {:?}: {e}", stale.href);
+                }
             }
         }
     }
@@ -2832,18 +2829,9 @@ async fn fetch_graph_contacts(client: &ContactsClient, account: &GoaContactsAcco
         let live_hrefs: HashSet<&str> = books.iter().map(|book| book.href.as_str()).collect();
         if let Ok(cached_books) = cache.load_address_books() {
             for stale in cached_books.iter().filter(|book| !live_hrefs.contains(book.href.as_str())) {
-                let gone: Vec<String> = cache
-                    .load_contacts()
-                    .ok()
-                    .map(|contacts| {
-                        contacts
-                            .iter()
-                            .filter(|contact| contact.book_href == stale.href)
-                            .map(|contact| contact.href.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let _ = cache.apply_delta(&stale.href, None, &[], &gone);
+                if let Err(e) = cache.remove_book(&stale.href) {
+                    tracing::warn!("failed to drop vanished Graph contact folder {:?}: {e}", stale.href);
+                }
             }
         }
     }
