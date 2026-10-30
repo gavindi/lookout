@@ -357,7 +357,7 @@ pub fn parse_draft_prefill(raw: &[u8]) -> Option<DraftPrefillContent> {
             Some(Attachment {
                 filename: part.attachment_name().map(str::to_string).unwrap_or_else(|| "attachment".to_string()),
                 content_type,
-                bytes: part.contents().to_vec(),
+                bytes: std::sync::Arc::from(part.contents()),
             })
         })
         .collect();
@@ -1421,7 +1421,7 @@ mod tests {
             attachments: vec![Attachment {
                 filename: "notes.txt".to_string(),
                 content_type: "text/plain".to_string(),
-                bytes: b"attached notes".to_vec(),
+                bytes: std::sync::Arc::from(&b"attached notes"[..]),
             }],
             inline_images: vec![InlineImage {
                 cid: "img-1@lookout.local".to_string(),
@@ -1446,7 +1446,7 @@ mod tests {
         assert!(html.contains("data:image/png;base64,"));
         assert_eq!(prefill.attachments.len(), 1, "only the regular attachment is listed");
         assert_eq!(prefill.attachments[0].filename, "notes.txt");
-        assert_eq!(prefill.attachments[0].bytes, b"attached notes");
+        assert_eq!(&prefill.attachments[0].bytes[..], b"attached notes");
         assert_eq!(prefill.bcc, vec!["Ada <hidden@example.com>".to_string()]);
         assert!(prefill.request_delivery_receipt, "the delivery-receipt request survives a draft save/reopen");
         assert!(!prefill.request_read_receipt);

@@ -475,7 +475,7 @@ pub(crate) fn open_forward_composer(state: &Rc<RefCell<UiState>>, worker: &Rc<Wo
             attachments.push(Attachment {
                 filename: c.name,
                 content_type: part_content_type(&c.part),
-                bytes: c.bytes,
+                bytes: c.bytes.into(),
             });
         } else if let Some(cid) = c.part.cid.clone() {
             images.push((cid, part_content_type(&c.part), c.bytes));

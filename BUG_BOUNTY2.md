@@ -71,7 +71,7 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
    - **Code:** Close spawns `autosave.attempt()` and then immediately sets `closed` and calls `on_done()`.
    - **Failure, part 1:** `attempt()` returns early when a save is already in flight ([compose.rs:1068-1075](source/crates/app/src/compose.rs#L1068-L1075)). With a 5 s autosave tick, an in-flight tick is common, so edits made after that tick's snapshot are lost. `flush()` exists for exactly this case and is only used by schedule-send.
    - **Failure, part 2:** the spawned future first runs after `on_done()` has torn the page down. In rich-text mode `snapshot()` then has to read a WebView that the send path's own comment says must still be parented. If `read_content` returns `None`, nothing is saved.
-   - **Check:** close a rich-text composer within 5 s of typing, then look in Drafts.
+   - **Check:** close a rich-text composer within 30 s of typing (the tick since 0.9.303), then look in Drafts.
    - **Fix:** `close_button` should `await autosave.flush()` *before* `closed.set(true); on_done()`, in the same task. The send path already does this.
    - **Fixed (0.9.298):** Close sets `closed` idempotently, then awaits `autosave.flush()` in the same task and only then calls `on_done()`, so an in-flight tick is waited out and the rich editor is read while still parented.
 
@@ -192,12 +192,13 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
     - **Call sites:** filter loops ([graph_sync.rs:93, 271, 359, 485](source/crates/app/src/window/graph_sync.rs#L485)), `focused_inbox_available` ([support.rs:657](source/crates/app/src/window/support.rs#L657)), the composer's directory assembly ([graph_directory.rs:84](source/crates/app/src/graph_directory.rs#L84)), Settings repaints, and ad-hoc `MicrosoftOAuth::new(..).graph_consented()` in [contacts_view.rs:2340, 3003, 3013](source/crates/app/src/contacts_view.rs#L3003) and [connect.rs:1986, 2425](source/crates/app/src/window/connect.rs#L1986).
     - **Fix:** cache the flags in memory on the shared per-account `MicrosoftOAuth` (BUG_BOUNTY1 #5's registry) and update them on save.
 
-23. **P1** (a) / **P2** (b) ✔ **Draft autosave re-uploads every attachment on every changed tick.** [compose.rs:24, 1113-1137](source/crates/app/src/compose.rs#L1113-L1137).
+23. **P1** (a) / **P2** (b) ✔ **Fixed** — **Draft autosave re-uploads every attachment on every changed tick.** [compose.rs:24, 1113-1137](source/crates/app/src/compose.rs#L1113-L1137).
     - **Code:** with a 5 s tick, each changed snapshot builds a `ComposedMessage` that deep-copies every attachment (`(*self.bytes).clone()`). The session then re-`APPEND`s the whole MIME message to Drafts, and deletes the previous copy.
     - **Cost:** typing in a composer with a 20 MB attachment uploads 20 MB every 5 seconds.
     - **Fix:**
       - Back off the interval when attachments exceed a threshold (e.g. 30 s or more), or save on idle/blur rather than on every tick.
       - Pass `Rc`/`Arc<[u8]>` into `Attachment` so the copy is shared.
+    - **Fixed (0.9.303):** the tick is a fixed 30 s for every composer, attachments or not. Change detection now starts from a baseline snapshot taken when the composer opens (straight away for the plain editor, on the rich editor's first load), so an untouched reply, forward or reopened draft is never autosaved and a reopened draft's attachments are not re-uploaded unchanged. Save Draft and schedule send force one save when nothing is stored yet; Close still flushes but stores nothing for an untouched composer. `lookout_mail::Attachment.bytes` is `Arc<[u8]>`, shared with the composer's `PendingAttachment` and borrowed by `build_raw_message`, so a save copies no attachment bytes (the Graph path keeps one copy into `OutgoingAttachment`). Covered by the `should_save` baseline/force tests and `a_draft_save_shares_attachment_bytes_instead_of_copying_them`.
 
 24. **P1** (a) / **P4** (b) ✔ **Synchronous SQLite and file I/O on the GTK thread** (beyond BUG_BOUNTY1 #16 and #17).
     - **What:** `UiStateDb` writes (`set_starred`, `set_recent_folders`, `set_folder_expansion`, reminder state, My Day, local tasks: about 40 call sites) run on the main thread with the default `synchronous=FULL` (one fsync per write) and a 5 s `busy_timeout` ([ui_state_db.rs:147-156](source/crates/app/src/ui_state_db.rs#L147-L156)).
@@ -329,12 +330,12 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 1. **#26 (weak ETags):** one line, and it unblocks every edit or delete against a weak-validator DAV server.
 2. **#24 (a):** `UiStateDb` `synchronous=NORMAL` plus the icon-pack sibling-dir rename — the two biggest GTK stalls in the tier.
 3. **#17:** `ContactsCache::remove_book`, which stops an unbounded per-poll re-parse.
-4. **#23 (a):** autosave interval backoff / save-on-idle, which removes the 20 MB-per-5-s upload without touching the `Attachment` type.
+4. ~~**#23 (a):** autosave interval backoff / save-on-idle.~~ ✔ Fixed (0.9.303).
 5. **#31:** the shared `fsutil::write_atomic`, which also closes BUG_BOUNTY1 #9 and #12.
 
 **P2 — schedule next**
 
-6. **#23 (b):** `Rc<[u8]>`/`Arc<[u8]>` attachments.
+6. ~~**#23 (b):** `Rc<[u8]>`/`Arc<[u8]>` attachments.~~ ✔ Fixed (0.9.303).
 7. **#22 + BUG_BOUNTY1 #5/#6 + #32/#33:** one shared per-account OAuth/Graph account with cached consent flags, so the consent cache is written once.
 8. **#25:** `spawn_blocking` around `Cache::open`.
 9. **#20:** the generated `date` column and `(partial, date)` index.
@@ -367,5 +368,6 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
   - Rules sync: a remote-deleted rule with a Graph id is deleted locally and not re-created.
 - **Manual (ask before launching; see memory):**
   - Double-click Send.
-  - Close a rich-text composer within 5 s of typing and check Drafts.
+  - Close a rich-text composer within 30 s of typing and check Drafts.
+  - Reopen a draft with a large attachment and leave it for over 30 s: no "Saving draft…". Close an untouched reply: no draft. Save Draft on an untouched reply: stored.
   - Suspend for 2 hours with an M365 account, resume and check mail and Graph calls work immediately.

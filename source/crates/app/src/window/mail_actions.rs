@@ -2384,7 +2384,7 @@ pub(crate) fn report_phishing_message(state: &Rc<RefCell<UiState>>, summary: &Em
         attachments: vec![lookout_mail::Attachment {
             filename: phishing_attachment_name(&subject),
             content_type: "message/rfc822".to_string(),
-            bytes: raw.to_vec(),
+            bytes: std::sync::Arc::from(raw),
         }],
         inline_images: vec![],
         calendar_part: None,

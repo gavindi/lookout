@@ -636,7 +636,7 @@ pub(crate) fn build_rule_forward(from: &str, display_name: &str, pending: &Pendi
         attachments: vec![Attachment {
             filename: "forwarded-message.eml".to_string(),
             content_type: "message/rfc822".to_string(),
-            bytes: raw.to_vec(),
+            bytes: std::sync::Arc::from(raw),
         }],
         inline_images: Vec::new(),
         calendar_part: None,

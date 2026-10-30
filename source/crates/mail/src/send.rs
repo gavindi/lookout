@@ -12,6 +12,7 @@ use mail_builder::headers::raw::Raw;
 use mail_builder::headers::HeaderType;
 use mail_builder::mime::{BodyPart as MimeBodyPart, MimePart};
 use mail_builder::MessageBuilder;
+use std::sync::Arc;
 
 use crate::config::{Credential, EndpointConfig};
 use crate::error::{Error, Result};
@@ -56,12 +57,15 @@ pub struct ReadReceipt {
 
 /// A regular (non-inline) file attached to a composed message. `content_type`
 /// is always supplied by the caller - the app crate resolves it from the
-/// picked file before building this; nothing here guesses it.
+/// picked file before building this; nothing here guesses it. `bytes` is
+/// shared rather than owned: the composer builds a fresh `ComposedMessage` on
+/// every changed draft autosave, and a multi-MB attachment must not be
+/// copied each time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attachment {
     pub filename: String,
     pub content_type: String,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 /// An inline, `cid:`-referenced image embedded in an HTML body - extracted
@@ -315,7 +319,7 @@ fn build_raw_message_inner(msg: &ComposedMessage, draft_only: bool) -> (Vec<u8>,
             builder = builder.inline(image.content_type.clone(), image.cid.clone(), image.bytes.clone());
         }
         for attachment in &msg.attachments {
-            builder = builder.attachment(attachment.content_type.clone(), attachment.filename.clone(), attachment.bytes.clone());
+            builder = builder.attachment(attachment.content_type.clone(), attachment.filename.clone(), &attachment.bytes[..]);
         }
     }
 
@@ -863,7 +867,7 @@ mod tests {
         Attachment {
             filename: "report.pdf".to_string(),
             content_type: "application/pdf".to_string(),
-            bytes: b"%PDF-fake".to_vec(),
+            bytes: Arc::from(&b"%PDF-fake"[..]),
         }
     }
 

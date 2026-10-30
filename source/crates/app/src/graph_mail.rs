@@ -125,7 +125,7 @@ fn outgoing_message(message: &lookout_mail::ComposedMessage) -> OutgoingMessage 
                 name: attachment.filename.clone(),
                 content_type: attachment.content_type.clone(),
                 content_id: None,
-                data: attachment.bytes.clone(),
+                data: attachment.bytes.to_vec(),
             })
             .collect(),
         inline_images: message

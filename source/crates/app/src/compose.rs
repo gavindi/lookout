@@ -2,6 +2,7 @@
 /// Software released under the GPL3 license
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -19,9 +20,11 @@ use crate::util::escape_html;
 /// How long the composer waits after the last check before autosaving the
 /// draft again. The autosave runs on a fixed tick and compares the current
 /// fields against the last saved snapshot, so this is the worst-case gap
-/// between an edit and its draft landing server-side. A draft save is
-/// several IMAP round trips (replace + append), so this errs slow.
-const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// between an edit and its draft landing server-side. Every save re-uploads
+/// the whole MIME message - attachments included - and is several IMAP
+/// round trips (replace + append), so this is deliberately slow; Close,
+/// Send and schedule send all flush, so the gap only matters on a crash.
+const DRAFT_AUTOSAVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Everything the window layer needs to move a composer between the reading
 /// pane and its pop-out window. `widget` is the composer root the window
@@ -332,7 +335,7 @@ pub fn build_forward_attachment_prefill(summary: &EmailSummary, raw: &[u8]) -> C
         attachments: vec![Attachment {
             filename: crate::window::eml_suggested_name(summary),
             content_type: "message/rfc822".to_string(),
-            bytes: raw.to_vec(),
+            bytes: Arc::from(raw),
         }],
         ..Default::default()
     }
@@ -921,16 +924,15 @@ struct DraftSnapshot {
 /// compose session. Drafts do persist attachments - they are MIME parts of
 /// the saved message, and reopening a draft seeds this list from
 /// `ComposePrefill::attachments` (item 1.12) - though a crash before the
-/// next autosave still drops whatever was added since. `bytes` is
-/// `Rc`-wrapped so add/remove/rebuild never reclones potentially multi-MB
-/// payloads; it's cloned into an owned `lookout_mail::Attachment` only at
-/// the two points that actually build a `ComposedMessage` (Send, and a
-/// changed autosave tick).
+/// next autosave still drops whatever was added since. `bytes` is shared
+/// with the `lookout_mail::Attachment` built from it (Send, and a changed
+/// autosave tick), so neither add/remove/rebuild nor a draft save ever
+/// reclones potentially multi-MB payloads.
 #[derive(Clone)]
 struct PendingAttachment {
     filename: String,
     content_type: String,
-    bytes: Rc<Vec<u8>>,
+    bytes: Arc<[u8]>,
 }
 
 impl PartialEq for PendingAttachment {
@@ -939,7 +941,7 @@ impl PartialEq for PendingAttachment {
     // `DraftSnapshot` equality (checked every autosave tick) cheap instead
     // of a multi-MB `memcmp`.
     fn eq(&self, other: &Self) -> bool {
-        self.filename == other.filename && self.content_type == other.content_type && Rc::ptr_eq(&self.bytes, &other.bytes)
+        self.filename == other.filename && self.content_type == other.content_type && Arc::ptr_eq(&self.bytes, &other.bytes)
     }
 }
 
@@ -948,7 +950,7 @@ impl PendingAttachment {
         Attachment {
             filename: self.filename.clone(),
             content_type: self.content_type.clone(),
-            bytes: (*self.bytes).clone(),
+            bytes: Arc::clone(&self.bytes),
         }
     }
 }
@@ -1017,8 +1019,9 @@ struct AutosaveCtx {
     /// The canonical in-session attachment list, shared with the attach
     /// button and the Send handler.
     attachments: Rc<RefCell<Vec<PendingAttachment>>>,
-    /// The last snapshot queued for saving; a tick whose fields still match
-    /// it does nothing.
+    /// The last snapshot queued for saving - or, until the first save, what
+    /// the composer opened with (see `capture_baseline`). A tick whose fields
+    /// still match it does nothing.
     last_saved: Rc<RefCell<Option<DraftSnapshot>>>,
     /// Set the moment a `SaveDraft` is queued for this session - gates the
     /// `replace` flag and the delete-before-send, so it's deliberately
@@ -1087,15 +1090,30 @@ impl AutosaveCtx {
         })
     }
 
+    /// Records what the composer opened with as the change-detection
+    /// baseline, so a reply, forward or reopened draft that is never edited
+    /// is never autosaved - and a reopened draft's attachments are not
+    /// re-uploaded unchanged. Never overwrites a real save, and does nothing
+    /// if the rich editor can't be read yet (the first tick then saves, as
+    /// it would without a baseline).
+    async fn capture_baseline(&self) {
+        let Some(snap) = self.snapshot().await else { return };
+        let mut last_saved = self.last_saved.borrow_mut();
+        if last_saved.is_none() {
+            *last_saved = Some(snap);
+        }
+    }
+
     /// Saves the draft if anything worth saving has changed since the last
-    /// save. Safe to call at any time: trivial, unchanged, and concurrent
-    /// invocations all return without queueing anything.
-    async fn attempt(&self) {
+    /// save (see [`should_save`] for what `force` adds). Safe to call at any
+    /// time: trivial, unchanged, and concurrent invocations all return
+    /// without queueing anything.
+    async fn attempt(&self, force: bool) {
         if self.in_flight.get() {
             return;
         }
         self.in_flight.set(true);
-        self.save_if_changed().await;
+        self.save_if_changed(force).await;
         self.in_flight.set(false);
     }
 
@@ -1103,23 +1121,20 @@ impl AutosaveCtx {
     /// final content is always queued - schedule send (item 1.14) relies on
     /// the Drafts copy being current, and on `draft_queued` being set,
     /// before it queues the message.
-    async fn flush(&self) {
+    async fn flush(&self, force: bool) {
         while self.in_flight.get() {
             glib::timeout_future(Duration::from_millis(50)).await;
         }
-        self.attempt().await;
+        self.attempt(force).await;
     }
 
-    async fn save_if_changed(&self) {
+    async fn save_if_changed(&self, force: bool) {
         let Some(snap) = self.snapshot().await else { return };
-        if draft_is_trivial(&snap) {
-            return;
-        }
         // Scoped so no borrow is held across the sends below - and, more to
         // the point, never across the `.await` above, which yields to the
         // main loop and lets other handlers run.
-        let unchanged = self.last_saved.borrow().as_ref() == Some(&snap);
-        if unchanged {
+        let save = should_save(&snap, self.last_saved.borrow().as_ref(), self.draft_queued.get(), force);
+        if !save {
             return;
         }
         // First save of a reopened draft takes its exact source UID (then
@@ -1177,6 +1192,19 @@ fn draft_is_trivial(snap: &DraftSnapshot) -> bool {
         && snap.body_text.trim().is_empty()
         && snap.attachments.is_empty()
         && snap.inline_images.is_empty()
+}
+
+/// Whether a draft save of `snap` should be queued. A trivial draft never
+/// is. Otherwise it is saved when it differs from `last_saved` - the last
+/// stored copy, or the composer's opening baseline - or when `force`d by an
+/// explicit save (Save Draft, schedule send) while nothing is stored yet: an
+/// untouched reply still lands in Drafts when the user asks for it, but an
+/// unchanged draft that is already stored is never re-uploaded.
+fn should_save(snap: &DraftSnapshot, last_saved: Option<&DraftSnapshot>, draft_queued: bool, force: bool) -> bool {
+    if draft_is_trivial(snap) {
+        return false;
+    }
+    last_saved != Some(snap) || (force && !draft_queued)
 }
 
 /// Word stems that suggest the sender meant to attach something (item 1.19 /
@@ -1616,7 +1644,7 @@ async fn add_attachment_from_file(file: &gio::File, attachments: &Rc<RefCell<Vec
     attachments.borrow_mut().push(PendingAttachment {
         filename: info.display_name().to_string(),
         content_type,
-        bytes: Rc::new(bytes.to_vec()),
+        bytes: Arc::from(&bytes[..]),
     });
 }
 
@@ -1695,12 +1723,15 @@ fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow
 /// the text.
 ///
 /// Draft autosave: while the composer is open, a periodic timer compares
-/// the fields against the last saved snapshot and, when they differ (and
-/// the content isn't trivial), `APPEND`s the message to the account's
-/// Drafts mailbox via `AccountCommand::SaveDraft` - replacing the previous
-/// autosave in place, keyed by a stable per-compose-session `Message-ID`.
-/// Cancel saves one final time (so closing the composer never loses work);
-/// Send deletes the stored draft before sending. The returned `Sender` is
+/// the fields against the last saved snapshot - or, before the first save,
+/// against what the composer opened with, so an untouched reply, forward or
+/// reopened draft is never saved - and, when they differ (and the content
+/// isn't trivial), `APPEND`s the message to the account's Drafts mailbox via
+/// `AccountCommand::SaveDraft` - replacing the previous autosave in place,
+/// keyed by a stable per-compose-session `Message-ID`. Close saves one final
+/// time (so closing the composer never loses work); Save Draft and schedule
+/// send store even an untouched composer; Send deletes the stored draft
+/// before sending. The returned `Sender` is
 /// how the account's event loop forwards `DraftSaved` confirmations back to
 /// this composer (which flips the status label from "Saving draft…" to
 /// "Draft saved"); dropping it lets the composer's confirmation consumer
@@ -1936,7 +1967,7 @@ pub fn build_compose_view(
         attachments.borrow_mut().push(PendingAttachment {
             filename: attachment.filename.clone(),
             content_type: attachment.content_type.clone(),
-            bytes: Rc::new(attachment.bytes.clone()),
+            bytes: attachment.bytes.clone(),
         });
     }
     rebuild_attachment_chips(&attachments, &attachment_flow);
@@ -2581,9 +2612,32 @@ pub fn build_compose_view(
                 if closed.get() {
                     break;
                 }
-                autosave.attempt().await;
+                autosave.attempt(false).await;
             }
         });
+    }
+
+    // The opening baseline the tick compares against before the first save.
+    // Both paths run after this function returns, so every synchronous
+    // prefill (quote, signature, recipients, toggles) is already in place.
+    // The plain editor can be read straight away; the rich one only once its
+    // document has loaded, and this handler is connected after the
+    // signature-append and caret-placement ones, so its `read_content` is
+    // queued behind their scripts and sees the finished document. Nothing
+    // can be typed into the editor before it loads, so no edit is absorbed.
+    if rich_toggle.is_active() {
+        let autosave = autosave.clone();
+        let captured = Cell::new(false);
+        rich_web_view.connect_load_changed(move |_, event| {
+            if event != webkit::LoadEvent::Finished || captured.replace(true) {
+                return;
+            }
+            let autosave = autosave.clone();
+            glib::spawn_future_local(async move { autosave.capture_baseline().await });
+        });
+    } else {
+        let autosave = autosave.clone();
+        glib::spawn_future_local(async move { autosave.capture_baseline().await });
     }
 
     // DraftSaved confirmations arrive on the account's event loop and are
@@ -2728,9 +2782,11 @@ pub fn build_compose_view(
     }
     {
         let autosave = autosave.clone();
+        // An explicit save: waits out an in-flight tick rather than doing
+        // nothing, and stores even an untouched reply or forward.
         save_draft_button.connect_clicked(move |_| {
             let autosave = autosave.clone();
-            glib::spawn_future_local(async move { autosave.attempt().await });
+            glib::spawn_future_local(async move { autosave.flush(true).await });
         });
     }
     {
@@ -2753,7 +2809,7 @@ pub fn build_compose_view(
             let autosave = autosave.clone();
             let on_done = on_done.clone();
             glib::spawn_future_local(async move {
-                autosave.flush().await;
+                autosave.flush(false).await;
                 on_done();
             });
         });
@@ -2839,7 +2895,7 @@ pub fn build_compose_view(
                 // delete once sent. Commands reach the session in order, so
                 // the save lands before the outbox row is queued.
                 if schedule.is_some() {
-                    autosave.flush().await;
+                    autosave.flush(true).await;
                 }
                 let (text_body, html_body, inline_images) = if rich {
                     // Reading the editor's live HTML back out is a round trip
@@ -3017,7 +3073,7 @@ pub fn build_compose_view(
 
     // Belt and braces for the autosave timer: Cancel and Send set `closed`
     // themselves, but a composer displaced some other way (a second composer
-    // opening over this one) would otherwise leave its 5-second loop running
+    // opening over this one) would otherwise leave its autosave loop running
     // forever against a detached editor - still writing drafts. A pop-out is
     // not a displacement: `moving` is set around the removal, so the flag
     // gates the kill. Re-rooting (the composer landing in the pop-out window
@@ -3163,7 +3219,7 @@ mod tests {
             attachments: vec![Attachment {
                 filename: "notes.txt".to_string(),
                 content_type: "text/plain".to_string(),
-                bytes: b"notes".to_vec(),
+                bytes: Arc::from(&b"notes"[..]),
             }],
             bcc: vec!["Ada <hidden@example.com>".to_string()],
             in_reply_to: Some("older@example.com".to_string()),
@@ -3187,7 +3243,7 @@ mod tests {
         assert!(prefill.request_read_receipt);
         assert_eq!(prefill.request_delivery_receipt, Some(true), "the draft's own receipt choice survives reopening");
         assert_eq!(prefill.attachments.len(), 1);
-        assert_eq!(prefill.attachments[0].bytes, b"notes");
+        assert_eq!(&prefill.attachments[0].bytes[..], b"notes");
         assert_eq!(prefill.draft_message_id.as_deref(), Some("draft-1@lookout.local"));
         assert_eq!(prefill.draft_source.as_ref().map(|(m, u)| (m.clone(), *u)), Some((summary.mailbox.clone(), summary.uid)));
         assert_eq!(prefill.in_reply_to.as_deref(), Some("older@example.com"));
@@ -3215,7 +3271,7 @@ mod tests {
             attachments: vec![Attachment {
                 filename: "q3.csv".to_string(),
                 content_type: "text/csv".to_string(),
-                bytes: b"a,b\n1,2\n".to_vec(),
+                bytes: Arc::from(&b"a,b\n1,2\n"[..]),
             }],
             inline_images: vec![InlineImage {
                 cid: "chart1".to_string(),
@@ -3308,7 +3364,7 @@ mod tests {
             attachments: vec![Attachment {
                 filename: "q3.csv".to_string(),
                 content_type: "text/csv".to_string(),
-                bytes: b"a,b\n1,2\n".to_vec(),
+                bytes: Arc::from(&b"a,b\n1,2\n"[..]),
             }],
             inline_images: vec![InlineImage {
                 cid: "chart1".to_string(),
@@ -3337,7 +3393,7 @@ mod tests {
         assert!(!html.contains("cid:"), "{html}");
         assert_eq!(prefill.attachments.len(), 1);
         assert_eq!(prefill.attachments[0].filename, "q3.csv");
-        assert_eq!(prefill.attachments[0].bytes, b"a,b\n1,2\n");
+        assert_eq!(&prefill.attachments[0].bytes[..], b"a,b\n1,2\n");
         assert_eq!(prefill.importance, Importance::High);
         assert_eq!(prefill.sensitivity, MessageSensitivity::CompanyConfidential);
         assert!(prefill.request_read_receipt);
@@ -3455,7 +3511,7 @@ mod tests {
         assert_eq!(forward.attachments.len(), 1);
         assert_eq!(forward.attachments[0].content_type, "message/rfc822");
         assert_eq!(forward.attachments[0].filename, "Hello there.eml");
-        assert_eq!(forward.attachments[0].bytes, raw.to_vec());
+        assert_eq!(&forward.attachments[0].bytes[..], &raw[..]);
         // Nothing is quoted inline - the attachment carries the original.
         assert!(forward.body.as_deref().unwrap_or("").trim().is_empty());
         assert!(forward.html_body.is_none());
@@ -3556,7 +3612,7 @@ mod tests {
         with_attachment.attachments = vec![PendingAttachment {
             filename: "photo.png".to_string(),
             content_type: "image/png".to_string(),
-            bytes: Rc::new(vec![0u8; 4]),
+            bytes: Arc::from(vec![0u8; 4]),
         }];
         assert!(!draft_is_trivial(&with_attachment));
 
@@ -3567,6 +3623,42 @@ mod tests {
             bytes: vec![0u8; 4],
         }];
         assert!(!draft_is_trivial(&with_image));
+    }
+
+    #[test]
+    fn an_untouched_composer_is_not_autosaved_against_its_opening_baseline() {
+        let reply = snapshot("a@example.com", "Re: plans", "> quoted");
+        // The tick: an unedited reply, forward or reopened draft is skipped.
+        assert!(!should_save(&reply, Some(&reply), false, false));
+        assert!(!should_save(&reply, Some(&reply), true, false));
+        // Any edit since the baseline (or no baseline at all) is saved.
+        let edited = snapshot("a@example.com", "Re: plans", "sounds good\n> quoted");
+        assert!(should_save(&edited, Some(&reply), false, false));
+        assert!(should_save(&reply, None, false, false));
+    }
+
+    #[test]
+    fn a_forced_save_stores_an_untouched_composer_only_once() {
+        let reply = snapshot("a@example.com", "Re: plans", "> quoted");
+        // Save Draft / schedule send on an untouched reply: nothing stored
+        // yet, so it is saved despite matching the baseline.
+        assert!(should_save(&reply, Some(&reply), false, true));
+        // Already stored and unchanged: never re-uploaded, forced or not.
+        assert!(!should_save(&reply, Some(&reply), true, true));
+        // An empty composer is never stored, even when asked to.
+        let empty = snapshot("", "", "");
+        assert!(!should_save(&empty, None, false, true));
+    }
+
+    #[test]
+    fn a_draft_save_shares_attachment_bytes_instead_of_copying_them() {
+        let pending = PendingAttachment {
+            filename: "big.bin".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            bytes: Arc::from(vec![7u8; 1024]),
+        };
+        let attachment = pending.to_mail_attachment();
+        assert!(Arc::ptr_eq(&pending.bytes, &attachment.bytes));
     }
 
     #[test]
