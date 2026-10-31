@@ -88,18 +88,8 @@ impl TokenStore {
     }
 
     fn save(&self, stored: &StoredToken) -> Result<(), String> {
-        let dir = self.path.parent().ok_or("no parent directory for the token store")?;
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let data = serde_json::to_vec_pretty(stored).map_err(|e| e.to_string())?;
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-        }
-        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-        Ok(())
+        lookout_core::fsutil::write_private(&self.path, &data).map_err(|e| e.to_string())
     }
 
     fn delete(&self) {
@@ -269,15 +259,8 @@ fn load_client_id_file() -> Option<String> {
 /// Persists the client id to the config file. Writes atomically; a failure
 /// is surfaced to the caller (the Config view toasts it).
 pub fn set_client_id(client_id: &str) -> Result<(), String> {
-    let path = client_id_file_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
     let data = serde_json::to_vec_pretty(&serde_json::json!({ "client_id": client_id })).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(())
+    lookout_core::fsutil::write_atomic(&client_id_file_path(), &data, 0o600).map_err(|e| e.to_string())
 }
 
 /// The currently-configured client id (env var or file), for display in the
@@ -585,16 +568,15 @@ fn load_cache(email: &str) -> Option<TasksCache> {
 
 fn store_cache(email: &str, lists: &[TaskList], tasks: &[CalendarTask]) {
     let path = cache_path(email);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let Ok(data) = serde_json::to_vec(&TasksCache {
         lists: lists.to_vec(),
         tasks: tasks.to_vec(),
     }) else {
         return;
     };
-    let _ = std::fs::write(&path, data);
+    if let Err(e) = lookout_core::fsutil::write_atomic(&path, &data, 0o600) {
+        tracing::warn!("couldn't write the Google Tasks cache {}: {e}", path.display());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -961,7 +943,25 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "refresh tokens must be stored 0600");
+
+            // A token file left readable by an older build is tightened on
+            // the next save rather than keeping its mode.
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            store
+                .save(&StoredToken {
+                    refresh_token: "rt-456".to_string(),
+                })
+                .unwrap();
+            let mode = std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a resave must tighten a readable token file");
         }
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "acct.json")
+            .collect();
+        assert!(leftovers.is_empty(), "files left beside the token: {leftovers:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

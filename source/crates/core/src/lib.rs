@@ -11,6 +11,7 @@ pub mod calendar_protocol;
 pub mod contact_merge;
 pub mod email;
 pub mod freebusy;
+pub mod fsutil;
 pub mod holidays;
 pub mod identity;
 pub mod ids;

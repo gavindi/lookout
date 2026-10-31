@@ -189,20 +189,10 @@ impl TokenStore {
     }
 
     fn save(&self, stored: &StoredToken) -> Result<(), String> {
-        let dir = self.path.parent().ok_or("no parent directory for the token store")?;
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let data = serde_json::to_vec_pretty(stored).map_err(|e| e.to_string())?;
-        // Write atomically (tmp + rename) and with 0600 permissions: a
-        // refresh token is as sensitive as a saved password.
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-        }
-        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())?;
-        Ok(())
+        // Atomic and owner-only from the first byte: a refresh token is as
+        // sensitive as a saved password.
+        lookout_core::fsutil::write_private(&self.path, &data).map_err(|e| e.to_string())
     }
 
     fn delete(&self) {
@@ -729,7 +719,27 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "refresh tokens must be stored 0600");
+
+            // A token file left readable by an older build is tightened on
+            // the next save rather than keeping its mode.
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            store
+                .save(&StoredToken {
+                    refresh_token: "rt-456".to_string(),
+                    graph_consented: true,
+                    mail_send: true,
+                })
+                .unwrap();
+            let mode = std::fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a resave must tighten a readable token file");
         }
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "acct.json")
+            .collect();
+        assert!(leftovers.is_empty(), "files left beside the token: {leftovers:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

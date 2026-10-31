@@ -197,15 +197,9 @@ fn autostart_file_content() -> &'static str {
 }
 
 fn write_autostart_file_in(path: &Path) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    // Write the temp file next to the target, then rename over it, so a
-    // half-written entry can never be picked up by the autostart generator.
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    fs::write(&tmp, autostart_file_content())?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    // Atomic, so a half-written entry can never be picked up by the
+    // autostart generator; the hidden temp name doesn't end in `.desktop`.
+    lookout_core::fsutil::write_atomic(path, autostart_file_content().as_bytes(), 0o644)
 }
 
 /// Writes the app's own autostart entry (creating `~/.config/autostart`

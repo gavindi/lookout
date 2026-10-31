@@ -123,25 +123,12 @@ fn mailbox_filename_hash(mailbox_id: &MailboxId) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Writes `bytes` to `path` atomically: write to a sibling temp file, then
-/// rename over the target. A crash or a concurrent read mid-write can never
-/// observe a truncated `.bin`/`.eml` file this way (`load_attachment`/
-/// `load_raw_message` would otherwise be able to read a partial write and
-/// cache a corrupt attachment). Mirrors the tmp+rename idiom already used
-/// for the OAuth token stores (`microsoft_oauth.rs`, `google_tasks.rs`) and
-/// the autostart file (`background.rs`); the pid suffix keeps concurrent
-/// writers (different blocking-pool threads) from colliding on the same
-/// temp name.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut tmp_name = path.as_os_str().to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = PathBuf::from(tmp_name);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+/// Writes one attachment `.bin` or raw `.eml` flat file atomically and
+/// owner-only, so a crash or a concurrent read mid-write can never observe a
+/// truncated file (`load_attachment`/`load_raw_message` would otherwise read
+/// a partial write and serve a corrupt attachment).
+fn write_cache_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    Ok(lookout_core::fsutil::write_atomic(path, bytes, 0o600)?)
 }
 
 fn cache_dir() -> std::path::PathBuf {
@@ -1521,7 +1508,7 @@ impl Cache {
     /// `BodyPart::transfer_encoding` concern that belongs to the fetch path.
     pub fn store_attachment(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, part_number: &str, bytes: &[u8]) -> Result<()> {
         let path = self.attachment_path(mailbox_id, uid, uidvalidity, part_number);
-        write_atomic(&path, bytes)
+        write_cache_file(&path, bytes)
     }
 
     /// The per-account flat-file path a whole raw RFC 5322 message's bytes are
@@ -1550,7 +1537,7 @@ impl Cache {
     /// path) at near-zero cost, or fetch on demand for an export.
     pub fn store_raw_message(&self, mailbox_id: &MailboxId, uid: Uid, uidvalidity: UidValidity, bytes: &[u8]) -> Result<()> {
         let path = self.raw_message_path(mailbox_id, uid, uidvalidity);
-        write_atomic(&path, bytes)
+        write_cache_file(&path, bytes)
     }
 
     /// Removes the flat-file cache for every `(uid, uidvalidity)` pair in
@@ -1605,8 +1592,8 @@ impl Cache {
     /// O(files) `read_dir` per uid.
     ///
     /// Best-effort like `purge_message_files`: a name that doesn't parse (or
-    /// a `write_atomic` temp file mid-write, which never matches the `.bin`/
-    /// `.eml` suffix in the first place) is left alone, and unlink failures
+    /// a `write_cache_file` temp file mid-write, a hidden `.<name>.tmp-…`
+    /// that never ends in the `.bin`/`.eml` suffix in the first place) is left alone, and unlink failures
     /// are ignored - worst case a stale file survives to the next sweep, or
     /// a live file is deleted and re-fetched from the server on next use.
     /// Called once per session start (see `session.rs`), never inline with

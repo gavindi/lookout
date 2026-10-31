@@ -253,7 +253,7 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
 
     Move them into `graph/src/json.rs` (or `client.rs`) as `pub(crate)`, and export `string_array` for the app.
 
-31. **P1** **Atomic-write family.** There are six hand-rolled tmp+rename copies, each slightly different and each with the pid or fixed-name collision from BUG_BOUNTY1 #12:
+31. **P1** ✔ **Fixed** — **Atomic-write family.** There are six hand-rolled tmp+rename copies, each slightly different and each with the pid or fixed-name collision from BUG_BOUNTY1 #12:
     - [mail cache.rs:135](source/crates/mail/src/cache.rs#L135)
     - [eds_mirror.rs:543](source/crates/app/src/eds_mirror.rs#L543), the only one that `sync_all`s
     - [background.rs:199](source/crates/app/src/background.rs#L199)
@@ -261,6 +261,7 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
     - `set_client_id` in [google_tasks.rs:268](source/crates/app/src/google_tasks.rs#L268)
 
     Three more writers are plain `fs::write`: `app_config::save_at`, `calendar_colors::save` and `google_tasks::store_cache`. Replace all nine with one `lookout_core::fsutil::write_atomic(path, bytes, mode)` that uses `create_new`, a unique suffix, `mode(0o600)` where needed, `sync_all` and rename.
+    - **Fixed (0.9.306):** #15's `app/src/fsutil.rs` (already used by `settings.json` and `calendar-colors.json`) moved to `lookout_core::fsutil`. It gained `write_private`, which forces `0o600` even over an existing looser file, and the temp name is now `.<name>.tmp-<pid>-<n>`. The mail cache's `.bin`/`.eml` files, the EDS mirror, the autostart entry, both `TokenStore::save`s, `set_client_id` and the Google Tasks cache all go through it. Each one is now `create_new` + `sync_all` + rename with a unique hidden temp name, and the token files are created `0600` rather than chmodded after the write. Covered by the core module's mode, private-mode, temp-name and failed-write tests and the extended `token_store_round_trips_with_restrictive_permissions` tests.
 
 32. **P2** **OAuth plumbing (Microsoft vs Google).** The two files differ only in the provider name:
     - `receive_auth_code`, `read_request_until_headers`, `respond_html`, `parse_query`, `open_browser`, `oauth_dir`, `pkce_verifier`/`pkce_challenge`, `post_token_request` and `TokenStore`
@@ -295,7 +296,7 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
 
 ## 7. BUG_BOUNTY1 items re-verified
 
-Rows 2 and 4 are kept for traceability because they were closed by work in this document (#8 and #15 respectively); the rest are still open.
+Rows 2, 4, 9 and 12 are kept for traceability because they were closed by work in this document (#8, #15 and #31); the rest are still open.
 
 | # | Priority | Item | State now |
 |---|----------|------|-----------|
@@ -305,9 +306,9 @@ Rows 2 and 4 are kept for traceability because they were closed by work in this 
 | 6 | P2 | Google OAuth: no refresh lock; `exists()` then `load()?` TOCTOU | Open ([google_tasks.rs:150-160](source/crates/app/src/google_tasks.rs#L150-L160)) |
 | 7 | P3 | `sender_photo_cache` never cleared or capped | Open ([window.rs:863](source/crates/app/src/window.rs#L863), only 3 references) |
 | 8 | P2 | ICS import duplicates UIDs outside loaded months | Open ([imip.rs:1153](source/crates/app/src/window/imip.rs#L1153)) |
-| 9 | P1 | Token files written at umask then chmod | Open; folded into #31 |
+| 9 | P1 | Token files written at umask then chmod | Closed by #31 (0.9.306) |
 | 10 | P1 | Attachment "Open" temp files at umask in shared `$TMPDIR` | Open ([attachments.rs:719-731](source/crates/app/src/window/attachments.rs#L719-L731)) |
-| 12 | P1 | `write_atomic` pid-suffix collision | Open; see #31 |
+| 12 | P1 | `write_atomic` pid-suffix collision | Closed by #31 (0.9.306) |
 | 16 | P3 | ICS/vCard import read synchronously, `file.path()` only | Open ([calendar_glue.rs:3208](source/crates/app/src/window/calendar_glue.rs#L3208), [contacts_view.rs:1050](source/crates/app/src/contacts_view.rs#L1050)) |
 | 17 | P3 | Blocking contacts SQLite inside async tasks | Open; see #18 |
 | 25 | P4 | `undo_stack.remove(0)` | Open ([mail_actions.rs:2772](source/crates/app/src/window/mail_actions.rs#L2772)) |
@@ -334,7 +335,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 2. ~~**#24 (a):** `UiStateDb` `synchronous=NORMAL` plus the icon-pack sibling-dir rename — the two biggest GTK stalls in the tier.~~ ✔ Fixed (0.9.304).
 3. **#17:** `ContactsCache::remove_book`, which stops an unbounded per-poll re-parse.
 4. ~~**#23 (a):** autosave interval backoff / save-on-idle.~~ ✔ Fixed (0.9.303).
-5. **#31:** the shared `fsutil::write_atomic`, which also closes BUG_BOUNTY1 #9 and #12.
+5. ~~**#31:** the shared `fsutil::write_atomic`, which also closes BUG_BOUNTY1 #9 and #12.~~ ✔ Fixed (0.9.306).
 
 **P2 — schedule next**
 

@@ -40,7 +40,7 @@ const RESOURCE_ICON_DIR: &str = "/io/github/gavindi/Lookout/icons/Lookout-Fluent
 static FLUENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Names the staging and retired directories of a theme swap uniquely within
-/// this process (the pid separates processes), as `fsutil::write_atomic` does.
+/// this process (the pid separates processes), as `lookout_core::fsutil::write_atomic` does.
 static SWAP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The prefix of a swap's staging (`tmp-`) and retired (`old-`) siblings of

@@ -761,7 +761,7 @@ fn load_at(path: &Path) -> AppConfig {
             Ok(config) => config,
             Err(e) => {
                 tracing::warn!(path = %path.display(), "unreadable settings.json: {e}");
-                match crate::fsutil::backup_corrupt(path) {
+                match lookout_core::fsutil::backup_corrupt(path) {
                     Ok(backup) => {
                         tracing::warn!(path = %path.display(), backup = %backup.display(), "kept a copy of the unreadable settings.json");
                         if let Ok(mut backups) = CORRUPT_BACKUPS.lock() {
@@ -786,7 +786,7 @@ fn save_at(path: &Path, config: &AppConfig) {
     }
     match serde_json::to_string_pretty(config) {
         Ok(text) => {
-            if let Err(e) = crate::fsutil::write_atomic(path, text.as_bytes(), 0o600) {
+            if let Err(e) = lookout_core::fsutil::write_atomic(path, text.as_bytes(), 0o600) {
                 tracing::warn!(path = %path.display(), "could not save settings.json: {e}");
             }
         }

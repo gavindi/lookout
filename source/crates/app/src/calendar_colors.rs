@@ -72,7 +72,7 @@ fn load_at(path: &std::path::Path) -> CalendarColorMap {
             Ok(map) => map,
             Err(e) => {
                 tracing::warn!(path = %path.display(), "unreadable calendar-colors.json: {e}");
-                match crate::fsutil::backup_corrupt(path) {
+                match lookout_core::fsutil::backup_corrupt(path) {
                     Ok(backup) => {
                         tracing::warn!(path = %path.display(), backup = %backup.display(), "kept a copy of the unreadable calendar-colors.json");
                         if let Ok(mut backups) = CORRUPT_BACKUPS.lock() {
@@ -97,7 +97,7 @@ pub fn save(map: &CalendarColorMap) {
 fn save_at(path: &std::path::Path, map: &CalendarColorMap) {
     match serde_json::to_string_pretty(map) {
         Ok(text) => {
-            if let Err(e) = crate::fsutil::write_atomic(path, text.as_bytes(), 0o600) {
+            if let Err(e) = lookout_core::fsutil::write_atomic(path, text.as_bytes(), 0o600) {
                 tracing::warn!(path = %path.display(), "could not save calendar colours: {e}");
             }
         }

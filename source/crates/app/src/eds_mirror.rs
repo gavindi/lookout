@@ -522,7 +522,9 @@ fn sync_mirror_blocking(config: &MirrorConfig, path: &Path) -> Result<MirrorOutc
     }
 
     let calendar = build_calendar(&desired);
-    write_atomic(path, &calendar).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+    // Atomic, so EDS's file monitor never sees a half-written calendar
+    // (E0.1's atomic-rename reload path).
+    lookout_core::fsutil::write_atomic(path, calendar.as_bytes(), 0o600).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
     tracing::info!(
         "EDS mirror: wrote {} events ({} new, {} changed, {} removed)",
         desired.len(),
@@ -535,29 +537,6 @@ fn sync_mirror_blocking(config: &MirrorConfig, path: &Path) -> Result<MirrorOutc
         written: true,
         plan,
     })
-}
-
-/// Writes through a pid-suffixed temp file and renames it over the mirror, so
-/// EDS's file monitor never sees a half-written calendar (E0.1's atomic-rename
-/// reload path).
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp);
-            Err(e)
-        }
-    }
 }
 
 /// The pacing state stored on `CalendarUiState`. E2.4 fills `enabled` and

@@ -37,7 +37,6 @@ mod evolution_import;
 mod folder_menu;
 mod folder_tree;
 mod follow_up;
-mod fsutil;
 mod goa_calendar_credentials;
 mod goa_credentials;
 mod google_tasks;
