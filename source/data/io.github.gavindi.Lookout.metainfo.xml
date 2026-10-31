@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.305" date="2026-10-31">
+      <description>
+        <p>Contact and calendar fixes. Editing or deleting a contact or event on a CalDAV/CardDAV server that uses weak ETags no longer fails every time. Mail accounts open their local cache without holding up other background work, large contact lists in the contact picker sort faster, the draft autosave no longer polls while waiting for a save in progress, and opening Online Accounts from a development build no longer leaves a defunct process behind.</p>
+      </description>
+    </release>
     <release version="0.9.304" date="2026-10-31">
       <description>
         <p>Smoother saving of your view settings. Starred contacts, trusted and blocked senders, folder colours and expansion, recent folders and searches, reminder state, local tasks and My Day are now saved in the background instead of pausing the window, and Lookout opens that database once instead of three times. Switching to Fluent icons now builds the icon pack next to the old one and swaps it in whole, so another open Lookout window never sees a half-written pack.</p>

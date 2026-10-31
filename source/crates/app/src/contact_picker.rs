@@ -130,7 +130,7 @@ fn directory_subtitle(person: &DirectoryPerson) -> String {
 pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, directory: Option<DirectoryLookup>, on_add: Rc<dyn Fn(Vec<Suggestion>)>) {
     let mut contacts: Vec<EmailAddress> = state.borrow().contacts_by_account.values().flat_map(|snapshot| snapshot.suggestions.clone()).collect();
     contacts = dedupe_addresses(contacts, usize::MAX);
-    contacts.sort_by_key(|a| a.display_label().to_lowercase());
+    contacts.sort_by_cached_key(|a| a.display_label().to_lowercase());
 
     let lists: Vec<ContactList> = {
         let mut seen = HashSet::new();
@@ -141,7 +141,7 @@ pub fn show_contact_picker(anchor: &gtk::Widget, state: Rc<RefCell<UiState>>, di
             .flat_map(|snapshot| snapshot.contact_lists.clone())
             .filter(|list| !list.name.trim().is_empty() && seen.insert(list.name.to_lowercase()))
             .collect();
-        lists.sort_by_key(|list| list.name.to_lowercase());
+        lists.sort_by_cached_key(|list| list.name.to_lowercase());
         lists
     };
 

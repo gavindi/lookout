@@ -1032,8 +1032,10 @@ struct AutosaveCtx {
     /// Held for the duration of one save. Both the tick and Cancel can start
     /// a save, and each awaits a WebKit round trip in the middle - without
     /// this, two overlapping saves could both observe `draft_queued == false`
-    /// and each `APPEND`, leaving two copies under one `Message-ID`.
-    in_flight: Rc<Cell<bool>>,
+    /// and each `APPEND`, leaving two copies under one `Message-ID`. An
+    /// async lock rather than a flag, so `flush` can wait for it without
+    /// polling and a dropped save future can never leave it held.
+    save_lock: Rc<futures_util::lock::Mutex<()>>,
     /// One stable Message-ID per compose session: every autosave carries it,
     /// and `replace` purges whatever the previous save stored under it, so
     /// the Drafts folder only ever holds one copy of this draft. A reopened
@@ -1109,12 +1111,8 @@ impl AutosaveCtx {
     /// time: trivial, unchanged, and concurrent invocations all return
     /// without queueing anything.
     async fn attempt(&self, force: bool) {
-        if self.in_flight.get() {
-            return;
-        }
-        self.in_flight.set(true);
+        let Some(_saving) = self.save_lock.try_lock() else { return };
         self.save_if_changed(force).await;
-        self.in_flight.set(false);
     }
 
     /// Like `attempt`, but waits out a save already in flight first, so the
@@ -1122,10 +1120,8 @@ impl AutosaveCtx {
     /// the Drafts copy being current, and on `draft_queued` being set,
     /// before it queues the message.
     async fn flush(&self, force: bool) {
-        while self.in_flight.get() {
-            glib::timeout_future(Duration::from_millis(50)).await;
-        }
-        self.attempt(force).await;
+        let _saving = self.save_lock.lock().await;
+        self.save_if_changed(force).await;
     }
 
     async fn save_if_changed(&self, force: bool) {
@@ -2587,7 +2583,7 @@ pub fn build_compose_view(
         // A reopened draft is already stored: its first save must replace,
         // not append (and its Send must delete the stored copy).
         draft_queued: Rc::new(Cell::new(prefill.draft_source.is_some() || prefill.draft_saved)),
-        in_flight: Rc::new(Cell::new(false)),
+        save_lock: Rc::new(futures_util::lock::Mutex::new(())),
         draft_message_id: draft_message_id.clone(),
         replace_uid,
         cmd_tx: cmd_tx.clone(),
@@ -3635,6 +3631,23 @@ mod tests {
         let edited = snapshot("a@example.com", "Re: plans", "sounds good\n> quoted");
         assert!(should_save(&edited, Some(&reply), false, false));
         assert!(should_save(&reply, None, false, false));
+    }
+
+    /// The autosave lock's contract: a tick (`attempt`'s `try_lock`) skips
+    /// while a save holds it, a flush (`lock`) waits instead of skipping and
+    /// gets it as soon as that save ends, and dropping a save releases it.
+    #[test]
+    fn a_flush_waits_for_an_in_flight_save_instead_of_skipping_it() {
+        use futures_util::FutureExt;
+        let save_lock = futures_util::lock::Mutex::new(());
+        let saving = save_lock.try_lock().expect("an idle lock is free");
+        assert!(save_lock.try_lock().is_none(), "a tick skips while a save is in flight");
+        let mut flush = Box::pin(save_lock.lock());
+        assert!(flush.as_mut().now_or_never().is_none(), "a flush waits for the save");
+        drop(saving);
+        let flushed = flush.now_or_never().expect("the flush gets the lock once the save ends");
+        drop(flushed);
+        assert!(save_lock.try_lock().is_some(), "nothing stays held after the flush");
     }
 
     #[test]

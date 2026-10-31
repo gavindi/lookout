@@ -1734,7 +1734,7 @@ pub fn refresh_contacts_category_ui(
             crate::privacy::mark_ui(&categories_header);
             row_widgets.push((categories_header, None));
             let mut names: Vec<String> = category_members.keys().cloned().collect();
-            names.sort_by_key(|name| name.to_lowercase());
+            names.sort_by_cached_key(|name| name.to_lowercase());
             for name in names {
                 let members = category_members.remove(&name).unwrap_or_default();
                 rows.push(ContactsCategoryChoice {
@@ -3095,7 +3095,7 @@ pub fn show_manage_groups_dialog(window: &adw::ApplicationWindow, state: &Rc<Ref
             }
 
             let mut names: Vec<String> = members.keys().cloned().collect();
-            names.sort_by_key(|name| name.to_lowercase());
+            names.sort_by_cached_key(|name| name.to_lowercase());
             for name in names {
                 let member_list = members.remove(&name).unwrap_or_default();
                 let row = gtk::ListBoxRow::new();

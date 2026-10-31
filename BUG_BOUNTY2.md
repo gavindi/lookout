@@ -206,15 +206,17 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
     - **Same pattern:** `icon_style::materialise` ([icon_style.rs:175-209](source/crates/app/src/icon_style.rs#L175-L209)) `remove_dir_all`s and rewrites the whole icon pack synchronously on every switch. GTK can also scan the half-written directory in between. Write it to a sibling directory and rename it into place.
     - **Fixed (0.9.304):** `UiStateDb::open` sets `synchronous=NORMAL`. The three startup opens are now one `UiStateStore`, shared by `UiState`, the calendar's local tasks and My Day, and the reminder engine. Its UI-thread `reader()` serves the loads, and every write is queued in FIFO order to a dedicated `ui-state-db` writer thread with its own connection. `flush()` is the barrier before the Ignored-conversations dialog reads its list and at close and quit, and dropping the store drains the queue. The Fluent pack is built in a hidden `.Lookout-Fluent.tmp-*` sibling and renamed into place, the old copy is retired the same way and restored if the install fails, and stale leftovers are swept. Covered by the store's ordering, drop and pragma tests and the two `write_theme` tests.
 
-25. **P2** ✔ **The Graph mail session opens its cache synchronously on the async runtime.** [graph/src/mail/session.rs:122](source/crates/graph/src/mail/session.rs#L122).
+25. **P2** ✔ **Fixed** — **The Graph mail session opens its cache synchronously on the async runtime.** [graph/src/mail/session.rs:122](source/crates/graph/src/mail/session.rs#L122).
     - **Code:** `Cache::open` (file open, `PRAGMA`s, DDL, migrations) runs inline on the tokio worker. Everything else in the session goes through `cache_op` and `spawn_blocking`.
     - **Fix:** `spawn_blocking(move || Cache::open(..)).await`.
+    - **Fixed (0.9.305):** both `run_graph_mail_session` and the IMAP `run_account_session` (which had the same inline open) now `spawn_blocking` `Cache::open`, as `spawn_cache_open` already did; a failed join is logged and treated as a failed open.
 
-26. **P1** (weak ETags) / **P4** (rest) — **Minor:**
+26. **P1** (weak ETags) / **P4** (rest) ✔ **Fixed** — **Minor:**
     - **P4** **Sort keys:** `sort_by_key(|c| c.display_label().to_lowercase())` allocates the key on every comparison ([contact_picker.rs:133](source/crates/app/src/contact_picker.rs#L133), [contacts_view.rs:1737, 3110](source/crates/app/src/contacts_view.rs#L1737)). These lists can hold thousands of contacts, so use `sort_by_cached_key`.
     - **P4** **Busy-wait:** `AutosaveCtx::flush` polls with a 50 ms `timeout_future` loop ([compose.rs:1081-1086](source/crates/app/src/compose.rs#L1081-L1086)). A `Notify`-style async signal would avoid the busy-wait.
     - **P4** **Zombie process:** [online_accounts.rs:59](source/crates/app/src/online_accounts.rs#L59) drops a spawned `gnome-control-center` `Child` without waiting, which leaves a zombie until Lookout exits. Use `gio::Subprocess` or `glib::spawn_async` with a child watch.
     - **P1** **Weak ETags:** `format!("\"{}\"", etag.trim_matches('"'))` ([dav/src/client.rs:731, 751](source/crates/dav/src/client.rs#L731)) turns a weak validator `W/"abc"` into `"W/"abc"`, so every edit or delete on such a server fails with 412. Pass a value that is already quoted, or starts with `W/`, through unchanged.
+    - **Fixed (0.9.305):** `if_match_value` sends a quoted or `W/` tag unchanged and quotes a bare one, for both PUT and DELETE. The picker's contact and list sorts and the two category-name sorts use `sort_by_cached_key`. `AutosaveCtx::flush` awaits a `futures_util` async lock (a tick still `try_lock`s and skips) instead of polling. The `gnome-control-center` fallback runs through `gio::Subprocess` with `wait_async`, so it is reaped. Covered by the `if_match_value` and weak-ETag wiremock tests and `a_flush_waits_for_an_in_flight_save_instead_of_skipping_it`.
 
 ## Tier 5 — Latent hazards
 
@@ -328,7 +330,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 
 **P1 — next: small diffs, no schema work**
 
-1. **#26 (weak ETags):** one line, and it unblocks every edit or delete against a weak-validator DAV server.
+1. ~~**#26 (weak ETags):** one line, and it unblocks every edit or delete against a weak-validator DAV server.~~ ✔ Fixed (0.9.305).
 2. ~~**#24 (a):** `UiStateDb` `synchronous=NORMAL` plus the icon-pack sibling-dir rename — the two biggest GTK stalls in the tier.~~ ✔ Fixed (0.9.304).
 3. **#17:** `ContactsCache::remove_book`, which stops an unbounded per-poll re-parse.
 4. ~~**#23 (a):** autosave interval backoff / save-on-idle.~~ ✔ Fixed (0.9.303).
@@ -338,7 +340,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 
 6. ~~**#23 (b):** `Rc<[u8]>`/`Arc<[u8]>` attachments.~~ ✔ Fixed (0.9.303).
 7. **#22 + BUG_BOUNTY1 #5/#6 + #32/#33:** one shared per-account OAuth/Graph account with cached consent flags, so the consent cache is written once.
-8. **#25:** `spawn_blocking` around `Cache::open`.
+8. ~~**#25:** `spawn_blocking` around `Cache::open`.~~ ✔ Fixed (0.9.305).
 9. **#20:** the generated `date` column and `(partial, date)` index.
 10. ~~**#27 + BUG_BOUNTY1 #26:** bind the hook clone before calling it.~~ ✔ Fixed (0.9.301).
 11. **BUG_BOUNTY1 #8:** ICS import duplicating UIDs outside the loaded months.
@@ -353,7 +355,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 
 **P4 — opportunistic**
 
-17. **#19 (b), #26 (rest), #35**, plus BUG_BOUNTY1 #25 and #31 (#28 is fixed). ~~#24 (b)~~ ✔ Fixed (0.9.304).
+17. **#19 (b), #35**, plus BUG_BOUNTY1 #25 and #31 (#28 is fixed). ~~#24 (b)~~ ✔ Fixed (0.9.304). ~~#26 (rest)~~ ✔ Fixed (0.9.305).
 
 ## Verification
 - `cargo fmt --all -- --check`

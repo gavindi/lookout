@@ -119,10 +119,17 @@ pub async fn run_graph_mail_session(
     interactive_commands: async_channel::Receiver<AccountCommand>,
     events: async_channel::Sender<AccountEvent>,
 ) {
-    let cache: CacheHandle = Arc::new(match Cache::open(&config.account_id) {
-        Ok(cache) => Some(cache),
-        Err(e) => {
+    // Opening runs the file open, pragmas, DDL and migrations, so it goes to
+    // the blocking pool like every other cache call (`cache_op`).
+    let open_id = config.account_id.clone();
+    let cache: CacheHandle = Arc::new(match tokio::task::spawn_blocking(move || Cache::open(&open_id)).await {
+        Ok(Ok(cache)) => Some(cache),
+        Ok(Err(e)) => {
             tracing::warn!("couldn't open the local cache, continuing without it: {e}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("the local cache open task failed, continuing without it: {e}");
             None
         }
     });

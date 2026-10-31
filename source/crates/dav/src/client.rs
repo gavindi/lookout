@@ -728,7 +728,7 @@ impl DavClient {
         let request_url = url.clone();
         let mut headers = vec![("Content-Type", content_type.to_string())];
         match etag {
-            Some(etag) => headers.push(("If-Match", format!("\"{}\"", etag.trim_matches('"')))),
+            Some(etag) => headers.push(("If-Match", if_match_value(etag))),
             None => headers.push(("If-None-Match", "*".to_string())),
         }
         let response = self.send_request("PUT", url, credential, Some(body.to_string()), &headers).await?;
@@ -748,7 +748,7 @@ impl DavClient {
         let request_url = url.clone();
         let mut headers: Vec<(&str, String)> = Vec::new();
         if let Some(etag) = etag {
-            headers.push(("If-Match", format!("\"{}\"", etag.trim_matches('"'))));
+            headers.push(("If-Match", if_match_value(etag)));
         }
         let response = self.send_request("DELETE", url, credential, None, &headers).await?;
         tracing::debug!("DAV DELETE {request_url} -> {}", response.status());
@@ -891,6 +891,23 @@ impl DavClient {
         let text = response.text().await?;
         tracing::debug!("DAV {method_name} {request_url} -> {status}, body:\n{text}");
         xml::parse_multistatus_with_token(&text)
+    }
+}
+
+/// The `If-Match` header value for a stored `getetag`. A bare token is
+/// quoted, as `If-Match` requires; an already-quoted tag or a weak validator
+/// (`W/"abc"`) is sent exactly as the server gave it - stripping and
+/// re-quoting a weak one would produce the malformed `"W/"abc"`, which no
+/// server matches. (A strict server may still refuse a weak tag, since
+/// `If-Match` uses strong comparison, but the lenient ones that hand them out
+/// accept it back.)
+fn if_match_value(etag: &str) -> String {
+    let etag = etag.trim();
+    let quoted = etag.len() >= 2 && etag.starts_with('"') && etag.ends_with('"');
+    if quoted || etag.starts_with("W/") {
+        etag.to_string()
+    } else {
+        format!("\"{}\"", etag.trim_matches('"'))
     }
 }
 
@@ -1610,6 +1627,45 @@ END:VCALENDAR
             .put_contact_vcard("/books/alice/jane.vcf", &sample_card(), &credential, Some("old-etag"))
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn if_match_value_quotes_bare_tags_and_keeps_quoted_and_weak_ones() {
+        assert_eq!(if_match_value("abc"), "\"abc\"");
+        assert_eq!(if_match_value("\"abc\""), "\"abc\"");
+        assert_eq!(if_match_value("  \"abc\" "), "\"abc\"");
+        assert_eq!(if_match_value("W/\"abc\""), "W/\"abc\"");
+        assert_eq!(if_match_value("\"abc"), "\"abc\"", "a stray quote is still normalized");
+    }
+
+    #[tokio::test]
+    async fn put_and_delete_pass_a_weak_etag_through_unchanged() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/books/alice/jane.vcf"))
+            .and(wiremock::matchers::header("If-Match", "W/\"weak-etag\""))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/books/alice/jane.vcf"))
+            .and(wiremock::matchers::header("If-Match", "W/\"weak-etag\""))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base_url = format!("{}/dav/", server.uri());
+        let client = DavClient::new(&base_url, false, "alice".to_string()).unwrap();
+        let credential = Credential::Password("secret".to_string());
+
+        client
+            .put_contact_vcard("/books/alice/jane.vcf", &sample_card(), &credential, Some("W/\"weak-etag\""))
+            .await
+            .unwrap();
+        client.delete_contact_vcard("/books/alice/jane.vcf", &credential, Some("W/\"weak-etag\"")).await.unwrap();
     }
 
     #[tokio::test]

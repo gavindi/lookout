@@ -56,5 +56,14 @@ pub async fn open_online_accounts() {
         }
     }
     // Unsandboxed fallback: the control-center CLI still accepts panel ids.
-    let _ = std::process::Command::new("gnome-control-center").arg(ONLINE_ACCOUNTS_PANEL).spawn();
+    // A `GSubprocess` is reaped by GLib's own child watch, so the exited
+    // process never lingers as a zombie until Lookout quits.
+    let Some(program) = gtk::glib::find_program_in_path("gnome-control-center") else {
+        return;
+    };
+    let argv = [program.as_os_str(), std::ffi::OsStr::new(ONLINE_ACCOUNTS_PANEL)];
+    match gtk::gio::Subprocess::newv(&argv, gtk::gio::SubprocessFlags::NONE) {
+        Ok(process) => process.wait_async(None::<&gtk::gio::Cancellable>, |_| {}),
+        Err(e) => tracing::debug!("couldn't run gnome-control-center: {e}"),
+    }
 }
