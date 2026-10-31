@@ -6,8 +6,8 @@
 //! scheduledEndDateTime, internalReplyMessage, externalReplyMessage,
 //! externalAudience }`), and Graph is the only way to see or change it for an
 //! M365 account - IMAP exposes nothing and ManageSieve needs a password
-//! sign-in. The client follows the pin/flag/category pattern: one
-//! [`MicrosoftOAuth`] per account, gated by `consented()` (Config's "Sync with
+//! sign-in. The client follows the pin/flag/category pattern: built on the
+//! account's [`GraphAccount`], gated by `consented()` (Config's "Sync with
 //! Outlook"), mapping in pure functions covered by a captured fixture.
 //!
 //! Graph documents the two reply messages as HTML; Lookout's editors are plain
@@ -19,53 +19,47 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use lookout_core::{windows_to_iana, AutomaticReplies, AutomaticReplyStatus, ExternalAudience};
-use lookout_graph::{GraphClient, GraphError};
+use lookout_graph::GraphError;
 use serde_json::{json, Value};
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// One Microsoft 365 account's automatic-replies client.
 pub struct GraphAutomaticRepliesClient {
-    oauth: Arc<MicrosoftOAuth>,
-    graph: GraphClient,
+    account: GraphAccount,
 }
 
 impl GraphAutomaticRepliesClient {
-    pub fn new(account_id: lookout_core::AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
-        GraphAutomaticRepliesClient {
-            graph: GraphClient::new(oauth.clone()),
-            oauth,
-        }
-    }
-
-    /// Whether the account has granted Graph access (disk-only check).
-    pub fn consented(&self) -> bool {
-        self.oauth.graph_consented()
+    pub fn new(account: GraphAccount) -> Self {
+        GraphAutomaticRepliesClient { account }
     }
 
     /// Runs the interactive Graph consent flow (Config's "Sync with Outlook"
     /// path) for an account that hasn't opted in yet, so the Automatic replies
     /// dialog can enable the feature without a trip through Config.
     pub async fn ensure_consent(&self) -> Result<(), String> {
-        self.oauth.ensure_graph_consent().await
+        self.account.ensure_outlook_consent().await
     }
 
     /// The mailbox's current automatic replies.
     pub async fn get(&self) -> Result<AutomaticReplies, GraphError> {
-        let value = self.graph.get("me/mailboxSettings").await?;
+        let value = self.account.graph().get("me/mailboxSettings").await?;
         Ok(automatic_replies_from_graph(&value))
     }
 
     /// Writes `settings` to the mailbox. Outlook sends while Lookout is
     /// closed, so this is the whole point of the Graph backend.
     pub async fn set(&self, settings: &AutomaticReplies) -> Result<(), GraphError> {
-        self.graph.patch("me/mailboxSettings", &automatic_replies_body(settings)).await?;
+        self.account.graph().patch("me/mailboxSettings", &automatic_replies_body(settings)).await?;
         Ok(())
+    }
+}
+
+impl GraphFeatureClient for GraphAutomaticRepliesClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }
 

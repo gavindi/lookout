@@ -77,11 +77,9 @@ pub(crate) struct AccountHandle {
     /// of) the IMAP `\Flagged` toggle that remains this app's own source of
     /// truth. `None` for every other account, which is the entire guarantee
     /// that non-M365 accounts see zero behavior change from this feature -
-    /// see `mirror_pin_to_graph`. An independent `MicrosoftOAuth` instance
-    /// from the one wrapped in `SendWrapper` for the session actor in
-    /// `connect_account` (that one is handed to the worker thread and never
-    /// touched from the GTK thread again); both safely share the same
-    /// on-disk token file via its atomic tmp+rename save.
+    /// see `mirror_pin_to_graph`. Built on the account's shared
+    /// `GraphAccount`, so it refreshes through the same `MicrosoftOAuth`
+    /// instance as the session actor's credential provider.
     pub(crate) graph_pin: Option<Rc<crate::graph_pin::GraphPinClient>>,
     /// Present only for Microsoft 365 accounts: syncs follow-up flags with
     /// Outlook's own `flag` property through Graph (item 1.16), both ways,

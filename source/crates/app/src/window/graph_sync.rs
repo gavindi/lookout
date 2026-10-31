@@ -11,6 +11,7 @@ use gtk::glib;
 use lookout_core::{AccountId, EmailAddress, EmailSummary, FollowUpFlag, Importance, InferenceClassification, Rule, RuleBackend, RuleSync};
 use lookout_mail::session::AccountCommand;
 
+use crate::graph_account::GraphFeatureClient;
 use crate::graph_mail::GraphMailClient;
 use crate::graph_pin::GraphPinClient;
 use crate::message_list::MessageListModel;

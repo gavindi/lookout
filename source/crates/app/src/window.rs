@@ -24,6 +24,7 @@ use crate::contacts_view::{
 };
 use crate::folder_tree::TreeItem;
 use crate::google_tasks::GoogleTasksCommand;
+use crate::graph_account::GraphFeatureClient;
 use crate::last_view::{self};
 use crate::message_list::{format_row_date, Filter, FilterSet, MessageItem, MessageListModel, ReadingTarget, SelectionKind, SortKey, ThreadId};
 use crate::util::card_section;
@@ -10794,7 +10795,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                             // that already carries both - a re-enable, or an
                             // earlier schedule-send consent - skips the
                             // browser prompt.
-                            let oauth = crate::microsoft_oauth::MicrosoftOAuth::new(id.clone());
+                            let oauth = crate::microsoft_oauth::MicrosoftOAuth::for_account(&id);
                             let consent = if oauth.graph_mail_consented() {
                                 Ok(())
                             } else {
@@ -10925,7 +10926,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     let toast_overlay = toast_overlay.clone();
                     let refresh_directory_surfaces = refresh_directory_surfaces.clone();
                     glib::spawn_future_local(async move {
-                        let client = crate::graph_directory::GraphDirectoryBackend::new(account_id.clone());
+                        let client = crate::graph_directory::GraphDirectoryBackend::new(account_id.clone(), crate::graph_account::GraphAccount::new(&account_id));
                         match client.ensure_consent().await {
                             Ok(()) => {
                                 let app_config = state.borrow().app_config.clone();

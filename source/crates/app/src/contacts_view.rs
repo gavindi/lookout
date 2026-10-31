@@ -2337,7 +2337,7 @@ pub fn spawn_contacts_discovery(
                     .filter(|mail| !started.contains(&mail.account_id))
                     .filter(|mail| state.borrow().account_enabled(&mail.account_id))
                     .filter_map(|mail| {
-                        let consented = crate::microsoft_oauth::MicrosoftOAuth::new(mail.account_id.clone()).graph_consented();
+                        let consented = MicrosoftOAuth::for_account(&mail.account_id).graph_consented();
                         graph_contacts_account_from_mail(&mail, &mail.account_id, &mail.display_name, consented)
                     })
                     .collect();
@@ -2418,10 +2418,7 @@ pub fn sync_contacts_account(
         // cache (full refetches every poll, no fast paint), never an error.
         let cache = ContactsCache::open(&cache_account_id).ok();
         // The Graph transport, built once per session; `None` for CardDAV.
-        let graph = graph_backend.then(|| {
-            let oauth = std::sync::Arc::new(MicrosoftOAuth::new(account.account_id.clone()));
-            ContactsClient::new(GraphClient::new(oauth))
-        });
+        let graph = graph_backend.then(|| ContactsClient::new(GraphClient::new(MicrosoftOAuth::for_account(&account.account_id))));
         let mut first = true;
         // Render whatever the previous session cached immediately, so the
         // People screen shows data before the first live poll completes.
@@ -2988,7 +2985,7 @@ async fn graph_delete_contact(client: &ContactsClient, href: &str, etag: Option<
 /// does. Without consent the Graph client would only produce
 /// `ConsentRequired` errors, so the account is left out until enabled.
 pub fn contacts_account_usable(account: &GoaContactsAccount) -> bool {
-    !account.is_microsoft_365() || crate::microsoft_oauth::MicrosoftOAuth::new(account.account_id.clone()).graph_consented()
+    !account.is_microsoft_365() || MicrosoftOAuth::for_account(&account.account_id).graph_consented()
 }
 
 /// The Graph contacts account for a discovered Microsoft 365 mailbox that GOA
@@ -2998,7 +2995,7 @@ pub fn contacts_account_usable(account: &GoaContactsAccount) -> bool {
 /// channel - matches every other module. `None` when GOA already reported
 /// contacts, the account isn't Microsoft 365, or Graph access isn't granted.
 pub fn microsoft_graph_contacts_account(account: &DiscoveredGoaAccount, account_id: &AccountId) -> Option<GoaContactsAccount> {
-    let consented = crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()).graph_consented();
+    let consented = MicrosoftOAuth::for_account(account_id).graph_consented();
     microsoft_graph_contacts_account_if_consented(account, account_id, consented)
 }
 

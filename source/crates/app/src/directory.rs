@@ -346,7 +346,7 @@ fn assemble_directory_source(state: &Rc<RefCell<UiState>>, account: Option<Accou
         if account.as_ref().is_some_and(|scope| scope != &id) {
             continue;
         }
-        let backend = GraphDirectoryBackend::new(id);
+        let backend = GraphDirectoryBackend::new(id.clone(), crate::graph_account::GraphAccount::new(&id));
         if backend.enabled(&config) {
             backends.push(Arc::new(backend));
         }

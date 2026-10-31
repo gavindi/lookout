@@ -28,23 +28,21 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use lookout_core::AccountId;
-use lookout_graph::{ContactsClient, DirectoryPerson, GraphClient};
+use lookout_graph::{ContactsClient, DirectoryPerson};
 
 use crate::app_config::AppConfig;
 use crate::directory::DirectoryBackend;
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// One Microsoft 365 account's Graph directory provider. Cheap to construct -
-/// holds a [`ContactsClient`] over an independent `MicrosoftOAuth` (the mail
-/// session and the other Graph feature clients each hold their own; they all
-/// safely share the same on-disk token file through its atomic save).
+/// holds a [`ContactsClient`] over the account's shared [`GraphAccount`], the
+/// same OAuth instance the mail session and the other Graph feature clients
+/// use.
 pub(crate) struct GraphDirectoryBackend {
     account_id: AccountId,
-    oauth: Arc<MicrosoftOAuth>,
+    account: GraphAccount,
     contacts: ContactsClient,
 }
 
@@ -52,27 +50,12 @@ impl GraphDirectoryBackend {
     /// Builds the provider for one Microsoft 365 account. Constructing it
     /// touches no network and no token file - whether it is actually offered
     /// to a [`crate::directory::DirectorySource`] is [`Self::enabled`]'s call.
-    pub(crate) fn new(account_id: AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id.clone()));
+    pub(crate) fn new(account_id: AccountId, account: GraphAccount) -> Self {
         GraphDirectoryBackend {
             account_id,
-            contacts: ContactsClient::new(GraphClient::new(oauth.clone())),
-            oauth,
+            contacts: ContactsClient::new(account.graph().clone()),
+            account,
         }
-    }
-
-    /// A provider over an explicit contacts client, for tests driving a
-    /// wiremock base URL.
-    #[cfg(test)]
-    fn with_client(account_id: AccountId, contacts: ContactsClient) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id.clone()));
-        GraphDirectoryBackend { account_id, oauth, contacts }
-    }
-
-    /// Synchronous, disk-only check for the account's "Sync with Outlook"
-    /// Graph consent - the second of [`Self::enabled`]'s two gates.
-    pub(crate) fn consented(&self) -> bool {
-        self.oauth.graph_consented()
     }
 
     /// Whether the account currently contributes directory hits: the user has
@@ -90,7 +73,7 @@ impl GraphDirectoryBackend {
     /// Settings → People opt-in switch (item 4.7.9) - never from
     /// [`DirectoryBackend::search`].
     pub(crate) async fn ensure_consent(&self) -> Result<(), String> {
-        self.contacts.ensure_directory_consent().await.map_err(|error| error.to_string())
+        self.account.ensure_feature(lookout_graph::GraphFeature::Directory).await
     }
 
     /// The `/me/people` fallback, degrading an unreachable or unauthorised
@@ -103,6 +86,12 @@ impl GraphDirectoryBackend {
                 Vec::new()
             }
         }
+    }
+}
+
+impl GraphFeatureClient for GraphDirectoryBackend {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }
 
@@ -128,8 +117,9 @@ impl DirectoryBackend for GraphDirectoryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lookout_graph::TokenProvider;
+    use lookout_graph::{GraphClient, TokenProvider};
     use serde_json::json;
+    use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -148,7 +138,8 @@ mod tests {
 
     fn backend(server: &MockServer) -> GraphDirectoryBackend {
         let client = GraphClient::with_base_url(Arc::new(StubTokens), format!("{}/v1.0", server.uri()));
-        GraphDirectoryBackend::with_client(AccountId("account_1".into()), ContactsClient::new(client))
+        let id = AccountId("account_1".into());
+        GraphDirectoryBackend::new(id.clone(), GraphAccount::with_client(&id, client))
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

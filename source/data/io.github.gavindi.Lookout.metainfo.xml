@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.307" date="2026-10-31">
+      <description>
+        <p>More dependable Microsoft 365 sign-in. Mail, calendar, contacts, tasks and every Outlook sync feature of an account now share one sign-in session instead of each refreshing it separately, so they can no longer undo each other's changes to the stored sign-in or forget that Outlook sync was enabled. Checking whether Outlook sync is enabled no longer reads a file each time, which keeps Settings and the folder list responsive, and a mail account whose sign-in expired during use now refreshes it on the next reconnect.</p>
+      </description>
+    </release>
     <release version="0.9.306" date="2026-10-31">
       <description>
         <p>Safer file saving. Sign-in tokens, settings, cached attachments, the calendar mirror for the GNOME desktop and the start-at-login entry are now all written the same careful way: completely or not at all, so a crash can no longer leave a half-written file. Sign-in tokens are private to your user from the moment they are written, and two copies of Lookout saving at the same time can no longer corrupt each other's files.</p>

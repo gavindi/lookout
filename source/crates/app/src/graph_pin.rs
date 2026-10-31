@@ -28,14 +28,11 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use chrono::{DateTime, SecondsFormat, Utc};
-use lookout_core::AccountId;
-use lookout_graph::{GraphClient, GraphError, MailClient};
+use lookout_graph::{GraphError, MailClient};
 use serde_json::json;
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// The `PR_RENEW_TIME` sentinel Exchange itself uses for a pinned message -
 /// far enough in the future that date-sorted views always put it first.
@@ -67,32 +64,25 @@ impl From<GraphError> for GraphPinError {
 }
 
 /// One Microsoft 365 account's Graph pin-mirroring client. Cheap to
-/// construct - holds a [`MailClient`] over an independent `MicrosoftOAuth`
-/// (separate from the one driving the IMAP/SMTP session; both safely share
-/// the same on-disk token file via its atomic save).
+/// construct - holds a [`MailClient`] over the account's shared
+/// [`GraphAccount`], whose OAuth instance the IMAP/SMTP session uses too.
 pub struct GraphPinClient {
-    oauth: Arc<MicrosoftOAuth>,
+    account: GraphAccount,
     mail: MailClient,
 }
 
 impl GraphPinClient {
-    pub fn new(account_id: AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
+    pub fn new(account: GraphAccount) -> Self {
         GraphPinClient {
-            mail: MailClient::new(GraphClient::new(oauth.clone())),
-            oauth,
+            mail: MailClient::new(account.graph().clone()),
+            account,
         }
-    }
-
-    /// Synchronous, disk-only check for Config UI.
-    pub fn consented(&self) -> bool {
-        self.oauth.graph_consented()
     }
 
     /// Runs the interactive consent flow for Config's "Sync pins with
     /// Outlook" action.
     pub async fn ensure_consent(&self) -> Result<(), String> {
-        self.oauth.ensure_graph_consent().await
+        self.account.ensure_outlook_consent().await
     }
 
     /// Sets or clears `PR_RENEW_TIME` on the Graph message matching
@@ -116,5 +106,11 @@ impl GraphPinClient {
         });
         self.mail.patch_message(&graph_id, &body).await?;
         Ok(())
+    }
+}
+
+impl GraphFeatureClient for GraphPinClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }

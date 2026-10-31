@@ -40,6 +40,7 @@ mod follow_up;
 mod goa_calendar_credentials;
 mod goa_credentials;
 mod google_tasks;
+mod graph_account;
 mod graph_automatic_replies;
 mod graph_calendar_share;
 mod graph_categories;

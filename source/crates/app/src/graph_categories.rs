@@ -14,13 +14,11 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use lookout_core::{graph_preset, preset_by_graph};
-use lookout_graph::{GraphClient, GraphError};
+use lookout_graph::GraphError;
 use serde_json::{json, Value};
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// One remote category: its Graph id, its name, and its preset index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,41 +30,40 @@ pub struct GraphCategory {
 
 /// One Microsoft 365 account's Graph category client.
 pub struct GraphCategoriesClient {
-    oauth: Arc<MicrosoftOAuth>,
-    graph: GraphClient,
+    account: GraphAccount,
 }
 
 impl GraphCategoriesClient {
-    pub fn new(account_id: lookout_core::AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
-        GraphCategoriesClient {
-            graph: GraphClient::new(oauth.clone()),
-            oauth,
-        }
-    }
-
-    /// Whether the account has granted Graph access (disk-only check).
-    pub fn consented(&self) -> bool {
-        self.oauth.graph_consented()
+    pub fn new(account: GraphAccount) -> Self {
+        GraphCategoriesClient { account }
     }
 
     /// Every category in the mailbox's master list.
     pub async fn list(&self) -> Result<Vec<GraphCategory>, GraphError> {
-        let items = self.graph.get_all("me/outlook/masterCategories?$top=100", 500).await?;
+        let items = self.account.graph().get_all("me/outlook/masterCategories?$top=100", 500).await?;
         Ok(items.iter().filter_map(category_from_graph).collect())
     }
 
     /// Creates a category. `Err(GraphError::Status{409,..})` when one with the
     /// same name already exists.
     pub async fn create(&self, name: &str, preset: u8) -> Result<(), GraphError> {
-        self.graph.post("me/outlook/masterCategories", &category_body(name, preset)).await?;
+        self.account.graph().post("me/outlook/masterCategories", &category_body(name, preset)).await?;
         Ok(())
     }
 
     /// Repoints an existing category (id) to `name`/`preset`.
     pub async fn update(&self, id: &str, name: &str, preset: u8) -> Result<(), GraphError> {
-        self.graph.patch(&format!("me/outlook/masterCategories/{id}"), &category_body(name, preset)).await?;
+        self.account
+            .graph()
+            .patch(&format!("me/outlook/masterCategories/{id}"), &category_body(name, preset))
+            .await?;
         Ok(())
+    }
+}
+
+impl GraphFeatureClient for GraphCategoriesClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }
 

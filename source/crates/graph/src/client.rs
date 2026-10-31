@@ -56,9 +56,10 @@ enum RequestBody<'a> {
     Raw { bytes: &'a [u8], content_type: &'a str },
 }
 
-/// A Microsoft Graph client over a [`TokenProvider`]. Cheap to clone-by-`Arc`
-/// at call sites; holds a handle on the shared `reqwest::Client` (one
+/// A Microsoft Graph client over a [`TokenProvider`]. Cheap to clone (every
+/// field is a handle): holds the shared `reqwest::Client` (one
 /// connection pool for every Graph client) and the token provider.
+#[derive(Clone)]
 pub struct GraphClient {
     http: reqwest::Client,
     base_url: String,

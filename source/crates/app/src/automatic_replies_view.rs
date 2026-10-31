@@ -29,6 +29,7 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Timelike, Utc};
 use gtk::glib;
 use lookout_core::{AccountId, AutomaticReplies, AutomaticReplyStatus, ExternalAudience};
 
+use crate::graph_account::GraphFeatureClient;
 use crate::util::labeled_row;
 use crate::window::UiState;
 

@@ -18,6 +18,7 @@ use gtk::glib;
 
 use lookout_core::CalendarInfo;
 
+use crate::graph_account::GraphFeatureClient;
 use crate::graph_calendar_share::{role_for_index, role_label, GraphCalendarShareClient, SHARE_ROLES};
 use crate::util::clear_box;
 
@@ -37,7 +38,7 @@ pub(crate) fn show_share_calendar_dialog(window: &adw::ApplicationWindow, calend
         .default_height(520)
         .build();
 
-    let client = Rc::new(GraphCalendarShareClient::new(calendar.account_id.clone()));
+    let client = Rc::new(GraphCalendarShareClient::new(crate::graph_account::GraphAccount::new(&calendar.account_id)));
 
     let heading = gtk::Label::builder().label(calendar.display_name.clone()).xalign(0.0).css_classes(["title-4"]).build();
 

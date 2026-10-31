@@ -14,6 +14,7 @@ use lookout_mail::session::AccountCommand;
 use webkit::prelude::*;
 
 use crate::google_tasks::{self, GoogleTasksCommand};
+use crate::graph_account::GraphFeatureClient;
 use crate::last_view::{self, LastSelection};
 use crate::message_list::{MessageListModel, SelectionKind, ThreadId};
 use crate::worker::Worker;

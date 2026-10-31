@@ -23,13 +23,11 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use lookout_core::{AccountId, EmailAddress, Importance, MailboxRole, Rule, RuleAction, RuleBackend, RuleCondition, RuleTarget, SizeComparison};
-use lookout_graph::{GraphClient, GraphError};
+use lookout_graph::GraphError;
 use serde_json::{json, Map, Value};
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// One Microsoft 365 folder, enough to map a move/copy target to a Graph
 /// folder id and back.
@@ -44,31 +42,20 @@ pub struct GraphFolder {
 
 /// One Microsoft 365 account's Graph rules client.
 pub struct GraphRulesClient {
-    oauth: Arc<MicrosoftOAuth>,
-    graph: GraphClient,
+    account: GraphAccount,
     account_id: AccountId,
 }
 
 impl GraphRulesClient {
-    pub fn new(account_id: AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id.clone()));
-        GraphRulesClient {
-            graph: GraphClient::new(oauth.clone()),
-            oauth,
-            account_id,
-        }
-    }
-
-    /// Whether the account has granted Graph access (disk-only check).
-    pub fn consented(&self) -> bool {
-        self.oauth.graph_consented()
+    pub fn new(account_id: AccountId, account: GraphAccount) -> Self {
+        GraphRulesClient { account, account_id }
     }
 
     /// Every inbox rule, mapped back into the shared model (backend `Graph`,
     /// account set, id = Graph id).
     pub async fn list(&self) -> Result<Vec<Rule>, GraphError> {
         let folders = self.folders().await?;
-        let items = self.graph.get_all("me/mailFolders/inbox/messageRules?$top=100", 500).await?;
+        let items = self.account.graph().get_all("me/mailFolders/inbox/messageRules?$top=100", 500).await?;
         Ok(items.iter().filter_map(|value| rule_from_graph(value, &folders, &self.account_id)).collect())
     }
 
@@ -76,7 +63,7 @@ impl GraphRulesClient {
     pub async fn create(&self, rule: &Rule) -> Result<String, GraphError> {
         let folders = self.folders().await?;
         let body = rule_to_graph(rule, &folders).ok_or_else(unexpressible)?;
-        let created = self.graph.post("me/mailFolders/inbox/messageRules", &body).await?;
+        let created = self.account.graph().post("me/mailFolders/inbox/messageRules", &body).await?;
         Ok(created.get("id").and_then(Value::as_str).unwrap_or_default().to_string())
     }
 
@@ -84,20 +71,26 @@ impl GraphRulesClient {
     pub async fn update(&self, rule: &Rule) -> Result<(), GraphError> {
         let folders = self.folders().await?;
         let body = rule_to_graph(rule, &folders).ok_or_else(unexpressible)?;
-        self.graph.patch(&format!("me/mailFolders/inbox/messageRules/{}", rule.id), &body).await?;
+        self.account.graph().patch(&format!("me/mailFolders/inbox/messageRules/{}", rule.id), &body).await?;
         Ok(())
     }
 
     /// Deletes the Graph rule with `id`.
     pub async fn delete(&self, id: &str) -> Result<(), GraphError> {
-        self.graph.delete(&format!("me/mailFolders/inbox/messageRules/{id}")).await?;
+        self.account.graph().delete(&format!("me/mailFolders/inbox/messageRules/{id}")).await?;
         Ok(())
     }
 
     /// The account's mailbox folders (for move/copy target resolution).
     pub async fn folders(&self) -> Result<Vec<GraphFolder>, GraphError> {
-        let items = self.graph.get_all("me/mailFolders?$top=250&$select=id,displayName,wellKnownName", 500).await?;
+        let items = self.account.graph().get_all("me/mailFolders?$top=250&$select=id,displayName,wellKnownName", 500).await?;
         Ok(items.iter().filter_map(folder_from_graph).collect())
+    }
+}
+
+impl GraphFeatureClient for GraphRulesClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }
 

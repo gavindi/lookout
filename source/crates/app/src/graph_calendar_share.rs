@@ -16,65 +16,61 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use lookout_core::{AccountId, CalendarInfo};
-use lookout_graph::{CalendarClient, CalendarPermission, CalendarRole, GraphClient, GraphError, GraphUser};
+use lookout_graph::{CalendarClient, CalendarPermission, CalendarRole, GraphError, GraphUser};
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// One Microsoft 365 account's calendar-sharing client.
 pub struct GraphCalendarShareClient {
-    oauth: Arc<MicrosoftOAuth>,
-    graph: GraphClient,
+    account: GraphAccount,
+    calendar: CalendarClient,
 }
 
 impl GraphCalendarShareClient {
-    pub fn new(account_id: AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
+    pub fn new(account: GraphAccount) -> Self {
         GraphCalendarShareClient {
-            graph: GraphClient::new(oauth.clone()),
-            oauth,
+            calendar: CalendarClient::new(account.graph().clone()),
+            account,
         }
-    }
-
-    /// Whether the account has granted Graph access (disk-only check).
-    pub fn consented(&self) -> bool {
-        self.oauth.graph_consented()
     }
 
     /// Runs the interactive consent flow for the shared-calendar scope
     /// (`Calendars.ReadWrite.Shared`). Only ever called from a user action.
     pub async fn ensure_consent(&self) -> Result<(), String> {
-        self.graph.ensure_feature(lookout_graph::GraphFeature::SharedCalendars).await.map_err(|e| e.to_string())
+        self.account.ensure_feature(lookout_graph::GraphFeature::SharedCalendars).await
     }
 
     /// Resolves another user's address to a directory user, so their calendars
     /// can be opened.
     pub async fn resolve_user(&self, address: &str) -> Result<Option<GraphUser>, GraphError> {
-        lookout_graph::resolve_user(&self.graph, address).await
+        lookout_graph::resolve_user(self.account.graph(), address).await
     }
 
     /// Another user's calendars (`/users/{owner}/calendars`).
     pub async fn list_calendars(&self, account_id: &AccountId, owner: &str) -> Result<Vec<CalendarInfo>, GraphError> {
-        CalendarClient::new(GraphClient::new(self.oauth.clone())).list_calendars(account_id, Some(owner)).await
+        self.calendar.list_calendars(account_id, Some(owner)).await
     }
 
     /// The grants on `calendar` (the user's own).
     pub async fn list_permissions(&self, calendar: &CalendarInfo) -> Result<Vec<CalendarPermission>, GraphError> {
-        CalendarClient::new(GraphClient::new(self.oauth.clone())).list_permissions(calendar).await
+        self.calendar.list_permissions(calendar).await
     }
 
     /// Grants `email` the given `role` on `calendar`.
     pub async fn create_permission(&self, calendar: &CalendarInfo, email: &str, role: CalendarRole, send_notification: bool) -> Result<CalendarPermission, GraphError> {
-        CalendarClient::new(GraphClient::new(self.oauth.clone()))
-            .create_permission(calendar, email, role, send_notification)
-            .await
+        self.calendar.create_permission(calendar, email, role, send_notification).await
     }
 
     /// Revokes a grant by its id.
     pub async fn delete_permission(&self, calendar: &CalendarInfo, permission_id: &str) -> Result<(), GraphError> {
-        CalendarClient::new(GraphClient::new(self.oauth.clone())).delete_permission(calendar, permission_id).await
+        self.calendar.delete_permission(calendar, permission_id).await
+    }
+}
+
+impl GraphFeatureClient for GraphCalendarShareClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }
 

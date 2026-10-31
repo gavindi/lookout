@@ -276,15 +276,18 @@ pub(crate) fn connect_account(
     // mailbox only: the Graph transport routes through `/me`, and a shared
     // mailbox still connects over IMAP under the parent's token (item 5.6).
     let uses_graph_mail = graph_own && state.borrow().app_config.borrow().graph_mail_enabled_for(&account_id);
+    // One Graph identity for every feature client on the handle below,
+    // sharing the account's OAuth instance with the credential provider.
+    let graph_account = graph_own.then(|| crate::graph_account::GraphAccount::new(&account_id));
     let credentials: Rc<dyn lookout_mail::session::CredentialProvider> = if let Some(parent) = &shared_parent {
-        Rc::new(MicrosoftCredentialProvider::new(parent.clone()))
+        Rc::new(MicrosoftCredentialProvider::new(parent))
     } else if is_microsoft_365 {
         // GOA's Microsoft 365 token carries only Microsoft Graph scopes and
         // can't authenticate to Exchange Online IMAP/SMTP (verified live), so
         // Microsoft accounts use Lookout's own OAuth2 flow instead - see
         // `microsoft_oauth.rs`. The first connect opens a browser; afterwards
         // the stored refresh token keeps it silent.
-        Rc::new(MicrosoftCredentialProvider::new(account_id.clone()))
+        Rc::new(MicrosoftCredentialProvider::new(&account_id))
     } else {
         Rc::new(GoaCredentialProvider::new(goa_client, account))
     };
@@ -306,6 +309,12 @@ pub(crate) fn connect_account(
 
         async fn smtp_credential(&self) -> Result<lookout_mail::Credential, String> {
             self.0.smtp_credential().await
+        }
+
+        // Forwarded, or the session's eviction of a rejected Exchange token
+        // (on `AUTHENTICATE`/`AUTH` failure) never reaches the provider.
+        async fn invalidate_credential(&self) {
+            self.0.invalidate_credential().await
         }
     }
     let credentials: std::sync::Arc<dyn lookout_mail::session::CredentialProvider> = std::sync::Arc::new(SendWrapper(credentials));
@@ -336,16 +345,19 @@ pub(crate) fn connect_account(
             // file; whichever gets there first wins, and until either lands
             // the field just means no composer suggestions yet.
             address_cache: None,
-            // Independent of the `credentials` provider constructed above -
-            // see the field's own doc comment on `AccountHandle`.
-            graph_pin: graph_own.then(|| Rc::new(crate::graph_pin::GraphPinClient::new(account_id.clone()))),
+            graph_pin: graph_account.clone().map(|account| Rc::new(crate::graph_pin::GraphPinClient::new(account))),
             // The property mirror only exists for the IMAP + Graph layering
             // (item 5.4). When the Graph session is the transport it owns
             // both reads and writes, so the mirror must not race it.
-            graph_mail: (!uses_graph_mail && graph_own).then(|| Rc::new(crate::graph_mail::GraphMailClient::new(account_id.clone()))),
-            graph_categories: graph_own.then(|| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account_id.clone()))),
-            graph_rules: graph_own.then(|| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone()))),
-            graph_automatic_replies: graph_own.then(|| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account_id.clone()))),
+            graph_mail: graph_account
+                .clone()
+                .filter(|_| !uses_graph_mail)
+                .map(|account| Rc::new(crate::graph_mail::GraphMailClient::new(account))),
+            graph_categories: graph_account.clone().map(|account| Rc::new(crate::graph_categories::GraphCategoriesClient::new(account))),
+            graph_rules: graph_account
+                .clone()
+                .map(|account| Rc::new(crate::graph_rules::GraphRulesClient::new(account_id.clone(), account))),
+            graph_automatic_replies: graph_account.map(|account| Rc::new(crate::graph_automatic_replies::GraphAutomaticRepliesClient::new(account))),
             microsoft_365: is_microsoft_365,
             local_focus_contacts: local_focus_contacts.clone(),
             sieve_advertised: false,
@@ -396,7 +408,7 @@ pub(crate) fn connect_account(
         // The same `AccountCommand`/`AccountEvent` seam, driven by Microsoft
         // Graph instead of IMAP/SMTP (item 5.7.5), so nothing above this line
         // changes. `MicrosoftOAuth` supplies both the Graph token and consent.
-        let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
+        let oauth = crate::microsoft_oauth::MicrosoftOAuth::for_account(&account_id);
         let client = lookout_graph::MailClient::new(lookout_graph::GraphClient::new(oauth));
         let session_config = lookout_graph::GraphMailSessionConfig {
             account_id: account_id.clone(),
@@ -2012,7 +2024,7 @@ pub(crate) fn spawn_calendar_discovery(
                     // A Microsoft 365 account is only a usable calendar once
                     // the user has opted into Outlook sync (Graph); until then
                     // it isn't counted as enabled, so the page stays empty.
-                    let usable = !account.is_microsoft_365() || crate::microsoft_oauth::MicrosoftOAuth::new(account.account_id.clone()).graph_consented();
+                    let usable = !account.is_microsoft_365() || crate::microsoft_oauth::MicrosoftOAuth::for_account(&account.account_id).graph_consented();
                     if enabled && usable {
                         enabled_accounts.push(account);
                     }
@@ -2277,7 +2289,7 @@ pub(crate) fn connect_graph_todo_account(
             error: None,
         },
     );
-    let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
+    let oauth = crate::microsoft_oauth::MicrosoftOAuth::for_account(&account_id);
     let client = lookout_graph::TodoClient::new(lookout_graph::GraphClient::new(oauth));
     worker.spawn(lookout_graph::run_todo_session(account_id.clone(), client, cmd_rx, evt_tx));
 
@@ -2451,7 +2463,7 @@ pub(crate) fn connect_calendar_account(
     // empty `Uri`. Graph access is opt-in (Config's "Sync with Outlook" runs
     // the consent flow), so an unconsented account has no calendar until then.
     let microsoft_365 = account.is_microsoft_365();
-    if microsoft_365 && !crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()).graph_consented() {
+    if microsoft_365 && !crate::microsoft_oauth::MicrosoftOAuth::for_account(&account_id).graph_consented() {
         tracing::debug!("Microsoft 365 calendar {account_id} has no Outlook-sync consent yet; skipping until enabled in Config");
         return;
     }
@@ -2507,7 +2519,7 @@ pub(crate) fn connect_calendar_account(
     if microsoft_365 {
         // The Graph session needs only the account's own OAuth token provider,
         // which `MicrosoftOAuth` supplies (`lookout_graph::TokenProvider`).
-        let oauth = std::sync::Arc::new(crate::microsoft_oauth::MicrosoftOAuth::new(account_id.clone()));
+        let oauth = crate::microsoft_oauth::MicrosoftOAuth::for_account(&account_id);
         let client = lookout_graph::CalendarClient::new(lookout_graph::GraphClient::new(oauth));
         worker.spawn(lookout_graph::run_calendar_session(account_id.clone(), client, cmd_rx, evt_tx));
         // Other users' calendars this account also shows (item 5.6 / CAL-25):

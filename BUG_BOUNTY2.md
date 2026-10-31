@@ -107,6 +107,7 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
      - On a 401, evict the cached access token for that audience and retry once (add `TokenProvider::invalidate`).
      - Do the same for the IMAP session's reconnect after an `AUTHENTICATE` failure.
    - **Fixed (0.9.298):** both Microsoft and Google access-token caches use `SystemTime`; `TokenProvider::invalidate`/`CredentialProvider::invalidate_credential` evict the cached token, `GraphClient` retries once on a 401, and rejected IMAP `AUTHENTICATE`/`LOGIN` (primary and IDLE connections) and SMTP `AUTH` failures evict the Exchange token (new `Error::AuthRejected`).
+   - **Follow-up (0.9.307):** the IMAP session's `SendWrapper` (`window/connect.rs`) did not forward `invalidate_credential`, so the IMAP/SMTP eviction above never reached `MicrosoftCredentialProvider`. It is forwarded now.
 
 10. **P2** ✔ **Graph `Retry-After` is uncapped, and it stalls the whole session actor.** [client.rs:17-22, 291-297](source/crates/graph/src/client.rs#L291-L297).
     - **Code:** the doc comment says `MAX_RETRY_DELAY` (120 s) is the "ceiling on any single retry wait", but only the fallback backoff is clamped; a server `Retry-After` is slept verbatim, up to 5 times.
@@ -187,10 +188,11 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
     - **Code:** `previously_seen: HashMap<String, VCard>` clones every previous card, photos included, to find the few that disappeared.
     - **Fix:** build a `HashSet` of identities from the new snapshot, iterate the previous records by reference, and clone only the missing ones.
 
-22. **P2** ✔ **Graph consent checks read and parse the token file on the GTK thread.** [microsoft_oauth.rs:355-364](source/crates/app/src/microsoft_oauth.rs#L355-L364).
+22. **P2** ✔ **Fixed** — **Graph consent checks read and parse the token file on the GTK thread.** [microsoft_oauth.rs:355-364](source/crates/app/src/microsoft_oauth.rs#L355-L364).
     - **Code:** every `consented()` (the seven `graph_*` wrappers) and `graph_mail_consented()` call does `TokenStore::load()`: a synchronous `fs::read` plus JSON parse of the refresh-token file.
     - **Call sites:** filter loops ([graph_sync.rs:93, 271, 359, 485](source/crates/app/src/window/graph_sync.rs#L485)), `focused_inbox_available` ([support.rs:657](source/crates/app/src/window/support.rs#L657)), the composer's directory assembly ([graph_directory.rs:84](source/crates/app/src/graph_directory.rs#L84)), Settings repaints, and ad-hoc `MicrosoftOAuth::new(..).graph_consented()` in [contacts_view.rs:2340, 3003, 3013](source/crates/app/src/contacts_view.rs#L3003) and [connect.rs:1986, 2425](source/crates/app/src/window/connect.rs#L1986).
     - **Fix:** cache the flags in memory on the shared per-account `MicrosoftOAuth` (BUG_BOUNTY1 #5's registry) and update them on save.
+    - **Fixed (0.9.307):** with #33's registry, every caller of an account shares one `MicrosoftOAuth`, which reads the token file's consent flags once and keeps them in step with its own writes. `graph_consented()`/`graph_mail_consented()` and every feature client's `consented()` no longer touch the disk after the first call. Covered by `consent_is_read_from_disk_once_and_tracks_this_instances_writes`.
 
 23. **P1** (a) / **P2** (b) ✔ **Fixed** — **Draft autosave re-uploads every attachment on every changed tick.** [compose.rs:24, 1113-1137](source/crates/app/src/compose.rs#L1113-L1137).
     - **Code:** with a 5 s tick, each changed snapshot builds a `ComposedMessage` that deep-copies every attachment (`(*self.bytes).clone()`). The session then re-`APPEND`s the whole MIME message to Drafts, and deletes the previous copy.
@@ -270,10 +272,16 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
 
     Extract an `oauth_common.rs` (BUG_BOUNTY1 #30, still open), which also fixes #2 above in one place.
 
-33. **P2** **Graph feature clients.** Seven `graph_*` wrappers each carry their own `MicrosoftOAuth`/`GraphClient` and an identical `consented()`, and four have an `ensure_consent()` that differs only in which consent call it makes:
+33. **P2** ✔ **Fixed** — **Graph feature clients.** Seven `graph_*` wrappers each carry their own `MicrosoftOAuth`/`GraphClient` and an identical `consented()`, and four have an `ensure_consent()` that differs only in which consent call it makes:
     - [graph_categories.rs:49](source/crates/app/src/graph_categories.rs#L49), [graph_rules.rs:63](source/crates/app/src/graph_rules.rs#L63), [graph_pin.rs:88](source/crates/app/src/graph_pin.rs#L88), [graph_calendar_share.rs:42](source/crates/app/src/graph_calendar_share.rs#L42), [graph_automatic_replies.rs:47](source/crates/app/src/graph_automatic_replies.rs#L47), [graph_mail.rs:47](source/crates/app/src/graph_mail.rs#L47), [graph_directory.rs:74](source/crates/app/src/graph_directory.rs#L74)
 
     `MicrosoftOAuth::new` appears 21 times. One per-account `GraphAccount { oauth: Arc<MicrosoftOAuth>, graph: GraphClient }` shared by all features removes the duplication and is the registry BUG_BOUNTY1 #5 needs.
+    - **Fixed (0.9.307):**
+      - **Registry:** `MicrosoftOAuth::for_account` returns one process-wide instance per account, from a `Weak` registry, and `new` is private. The IMAP/SMTP credential provider (a shared mailbox's provider uses the parent's), the Graph mail, calendar, To Do and contacts sessions, the ad-hoc consent checks and every feature client therefore refresh under the same per-audience lock and cache.
+      - **`GraphAccount`:** the new `graph_account.rs` pairs that instance with a `GraphClient`, which now derives `Clone`. All eight wrappers (the seven above plus `graph_rooms`) take a `GraphAccount` and implement `GraphFeatureClient`, whose default `consented()` replaces the eight copies; the `ensure_consent()`s delegate to `ensure_outlook_consent`/`ensure_feature`.
+      - **BUG_BOUNTY1 #5:** token-file writes are a read-modify-write under `store_lock`. A rotation keeps the consent flags now on disk rather than the ones read before the round trip; a rejection only clears consent or deletes the file if the stored refresh token is still the rejected one, so a grant stored meanwhile survives; a deleted file is never recreated.
+      - **Rooms tests:** `graph_rooms` and `graph_calendar_share` built a fresh `CalendarClient` from the OAuth instance on every call instead of using their own transport, so the two `graph_rooms` tests hit the real Graph and had failed since 0.9.301. Both pass now.
+      - **Tests:** covered by the registry, consent-cache, rotation and stale-rejection tests in `microsoft_oauth.rs`.
 
 34. **P3** **IMAP vs Graph session actors.** They share `cache_op` (identical), the outbox drain (decode, delete undecodable, send, delete draft, delete row, retry and fail bookkeeping), and `outbox_retry_delay`/`tag_keys`. [session.rs:1216](source/crates/mail/src/session.rs#L1216) vs [graph/src/mail/session.rs:2281](source/crates/graph/src/mail/session.rs#L2281); [session.rs:1771-1880](source/crates/mail/src/session.rs#L1771) vs [graph/src/mail/session.rs:812-880](source/crates/graph/src/mail/session.rs#L812-L880).
     - **Fix:** move `cache_op` and an `OutboxDrainer` that takes a `send` closure into `lookout_mail`. The #6 fix then lands once.
@@ -296,13 +304,13 @@ An item split into halves (#19, #23, #24, #26) carries a tag per half. On a ✔ 
 
 ## 7. BUG_BOUNTY1 items re-verified
 
-Rows 2, 4, 9 and 12 are kept for traceability because they were closed by work in this document (#8, #15 and #31); the rest are still open.
+Rows 2, 4, 5, 9 and 12 are kept for traceability because they were closed by work in this document (#8, #15, #31 and #33); the rest are still open.
 
 | # | Priority | Item | State now |
 |---|----------|------|-----------|
 | 2 | P1 | Concurrent rule push across accounts | Addressed by #8 (0.9.298) |
 | 4 | P1 | `settings.json` non-atomic write | Closed by #15 (0.9.299) |
-| 5 | P2 | Per-instance `MicrosoftOAuth`, fixed `json.tmp`, stale consent flag on refresh | Open (21 `MicrosoftOAuth::new`, `with_extension("json.tmp")` at [microsoft_oauth.rs:197](source/crates/app/src/microsoft_oauth.rs#L197)) |
+| 5 | P2 | Per-instance `MicrosoftOAuth`, fixed `json.tmp`, stale consent flag on refresh | Closed by #31 (0.9.306, `json.tmp`) and #33 (0.9.307) |
 | 6 | P2 | Google OAuth: no refresh lock; `exists()` then `load()?` TOCTOU | Open ([google_tasks.rs:150-160](source/crates/app/src/google_tasks.rs#L150-L160)) |
 | 7 | P3 | `sender_photo_cache` never cleared or capped | Open ([window.rs:863](source/crates/app/src/window.rs#L863), only 3 references) |
 | 8 | P2 | ICS import duplicates UIDs outside loaded months | Open ([imip.rs:1153](source/crates/app/src/window/imip.rs#L1153)) |
@@ -340,7 +348,7 @@ Tiers 1–3 and #4–#8, #11–#12, #14–#15 in Tier 4 are already fixed, so th
 **P2 — schedule next**
 
 6. ~~**#23 (b):** `Rc<[u8]>`/`Arc<[u8]>` attachments.~~ ✔ Fixed (0.9.303).
-7. **#22 + BUG_BOUNTY1 #5/#6 + #32/#33:** one shared per-account OAuth/Graph account with cached consent flags, so the consent cache is written once.
+7. ~~**#22 + BUG_BOUNTY1 #5 + #33:** one shared per-account OAuth/Graph account with cached consent flags, so the consent cache is written once.~~ ✔ Fixed (0.9.307). Still open here: **#32** (the shared OAuth plumbing) and **BUG_BOUNTY1 #6** (Google: no refresh lock, `exists()` then `load()` TOCTOU).
 8. ~~**#25:** `spawn_blocking` around `Cache::open`.~~ ✔ Fixed (0.9.305).
 9. **#20:** the generated `date` column and `(partial, date)` index.
 10. ~~**#27 + BUG_BOUNTY1 #26:** bind the hook clone before calling it.~~ ✔ Fixed (0.9.301).

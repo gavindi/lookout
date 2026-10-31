@@ -17,13 +17,11 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, AttendeeAvailability, EmailAddress};
-use lookout_graph::{CalendarClient, GraphClient, GraphError, Room};
+use lookout_core::{AttendeeAvailability, EmailAddress};
+use lookout_graph::{CalendarClient, GraphError, Room};
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// Graph caps `getSchedule` at 20 schedules per request, so room availability
 /// is asked for in batches of this size.
@@ -36,26 +34,15 @@ pub(crate) const MAX_ROOM_AVAILABILITY: usize = 40;
 
 /// One Microsoft 365 account's room-directory client.
 pub struct GraphRoomsClient {
-    oauth: Arc<MicrosoftOAuth>,
-    graph: GraphClient,
+    account: GraphAccount,
+    calendar: CalendarClient,
 }
 
 impl GraphRoomsClient {
-    pub fn new(account_id: AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
+    pub fn new(account: GraphAccount) -> Self {
         GraphRoomsClient {
-            graph: GraphClient::new(oauth.clone()),
-            oauth,
-        }
-    }
-
-    /// A client over an explicit transport, for tests driving a wiremock base
-    /// URL.
-    #[cfg(test)]
-    fn with_client(account_id: AccountId, graph: GraphClient) -> Self {
-        GraphRoomsClient {
-            oauth: Arc::new(MicrosoftOAuth::new(account_id)),
-            graph,
+            calendar: CalendarClient::new(account.graph().clone()),
+            account,
         }
     }
 
@@ -63,12 +50,12 @@ impl GraphRoomsClient {
     /// (`GraphFeature::Rooms`). Only ever called from the popover's Allow
     /// button.
     pub async fn ensure_consent(&self) -> Result<(), String> {
-        self.graph.ensure_feature(lookout_graph::GraphFeature::Rooms).await.map_err(|e| e.to_string())
+        self.account.ensure_feature(lookout_graph::GraphFeature::Rooms).await
     }
 
     /// The tenant's bookable rooms.
     pub async fn list_rooms(&self) -> Result<Vec<Room>, GraphError> {
-        CalendarClient::new(GraphClient::new(self.oauth.clone())).list_rooms().await
+        self.calendar.list_rooms().await
     }
 
     /// Free/busy for up to [`MAX_ROOM_AVAILABILITY`] candidate rooms over
@@ -79,7 +66,7 @@ impl GraphRoomsClient {
         let rooms = &rooms[..rooms.len().min(MAX_ROOM_AVAILABILITY)];
         let mut answers = Vec::with_capacity(rooms.len());
         for batch in rooms.chunks(MAX_SCHEDULES_PER_REQUEST) {
-            match CalendarClient::new(GraphClient::new(self.oauth.clone())).get_schedule(batch, start, end).await {
+            match self.calendar.get_schedule(batch, start, end).await {
                 Ok(mut availabilities) => answers.append(&mut availabilities),
                 Err(error) => {
                     tracing::debug!("room availability lookup failed: {error}");
@@ -91,12 +78,20 @@ impl GraphRoomsClient {
     }
 }
 
+impl GraphFeatureClient for GraphRoomsClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use lookout_graph::TokenProvider;
+    use lookout_core::AccountId;
+    use lookout_graph::{GraphClient, TokenProvider};
     use serde_json::json;
+    use std::sync::Arc;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -115,7 +110,7 @@ mod tests {
 
     fn client(server: &MockServer) -> GraphRoomsClient {
         let graph = GraphClient::with_base_url(Arc::new(StubTokens), format!("{}/v1.0", server.uri()));
-        GraphRoomsClient::with_client(AccountId("account_1".into()), graph)
+        GraphRoomsClient::new(GraphAccount::with_client(&AccountId("account_1".into()), graph))
     }
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {

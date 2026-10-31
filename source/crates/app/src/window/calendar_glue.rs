@@ -2300,7 +2300,7 @@ pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>)
                 on_result(Err(RoomLookupError::Unavailable("This calendar isn't a Microsoft 365 calendar.".to_string())));
                 return;
             };
-            let client = crate::graph_rooms::GraphRoomsClient::new(account_id);
+            let client = crate::graph_rooms::GraphRoomsClient::new(crate::graph_account::GraphAccount::new(&account_id));
             glib::spawn_future_local(async move {
                 match client.list_rooms().await {
                     Ok(rooms) => on_result(Ok(rooms.into_iter().map(RoomSuggestion::from).collect())),
@@ -2317,7 +2317,7 @@ pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>)
                 on_result(Err("This calendar isn't a Microsoft 365 calendar.".to_string()));
                 return;
             };
-            let client = crate::graph_rooms::GraphRoomsClient::new(account_id);
+            let client = crate::graph_rooms::GraphRoomsClient::new(crate::graph_account::GraphAccount::new(&account_id));
             glib::spawn_future_local(async move { on_result(client.ensure_consent().await) });
         })
     };
@@ -2329,7 +2329,7 @@ pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>)
                 on_result(generation, Vec::new());
                 return;
             };
-            let client = crate::graph_rooms::GraphRoomsClient::new(account_id);
+            let client = crate::graph_rooms::GraphRoomsClient::new(crate::graph_account::GraphAccount::new(&account_id));
             glib::spawn_future_local(async move {
                 let answers = client.room_availability(&addresses, start, end).await;
                 on_result(generation, answers);
@@ -3326,7 +3326,7 @@ pub(crate) fn show_calendar_dialog(
                 return;
             };
             let account_id = parent.account_id.clone();
-            let client = crate::graph_calendar_share::GraphCalendarShareClient::new(account_id.clone());
+            let client = crate::graph_calendar_share::GraphCalendarShareClient::new(crate::graph_account::GraphAccount::new(&account_id));
             let shared_status = shared_status.clone();
             let shared_calendar_dropdown = shared_calendar_dropdown.clone();
             let shared_add_button = shared_add_button.clone();

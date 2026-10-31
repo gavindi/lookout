@@ -13,6 +13,7 @@ use lookout_core::{AccountId, EmailSummary, Mailbox, MailboxId, MailboxRole, Sys
 use lookout_mail::session::AccountCommand;
 
 use crate::google_tasks::{self};
+use crate::graph_account::GraphFeatureClient;
 use crate::message_list::{FilterSet, MessageListModel, SortKey};
 use crate::worker::Worker;
 

@@ -32,8 +32,9 @@
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 use std::time::{Duration, SystemTime};
 
 use gtk::{gio, glib};
@@ -225,13 +226,44 @@ impl std::fmt::Display for GraphAuthError {
     }
 }
 
+/// The consent flags of an account's stored grant, held in memory so the
+/// GTK-thread gates (`graph_consented`, `graph_mail_consented`) don't read and
+/// parse the token file on every call.
+#[derive(Clone, Copy, Default)]
+struct Consent {
+    graph: bool,
+    mail_send: bool,
+}
+
+impl Consent {
+    fn of(stored: &StoredToken) -> Self {
+        Consent {
+            graph: stored.graph_consented,
+            mail_send: stored.mail_send,
+        }
+    }
+}
+
+/// Every live [`MicrosoftOAuth`], one per account. Weak, so an account nobody
+/// holds any more is dropped without a removal hook, while every caller that
+/// asks while one is alive shares it - and with it the refresh locks and the
+/// access-token caches.
+static REGISTRY: LazyLock<Mutex<HashMap<AccountId, Weak<MicrosoftOAuth>>>> = LazyLock::new(Default::default);
+
 /// Manages one Microsoft 365 account's access tokens, running the
 /// interactive browser flow on first use (or on explicit Graph consent) and
 /// refresh-token exchanges afterwards. Exchange and Graph audiences are
 /// cached and refreshed independently (see `TokenAudience`) but share one
 /// on-disk refresh token once both have been consented.
+///
+/// Obtained through [`MicrosoftOAuth::for_account`], so the IMAP/SMTP
+/// session, a shared mailbox borrowing the account's token, the Graph
+/// sessions and every Graph feature client share one instance: its locks only
+/// serialise refreshes, and its consent cache only stays true, because nobody
+/// else in the process writes the same token file.
 pub struct MicrosoftOAuth {
     account_id: AccountId,
+    store: TokenStore,
     cached_exchange: Mutex<Option<(String, SystemTime)>>,
     cached_graph: Mutex<Option<(String, SystemTime)>>,
     // Serializes `access_token`/`graph_access_token` per audience so two
@@ -246,17 +278,114 @@ pub struct MicrosoftOAuth {
     // ever held for a quick, synchronous read/write.
     refresh_exchange: tokio::sync::Mutex<()>,
     refresh_graph: tokio::sync::Mutex<()>,
+    /// Held around every load-modify-save of the token file (never across a
+    /// network call), so the Exchange and Graph refreshes and a consent run
+    /// can't overwrite each other's rotation or consent flags.
+    store_lock: Mutex<()>,
+    /// The stored grant's consent flags, read from disk on first use and kept
+    /// in step by every write below. A grant made by a second Lookout process
+    /// is only seen after a restart.
+    consent: Mutex<Option<Consent>>,
 }
 
 impl MicrosoftOAuth {
-    pub fn new(account_id: AccountId) -> Self {
+    /// The account's shared instance, created on first use.
+    pub fn for_account(account_id: &AccountId) -> Arc<MicrosoftOAuth> {
+        let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(live) = registry.get(account_id).and_then(Weak::upgrade) {
+            return live;
+        }
+        registry.retain(|_, weak| weak.strong_count() > 0);
+        let oauth = Arc::new(MicrosoftOAuth::new(account_id.clone()));
+        registry.insert(account_id.clone(), Arc::downgrade(&oauth));
+        oauth
+    }
+
+    fn new(account_id: AccountId) -> Self {
+        let store = TokenStore::for_account(&account_id);
+        MicrosoftOAuth::with_store(account_id, store)
+    }
+
+    fn with_store(account_id: AccountId, store: TokenStore) -> Self {
         MicrosoftOAuth {
             account_id,
+            store,
             cached_exchange: Mutex::new(None),
             cached_graph: Mutex::new(None),
             refresh_exchange: tokio::sync::Mutex::new(()),
             refresh_graph: tokio::sync::Mutex::new(()),
+            store_lock: Mutex::new(()),
+            consent: Mutex::new(None),
         }
+    }
+
+    /// An instance over an explicit token file, for tests.
+    #[cfg(test)]
+    fn at(account_id: AccountId, path: PathBuf) -> Self {
+        MicrosoftOAuth::with_store(account_id, TokenStore::at(path))
+    }
+
+    /// The stored grant's consent flags, from memory after the first read.
+    fn consent(&self) -> Consent {
+        let mut consent = self.consent.lock().unwrap_or_else(PoisonError::into_inner);
+        *consent.get_or_insert_with(|| self.store.load().map(|stored| Consent::of(&stored)).unwrap_or_default())
+    }
+
+    fn set_consent(&self, consent: Consent) {
+        *self.consent.lock().unwrap_or_else(PoisonError::into_inner) = Some(consent);
+    }
+
+    /// Stores a whole new grant (an interactive sign-in or consent).
+    fn replace_stored(&self, stored: &StoredToken) -> Result<(), String> {
+        let _guard = self.store_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.store.save(stored)?;
+        self.set_consent(Consent::of(stored));
+        Ok(())
+    }
+
+    /// Re-reads the token file and applies `update` only if it still holds
+    /// `expected_refresh_token`, so a refresh or a rejection never writes its
+    /// stale view over a grant stored meanwhile, and a deleted file is never
+    /// brought back. Returns whether the update was saved.
+    fn update_stored_if(&self, expected_refresh_token: &str, update: impl FnOnce(&mut StoredToken)) -> bool {
+        let _guard = self.store_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let Ok(mut stored) = self.store.load() else { return false };
+        if stored.refresh_token != expected_refresh_token {
+            return false;
+        }
+        update(&mut stored);
+        match self.store.save(&stored) {
+            Ok(()) => {
+                self.set_consent(Consent::of(&stored));
+                true
+            }
+            Err(e) => {
+                tracing::warn!("couldn't update stored Microsoft credentials for {}: {e}", self.account_id);
+                false
+            }
+        }
+    }
+
+    /// Deletes the token file if it still holds the rejected
+    /// `refresh_token`. Returns `false` when a newer grant replaced it
+    /// meanwhile, which the caller should try instead of re-authorising.
+    fn delete_stored_if(&self, refresh_token: &str) -> bool {
+        let _guard = self.store_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        match self.store.load() {
+            Ok(stored) if stored.refresh_token != refresh_token => false,
+            _ => {
+                self.store.delete();
+                self.set_consent(Consent::default());
+                true
+            }
+        }
+    }
+
+    /// Persists a rotated refresh token, keeping the consent flags currently
+    /// on disk rather than the ones `current` was read with before the round
+    /// trip.
+    fn persist_rotation(&self, current: &StoredToken, new_refresh: String) {
+        self.update_stored_if(&current.refresh_token, |stored| stored.refresh_token = new_refresh);
     }
 
     fn cache_slot(&self, audience: TokenAudience) -> &Mutex<Option<(String, SystemTime)>> {
@@ -287,19 +416,25 @@ impl MicrosoftOAuth {
             }
         }
 
-        let store = TokenStore::for_account(&self.account_id);
-        if let Ok(stored) = store.load() {
-            match self.refresh(&store, &stored, TokenAudience::Exchange).await? {
+        // At most twice: once for the stored grant, and once more if a
+        // newer grant replaced it while the first refresh was rejected.
+        for _ in 0..2 {
+            let Ok(stored) = self.store.load() else { break };
+            match self.refresh(&stored, TokenAudience::Exchange).await? {
                 RefreshOutcome::AccessToken(token) => return Ok(token),
                 // The token endpoint rejected the stored refresh token
                 // (revoked, expired, or issued for a different client id).
                 // It can never be fixed by retrying, so drop it and ask the
                 // user to authorize again.
-                RefreshOutcome::ReauthNeeded => store.delete(),
+                RefreshOutcome::ReauthNeeded => {
+                    if self.delete_stored_if(&stored.refresh_token) {
+                        break;
+                    }
+                }
             }
         }
 
-        self.authorize(&store).await
+        self.authorize().await
     }
 
     /// Returns a fresh Graph-audience access token for `graph_pin.rs`, or
@@ -316,41 +451,39 @@ impl MicrosoftOAuth {
             }
         }
 
-        let store = TokenStore::for_account(&self.account_id);
-        let stored = store.load().map_err(|_| GraphAuthError::ConsentRequired)?;
+        let stored = self.store.load().map_err(|_| GraphAuthError::ConsentRequired)?;
         if !stored.graph_consented {
             return Err(GraphAuthError::ConsentRequired);
         }
-        match self.refresh(&store, &stored, TokenAudience::Graph).await {
+        match self.refresh(&stored, TokenAudience::Graph).await {
             Ok(RefreshOutcome::AccessToken(token)) => Ok(token),
             Ok(RefreshOutcome::ReauthNeeded) => {
                 // Consent was revoked out of band (e.g. an admin pulled the
                 // permission) - clear the flag so Config offers the
                 // "Sync pins with Outlook" action again, but leave the
                 // refresh token itself alone; the Exchange audience may
-                // still work fine off it.
-                let _ = store.save(&StoredToken {
-                    refresh_token: stored.refresh_token,
-                    graph_consented: false,
-                    mail_send: stored.mail_send,
-                });
+                // still work fine off it. Skipped if a new grant was stored
+                // while this refresh was in flight.
+                self.update_stored_if(&stored.refresh_token, |stored| stored.graph_consented = false);
                 Err(GraphAuthError::ConsentRequired)
             }
             Err(e) => Err(GraphAuthError::Transient(e)),
         }
     }
 
-    /// Synchronous, disk-only check for Config UI - never touches the
-    /// network, so it's safe to call while just building rows.
+    /// Synchronous check for Config UI - never touches the network, and
+    /// reads the token file only the first time, so it's safe to call while
+    /// just building rows.
     pub fn graph_consented(&self) -> bool {
-        TokenStore::for_account(&self.account_id).load().map(|s| s.graph_consented).unwrap_or(false)
+        self.consent().graph
     }
 
     /// Whether the stored grant already includes both Graph access and
     /// `Mail.Send`, so enabling Graph mail needs no new browser prompt (item
-    /// 5.7.6). Disk-only, like [`Self::graph_consented`].
+    /// 5.7.6). In-memory, like [`Self::graph_consented`].
     pub fn graph_mail_consented(&self) -> bool {
-        TokenStore::for_account(&self.account_id).load().map(|s| s.graph_consented && s.mail_send).unwrap_or(false)
+        let consent = self.consent();
+        consent.graph && consent.mail_send
     }
 
     /// Runs the interactive PKCE/loopback consent flow requesting both the
@@ -388,11 +521,10 @@ impl MicrosoftOAuth {
     /// account has opted into Graph mail so a later re-consent (say, for
     /// categories) can't silently take sending away.
     async fn ensure_graph_consent_scopes(&self, scopes: &str, mail_send: bool) -> Result<(), String> {
-        let store = TokenStore::for_account(&self.account_id);
         // Keep Mail.Send once requested, whether by the Graph mail opt-in or
         // by a feature whose own scope set names it (e.g. schedule send).
         let requests_mail_send = scopes.split_whitespace().any(|scope| scope.ends_with("/Mail.Send"));
-        let mail_send = mail_send || requests_mail_send || store.load().map(|stored| stored.mail_send).unwrap_or(false);
+        let mail_send = mail_send || requests_mail_send || self.consent().mail_send;
         let scopes = if mail_send && !requests_mail_send {
             format!("{scopes} https://graph.microsoft.com/{}", lookout_graph::MAIL_SEND)
         } else {
@@ -405,18 +537,17 @@ impl MicrosoftOAuth {
             graph_consented: true,
             mail_send,
         };
-        store.save(&stored)?;
-        match self.refresh(&store, &stored, TokenAudience::Graph).await {
+        self.replace_stored(&stored)?;
+        match self.refresh(&stored, TokenAudience::Graph).await {
             Ok(RefreshOutcome::AccessToken(_)) => Ok(()),
             Ok(RefreshOutcome::ReauthNeeded) => {
                 // The combined grant didn't actually deliver Graph
                 // capability on this tenant - don't leave a false promise
                 // behind (the refresh token itself is still kept: it's
                 // valid for Exchange either way).
-                let _ = store.save(&StoredToken {
-                    refresh_token: stored.refresh_token,
-                    graph_consented: false,
-                    mail_send: false,
+                self.update_stored_if(&stored.refresh_token, |stored| {
+                    stored.graph_consented = false;
+                    stored.mail_send = false;
                 });
                 Err("Microsoft granted sign-in but didn't allow the Outlook permissions requested - check your organization's app consent policy and try again".to_string())
             }
@@ -424,7 +555,7 @@ impl MicrosoftOAuth {
         }
     }
 
-    async fn refresh(&self, store: &TokenStore, current: &StoredToken, audience: TokenAudience) -> Result<RefreshOutcome, String> {
+    async fn refresh(&self, current: &StoredToken, audience: TokenAudience) -> Result<RefreshOutcome, String> {
         let scopes = audience.refresh_scopes(current.mail_send);
         let params = [
             ("client_id", CLIENT_ID),
@@ -442,24 +573,19 @@ impl MicrosoftOAuth {
             Ok(resp) => resp,
         };
         if let Some(new_refresh) = resp.refresh_token.filter(|t| !t.is_empty()) {
-            // Microsoft rotates refresh tokens; persist the new one (keeping
-            // the existing consent flag) so a stale stored token can't
-            // trigger a silent re-auth later.
-            let _ = store.save(&StoredToken {
-                refresh_token: new_refresh,
-                graph_consented: current.graph_consented,
-                mail_send: current.mail_send,
-            });
+            // Microsoft rotates refresh tokens; persist the new one so a
+            // stale stored token can't trigger a silent re-auth later.
+            self.persist_rotation(current, new_refresh);
         }
         let (access_token, expires_in) = (resp.access_token, resp.expires_in);
         self.cache(audience, access_token.clone(), expires_in);
         Ok(RefreshOutcome::AccessToken(access_token))
     }
 
-    async fn authorize(&self, store: &TokenStore) -> Result<String, String> {
+    async fn authorize(&self) -> Result<String, String> {
         let resp = self.authorize_interactive(EXCHANGE_SCOPES).await?;
         let refresh_token = resp.refresh_token.ok_or("Microsoft token response didn't include a refresh token")?;
-        store.save(&StoredToken {
+        self.replace_stored(&StoredToken {
             refresh_token,
             graph_consented: false,
             mail_send: false,
@@ -567,13 +693,15 @@ impl lookout_graph::TokenProvider for MicrosoftOAuth {
 /// tokio tasks, unlike the GOA provider (which only ever runs on the single
 /// worker task and is wrapped in a `SendWrapper` in `window.rs`).
 pub struct MicrosoftCredentialProvider {
-    oauth: MicrosoftOAuth,
+    oauth: Arc<MicrosoftOAuth>,
 }
 
 impl MicrosoftCredentialProvider {
-    pub fn new(account_id: AccountId) -> Self {
+    /// A shared mailbox passes its parent's id, so it shares the parent's
+    /// instance and refreshes the one token under the same lock.
+    pub fn new(account_id: &AccountId) -> Self {
         MicrosoftCredentialProvider {
-            oauth: MicrosoftOAuth::new(account_id),
+            oauth: MicrosoftOAuth::for_account(account_id),
         }
     }
 }
@@ -796,6 +924,107 @@ mod tests {
             assert!(!GRAPH_SCOPES.contains(optional), "{optional} must not be in GRAPH_SCOPES");
             assert!(!COMBINED_SCOPES.contains(optional), "{optional} must not be in COMBINED_SCOPES");
         }
+    }
+
+    fn temp_token_path() -> PathBuf {
+        std::env::temp_dir().join(format!("lookout-oauth-test-{}", uuid::Uuid::new_v4().simple())).join("acct.json")
+    }
+
+    fn grant(refresh_token: &str, graph_consented: bool, mail_send: bool) -> StoredToken {
+        StoredToken {
+            refresh_token: refresh_token.to_string(),
+            graph_consented,
+            mail_send,
+        }
+    }
+
+    fn remove_temp(path: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Every caller asking while an instance is alive shares it - and so its
+    /// refresh locks and caches - and a dropped one is not kept alive.
+    #[test]
+    fn for_account_shares_one_instance_while_it_is_held() {
+        let id = AccountId(format!("registry-test-{}", uuid::Uuid::new_v4().simple()));
+        let first = MicrosoftOAuth::for_account(&id);
+        let second = MicrosoftOAuth::for_account(&id);
+        assert!(Arc::ptr_eq(&first, &second));
+        let other = MicrosoftOAuth::for_account(&AccountId(format!("{}-other", id.0)));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(second);
+        assert!(weak.upgrade().is_none(), "the registry must not keep an instance alive");
+        let fresh = MicrosoftOAuth::for_account(&id);
+        assert_eq!(fresh.account_id, id);
+    }
+
+    /// The consent gates read the token file once, then follow this
+    /// instance's own writes without touching the disk.
+    #[test]
+    fn consent_is_read_from_disk_once_and_tracks_this_instances_writes() {
+        let path = temp_token_path();
+        TokenStore::at(path.clone()).save(&grant("rt-1", true, false)).unwrap();
+        let oauth = MicrosoftOAuth::at(AccountId("acct".to_string()), path.clone());
+        assert!(oauth.graph_consented());
+        assert!(!oauth.graph_mail_consented());
+
+        // A change behind the instance's back is not re-read...
+        TokenStore::at(path.clone()).save(&grant("rt-1", false, false)).unwrap();
+        assert!(oauth.graph_consented(), "the gate must not re-read the file");
+
+        // ...but its own writes are reflected straight away.
+        oauth.replace_stored(&grant("rt-2", true, true)).unwrap();
+        assert!(oauth.graph_mail_consented());
+        assert!(oauth.delete_stored_if("rt-2"));
+        assert!(!oauth.graph_consented());
+
+        let missing = MicrosoftOAuth::at(AccountId("acct".to_string()), temp_token_path());
+        assert!(!missing.graph_consented(), "no token file means no consent");
+        remove_temp(&path);
+    }
+
+    /// A refresh's rotation keeps the flags on disk now, not the ones it read
+    /// before its round trip, so it can't revive a consent cleared meanwhile.
+    #[test]
+    fn a_rotation_keeps_a_consent_flag_cleared_meanwhile() {
+        let path = temp_token_path();
+        let oauth = MicrosoftOAuth::at(AccountId("acct".to_string()), path.clone());
+        oauth.replace_stored(&grant("rt-1", true, true)).unwrap();
+        let current = oauth.store.load().unwrap();
+        assert!(oauth.update_stored_if("rt-1", |stored| stored.graph_consented = false));
+
+        oauth.persist_rotation(&current, "rt-2".to_string());
+        let stored = oauth.store.load().unwrap();
+        assert_eq!(stored.refresh_token, "rt-2");
+        assert!(!stored.graph_consented, "the rotation brought back a cleared consent flag");
+        assert!(stored.mail_send);
+        assert!(!oauth.graph_consented());
+        remove_temp(&path);
+    }
+
+    /// A rejection seen for an old grant neither edits nor deletes a newer
+    /// grant stored while the refresh was in flight, and never recreates a
+    /// deleted file.
+    #[test]
+    fn a_rejected_token_does_not_clobber_a_newer_grant() {
+        let path = temp_token_path();
+        let oauth = MicrosoftOAuth::at(AccountId("acct".to_string()), path.clone());
+        oauth.replace_stored(&grant("rt-new", true, false)).unwrap();
+
+        assert!(!oauth.update_stored_if("rt-old", |stored| stored.graph_consented = false));
+        assert!(!oauth.delete_stored_if("rt-old"));
+        let stored = oauth.store.load().unwrap();
+        assert_eq!(stored.refresh_token, "rt-new");
+        assert!(stored.graph_consented);
+
+        assert!(oauth.delete_stored_if("rt-new"));
+        assert!(!path.exists());
+        assert!(!oauth.update_stored_if("rt-new", |stored| stored.graph_consented = true));
+        assert!(!path.exists(), "an update must not recreate a deleted token file");
+        remove_temp(&path);
     }
 
     #[test]

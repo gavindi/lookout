@@ -20,32 +20,24 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
-use std::sync::Arc;
-
 use chrono::{DateTime, Utc};
-use lookout_core::{AccountId, EmailAddress, FollowUpFlag, Importance, InferenceClassification};
-use lookout_graph::{GraphClient, GraphError, InferenceOverride, MailClient, MessageDelta, OutgoingAttachment, OutgoingMessage};
+use lookout_core::{EmailAddress, FollowUpFlag, Importance, InferenceClassification};
+use lookout_graph::{GraphError, InferenceOverride, MailClient, MessageDelta, OutgoingAttachment, OutgoingMessage};
 
-use crate::microsoft_oauth::MicrosoftOAuth;
+use crate::graph_account::{GraphAccount, GraphFeatureClient};
 
 /// One Microsoft 365 account's Graph mail-property client.
 pub struct GraphMailClient {
-    oauth: Arc<MicrosoftOAuth>,
+    account: GraphAccount,
     mail: MailClient,
 }
 
 impl GraphMailClient {
-    pub fn new(account_id: AccountId) -> Self {
-        let oauth = Arc::new(MicrosoftOAuth::new(account_id));
+    pub fn new(account: GraphAccount) -> Self {
         GraphMailClient {
-            mail: MailClient::new(GraphClient::new(oauth.clone())),
-            oauth,
+            mail: MailClient::new(account.graph().clone()),
+            account,
         }
-    }
-
-    /// Whether the account has granted Graph access (disk-only check).
-    pub fn consented(&self) -> bool {
-        self.oauth.graph_consented()
     }
 
     /// Resolves an RFC 822 `Message-ID` to Graph's message id, or `None` when
@@ -101,6 +93,12 @@ impl GraphMailClient {
     /// it - even if Lookout has closed.
     pub async fn send_scheduled(&self, message: &lookout_mail::ComposedMessage, at: DateTime<Utc>) -> Result<(), GraphError> {
         self.mail.send_scheduled(&outgoing_message(message), Some(at)).await
+    }
+}
+
+impl GraphFeatureClient for GraphMailClient {
+    fn account(&self) -> &GraphAccount {
+        &self.account
     }
 }
 
