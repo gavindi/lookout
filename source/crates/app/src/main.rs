@@ -115,6 +115,16 @@ use gtk::prelude::*;
 
 const APP_ID: &str = "io.github.gavindi.Lookout";
 
+/// Command-line options matching the desktop file's `[Desktop Action]`s.
+/// Each name is both the `--option` and the app action `build_window`
+/// registers for it.
+const LAUNCHER_ACTIONS: [(&str, &str); 4] = [
+    ("compose", "Compose a new message"),
+    ("contacts", "Open Contacts"),
+    ("calendar", "Open Calendar"),
+    ("tasks", "Open Tasks"),
+];
+
 fn main() -> glib::ExitCode {
     // GTK3-era accessibility modules (`gail`, `atk-bridge`) sometimes linger
     // in the environment's `GTK_MODULES`; GTK4 ships AT-SPI support natively,
@@ -128,7 +138,13 @@ fn main() -> glib::ExitCode {
 
     tracing_subscriber::fmt::init();
 
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // `HANDLES_COMMAND_LINE` forwards a second process's options (the
+    // launcher actions below) to the running instance instead of only
+    // activating it.
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
     let worker = Rc::new(worker::Worker::new());
     // The dock badge's D-Bus work needs the worker's tokio reactor (the UI
     // thread's GLib context has none - see `launcher_entry`); hand the
@@ -163,10 +179,40 @@ fn main() -> glib::ExitCode {
         });
     }
 
+    // The desktop file's launcher actions (`lookout --compose` etc.), each
+    // mapped to the app action of the same name that `build_window`
+    // registers. A second process forwards these to the running instance.
+    for (name, description) in LAUNCHER_ACTIONS {
+        app.add_main_option(name, glib::Char::from(0), glib::OptionFlags::NONE, glib::OptionArg::None, description, None);
+    }
+
     // Single window for the app's lifetime: an activation while one exists
     // (an app-icon click, a second process's D-Bus activation) just presents
     // it instead of building a duplicate.
     let window: Rc<RefCell<Option<adw::ApplicationWindow>>> = Rc::new(RefCell::new(None));
+    {
+        let window = window.clone();
+        app.connect_command_line(move |app, command_line| {
+            let options = command_line.options_dict();
+            let requested: Vec<&str> = LAUNCHER_ACTIONS
+                .iter()
+                .map(|(name, _)| *name)
+                .filter(|name| options.lookup_value(name, None).is_some())
+                .collect();
+            let hidden_requested = options.lookup_value("hidden", None).is_some() || command_line.arguments().iter().any(|arg| arg.to_str() == Some("--hidden"));
+            // Activate builds the window on a cold start (honouring
+            // `--hidden` through `handle-local-options` above) and presents
+            // it otherwise - except for a repeated `--hidden` while running,
+            // which should leave the window as it is.
+            if window.borrow().is_none() || !hidden_requested || !requested.is_empty() {
+                app.activate();
+            }
+            for name in requested {
+                app.activate_action(name, None);
+            }
+            glib::ExitCode::SUCCESS
+        });
+    }
     app.connect_activate(move |app| {
         let display = gtk::gdk::Display::default().expect("GTK initializes a display");
         crate::resources::register(&display);

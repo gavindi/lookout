@@ -1230,6 +1230,10 @@ pub(crate) struct UiState {
     /// whose attendee autocomplete unions the mail-history caches across
     /// every connected account.
     pub(crate) accounts: HashMap<AccountId, AccountHandle>,
+    /// A launcher `--compose` that arrived before any mail account was
+    /// connected; the first account to connect opens the composer
+    /// (`resume_launcher_compose`).
+    pub(crate) pending_launcher_compose: bool,
     /// CardDAV-derived contacts discovered per account, including both
     /// category buckets (for Contacts UI) and flattened suggestions (for
     /// composer autocomplete). Owned by the People screen module

@@ -2891,6 +2891,17 @@ pub(crate) fn compose_new_message(state: &Rc<RefCell<UiState>>, worker: &Rc<Work
     );
 }
 
+/// Opens the composer a launcher `--compose` asked for before any mail
+/// account had connected. Called once an account's handle is in
+/// `UiState::accounts`; deferred to idle so the rest of the account's setup
+/// finishes first.
+pub(crate) fn resume_launcher_compose(state: &Rc<RefCell<UiState>>, app: &adw::Application) {
+    if std::mem::take(&mut state.borrow_mut().pending_launcher_compose) {
+        let app = app.clone();
+        glib::idle_add_local_once(move || app.activate_action("compose", None));
+    }
+}
+
 /// How a Sweep selects which of the sender's messages to act on (item 2.7 /
 /// M-16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

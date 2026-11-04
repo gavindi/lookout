@@ -618,6 +618,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let mut corrupt_backups = crate::app_config::take_corrupt_backups();
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
+        pending_launcher_compose: false,
         contacts_by_account: HashMap::new(),
         starred_contacts,
         contacts_filter: String::new(),
@@ -9377,6 +9378,57 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 }
             }
         });
+    }
+    // The desktop file's launcher actions (`lookout --compose` etc., wired in
+    // `main`). Each presents the window and switches module the way its rail
+    // button does; compose shares the toolbar button's account choice.
+    {
+        let action = gio::SimpleAction::new("compose", None);
+        let window = window.clone();
+        let state = state.clone();
+        let worker = worker.clone();
+        let reading_stack = reading_stack.clone();
+        let message_list = message_list.clone();
+        let mail_view_button = mail_view_button.clone();
+        action.connect_activate(move |_, _| {
+            window.present();
+            mail_view_button.set_active(true);
+            // On a cold start no account has connected yet; the first one to
+            // connect opens the composer instead (`resume_launcher_compose`).
+            if state.borrow().accounts.is_empty() {
+                state.borrow_mut().pending_launcher_compose = true;
+                return;
+            }
+            state.borrow_mut().pending_launcher_compose = false;
+            compose_new_message(&state, &worker, &reading_stack, &message_list);
+        });
+        app.add_action(&action);
+    }
+    {
+        let action = gio::SimpleAction::new("contacts", None);
+        let window = window.clone();
+        let contacts_view_button = contacts_view_button.clone();
+        let contacts_window = contacts_window.clone();
+        action.connect_activate(move |_, _| {
+            window.present();
+            contacts_view_button.set_active(true);
+            // People may be popped out into their own window; raise that too.
+            let detached = contacts_window.borrow().clone();
+            if let Some(detached) = detached {
+                detached.present();
+            }
+        });
+        app.add_action(&action);
+    }
+    for (name, button) in [("calendar", &calendar_view_button), ("tasks", &tasks_view_button)] {
+        let action = gio::SimpleAction::new(name, None);
+        let window = window.clone();
+        let button = button.clone();
+        action.connect_activate(move |_, _| {
+            window.present();
+            button.set_active(true);
+        });
+        app.add_action(&action);
     }
     // Phase 5: apply the persisted Config → Appearance/Mail switch states now
     // that their handlers are wired. Each `set_active` fires the notify

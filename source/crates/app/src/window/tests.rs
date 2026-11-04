@@ -724,6 +724,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         .collect();
     Rc::new(RefCell::new(UiState {
         accounts,
+        pending_launcher_compose: false,
         contacts_by_account: HashMap::new(),
         starred_contacts: HashSet::new(),
         contacts_filter: String::new(),

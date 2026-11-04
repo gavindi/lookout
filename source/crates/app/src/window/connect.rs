@@ -365,6 +365,7 @@ pub(crate) fn connect_account(
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
+    resume_launcher_compose(&state, &app);
     if graph_own {
         // Read Outlook's per-message properties (categories, flags,
         // importance, Focused/Other) once the session has had a moment to open
@@ -1623,6 +1624,7 @@ pub(crate) fn connect_other_account(
         },
     );
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
+    resume_launcher_compose(&state, &app);
     {
         let reply_rx = spawn_cache_open(&worker, account_id.clone());
         let state = state.clone();
