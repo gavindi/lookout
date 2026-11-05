@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag to build and release (e.g. 0.9.309)"
+        description: "Git tag to build and release (e.g. 0.9.310)"
         required: true
 
 defaults:
@@ -70,7 +70,21 @@ jobs:
           python3 -m venv /tmp/fbtools
           /tmp/fbtools/bin/pip install --quiet aiohttp PyYAML tomlkit
           /tmp/fbtools/bin/python3 /tmp/flatpak-builder-tools/cargo/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
-      - uses: flathub-infra/flatpak-github-actions/flatpak-builder@master
+      # The image ships its SDK in a read-only overlayfs lower layer. When
+      # Flathub has a newer SDK than the image, flatpak-builder's
+      # --install-deps-from update renames deploy directories that live in
+      # that layer, overlayfs refuses with EXDEV ("Invalid cross-device
+      # link"), and flatpak-builder then segfaults. Copying each installation
+      # up once keeps every later rename inside the writable upper layer.
+      - name: Copy the preinstalled runtimes onto the writable layer
+        run: |
+          for inst in $(flatpak --installations); do
+            echo "Copying up $inst"
+            cp -a "$inst" "$inst.copy"
+            rm -rf "$inst"
+            mv "$inst.copy" "$inst"
+          done
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           bundle: lookout.flatpak
           manifest-path: source/flatpak/io.github.gavindi.Lookout.json

@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.310" date="2026-11-05">
+      <description>
+        <p>Packaging fix. The Flatpak release build failed while updating its GNOME SDK and now completes again. Lookout itself is unchanged from 0.9.309.</p>
+      </description>
+    </release>
     <release version="0.9.309" date="2026-11-05">
       <description>
         <p>Work offline and the Outbox. Send / Receive &gt; Preferences now has a Work Offline switch that pauses every account's syncing without quitting Lookout, so cached mail, calendar months, contacts and tasks stay readable while nothing is fetched or written. Messages you send while paused wait in a new always-visible Outbox folder (with Send now, Retry and Edit) and go out when you reconnect; calendar, contact and task edits are refused with a clear message until you are back online.</p>
