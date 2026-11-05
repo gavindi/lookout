@@ -36,19 +36,93 @@ pub(crate) fn show_anchor(calendar_state: &Rc<RefCell<CalendarUiState>>, calenda
     if let Some(birthdays) = &mut st.birthdays {
         birthdays.sync_month(month);
     }
-    for handle in st.accounts.values() {
-        let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
-    }
-    let webcal_cmd = st.webcal_cmd_tx.clone();
-    if let Some(cmd) = webcal_cmd {
-        let _ = cmd.send_blocking(SubscriptionCommand::SyncMonth(month));
+    // Work Offline (M-40): the month still changes locally (and Part C seeds
+    // it from the cache), but no dead network request is dispatched.
+    // Work Offline (M-40): paint the month from the local cache instead of
+    // asking the sessions, which are parked.
+    let offline_seed = if st.work_offline { st.calendar_seed_month.clone() } else { None };
+    if !st.work_offline {
+        for handle in st.accounts.values() {
+            let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncMonth(month));
+        }
+        let webcal_cmd = st.webcal_cmd_tx.clone();
+        if let Some(cmd) = webcal_cmd {
+            let _ = cmd.send_blocking(SubscriptionCommand::SyncMonth(month));
+        }
     }
     drop(st);
+    if let Some(seed) = offline_seed {
+        seed(month);
+    }
     let event_days = calendar_event_days(calendar_state, month);
     calendar_view::set_mini_month(mini_calendar, day, &event_days);
     // The header's current-month dropdown holds its own mini grid; keep it
     // showing the same month as the main panel so the dropdown is never stale.
     calendar_view::set_mini_month(&calendar_main.month_mini, day, &event_days);
+}
+
+/// Seeds one month of every calendar account's occurrences from its local
+/// cache (M-40), so Work Offline still paints the last synced month and month
+/// navigation keeps finding cached months. Graph has no session-side replay
+/// at all, and CalDAV only replays its startup month, so this is the app-side
+/// path both backends use while paused.
+///
+/// Reads only: the cache is already the source, so nothing is written back and
+/// `last_synced_month` is only set when the loaded month is the one being
+/// displayed (the same rule the live `OccurrencesUpdated` handler uses).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seed_calendar_month_from_cache(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    worker: &Rc<Worker>,
+    reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
+    calendar_main: &Rc<CalendarMain>,
+    mini_calendar: &calendar_view::MiniCalendar,
+    mail_overview_day: &Rc<Cell<chrono::NaiveDate>>,
+    mail_overview_day_list: &gtk::Box,
+    month: chrono::NaiveDate,
+) {
+    let month = first_of_month(month);
+    let accounts: Vec<AccountId> = calendar_state.borrow().accounts.keys().cloned().collect();
+    for account_id in accounts {
+        let slot = calendar_cache_slot(calendar_state, &account_id);
+        let reply = spawn_calendar_cache_load_month(worker, slot, account_id.clone(), month);
+        let calendar_state = calendar_state.clone();
+        let reminders_engine = reminders_engine.clone();
+        let calendar_main = calendar_main.clone();
+        let mini_calendar = mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        glib::spawn_future_local(async move {
+            let Ok(Some(occurrences)) = reply.recv().await else { return };
+            reminders_engine.borrow_mut().ingest(&account_id, &occurrences);
+            let displayed_month = calendar_state.borrow().displayed_month;
+            if let Some(handle) = calendar_state.borrow_mut().accounts.get_mut(&account_id) {
+                if month == displayed_month {
+                    handle.last_occurrences = occurrences.clone();
+                    handle.last_synced_month = Some(month);
+                }
+                insert_dashboard_occurrences(&mut handle.occurrences_by_month, month, occurrences.clone());
+            }
+            let search_refresh = calendar_state.borrow().calendar_search_refresh.clone();
+            if let Some(refresh) = search_refresh {
+                refresh();
+            }
+            if month == displayed_month {
+                refresh_displayed_calendar_view(&calendar_state, &calendar_main);
+                refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+            }
+            if dashboard_month_window().contains(&month) {
+                let dashboard_refresh = calendar_state.borrow().dashboard_refresh.clone();
+                if let Some(refresh) = dashboard_refresh {
+                    refresh();
+                }
+            }
+            if calendar_view::mini_month(&mini_calendar) == month {
+                let event_days = calendar_event_days(&calendar_state, month);
+                calendar_view::set_mini_event_days(&mini_calendar, &event_days);
+            }
+        });
+    }
 }
 
 /// The local dates within `month` that have at least one occurrence from a
@@ -715,7 +789,13 @@ pub(crate) fn install_calendar_sidebar_actions(
                             .find(|c| c.id == calendar_id)
                             .map(|c| c.display_name)
                             .unwrap_or_default();
+                        let state = state.clone();
                         crate::calendar_groups::show_name_dialog(&window, "Rename calendar", "Name", "Rename", &initial, move |name| {
+                            // Calendar renames are server writes (M-40).
+                            if state.borrow().work_offline {
+                                crate::window::mail_actions::toast_working_offline(&state);
+                                return;
+                            }
                             let _ = tx.send_blocking(CalendarCommand::UpdateCalendar {
                                 calendar_id: calendar_id.clone(),
                                 display_name: name,
@@ -1477,6 +1557,10 @@ pub(crate) fn open_event_editor_for(
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
         {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
+        },
+        {
             let window = window.clone();
             let state = state.clone();
             let calendar_state = calendar_state.clone();
@@ -1986,6 +2070,10 @@ pub(crate) fn show_new_event_editor(
         calendar_attendee_suggestions(state, worker),
         profile_card.clone(),
         {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
+        },
+        {
             let window = window.clone();
             let state = state.clone();
             let calendar_state = calendar_state.clone();
@@ -2218,6 +2306,10 @@ pub(crate) fn scheduling_context(state: &Rc<RefCell<UiState>>, calendar_state: &
         let state = state.clone();
         let calendar_state = calendar_state.clone();
         Rc::new(move |request: crate::event_editor::AvailabilityRequest| {
+            if calendar_state.borrow().work_offline {
+                handle.fail(request.generation, "Working offline — availability is unknown".to_string());
+                return;
+            }
             let (cmd_tx, supported) = {
                 let st = calendar_state.borrow();
                 match st.accounts.values().find(|h| h.calendars.iter().any(|c| c.id == request.calendar_id)) {
@@ -2296,6 +2388,10 @@ pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>)
     let load: Rc<dyn Fn(CalendarId, RoomsLoaded)> = {
         let calendar_state = calendar_state.clone();
         Rc::new(move |calendar_id, on_result: RoomsLoaded| {
+            if calendar_state.borrow().work_offline {
+                on_result(Err(RoomLookupError::Unavailable("You're working offline.".to_string())));
+                return;
+            }
             let Some(account_id) = graph_calendar_account(&calendar_state, &calendar_id) else {
                 on_result(Err(RoomLookupError::Unavailable("This calendar isn't a Microsoft 365 calendar.".to_string())));
                 return;
@@ -2313,6 +2409,10 @@ pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>)
     let grant: Rc<dyn Fn(CalendarId, ConsentFinished)> = {
         let calendar_state = calendar_state.clone();
         Rc::new(move |calendar_id, on_result: ConsentFinished| {
+            if calendar_state.borrow().work_offline {
+                on_result(Err("You're working offline.".to_string()));
+                return;
+            }
             let Some(account_id) = graph_calendar_account(&calendar_state, &calendar_id) else {
                 on_result(Err("This calendar isn't a Microsoft 365 calendar.".to_string()));
                 return;
@@ -2325,6 +2425,12 @@ pub(crate) fn room_finder_context(calendar_state: &Rc<RefCell<CalendarUiState>>)
     let availability: RoomAvailabilityLookup = {
         let calendar_state = calendar_state.clone();
         Rc::new(move |calendar_id, addresses, start, end, generation, on_result: RoomAvailabilityLoaded| {
+            if calendar_state.borrow().work_offline {
+                // Attendees and rooms stay "unknown", the same as a failed
+                // lookup, instead of spinning on a request that can't run.
+                on_result(generation, Vec::new());
+                return;
+            }
             let Some(account_id) = graph_calendar_account(&calendar_state, &calendar_id) else {
                 on_result(generation, Vec::new());
                 return;
@@ -2772,8 +2878,13 @@ pub(crate) fn set_lookout_data(
 /// it would starve the mail-overview day list and the calendar tab.
 pub(crate) fn widen_calendar_sync_horizon(calendar_state: &Rc<RefCell<CalendarUiState>>) {
     let mut st = calendar_state.borrow_mut();
+    // Birthdays are synthesized from local contacts, so they keep working
+    // offline; only the account and webcal fetches are skipped (M-40).
     if let Some(birthdays) = &mut st.birthdays {
         birthdays.sync_dashboard_window();
+    }
+    if st.work_offline {
+        return;
     }
     for handle in st.accounts.values() {
         for month in dashboard_month_window() {
@@ -2824,6 +2935,13 @@ pub(crate) fn route_task_toggle(
     mut task: CalendarTask,
     completed: bool,
 ) {
+    // Work Offline (M-40): a remote completion (including rolling a recurring
+    // task forward) is a server write. Refuse it before any optimistic toast;
+    // a local task list still toggles normally.
+    if !is_local_task_calendar(&task.calendar_id) && calendar_state.borrow().work_offline {
+        toast_overlay.add_toast(adw::Toast::new("You're working offline — the task was not updated"));
+        return;
+    }
     let rolled = completed && crate::task_recurrence::roll_forward_if_completed(Some(&previous), &mut task);
     let next_due = task.due;
     route_task_save(calendar_state, tasks_view, task.calendar_id.clone(), task);
@@ -2877,6 +2995,10 @@ pub(crate) fn show_new_task_editor(
             existing: None,
             prefill: None,
             categories: &categories,
+        },
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |_calendar_id, _uid, _href, _etag| {},

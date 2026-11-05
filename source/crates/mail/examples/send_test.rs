@@ -78,7 +78,8 @@ async fn main() -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = async_channel::unbounded();
     let (_interactive_tx, interactive_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
-    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx, offline_rx));
 
     let marker = format!("Lookout send_test {}", uuid::Uuid::new_v4());
     println!("Sending self-addressed test email, subject: {marker:?}");
@@ -180,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::MoveFailed { .. } => {}
                     AccountEvent::StoreFlagsFailed { .. } => {}
                     AccountEvent::OutboxCancelled { .. } | AccountEvent::OutboxCancelFailed { .. } | AccountEvent::OutboxContents { .. } => {}
+                    AccountEvent::DraftSaveFailed { .. } => {}
                     AccountEvent::OutboxFailed { message, .. } => {
                         println!("SEND FAILED: {message}");
                         break;

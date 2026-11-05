@@ -418,9 +418,25 @@ pub(crate) fn connect_account(
             mention_addresses: config.mention_addresses.clone(),
             mention_names: config.mention_names.clone(),
         };
-        worker.spawn(lookout_graph::run_graph_mail_session(session_config, client, cmd_rx, interactive_cmd_rx, evt_tx));
+        let offline_rx = crate::window::offline::offline_receiver(&state);
+        worker.spawn(lookout_graph::run_graph_mail_session(
+            session_config,
+            client,
+            cmd_rx,
+            interactive_cmd_rx,
+            evt_tx,
+            offline_rx,
+        ));
     } else {
-        worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx));
+        let offline_rx = crate::window::offline::offline_receiver(&state);
+        worker.spawn(lookout_mail::session::run_account_session(
+            config,
+            credentials,
+            cmd_rx,
+            interactive_cmd_rx,
+            evt_tx,
+            offline_rx,
+        ));
     }
 
     spawn_account_event_loop(
@@ -1366,6 +1382,13 @@ pub(crate) fn spawn_account_event_loop(
                             let _ = tx.try_send(message_id);
                         }
                     }
+                    AccountEvent::DraftSaveFailed { message_id, message } => {
+                        // Work Offline's autosave refusal (M-40): the composer
+                        // keeps its text and updates its status label.
+                        if let Some(tx) = state.borrow().draft_save_failed_tx.clone() {
+                            let _ = tx.try_send((message_id, message));
+                        }
+                    }
                     // Every move path already showed its "… / Undo" toast
                     // the moment it was clicked (item 1.13); a second
                     // "Deleted"/"Moved" toast once the server confirms would
@@ -1637,7 +1660,15 @@ pub(crate) fn connect_other_account(
         });
     }
 
-    worker.spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_cmd_rx, evt_tx));
+    let offline_rx = crate::window::offline::offline_receiver(&state);
+    worker.spawn(lookout_mail::session::run_account_session(
+        config,
+        credentials,
+        cmd_rx,
+        interactive_cmd_rx,
+        evt_tx,
+        offline_rx,
+    ));
 
     spawn_account_event_loop(
         evt_rx,
@@ -1914,6 +1945,7 @@ pub(crate) fn connect_goa_account(
                 contacts,
                 cmd_rx,
                 refresh_contacts_ui.clone(),
+                crate::window::offline_receiver(&state),
             );
         }
     }
@@ -2206,7 +2238,8 @@ pub(crate) fn connect_google_tasks_account(
             error: None,
         },
     );
-    worker.spawn(google_tasks::run_google_tasks_session(email.clone(), cmd_rx, evt_tx));
+    let offline_rx = calendar_state.borrow().offline_rx.clone();
+    worker.spawn(google_tasks::run_google_tasks_session(email.clone(), cmd_rx, evt_tx, offline_rx));
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
@@ -2293,7 +2326,8 @@ pub(crate) fn connect_graph_todo_account(
     );
     let oauth = crate::microsoft_oauth::MicrosoftOAuth::for_account(&account_id);
     let client = lookout_graph::TodoClient::new(lookout_graph::GraphClient::new(oauth));
-    worker.spawn(lookout_graph::run_todo_session(account_id.clone(), client, cmd_rx, evt_tx));
+    let offline_rx = calendar_state.borrow().offline_rx.clone();
+    worker.spawn(lookout_graph::run_todo_session(account_id.clone(), client, cmd_rx, evt_tx, offline_rx));
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {
@@ -2517,13 +2551,24 @@ pub(crate) fn connect_calendar_account(
             scheduling: SchedulingInfo::default(),
         },
     );
+    // Work Offline (M-40): seed the displayed month from each account's cache
+    // as soon as it is registered, so a paused launch has a month to paint
+    // even for the Graph backend (which has no session-side replay).
+    {
+        let seed = calendar_state.borrow().calendar_seed_month.clone();
+        let month = calendar_state.borrow().displayed_month;
+        if let Some(seed) = seed {
+            seed(month);
+        }
+    }
 
     if microsoft_365 {
         // The Graph session needs only the account's own OAuth token provider,
         // which `MicrosoftOAuth` supplies (`lookout_graph::TokenProvider`).
         let oauth = crate::microsoft_oauth::MicrosoftOAuth::for_account(&account_id);
         let client = lookout_graph::CalendarClient::new(lookout_graph::GraphClient::new(oauth));
-        worker.spawn(lookout_graph::run_calendar_session(account_id.clone(), client, cmd_rx, evt_tx));
+        let offline_rx = calendar_state.borrow().offline_rx.clone();
+        worker.spawn(lookout_graph::run_calendar_session(account_id.clone(), client, cmd_rx, evt_tx, offline_rx));
         // Other users' calendars this account also shows (item 5.6 / CAL-25):
         // the Graph actor merges them in alongside the account's own.
         if !shared_owners.is_empty() {
@@ -2541,7 +2586,8 @@ pub(crate) fn connect_calendar_account(
             display_name,
         );
     } else {
-        worker.spawn(lookout_dav::session::run_calendar_session(config, credentials, cmd_rx, evt_tx));
+        let offline_rx = calendar_state.borrow().offline_rx.clone();
+        worker.spawn(lookout_dav::session::run_calendar_session(config, credentials, cmd_rx, evt_tx, offline_rx));
     }
 
     // Graph's session has no cache of its own, so the app writes each synced
@@ -2782,7 +2828,8 @@ pub(crate) fn spawn_webcal_session(
     }
 
     let mirror_worker = worker.clone();
-    worker.spawn(lookout_dav::subscription::run_subscription_session(subscriptions, cmd_rx, evt_tx));
+    let offline_rx = calendar_state.borrow().offline_rx.clone();
+    worker.spawn(lookout_dav::subscription::run_subscription_session(subscriptions, cmd_rx, evt_tx, offline_rx));
 
     glib::spawn_future_local(async move {
         while let Ok(event) = evt_rx.recv().await {

@@ -48,6 +48,7 @@ mod folders;
 mod graph_sync;
 mod imip;
 mod mail_actions;
+mod offline;
 mod optimistic;
 mod reading;
 mod search;
@@ -71,6 +72,7 @@ pub(crate) use folders::*;
 pub(crate) use graph_sync::*;
 pub(crate) use imip::*;
 pub(crate) use mail_actions::*;
+pub(crate) use offline::*;
 pub(crate) use optimistic::*;
 pub(crate) use reading::*;
 pub(crate) use search::*;
@@ -426,6 +428,14 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // A pure grouping row: every folder under it shows its own.
                     set_count(0);
                 }
+                TreeItem::Outbox(count) => {
+                    icon.set_visible(true);
+                    icon.set_icon_name(Some(themed_icon_name(&["mail-send-symbolic", "mail-forward-symbolic"])));
+                    label.set_label("Outbox");
+                    label.set_css_classes(&["heading", "folder-row-label"]);
+                    crate::privacy::mark_ui(&label);
+                    set_count(*count);
+                }
                 TreeItem::Account(account) => {
                     icon.set_visible(false);
                     label.set_label(&account.label);
@@ -616,6 +626,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // backup path so the toast below can tell the user where it went.
     let loaded_app_config = crate::app_config::load();
     let mut corrupt_backups = crate::app_config::take_corrupt_backups();
+    // One app-wide Work Offline signal (M-40). The sender lives on `UiState`
+    // for the whole session; every actor subscribes at spawn time, so an
+    // account created while offline starts paused instead of racing a connect.
+    let work_offline = settings.get_bool(crate::settings::WORK_OFFLINE);
+    let (offline_tx, _offline_rx) = tokio::sync::watch::channel(work_offline);
     let state = Rc::new(RefCell::new(UiState {
         accounts: HashMap::new(),
         pending_launcher_compose: false,
@@ -637,6 +652,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         desktop_contacts: Vec::new(),
         ui_db,
         settings: settings.clone(),
+        offline_tx,
+        work_offline,
+        offline_indicator: None,
+        offline_toggle: None,
+        offline_banner: None,
+        reading_stack: None,
         app_config: Rc::new(RefCell::new(loaded_app_config)),
         categories: Rc::new(RefCell::new(crate::categories::CategorySet::default())),
         deleted_contacts: HashMap::new(),
@@ -649,6 +670,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         current_mailbox: None,
         pending_message_selection: None,
         mail_view: MailView::Single,
+        pre_search_view: None,
         unified_snapshots: HashMap::new(),
         mailbox_sync_epoch: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
@@ -671,6 +693,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         rendered_follow_up: None,
         flagged_mail: HashMap::new(),
         outbox: HashMap::new(),
+        outbox_count: 0,
+        outbox_page: None,
         outbox_banner: None,
         outbox_dialog: None,
         sieve_support: HashMap::new(),
@@ -740,6 +764,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         trust_banner_dismissed: None,
         rendered_remote_scan: None,
         draft_saved_tx: None,
+        draft_save_failed_tx: None,
         composer_identities_refresh: None,
         manage_signatures: None,
         manage_templates: None,
@@ -805,6 +830,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         move || rebuild_folder_tree(&state, &folder_selection, &folder_scroller)
     }));
     let reading_stack = gtk::Stack::new();
+    state.borrow_mut().reading_stack = Some(reading_stack.clone());
     let state_clone = state.clone();
     let state_clone2 = state.clone();
     let reading_stack_clone = reading_stack.clone();
@@ -2424,6 +2450,24 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     message_list_stack.add_named(&message_scroller, Some("list"));
     message_list_stack.add_named(&message_loading_box, Some("loading"));
     message_list_stack.add_named(&message_empty_box, Some("empty"));
+    // The synthetic cross-account Outbox page (M-40): every queued send, with
+    // the same rows and actions as the "Scheduled messages" dialog.
+    let outbox_page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    fill_outbox_page(&state, &outbox_page);
+    state.borrow_mut().outbox_page = Some(outbox_page.clone());
+    let outbox_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&outbox_page)
+        .vexpand(true)
+        .build();
+    message_list_stack.add_named(&outbox_scroller, Some("outbox"));
     message_list_stack.set_visible_child_name("list");
     // Header row atop the message list: what's being shown on the left (the
     // folder's name over its account, plus the favorite star), and the list's
@@ -2752,6 +2796,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     let search_debounce: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     state.borrow_mut().search_entry = Some(search_entry.clone());
 
+    // The Work Offline banner (M-40): shown above the message list while the
+    // app-wide switch is on, with a one-click way back online.
+    let offline_banner = adw::Banner::new("Working offline — messages won't be sent or received.");
+    offline_banner.set_button_label(Some("Go online"));
+    offline_banner.set_revealed(state.borrow().work_offline);
+    {
+        let state = state.clone();
+        offline_banner.connect_button_clicked(move |_| crate::window::offline::set_work_offline(&state, false));
+    }
+    state.borrow_mut().offline_banner = Some(offline_banner.clone());
+
     // The outbox banner (item 1.14): "N scheduled messages" (or waiting /
     // failed ones) above the list, opening the "Scheduled messages" dialog.
     // Revealed by `refresh_outbox_ui` whenever an `OutboxContents` arrives.
@@ -2778,6 +2833,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let message_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     message_box.append(&message_header_row);
+    message_box.append(&offline_banner);
     message_box.append(&outbox_banner);
     message_box.append(&automatic_replies_banner);
     message_box.append(&column_header_row);
@@ -4115,6 +4171,22 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     settings_button.set_tooltip_text(Some("Settings"));
     window_header.pack_end(&settings_button);
     window_header.pack_end(&header_privacy_toggle);
+    // Work Offline's title-bar indicator (M-40): visible in every module
+    // while the switch is on, so the paused state is never a Mail-only secret.
+    // Clicking it is the "Go online" action.
+    let offline_indicator = gtk::Button::builder()
+        .icon_name("network-offline-symbolic")
+        .tooltip_text("Working offline — mail, calendar, contacts and tasks won't sync. Click to go online.")
+        .css_classes(["flat"])
+        .visible(state.borrow().work_offline)
+        .build();
+    offline_indicator.set_widget_name("offline-indicator");
+    {
+        let state = state.clone();
+        offline_indicator.connect_clicked(move |_| crate::window::offline::set_work_offline(&state, false));
+    }
+    state.borrow_mut().offline_indicator = Some(offline_indicator.clone());
+    window_header.pack_end(&offline_indicator);
     #[cfg(debug_assertions)]
     window_header.pack_end(&open_eml_button);
 
@@ -4887,6 +4959,42 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         group.button(&add_account_button, "list-add-symbolic", "Add Account");
         group.button(&account_settings_button, "preferences-system-symbolic", "Account Settings");
     });
+    // Work Offline (M-40): the app-wide switch, in Outlook's Send / Receive
+    // ▸ Preferences group. The title-bar indicator and the Mail banner offer
+    // the same state, so all three stay in step through `set_work_offline`.
+    let work_offline_toggle = gtk::ToggleButton::new();
+    work_offline_toggle.set_active(state.borrow().work_offline);
+    let work_offline_icon = state.borrow().work_offline;
+    let work_offline_ribbon = send_receive_band.group("Preferences", |group| {
+        group.toggle(
+            &work_offline_toggle,
+            if work_offline_icon {
+                "network-offline-symbolic"
+            } else {
+                "network-transmit-receive-symbolic"
+            },
+            "Work Offline",
+        )
+    });
+    let work_offline_ribbon = Rc::new(work_offline_ribbon);
+    state.borrow_mut().offline_toggle = Some(work_offline_toggle.clone());
+    {
+        let state = state.clone();
+        let icon = work_offline_ribbon.clone();
+        work_offline_toggle.connect_toggled(move |button| {
+            icon.set_icon_name(if button.is_active() {
+                "network-offline-symbolic"
+            } else {
+                "network-transmit-receive-symbolic"
+            });
+            // The banner/indicator call `set_work_offline`, which sets this
+            // toggle programmatically; the state check keeps that echo from
+            // writing the preference twice or looping.
+            if state.borrow().work_offline != button.is_active() {
+                crate::window::offline::set_work_offline(&state, button.is_active());
+            }
+        });
+    }
     let send_receive_toolbar = send_receive_band.root().clone();
 
     // --- Folder tab: the open folder's own commands, run through the folder
@@ -7082,6 +7190,9 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         accounts: HashMap::new(),
         calendar_cache_slots: HashMap::new(),
         displayed_month: current_month_start(),
+        work_offline: state.borrow().work_offline,
+        offline_rx: state.borrow().offline_tx.subscribe(),
+        calendar_seed_month: None,
         checked_calendar_ids: HashSet::new(),
         calendar_colors: loaded_calendar_colors,
         webcal_cmd_tx: None,
@@ -7740,6 +7851,31 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // (that's the main Calendar view's own concern).
     let mail_overview_day: Rc<Cell<chrono::NaiveDate>> = Rc::new(Cell::new(crate::calendar_tz::display_zone().today()));
     refresh_mail_overview_day_list(&calendar_state, mail_overview_day.get(), &mail_overview_day_list);
+    // Work Offline's app-side month seed (M-40): the Graph calendar session
+    // has no replay and CalDAV only replays its startup month, so both read
+    // the cache here when the toggle goes offline or the displayed month
+    // changes while paused.
+    {
+        let seed_calendar_state = calendar_state.clone();
+        let seed_worker = worker.clone();
+        let seed_reminders = reminders_engine.clone();
+        let seed_calendar_main = calendar_main.clone();
+        let seed_mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let seed_overview_day = mail_overview_day.clone();
+        let seed_overview_list = mail_overview_day_list.clone();
+        calendar_state.borrow_mut().calendar_seed_month = Some(Rc::new(move |month| {
+            seed_calendar_month_from_cache(
+                &seed_calendar_state,
+                &seed_worker,
+                &seed_reminders,
+                &seed_calendar_main,
+                &seed_mini_calendar,
+                &seed_overview_day,
+                &seed_overview_list,
+                month,
+            );
+        }));
+    }
 
     // The overview panel's "Upcoming events" section needs the 90-day
     // window fetched; switching to the Mail screen widens it, the same way
@@ -10671,6 +10807,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                                             contacts_account,
                                             cmd_rx,
                                             refresh_contacts_ui.clone(),
+                                            offline_receiver(&state),
                                         );
                                         refresh_contacts_ui(None);
                                     }
@@ -12298,7 +12435,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let state = state.clone();
         let monitor = gio::NetworkMonitor::default();
         monitor.connect_network_changed(move |_monitor, available| {
-            if !available {
+            if !available || state.borrow().work_offline {
                 return;
             }
             for handle in state.borrow().accounts.values() {
@@ -12319,6 +12456,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let worker = worker.clone();
         let message_list = message_list.clone();
         let message_list_stack = message_list_stack.clone();
+        let reading_stack = reading_stack.clone();
         let list_header = list_header.clone();
         let search_entry = search_entry.clone();
         folder_selection.connect_selected_item_notify(move |sel| {
@@ -12337,6 +12475,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     // search; leave it and let the selection take over.
                     exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, &search_entry);
                     enter_unified_inbox(&state, &message_list, &message_list_stack);
+                    refresh_list_header(&state, &list_header);
+                }
+                TreeItem::Outbox(_) => {
+                    drop(tree_item);
+                    exit_search(&state, &worker, &message_list, &message_list_stack, &list_header, &search_entry);
+                    enter_outbox_view(&state, &message_list_stack, &reading_stack);
                     refresh_list_header(&state, &list_header);
                 }
                 TreeItem::Folder(node) | TreeItem::Favorite(node) => {
@@ -13044,11 +13188,17 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         });
     }
     {
+        let state = state.clone();
         let calendar_state = calendar_state.clone();
         let tasks_view = tasks_view.clone();
         tasks_view_button.connect_toggled(move |btn| {
             if btn.is_active() {
                 refresh_tasks_view(&calendar_state, &tasks_view);
+                // Work Offline (M-40): the Tasks view still paints from its
+                // caches; the Refresh burst waits for the reconnect.
+                if state.borrow().work_offline {
+                    return;
+                }
                 for handle in calendar_state.borrow().accounts.values() {
                     let _ = handle.cmd_tx.send_blocking(CalendarCommand::SyncTasks);
                 }

@@ -107,6 +107,10 @@ pub(crate) fn show_create_task_for_email(
             prefill: Some(&seed),
             categories: &categories,
         },
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
+        },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |_calendar_id, _uid, _href, _etag| {},
     );
@@ -172,6 +176,10 @@ pub(crate) fn open_task_editor_for(
             existing: Some(task),
             prefill: None,
             categories: &categories,
+        },
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
         },
         move |calendar_id, task| route_task_save(&calendar_state, &tasks_view, calendar_id, task),
         move |calendar_id, uid, href, etag| route_task_delete(&calendar_state_for_delete, &tasks_view_for_delete, calendar_id, uid, href, etag),
@@ -1803,6 +1811,7 @@ pub(crate) fn select_mailbox(
             &st.settings,
             &LastSelection {
                 unified: false,
+                outbox: false,
                 mailbox: Some(mailbox_id.0.clone()),
             },
         );
@@ -1884,6 +1893,11 @@ pub(crate) fn select_mailbox(
 /// (every reconnect re-lists folders), so a request that dies with a dropped
 /// connection can never permanently suppress a later one.
 pub(crate) fn request_mailbox_sync(state: &Rc<RefCell<UiState>>, account_id: &AccountId, mailbox_id: &MailboxId) -> bool {
+    // Work Offline (M-40): don't mark the mailbox syncing either - a spinner
+    // that can never clear is worse than a plain cached list.
+    if state.borrow().work_offline {
+        return false;
+    }
     if state.borrow().syncing.contains(mailbox_id) {
         return false;
     }
@@ -1999,6 +2013,11 @@ pub(crate) fn clear_account_syncing(state: &Rc<RefCell<UiState>>, account_id: &A
 /// that can change either input: a `repopulate`, or a `syncing`/
 /// `FoldersUpdated` change.
 pub(crate) fn refresh_message_loading_state(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, message_list_stack: &gtk::Stack) {
+    // The Outbox page owns the stack in this view; a mailbox rebuild or sync
+    // change must not swap it for list/loading/empty.
+    if matches!(state.borrow().mail_view, MailView::Outbox) {
+        return;
+    }
     let empty = message_list.selection.n_items() == 0;
     let waiting = if empty {
         let (mail_view, current_mailbox, syncing) = {
@@ -2008,7 +2027,9 @@ pub(crate) fn refresh_message_loading_state(state: &Rc<RefCell<UiState>>, messag
         match mail_view {
             MailView::Single => current_mailbox.is_some_and(|m| syncing.contains(&m)),
             MailView::UnifiedInbox => account_inboxes(state).into_iter().any(|(_, inbox)| syncing.contains(&inbox)),
-            MailView::Search => false,
+            // The Outbox page is built from `UiState::outbox`, never from a
+            // mailbox sync, so it must not be replaced by list/loading/empty.
+            MailView::Search | MailView::Outbox => false,
         }
     } else {
         false
@@ -2033,6 +2054,15 @@ pub(crate) fn account_inboxes(state: &Rc<RefCell<UiState>>) -> Vec<(AccountId, M
         .collect()
 }
 
+/// The shared "you asked for a network action while paused" toast (M-40).
+/// Uses the window's toast overlay so a guard never leaves a dead spinner
+/// behind without explaining why nothing happened.
+pub(crate) fn toast_working_offline(state: &Rc<RefCell<UiState>>) {
+    if let Some(overlay) = state.borrow().toast_overlay.clone() {
+        overlay.add_toast(adw::Toast::new("You're working offline"));
+    }
+}
+
 /// Re-syncs whatever the message list is currently showing: the open mailbox,
 /// or every account's Inbox in the unified view - then, for the same
 /// account(s), bumps their standard background refresh along too
@@ -2044,6 +2074,10 @@ pub(crate) fn account_inboxes(state: &Rc<RefCell<UiState>>) -> Vec<(AccountId, M
 /// being FIFO means the highlighted folder's own sync always lands first,
 /// with the account-wide relist following behind it.
 pub(crate) fn resync_current_view(state: &Rc<RefCell<UiState>>) {
+    if state.borrow().work_offline {
+        toast_working_offline(state);
+        return;
+    }
     if matches!(state.borrow().mail_view, MailView::UnifiedInbox) {
         for (account_id, inbox_id) in account_inboxes(state) {
             request_mailbox_sync(state, &account_id, &inbox_id);
@@ -2066,6 +2100,10 @@ pub(crate) fn resync_current_view(state: &Rc<RefCell<UiState>>) {
 /// behind them. The outbox needs nothing extra - it drains on its own clock.
 /// Both requests dedupe, so pressing it again while they run is a no-op.
 pub(crate) fn send_receive_all(state: &Rc<RefCell<UiState>>) {
+    if state.borrow().work_offline {
+        toast_working_offline(state);
+        return;
+    }
     resync_current_view(state);
     for (account_id, inbox_id) in account_inboxes(state) {
         request_mailbox_sync(state, &account_id, &inbox_id);
@@ -2082,6 +2120,9 @@ pub(crate) fn send_receive_all(state: &Rc<RefCell<UiState>>) {
 /// refresh's relist has landed would queue a second one behind it for no
 /// benefit.
 pub(crate) fn request_account_refresh(state: &Rc<RefCell<UiState>>, account_id: &AccountId) {
+    if state.borrow().work_offline {
+        return;
+    }
     if state.borrow().refreshing.contains(account_id) {
         return;
     }

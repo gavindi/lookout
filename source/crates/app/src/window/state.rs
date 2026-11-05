@@ -141,6 +141,9 @@ pub(crate) struct DiscoveredGoaAccount {
 pub(crate) enum MailView {
     Single,
     UnifiedInbox,
+    /// The synthetic cross-account Outbox (M-40): every account's queued
+    /// sends in one list, read from `UiState::outbox`.
+    Outbox,
     /// Full-text search results across the local FTS index plus the live IMAP
     /// pass on the open mailbox. Only ever active with a non-empty
     /// `UiState::search_query`; exiting search restores the pre-search view.
@@ -1306,6 +1309,29 @@ pub(crate) struct UiState {
     /// The GSettings-backed preference store (see `settings`), resolved once
     /// in `build_window` and written through on every preference change.
     pub(crate) settings: Rc<crate::settings::SettingsStore>,
+    /// The one app-wide **Work Offline** signal (M-40). Kept alive for the
+    /// app's lifetime; every network actor receives a clone of
+    /// `subscribe()`'s receiver at spawn time, so an account created while
+    /// offline starts with `true` and never races the first connect. A
+    /// receiver's `changed()` returns `Err` only if this sender is dropped, so
+    /// actors must treat that as "the signal is gone", never spin on it.
+    pub(crate) offline_tx: tokio::sync::watch::Sender<bool>,
+    /// The current Work Offline state, mirrored here so the UI guards can
+    /// answer without reading GSettings on every click.
+    pub(crate) work_offline: bool,
+    /// The title-bar "working offline" indicator, revealed while offline and
+    /// hidden while online. `None` until `build_window` creates it.
+    pub(crate) offline_indicator: Option<gtk::Button>,
+    /// The Send / Receive tab's Work Offline toggle, kept in step when the
+    /// banner or title-bar indicator puts the app back online.
+    pub(crate) offline_toggle: Option<gtk::ToggleButton>,
+    /// The Mail module's offline banner (beside the outbox and automatic-
+    /// replies banners), revealed while offline.
+    pub(crate) offline_banner: Option<adw::Banner>,
+    /// The reading pane's stack, so going offline can turn a pending body
+    /// fetch into the "message unavailable" page instead of leaving its
+    /// spinner running. Set once the stack exists.
+    pub(crate) reading_stack: Option<gtk::Stack>,
     /// The relational-data config (`settings.json`): sending identities and
     /// folder-role overrides. Loaded at startup, written through by the
     /// manage-identities dialog. `pub(crate)` so the rules engine
@@ -1362,6 +1388,10 @@ pub(crate) struct UiState {
     /// off `current_mailbox` exactly as before; `UnifiedInbox` instead merges
     /// every connected account's Inbox (see `unified_snapshots`).
     pub(crate) mail_view: MailView,
+    /// The view `start_search` replaced, restored by `exit_search` - so a
+    /// search started from Outbox returns to Outbox instead of guessing from
+    /// `current_mailbox` (M-40 / F5).
+    pub(crate) pre_search_view: Option<MailView>,
     /// The latest per-mailbox message sets for the unified view, filled from
     /// each account's `MessagesUpdated` events while `mail_view` is
     /// `UnifiedInbox`. The visible list is the union of these, deduplicated
@@ -1479,6 +1509,13 @@ pub(crate) struct UiState {
     /// (item 1.14): scheduled sends, messages waiting to go out, and ones
     /// that failed.
     pub(crate) outbox: HashMap<AccountId, Vec<lookout_mail::session::OutboxItem>>,
+    /// Total rows across every account's outbox, failed included - the
+    /// synthetic Outbox row's badge (M-40) and the value that decides whether
+    /// an `OutboxContents` needs a folder-tree rebuild.
+    pub(crate) outbox_count: u32,
+    /// The Outbox folder page's row container, refreshed by
+    /// `refresh_outbox_ui` whenever the queue changes.
+    pub(crate) outbox_page: Option<gtk::Box>,
     /// The "N scheduled messages" banner above the message list. `None`
     /// only in tests.
     pub(crate) outbox_banner: Option<adw::Banner>,
@@ -1861,6 +1898,11 @@ pub(crate) struct UiState {
     /// open; replaced whenever a new composer opens (dropping the previous
     /// sender lets the old composer's consumer exit).
     pub(crate) draft_saved_tx: Option<async_channel::Sender<String>>,
+    /// Relay to the currently-open composer for a draft autosave that could
+    /// not be stored - currently only Work Offline's "Not saved — working
+    /// offline" status (M-40). Carries `(message_id, detail)`; the composer
+    /// acts only on its own id.
+    pub(crate) draft_save_failed_tx: Option<async_channel::Sender<(String, String)>>,
     /// Refresh hook for the currently-open composer's From dropdown: the
     /// Config → Mail accounts manage-identities dialog fires it after every
     /// change, so an identity added/edited while a composer is open shows up
@@ -2336,6 +2378,20 @@ pub(crate) struct CalendarUiState {
     /// "Clear all caches", since the slot keeps a connection to the file.
     pub(crate) calendar_cache_slots: HashMap<AccountId, Arc<CalendarCacheSlot>>,
     pub(crate) displayed_month: chrono::NaiveDate,
+    /// Mirrors `UiState::work_offline` so the calendar glue's entry points
+    /// (month changes, the dashboard horizon, the Tasks Refresh action) can
+    /// skip requests that can never be answered. Kept in step by
+    /// `window::offline::set_work_offline`.
+    pub(crate) work_offline: bool,
+    /// A subscription to the app-wide Work Offline signal, for the calendar,
+    /// Graph calendar, webcal, Google Tasks and Graph To Do actors spawned
+    /// from calendar glue (which only carries this state, not `UiState`).
+    pub(crate) offline_rx: tokio::sync::watch::Receiver<bool>,
+    /// Seeds one month of every account's occurrences from its local cache
+    /// (M-40). Registered by the window once the calendar views and the
+    /// reminder engine exist; used when going offline, when the displayed
+    /// month changes offline, and once after each account is discovered.
+    pub(crate) calendar_seed_month: Option<Rc<dyn Fn(chrono::NaiveDate)>>,
     /// Which calendars (by id) are currently shown - unioned in
     /// `refresh_displayed_calendar_view`, toggled from the sidebar's "My
     /// calendars" checklist. Newly-discovered calendars default to checked

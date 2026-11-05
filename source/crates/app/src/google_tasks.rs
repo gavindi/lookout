@@ -626,11 +626,16 @@ pub enum GoogleTasksEvent {
 /// `POLL_INTERVAL` and answers write commands immediately, resyncing after
 /// each write. Returns (instead of looping forever) when the token is gone -
 /// re-authorization is an interactive step only the UI can trigger.
-pub async fn run_google_tasks_session(email: String, commands: async_channel::Receiver<GoogleTasksCommand>, events: async_channel::Sender<GoogleTasksEvent>) {
+pub async fn run_google_tasks_session(
+    email: String,
+    commands: async_channel::Receiver<GoogleTasksCommand>,
+    events: async_channel::Sender<GoogleTasksEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let oauth = GoogleTasksOAuth::new(&email);
     let client = GoogleTasksClient::new();
 
-    // Fast first paint from the last session's cache.
+    // Fast first paint from the last session's cache, before any token work.
     if let Some(cache) = load_cache(&email) {
         if !cache.lists.is_empty() {
             let _ = events.send(GoogleTasksEvent::ListsUpdated(cache.lists)).await;
@@ -638,109 +643,189 @@ pub async fn run_google_tasks_session(email: String, commands: async_channel::Re
         let _ = events.send(GoogleTasksEvent::TasksUpdated(cache.tasks)).await;
     }
 
-    // The first connect uses the stored refresh token only - never a browser
-    // from a background spawn. If nothing is stored (or it was rejected), the
-    // session reports it and exits; the UI's explicit connect action runs the
-    // interactive flow and re-spawns us.
-    let token = match oauth.try_access_token().await {
-        Ok(Some(token)) => token,
-        Ok(None) => {
-            let _ = events
-                .send(GoogleTasksEvent::Error(format!("Google Tasks for {email} needs authorization - use Connect Google Tasks")))
-                .await;
+    'session: loop {
+        // Work Offline (M-40): park before the token refresh, so an offline
+        // launch makes no OAuth or API request at all.
+        if *offline_rx.borrow() && !wait_offline(&commands, &events, &mut offline_rx).await {
             return;
         }
-        Err(e) => {
-            let _ = events.send(GoogleTasksEvent::Error(format!("Google Tasks for {email}: {e}"))).await;
-            return;
-        }
-    };
-    let mut token = Some(token);
-
-    loop {
-        let Some(current) = &token else { return };
-        match sync(&client, &email, current, &events).await {
-            Ok(()) => {}
-            Err(SessionError::Unauthorized) => {
+        // The first connect uses the stored refresh token only - never a
+        // browser from a background spawn. If nothing is stored (or it was
+        // rejected), the session reports it and exits; the UI's explicit
+        // connect action runs the interactive flow and re-spawns us.
+        let token = match oauth.try_access_token().await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
                 let _ = events
-                    .send(GoogleTasksEvent::Error(format!(
-                        "Google Tasks for {email} is no longer authorized - use Connect Google Tasks to sign in again"
-                    )))
+                    .send(GoogleTasksEvent::Error(format!("Google Tasks for {email} needs authorization - use Connect Google Tasks")))
                     .await;
                 return;
             }
-            Err(SessionError::Transient(message)) => {
-                tracing::warn!("google tasks sync error for {email}, will retry: {message}");
+            Err(e) => {
+                let _ = events.send(GoogleTasksEvent::Error(format!("Google Tasks for {email}: {e}"))).await;
+                return;
             }
+        };
+        let mut token = Some(token);
+        // The toggle can win the race with token acquisition.
+        if *offline_rx.borrow() {
+            continue 'session;
         }
 
-        enum Wake {
-            Poll,
-            Command(GoogleTasksCommand),
-            ChannelClosed,
-        }
-        let wake = tokio::select! {
-            _ = tokio::time::sleep(POLL_INTERVAL) => Wake::Poll,
-            c = commands.recv() => match c {
-                Ok(cmd) => Wake::Command(cmd),
-                Err(_) => Wake::ChannelClosed,
-            },
-        };
-        match wake {
-            Wake::Poll => {
-                if let Some(new_token) = refresh_token(&oauth).await {
-                    token = Some(new_token);
+        loop {
+            let Some(current) = &token else { return };
+            match sync(&client, &email, current, &events).await {
+                Ok(()) => {}
+                Err(SessionError::Unauthorized) => {
+                    let _ = events
+                        .send(GoogleTasksEvent::Error(format!(
+                            "Google Tasks for {email} is no longer authorized - use Connect Google Tasks to sign in again"
+                        )))
+                        .await;
+                    return;
+                }
+                Err(SessionError::Transient(message)) => {
+                    tracing::warn!("google tasks sync error for {email}, will retry: {message}");
+                }
+            }
+
+            enum Wake {
+                Poll,
+                Command(GoogleTasksCommand),
+                Offline,
+                ChannelClosed,
+            }
+            let wake = tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => Wake::Poll,
+                c = commands.recv() => match c {
+                    Ok(cmd) => Wake::Command(cmd),
+                    Err(_) => Wake::ChannelClosed,
+                },
+                changed = offline_rx.changed() => match changed {
+                    Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                    Ok(()) => Wake::Poll,
+                    Err(_) => Wake::ChannelClosed,
+                },
+            };
+            match wake {
+                Wake::Poll => {
+                    if *offline_rx.borrow() {
+                        continue 'session;
+                    }
+                    if let Some(new_token) = refresh_token(&oauth).await {
+                        token = Some(new_token);
+                        if let Some(current) = &token {
+                            let _ = sync(&client, &email, current, &events).await;
+                        }
+                    }
+                }
+                Wake::Command(cmd) => {
+                    // A command that arrived with the toggle must not trigger
+                    // the token refresh or the network write.
+                    if *offline_rx.borrow() {
+                        continue 'session;
+                    }
+                    let Some(current) = refresh_token(&oauth).await else { return };
+                    token = Some(current.clone());
+                    match cmd {
+                        GoogleTasksCommand::Refresh => {}
+                        GoogleTasksCommand::CreateTask { list_id, task } => {
+                            if let Err(e) = client.create_task(&current, &list_id, &task_to_write(&task)).await {
+                                let _ = events
+                                    .send(GoogleTasksEvent::Error(format!("couldn't save task \"{}\": {}", task.uid, api_error_string(e))))
+                                    .await;
+                            }
+                        }
+                        GoogleTasksCommand::UpdateTask { list_id, task } => {
+                            if let Err(e) = client.update_task(&current, &list_id, &task.uid.0, &task_to_write(&task)).await {
+                                let _ = events
+                                    .send(GoogleTasksEvent::Error(format!("couldn't save task \"{}\": {}", task.uid, api_error_string(e))))
+                                    .await;
+                            }
+                        }
+                        GoogleTasksCommand::DeleteTask { list_id, task_id } => {
+                            if let Err(e) = client.delete_task(&current, &list_id, &task_id).await {
+                                let _ = events.send(GoogleTasksEvent::Error(format!("couldn't delete task: {}", api_error_string(e)))).await;
+                            }
+                        }
+                        // List lifecycle (item 4.8 / T-01); each resyncs below.
+                        GoogleTasksCommand::CreateList { title } => {
+                            if let Err(e) = client.create_task_list(&current, &title).await {
+                                let _ = events.send(GoogleTasksEvent::Error(format!("couldn't create the list: {}", api_error_string(e)))).await;
+                            }
+                        }
+                        GoogleTasksCommand::RenameList { list_id, title } => {
+                            if let Err(e) = client.rename_task_list(&current, &list_id, &title).await {
+                                let _ = events.send(GoogleTasksEvent::Error(format!("couldn't rename the list: {}", api_error_string(e)))).await;
+                            }
+                        }
+                        GoogleTasksCommand::DeleteList { list_id } => {
+                            if let Err(e) = client.delete_task_list(&current, &list_id).await {
+                                let _ = events.send(GoogleTasksEvent::Error(format!("couldn't delete the list: {}", api_error_string(e)))).await;
+                            }
+                        }
+                    }
                     if let Some(current) = &token {
                         let _ = sync(&client, &email, current, &events).await;
                     }
                 }
+                Wake::Offline => continue 'session,
+                Wake::ChannelClosed => return,
             }
-            Wake::Command(cmd) => {
-                let Some(current) = refresh_token(&oauth).await else { return };
-                token = Some(current.clone());
-                match cmd {
-                    GoogleTasksCommand::Refresh => {}
-                    GoogleTasksCommand::CreateTask { list_id, task } => {
-                        if let Err(e) = client.create_task(&current, &list_id, &task_to_write(&task)).await {
-                            let _ = events
-                                .send(GoogleTasksEvent::Error(format!("couldn't save task \"{}\": {}", task.uid, api_error_string(e))))
-                                .await;
-                        }
-                    }
-                    GoogleTasksCommand::UpdateTask { list_id, task } => {
-                        if let Err(e) = client.update_task(&current, &list_id, &task.uid.0, &task_to_write(&task)).await {
-                            let _ = events
-                                .send(GoogleTasksEvent::Error(format!("couldn't save task \"{}\": {}", task.uid, api_error_string(e))))
-                                .await;
-                        }
-                    }
-                    GoogleTasksCommand::DeleteTask { list_id, task_id } => {
-                        if let Err(e) = client.delete_task(&current, &list_id, &task_id).await {
-                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't delete task: {}", api_error_string(e)))).await;
-                        }
-                    }
-                    // List lifecycle (item 4.8 / T-01); each resyncs below.
-                    GoogleTasksCommand::CreateList { title } => {
-                        if let Err(e) = client.create_task_list(&current, &title).await {
-                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't create the list: {}", api_error_string(e)))).await;
-                        }
-                    }
-                    GoogleTasksCommand::RenameList { list_id, title } => {
-                        if let Err(e) = client.rename_task_list(&current, &list_id, &title).await {
-                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't rename the list: {}", api_error_string(e)))).await;
-                        }
-                    }
-                    GoogleTasksCommand::DeleteList { list_id } => {
-                        if let Err(e) = client.delete_task_list(&current, &list_id).await {
-                            let _ = events.send(GoogleTasksEvent::Error(format!("couldn't delete the list: {}", api_error_string(e)))).await;
-                        }
+        }
+    }
+}
+
+/// Parks a Google Tasks account while Work Offline is on (M-40). Writes emit
+/// the same offline `Error` the UI already toasts; `Refresh` is ignored.
+/// Returns `true` when the signal goes back online, `false` on shutdown.
+async fn wait_offline(
+    commands: &async_channel::Receiver<GoogleTasksCommand>,
+    events: &async_channel::Sender<GoogleTasksEvent>,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return true;
                     }
                 }
-                if let Some(current) = &token {
-                    let _ = sync(&client, &email, current, &events).await;
+                Err(_) => return false,
+            },
+            command = commands.recv() => match command {
+                Ok(GoogleTasksCommand::Refresh) => {}
+                Ok(GoogleTasksCommand::CreateTask { task, .. }) | Ok(GoogleTasksCommand::UpdateTask { task, .. }) => {
+                    let _ = events
+                        .send(GoogleTasksEvent::Error(format!(
+                            "You're working offline — the task \"{}\" was not saved",
+                            task.uid
+                        )))
+                        .await;
                 }
-            }
-            Wake::ChannelClosed => return,
+                Ok(GoogleTasksCommand::DeleteTask { .. }) => {
+                    let _ = events
+                        .send(GoogleTasksEvent::Error("You're working offline — the task was not deleted".to_string()))
+                        .await;
+                }
+                Ok(GoogleTasksCommand::CreateList { .. }) => {
+                    let _ = events
+                        .send(GoogleTasksEvent::Error("You're working offline — the list was not created".to_string()))
+                        .await;
+                }
+                Ok(GoogleTasksCommand::RenameList { .. }) => {
+                    let _ = events
+                        .send(GoogleTasksEvent::Error("You're working offline — the list was not renamed".to_string()))
+                        .await;
+                }
+                Ok(GoogleTasksCommand::DeleteList { .. }) => {
+                    let _ = events
+                        .send(GoogleTasksEvent::Error("You're working offline — the list was not deleted".to_string()))
+                        .await;
+                }
+                Err(_) => return false,
+            },
         }
     }
 }
@@ -855,6 +940,81 @@ mod tests {
         assert_eq!(id.0, "googletasks:abc123");
         assert_eq!(google_task_list_id(&id), Some("abc123"));
         assert_eq!(google_task_list_id(&CalendarId("other".to_string())), None);
+    }
+
+    /// Work Offline (M-40 / T2): the cache paints before any token work, and
+    /// writes are refused locally instead of waiting for an authorization
+    /// attempt.
+    #[tokio::test]
+    async fn offline_session_paints_cache_without_authorizing() {
+        let email = format!(
+            "offline-{}-{}@example.com",
+            std::process::id(),
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let _ = std::fs::remove_file(cache_path(&email));
+        let lists = vec![TaskList {
+            id: "l1".to_string(),
+            title: "Cached list".to_string(),
+        }];
+        let tasks = vec![CalendarTask {
+            uid: lookout_core::TaskUid("cached-task".to_string()),
+            calendar_id: google_task_calendar_id("l1"),
+            summary: Some("Cached task".to_string()),
+            description: None,
+            due: None,
+            start: None,
+            rrule: None,
+            created: None,
+            completed: None,
+            status: lookout_core::TaskStatus::NeedsAction,
+            priority: lookout_core::TaskPriority(0),
+            percent_complete: None,
+            reminder_minutes_before: None,
+            categories: Vec::new(),
+            href: None,
+            etag: None,
+        }];
+        store_cache(&email, &lists, &tasks);
+
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+        let handle = tokio::spawn(run_google_tasks_session(email.clone(), cmd_rx, evt_tx, offline_rx));
+
+        let mut saw_lists = false;
+        let mut saw_tasks = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(GoogleTasksEvent::ListsUpdated(value))) => saw_lists = value.len() == 1,
+                Ok(Ok(GoogleTasksEvent::TasksUpdated(value))) => saw_tasks = value.len() == 1,
+                Ok(Ok(GoogleTasksEvent::Error(message))) => panic!("unexpected error before authorization: {message}"),
+                _ => break,
+            }
+            if saw_lists && saw_tasks {
+                break;
+            }
+        }
+        assert!(saw_lists && saw_tasks, "the cache paints offline");
+
+        cmd_tx
+            .send(GoogleTasksCommand::DeleteTask {
+                list_id: "l1".to_string(),
+                task_id: "cached-task".to_string(),
+            })
+            .await
+            .unwrap();
+        let refused = loop {
+            if let Ok(Ok(GoogleTasksEvent::Error(message))) = tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                break message;
+            }
+        };
+        assert!(refused.contains("working offline"), "unexpected refusal: {refused}");
+
+        offline_tx.send(false).unwrap();
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = std::fs::remove_file(cache_path(&email));
     }
 
     #[test]

@@ -385,6 +385,17 @@ pub(crate) fn send_account_command(state: &Rc<RefCell<UiState>>, account_id: &Ac
 /// "Sending: …" toast is still up (undo send, item 1.13) - that toast already
 /// covers it, and listing it too would flash the banner on every send.
 pub(crate) fn listed_outbox_items(st: &UiState) -> Vec<(AccountId, Vec<lookout_mail::session::OutboxItem>)> {
+    grouped_outbox_items(st, false)
+}
+
+/// Every outbox row, including one whose own "Sending: …" toast is still up -
+/// the Outbox folder's list, which must not hide a queued message. The banner
+/// and the "Scheduled messages" dialog use [`listed_outbox_items`] instead.
+pub(crate) fn all_outbox_items(st: &UiState) -> Vec<(AccountId, Vec<lookout_mail::session::OutboxItem>)> {
+    grouped_outbox_items(st, true)
+}
+
+fn grouped_outbox_items(st: &UiState, include_sending: bool) -> Vec<(AccountId, Vec<lookout_mail::session::OutboxItem>)> {
     let mut accounts: Vec<&AccountId> = st.outbox.keys().collect();
     accounts.sort_by(|a, b| a.0.cmp(&b.0));
     accounts
@@ -392,7 +403,7 @@ pub(crate) fn listed_outbox_items(st: &UiState) -> Vec<(AccountId, Vec<lookout_m
         .filter_map(|account_id| {
             let items: Vec<_> = st.outbox[account_id]
                 .iter()
-                .filter(|item| !st.pending_sends.iter().any(|p| !p.scheduled && p.account_id == *account_id && p.outbox_id == Some(item.id)))
+                .filter(|item| include_sending || !st.pending_sends.iter().any(|p| !p.scheduled && p.account_id == *account_id && p.outbox_id == Some(item.id)))
                 .cloned()
                 .collect();
             (!items.is_empty()).then(|| (account_id.clone(), items))
@@ -423,12 +434,22 @@ pub(crate) fn outbox_banner_text(items: &[&lookout_mail::session::OutboxItem], n
 /// dialog from `UiState::outbox` (item 1.14). An open dialog with nothing
 /// left to list closes itself.
 pub(crate) fn refresh_outbox_ui(state: &Rc<RefCell<UiState>>) {
-    let (banner, dialog, title, empty) = {
-        let st = state.borrow();
+    let (banner, dialog, title, empty, page, count_changed) = {
+        let mut st = state.borrow_mut();
+        let total: u32 = st.outbox.values().map(|items| items.len() as u32).sum();
+        let count_changed = st.outbox_count != total;
+        st.outbox_count = total;
         let listed = listed_outbox_items(&st);
         let items: Vec<_> = listed.iter().flat_map(|(_, items)| items.iter()).collect();
         let title = outbox_banner_text(&items, chrono::Utc::now());
-        (st.outbox_banner.clone(), st.outbox_dialog.clone(), title, listed.is_empty())
+        (
+            st.outbox_banner.clone(),
+            st.outbox_dialog.clone(),
+            title,
+            listed.is_empty(),
+            st.outbox_page.clone(),
+            count_changed,
+        )
     };
     if let Some(banner) = banner {
         if let Some(title) = &title {
@@ -441,6 +462,14 @@ pub(crate) fn refresh_outbox_ui(state: &Rc<RefCell<UiState>>) {
             dialog.close();
         } else {
             fill_outbox_dialog(state, &list);
+        }
+    }
+    if let Some(page) = page {
+        fill_outbox_page(state, &page);
+    }
+    if count_changed {
+        if let Some(refresh) = state.borrow().folder_tree_refresh.clone() {
+            refresh();
         }
     }
 }
@@ -477,85 +506,140 @@ pub(crate) fn present_outbox_dialog(state: &Rc<RefCell<UiState>>, parent: &impl 
 /// with "Send now" (or "Retry" for a failed one) and "Edit", which withdraws
 /// it from the outbox and reopens it in the composer (on `OutboxCancelled`).
 pub(crate) fn fill_outbox_dialog(state: &Rc<RefCell<UiState>>, list: &gtk::Box) {
+    fill_outbox_list(state, list, false, true, false);
+}
+
+/// (Re)builds the Outbox folder's page from every queued row, in the same
+/// per-account grouping as the dialog, including a send whose own "Sending: …"
+/// toast is still up.
+pub(crate) fn fill_outbox_page(state: &Rc<RefCell<UiState>>, list: &gtk::Box) {
+    fill_outbox_list(state, list, true, false, true);
+}
+
+/// The shared row/group builder behind the "Scheduled messages" dialog and the
+/// Outbox folder page, so their wording and actions never drift.
+fn fill_outbox_list(state: &Rc<RefCell<UiState>>, list: &gtk::Box, include_sending: bool, close_dialog_on_edit: bool, show_empty: bool) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
-    let (listed, emails) = {
+    let (grouped, emails) = {
         let st = state.borrow();
-        let listed = listed_outbox_items(&st);
-        let emails: HashMap<AccountId, String> = listed
+        let grouped = if include_sending { all_outbox_items(&st) } else { listed_outbox_items(&st) };
+        let emails: HashMap<AccountId, String> = grouped
             .iter()
             .map(|(id, _)| (id.clone(), st.accounts.get(id).map(|h| h.email.clone()).unwrap_or_else(|| id.0.clone())))
             .collect();
-        (listed, emails)
+        (grouped, emails)
     };
+    if grouped.is_empty() {
+        if show_empty {
+            let empty = adw::StatusPage::builder()
+                .icon_name("mail-send-symbolic")
+                .title("There are no items in this folder")
+                .description("Messages you send appear here until they go out.")
+                .build();
+            list.append(&empty);
+        }
+        return;
+    }
     let now_utc = chrono::Utc::now();
     let now = chrono::Local::now();
-    for (account_id, items) in listed {
+    for (account_id, items) in grouped {
         let group = adw::PreferencesGroup::builder().title(glib::markup_escape_text(&emails[&account_id]).as_str()).build();
         // The group heading is an account address: content, not chrome.
         crate::privacy::mark_content_heading(&group);
         for item in items {
-            let status = if item.failed {
-                "Couldn't send".to_string()
-            } else if item.not_before > now_utc {
-                format!(
-                    "Scheduled for {}",
-                    crate::datetime_picker::format_short_time(&item.not_before.with_timezone(&chrono::Local), &now)
-                )
-            } else {
-                "Waiting to send".to_string()
-            };
-            let to = if item.recipients.is_empty() {
-                String::new()
-            } else {
-                format!("To: {} · ", item.recipients.join(", "))
-            };
-            let subject = if item.subject.trim().is_empty() { "(No subject)" } else { item.subject.as_str() };
-            let row = adw::ActionRow::builder()
-                .title(glib::markup_escape_text(subject).as_str())
-                .subtitle(glib::markup_escape_text(&format!("{to}{status}")).as_str())
-                .subtitle_lines(2)
-                .build();
-            crate::privacy::mark_content(&row);
-            let send_now = gtk::Button::builder()
-                .label(if item.failed { "Retry" } else { "Send now" })
-                .valign(gtk::Align::Center)
-                .build();
-            {
-                let state = state.clone();
-                let account_id = account_id.clone();
-                let id = item.id;
-                send_now.connect_clicked(move |_| {
-                    send_account_command(
-                        &state,
-                        &account_id,
-                        AccountCommand::RescheduleOutbox {
-                            id,
-                            not_before: chrono::Utc::now(),
-                        },
-                    )
-                });
-            }
-            let edit = gtk::Button::builder().label("Edit").valign(gtk::Align::Center).build();
-            {
-                let state = state.clone();
-                let account_id = account_id.clone();
-                let id = item.id;
-                edit.connect_clicked(move |_| {
-                    send_account_command(&state, &account_id, AccountCommand::CancelOutbox { id });
-                    let dialog = state.borrow().outbox_dialog.as_ref().map(|(dialog, _)| dialog.clone());
-                    if let Some(dialog) = dialog {
-                        dialog.close();
-                    }
-                });
-            }
-            row.add_suffix(&send_now);
-            row.add_suffix(&edit);
-            group.add(&row);
+            group.add(&outbox_item_row(state, &account_id, &item, now_utc, now, close_dialog_on_edit));
         }
         list.append(&group);
     }
+}
+
+/// The status line shared by the banner dialog and the Outbox folder page.
+fn outbox_item_status(item: &lookout_mail::session::OutboxItem, now_utc: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Local>) -> String {
+    if item.failed {
+        "Couldn't send".to_string()
+    } else if item.not_before > now_utc {
+        format!(
+            "Scheduled for {}",
+            crate::datetime_picker::format_short_time(&item.not_before.with_timezone(&chrono::Local), &now)
+        )
+    } else {
+        "Waiting to send".to_string()
+    }
+}
+
+/// The subject shown for a queued item, with the empty fallback both the
+/// dialog and the folder use.
+fn outbox_item_subject(item: &lookout_mail::session::OutboxItem) -> &str {
+    if item.subject.trim().is_empty() {
+        "(No subject)"
+    } else {
+        item.subject.as_str()
+    }
+}
+
+/// One outbox row: subject, recipient/status line, and the Send now/Retry and
+/// Edit actions. Edit withdraws the row; `OutboxCancelled` reopens the
+/// composer with the withdrawn payload.
+fn outbox_item_row(
+    state: &Rc<RefCell<UiState>>,
+    account_id: &AccountId,
+    item: &lookout_mail::session::OutboxItem,
+    now_utc: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Local>,
+    close_dialog_on_edit: bool,
+) -> adw::ActionRow {
+    let status = outbox_item_status(item, now_utc, now);
+    let to = if item.recipients.is_empty() {
+        String::new()
+    } else {
+        format!("To: {} · ", item.recipients.join(", "))
+    };
+    let subject = outbox_item_subject(item);
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(subject).as_str())
+        .subtitle(glib::markup_escape_text(&format!("{to}{status}")).as_str())
+        .subtitle_lines(2)
+        .build();
+    crate::privacy::mark_content(&row);
+    let send_now = gtk::Button::builder()
+        .label(if item.failed { "Retry" } else { "Send now" })
+        .valign(gtk::Align::Center)
+        .build();
+    {
+        let state = state.clone();
+        let account_id = account_id.clone();
+        let id = item.id;
+        send_now.connect_clicked(move |_| {
+            send_account_command(
+                &state,
+                &account_id,
+                AccountCommand::RescheduleOutbox {
+                    id,
+                    not_before: chrono::Utc::now(),
+                },
+            )
+        });
+    }
+    let edit = gtk::Button::builder().label("Edit").valign(gtk::Align::Center).build();
+    {
+        let state = state.clone();
+        let account_id = account_id.clone();
+        let id = item.id;
+        edit.connect_clicked(move |_| {
+            send_account_command(&state, &account_id, AccountCommand::CancelOutbox { id });
+            if close_dialog_on_edit {
+                let dialog = state.borrow().outbox_dialog.as_ref().map(|(dialog, _)| dialog.clone());
+                if let Some(dialog) = dialog {
+                    dialog.close();
+                }
+            }
+        });
+    }
+    row.add_suffix(&send_now);
+    row.add_suffix(&edit);
+    row
 }
 
 /// The outbox row a saved draft is waiting to go out as (item 1.14): the
@@ -607,4 +691,34 @@ pub(crate) fn refresh_draft_banner(state: &Rc<RefCell<UiState>>, reading_stack: 
         }
     }
     banner.set_revealed(is_rendered_draft);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(subject: &str, not_before: chrono::DateTime<chrono::Utc>, failed: bool) -> lookout_mail::session::OutboxItem {
+        lookout_mail::session::OutboxItem {
+            id: 1,
+            not_before,
+            failed,
+            attempts: 0,
+            subject: subject.to_string(),
+            recipients: vec!["to@example.com".to_string()],
+            draft_message_id: None,
+        }
+    }
+
+    /// The shared row wording used by both the dialog and the folder: the
+    /// subject fallback and the three status lines.
+    #[test]
+    fn outbox_row_wording_matches_the_dialog_and_folder() {
+        let now = chrono::Local::now();
+        let now_utc = chrono::Utc::now();
+        assert_eq!(outbox_item_subject(&item("", now_utc, false)), "(No subject)");
+        assert_eq!(outbox_item_subject(&item("Hello", now_utc, false)), "Hello");
+        assert_eq!(outbox_item_status(&item("Hello", now_utc, false), now_utc, now), "Waiting to send");
+        assert_eq!(outbox_item_status(&item("Hello", now_utc, true), now_utc, now), "Couldn't send");
+        assert!(outbox_item_status(&item("Hello", now_utc + chrono::Duration::hours(1), false), now_utc, now).starts_with("Scheduled for "));
+    }
 }

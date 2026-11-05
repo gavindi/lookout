@@ -20,6 +20,7 @@ pub(crate) fn folder_tree_signature(
     accounts: &[(AccountId, String, Vec<Mailbox>)],
     favorites: &[Mailbox],
     prefs: &HashMap<MailboxId, crate::ui_state_db::FolderPrefs>,
+    outbox_count: u32,
 ) -> FolderTreeSignature {
     let row = |m: &Mailbox| {
         let pref = prefs.get(&m.id).cloned().unwrap_or_default();
@@ -34,6 +35,22 @@ pub(crate) fn folder_tree_signature(
     // Carried under a reserved pseudo-account id rather than a separate field
     // so the comparison stays a single `==`.
     signature.push((AccountId(FAVORITES_GROUP_KEY.into()), String::new(), favorites.iter().map(row).collect()));
+    // The synthetic Outbox row is always rendered, so its badge count is part
+    // of what the pane draws. Carried under its own reserved key, like the
+    // Favorites and Search Folders sections.
+    signature.push((
+        AccountId(OUTBOX_GROUP_KEY.into()),
+        String::new(),
+        vec![(
+            MailboxId("\u{0}outbox".into()),
+            "Outbox".into(),
+            MailboxRole::Custom,
+            '/',
+            outbox_count,
+            outbox_count,
+            Default::default(),
+        )],
+    ));
     signature
 }
 
@@ -169,7 +186,8 @@ pub(crate) fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection
     // expanded, and drops the selection (see the restore below), so skipping
     // it outright is what keeps the pane still while counts fill in.
     let search_folders = state.borrow().app_config.borrow().search_folders.clone();
-    let mut signature = folder_tree_signature(&accounts, &favorites, &state.borrow().folder_prefs);
+    let outbox_count = state.borrow().outbox_count;
+    let mut signature = folder_tree_signature(&accounts, &favorites, &state.borrow().folder_prefs, outbox_count);
     // Saved searches (item 2.4 / M-19) are part of the rendered tree, so they
     // belong in the signature too - a group appearing/disappearing or a name
     // changing must re-render the pane. Carried under a reserved pseudo-account
@@ -215,14 +233,19 @@ pub(crate) fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection
         match st.mail_view {
             // Row 0 is always the "All Inboxes" row.
             MailView::UnifiedInbox => Some(SelectionTarget::Unified),
-            // During a search the folder pane still highlights the mailbox the
-            // search started from (or nothing, if it started from the unified
-            // view).
-            MailView::Single | MailView::Search => st.current_mailbox.clone().map(SelectionTarget::Mailbox),
+            MailView::Outbox => Some(SelectionTarget::Outbox),
+            // During a search the folder pane still highlights the view the
+            // search started from - Outbox, All Inboxes, or the mailbox.
+            MailView::Search => match st.pre_search_view {
+                Some(MailView::Outbox) => Some(SelectionTarget::Outbox),
+                Some(MailView::UnifiedInbox) => Some(SelectionTarget::Unified),
+                _ => st.current_mailbox.clone().map(SelectionTarget::Mailbox),
+            },
+            MailView::Single => st.current_mailbox.clone().map(SelectionTarget::Mailbox),
         }
     };
 
-    let model = build_multi_account_tree_model(accounts, favorites, search_folders);
+    let model = build_multi_account_tree_model(accounts, favorites, search_folders, outbox_count);
     // Everything from here to the flag being cleared is the rebuild putting
     // the pane back the way the user left it, not the user navigating - so
     // the `selected-item` handler has to stay out of it. `set_model` alone
@@ -239,6 +262,11 @@ pub(crate) fn rebuild_folder_tree(state: &Rc<RefCell<UiState>>, folder_selection
     folder_scroller.vadjustment().set_value(scroll_value);
     match restore_to {
         Some(SelectionTarget::Unified) => folder_selection.set_selected(0),
+        Some(SelectionTarget::Outbox) => {
+            if let Some(index) = find_outbox_index(&model) {
+                folder_selection.set_selected(index);
+            }
+        }
         Some(SelectionTarget::Mailbox(mailbox)) => {
             if let Some(index) = find_mailbox_index(&model, &mailbox) {
                 folder_selection.set_selected(index);
@@ -428,6 +456,7 @@ pub(crate) fn rekey_renamed_folder(state: &Rc<RefCell<UiState>>, from: &MailboxI
                     &st.settings,
                     &LastSelection {
                         unified: false,
+                        outbox: false,
                         mailbox: Some(current.0),
                     },
                 );
@@ -476,6 +505,7 @@ pub(crate) fn forget_deleted_folder(state: &Rc<RefCell<UiState>>, root: &Mailbox
                     &st.settings,
                     &LastSelection {
                         unified: false,
+                        outbox: false,
                         mailbox: inbox.map(|id| id.0),
                     },
                 );
@@ -554,6 +584,7 @@ pub(crate) fn move_favorite(state: &Rc<RefCell<UiState>>, mailbox: &MailboxId, d
 /// the model: the pinned "All Inboxes" row, or the open mailbox's own row.
 pub(crate) enum SelectionTarget {
     Unified,
+    Outbox,
     Mailbox(MailboxId),
 }
 
@@ -690,6 +721,10 @@ pub(crate) fn expand_mailboxes(model: &gtk::TreeListModel, expanded: &HashSet<Ma
 /// comparison.
 pub(crate) const FAVORITES_GROUP_KEY: &str = "\u{0}favorites";
 
+/// The reserved pseudo-account key under which the synthetic Outbox row's
+/// count is carried in the folder-tree signature (M-40).
+pub(crate) const OUTBOX_GROUP_KEY: &str = "\u{0}outbox";
+
 /// The reserved pseudo-account key under which the Search Folders group's
 /// membership is carried in the folder-tree signature (item 2.4 / M-19).
 pub(crate) const SEARCH_FOLDERS_GROUP_KEY: &str = "\u{0}search-folders";
@@ -761,6 +796,7 @@ pub(crate) fn restore_or_default_initial_view(state: &Rc<RefCell<UiState>>, mode
         let action = match st.last_selection.clone() {
             None => Some(0),
             Some(sel) if sel.unified => Some(0),
+            Some(sel) if sel.outbox => find_outbox_index(model).or(Some(0)),
             Some(sel) => match sel.mailbox {
                 Some(mailbox) => {
                     let mailbox_id = MailboxId(mailbox);
@@ -805,6 +841,21 @@ pub(crate) fn restore_or_default_initial_view(state: &Rc<RefCell<UiState>>, mode
 /// `TreeItem::Favorite` row in the pinned Favorites section, which sorts
 /// *above* its real row, so matching both would resolve every favorite to its
 /// duplicate.
+pub(crate) fn find_outbox_index(model: &gtk::TreeListModel) -> Option<u32> {
+    for i in 0..model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else {
+            continue;
+        };
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else {
+            continue;
+        };
+        if matches!(&*boxed.borrow::<TreeItem>(), TreeItem::Outbox(_)) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 pub(crate) fn find_mailbox_index(model: &gtk::TreeListModel, mailbox_id: &MailboxId) -> Option<u32> {
     for i in 0..model.n_items() {
         let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else {

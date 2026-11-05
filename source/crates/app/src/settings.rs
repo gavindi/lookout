@@ -231,7 +231,15 @@ pub const DOCK_BADGE_ENABLED: &str = "dock-badge-enabled";
 /// (AppIndicator) icon in the notification area with the unread count.
 pub const TRAY_ICON_ENABLED: &str = "tray-icon-enabled";
 pub const SHORTCUTS: &str = "shortcuts";
+/// The app-wide **Work Offline** switch (M-40): while on, every module's
+/// network actor is paused - Mail, Calendar (CalDAV and Graph), webcal,
+/// People (CardDAV and Graph) and Tasks (CalDAV, Google and Graph To Do) -
+/// so cached data stays readable but nothing is fetched or written. Persisted
+/// across restarts, like Outlook's own switch.
+pub const WORK_OFFLINE: &str = "work-offline";
 pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
+/// The folder pane's last view was the synthetic cross-account Outbox (M-40).
+pub const LAST_VIEW_OUTBOX: &str = "last-view-outbox";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
 /// Config → Advanced → "Aggressive prefetch": whether the background body
 /// prefetch runs eagerly (short batch timer, larger per-folder warm-up,
@@ -428,7 +436,9 @@ fn defaults() -> HashMap<&'static str, Value> {
     map.insert(DOCK_BADGE_ENABLED, Value::Bool(true));
     map.insert(TRAY_ICON_ENABLED, Value::Bool(false));
     map.insert(SHORTCUTS, Value::Strv(Vec::new()));
+    map.insert(WORK_OFFLINE, Value::Bool(false));
     map.insert(LAST_VIEW_UNIFIED, Value::Bool(false));
+    map.insert(LAST_VIEW_OUTBOX, Value::Bool(false));
     map.insert(LAST_VIEW_MAILBOX, Value::String(String::new()));
     map.insert(PREFETCH_AGGRESSIVE, Value::Bool(false));
     map.insert(PREFETCH_BATCH_INTERVAL_SECONDS, Value::Int(30));
@@ -1019,6 +1029,16 @@ mod tests {
     }
 
     #[test]
+    fn work_offline_defaults_off_and_round_trips() {
+        let store = resolve();
+        assert!(!store.get_bool(WORK_OFFLINE), "a fresh install starts online");
+        store.set_bool(WORK_OFFLINE, true);
+        assert!(store.get_bool(WORK_OFFLINE));
+        store.set_bool(WORK_OFFLINE, false);
+        assert!(!store.get_bool(WORK_OFFLINE));
+    }
+
+    #[test]
     fn focused_inbox_local_defaults_off_and_round_trips() {
         let store = resolve();
         assert!(!store.get_bool(MAIL_FOCUSED_INBOX_LOCAL));
@@ -1263,6 +1283,7 @@ mod tests {
         assert!(store.get_bool(CALENDAR_ALERTS_ENABLED));
         assert!(store.get_bool(BACKGROUND_WALLPAPER_ENABLED));
         assert_eq!(store.get_string(LAST_VIEW_MAILBOX), "");
+        assert!(!store.get_bool(LAST_VIEW_OUTBOX));
         assert_eq!(store.get_string(SORT_KEY), "date");
         assert_eq!(store.get_string(ASSISTANT_API_URL), "");
         assert_eq!(store.get_string(ASSISTANT_AGENT), "");

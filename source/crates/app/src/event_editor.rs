@@ -244,11 +244,13 @@ pub struct EventEditorPrefill<'a> {
 /// else organizes (CAL-18) - fires from the top bar's Forward button. All are
 /// responsible for routing to the owning account's session - the dialog only
 /// builds and validates the event.
+#[allow(clippy::too_many_arguments)]
 pub fn show_event_editor(
     window: &adw::ApplicationWindow,
     prefill: EventEditorPrefill,
     attendee_suggestions: SuggestionSource,
     profile_card: crate::profile_card::ContextProvider,
+    is_offline: Rc<dyn Fn() -> bool>,
     on_save: impl Fn(CalendarId, CalendarEvent) + 'static,
     on_delete: impl Fn(CalendarId, EventOccurrence) + 'static,
     on_forward: Option<ForwardCallback>,
@@ -496,13 +498,18 @@ pub fn show_event_editor(
         let calendar_dropdown = calendar_dropdown.clone();
         let calendar_ids = calendar_ids.clone();
         let graph_calendars = prefill.graph_calendars.clone();
+        let is_offline = is_offline.clone();
         Rc::new(move || {
             let graph = calendar_ids
                 .get(calendar_dropdown.selected() as usize)
                 .is_some_and(|calendar_id| graph_calendars.contains(calendar_id));
             if graph {
                 video_toggle.set_title("Teams meeting");
-                video_toggle.set_subtitle("Microsoft Teams adds a join link when you save");
+                video_toggle.set_subtitle(if is_offline() {
+                    "The Teams join link will be created after you're back online"
+                } else {
+                    "Microsoft Teams adds a join link when you save"
+                });
                 video_url_row.set_visible(false);
             } else {
                 video_toggle.set_title("Video call link");
@@ -1296,12 +1303,21 @@ pub fn show_event_editor(
         let existing_attendees = existing_attendees.clone();
         let scope_dropdown = scope_dropdown.clone();
         let graph_calendars = prefill.graph_calendars.clone();
+        let is_offline = is_offline.clone();
         let on_save = on_save;
         // The parameter is annotated so the closure is created with a
         // higher-ranked `&Button` signature from the start - an unannotated
         // `|_|` in a `let`-bound closure gets an early-bound lifetime that then
         // fails the `Fn(&Button) + 'static` bound at `connect_clicked`.
         move |_button: &gtk::Button| {
+            // Work Offline (M-40): there is no calendar mutation queue, so
+            // keep the form open rather than closing and reporting a failure
+            // that arrives as a toast the user can no longer act on.
+            if is_offline() {
+                error_label.set_label("You're working offline — reconnect to save");
+                error_label.set_visible(true);
+                return;
+            }
             let selected = calendar_dropdown.selected() as usize;
             let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
                 error_label.set_label("No calendar selected.");
@@ -1396,8 +1412,14 @@ pub fn show_event_editor(
         let calendar_dropdown = calendar_dropdown.clone();
         let calendar_ids = calendar_ids.clone();
         let error_label = error_label.clone();
+        let is_offline = is_offline.clone();
         let existing = existing_for_delete;
         delete_button.connect_clicked(move |_| {
+            if is_offline() {
+                error_label.set_label("You're working offline — reconnect to save");
+                error_label.set_visible(true);
+                return;
+            }
             let selected = calendar_dropdown.selected() as usize;
             let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
                 error_label.set_label("No calendar selected.");

@@ -102,7 +102,10 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
     let (_interactive_tx, interactive_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
     let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredentialProvider);
-    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
+    // Kept alive for the session's lifetime: a dropped watch sender makes
+    // `changed()` return `Err` forever (see `window/offline.rs`).
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx, offline_rx));
 
     // --- Wait for the account to come up: folder list + initial inbox sync.
     let folders = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FoldersUpdated(_))).await;
@@ -750,7 +753,10 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
     let (_interactive_tx, interactive_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
     let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredentialProvider);
-    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
+    // Kept alive for the session's lifetime: a dropped watch sender makes
+    // `changed()` return `Err` forever (see `window/offline.rs`).
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx, offline_rx));
 
     // Wait for the folder list (must include "Big", or prefetch never
     // starts) and the initial (empty) INBOX sync.
@@ -817,6 +823,153 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
 
 /// Opens a plain-TCP IMAP session to GreenMail (auth is disabled in its test
 /// setup, so any credentials authenticate) and `APPEND`s `raw` to `mailbox`.
+/// Work Offline (M-40): starting paused makes no connection, queues a send
+/// from the cache-only pump, withdraws a cancel, and only delivers once the
+/// signal goes back online.
+#[tokio::test]
+#[ignore = "requires Docker; run explicitly with `cargo test -- --ignored`"]
+async fn queues_cancels_and_delivers_while_offline() {
+    std::env::set_var("LOOKOUT_INSECURE_TLS_FOR_TESTS", "1");
+
+    let container = GenericImage::new("greenmail/standalone", "2.1.11")
+        .with_wait_for(WaitFor::message_on_stdout("Starting GreenMail standalone"))
+        .with_exposed_port(3993.tcp())
+        .with_exposed_port(3465.tcp())
+        .start()
+        .await
+        .expect("failed to start GreenMail container - is Docker running?");
+
+    let host = container.get_host().await.unwrap().to_string();
+    let imaps_port = container.get_host_port_ipv4(3993).await.unwrap();
+    let smtps_port = container.get_host_port_ipv4(3465).await.unwrap();
+
+    let account_id = AccountId(format!(
+        "offline-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let config = AccountConfig {
+        account_id: account_id.clone(),
+        display_name: "Offline Test".to_string(),
+        email: "testuser@localhost".to_string(),
+        mention_addresses: vec!["testuser@localhost".to_string()],
+        mention_names: vec!["Offline Test".to_string()],
+        local_focus_enabled: false,
+        local_focus_contacts: Vec::new(),
+        imap: EndpointConfig {
+            host: host.clone(),
+            port: imaps_port,
+            use_tls: true,
+            username: "testuser".to_string(),
+        },
+        smtp: EndpointConfig {
+            host,
+            port: smtps_port,
+            use_tls: true,
+            username: "testuser".to_string(),
+        },
+    };
+
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (_interactive_tx, interactive_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredentialProvider);
+    let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx, offline_rx));
+
+    // The cache replay still runs, then the session parks without connecting.
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxContents { .. })).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FoldersUpdated(_))))
+            .await
+            .is_err(),
+        "an offline session must not reach the server"
+    );
+
+    let message = |subject: &str| ComposedMessage {
+        from: "testuser@localhost".to_string(),
+        display_name: None,
+        to: vec!["testuser@localhost".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject: subject.to_string(),
+        text_body: "queued while offline".to_string(),
+        html_body: None,
+        attachments: vec![],
+        inline_images: vec![],
+        calendar_part: None,
+        read_receipt: None,
+        request_read_receipt: false,
+        request_delivery_receipt: false,
+        importance: lookout_core::Importance::Normal,
+        sensitivity: lookout_core::MessageSensitivity::Normal,
+        in_reply_to: None,
+        references: vec![],
+        message_id: None,
+    };
+
+    // An ordinary send queues with no network.
+    let _ = cmd_tx
+        .send(AccountCommand::SendMessage {
+            message: Box::new(message("offline delivery")),
+            not_before: None,
+            client_token: Some(41),
+        })
+        .await;
+    let queued = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxQueued { client_token: Some(41), .. })).await;
+    let AccountEvent::OutboxQueued { id: due_now, .. } = queued else { unreachable!() };
+
+    // A future-dated row can be withdrawn entirely while offline.
+    let _ = cmd_tx
+        .send(AccountCommand::SendMessage {
+            message: Box::new(message("withdrawn offline")),
+            not_before: Some(chrono::Utc::now() + chrono::Duration::seconds(60)),
+            client_token: Some(42),
+        })
+        .await;
+    let queued = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxQueued { client_token: Some(42), .. })).await;
+    let AccountEvent::OutboxQueued { id: withdrawn, .. } = queued else { unreachable!() };
+    let _ = cmd_tx.send(AccountCommand::CancelOutbox { id: withdrawn }).await;
+    wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::OutboxCancelled { id, .. } if *id == withdrawn)).await;
+
+    // Going online reconnects and drains the queued send.
+    offline_tx.send(false).unwrap();
+    let mut sent_mailbox = None;
+    loop {
+        match wait_for_event_within(
+            &evt_rx,
+            |e| matches!(e, AccountEvent::OutboxSent { .. }) || matches!(e, AccountEvent::FoldersUpdated(_)),
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            AccountEvent::FoldersUpdated(folders) => {
+                sent_mailbox = folders.iter().find(|m| matches!(m.role, lookout_core::MailboxRole::Sent)).map(|m| m.id.clone());
+            }
+            AccountEvent::OutboxSent { id } => {
+                assert_eq!(id, due_now);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let sent_mailbox = sent_mailbox.expect("the reconnect lists a Sent mailbox");
+    let AccountEvent::MessagesUpdated { messages, .. } = wait_for_event_within(
+        &evt_rx,
+        |e| matches!(e, AccountEvent::MessagesUpdated { mailbox, messages, .. } if *mailbox == sent_mailbox && messages.iter().any(|m| m.subject.as_deref() == Some("offline delivery"))),
+        Duration::from_secs(30),
+    )
+    .await
+    else {
+        unreachable!()
+    };
+    assert!(messages.iter().any(|m| m.subject.as_deref() == Some("offline delivery")));
+
+    let _ = cmd_tx.send(AccountCommand::Shutdown).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
 async fn append_raw_to(host: &str, port: u16, mailbox: &str, raw: &[u8]) {
     let tcp = tokio::net::TcpStream::connect((host, port)).await.expect("plain IMAP connect");
     let client = async_imap::Client::new(tcp);

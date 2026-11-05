@@ -43,6 +43,10 @@ pub enum TreeItem {
     /// The "Favorites" grouping row, pinned between "All Inboxes" and the
     /// account groups. Present only while at least one folder is starred.
     Favorites,
+    /// The synthetic cross-account **Outbox** row (M-40): one leaf listing
+    /// every account's queued sends, always visible. Carries the summed count
+    /// of every row in every account's outbox, failed ones included.
+    Outbox(u32),
     Account(AccountNode),
     Folder(Rc<FolderNode>),
     /// A starred mailbox, shown inside the Favorites section. Selecting one
@@ -134,7 +138,12 @@ fn sort_paths(paths: &mut [String], by_path: &HashMap<String, Mailbox>) {
 ///
 /// `favorites` are rendered as flat leaves - a favorite is one folder, not a
 /// subtree - and are duplicates of rows that also live under their account.
-pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mailbox>)>, favorites: Vec<Mailbox>, search_folders: Vec<SearchFolder>) -> gtk::TreeListModel {
+pub fn build_multi_account_tree_model(
+    accounts: Vec<(AccountId, String, Vec<Mailbox>)>,
+    favorites: Vec<Mailbox>,
+    search_folders: Vec<SearchFolder>,
+    outbox_count: u32,
+) -> gtk::TreeListModel {
     let mut folder_roots_by_account: HashMap<AccountId, Vec<Rc<FolderNode>>> = HashMap::new();
     let root_store = gio::ListStore::new::<glib::BoxedAnyObject>();
     // The unified row merges exactly the inboxes the account rows count, so
@@ -145,6 +154,9 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
     if !favorite_nodes.is_empty() {
         root_store.append(&glib::BoxedAnyObject::new(TreeItem::Favorites));
     }
+    // The synthetic Outbox row is always present, between Favorites and the
+    // account groups, like Outlook's.
+    root_store.append(&glib::BoxedAnyObject::new(TreeItem::Outbox(outbox_count)));
     for (account_id, label, mailboxes) in accounts {
         let unread = inbox_unread(&mailboxes);
         let roots = build_folder_roots(mailboxes, &account_id);
@@ -183,7 +195,7 @@ pub fn build_multi_account_tree_model(accounts: Vec<(AccountId, String, Vec<Mail
             return Some(store.upcast::<gio::ListModel>());
         }
         let children = match &*tree_item {
-            TreeItem::Unified(_) | TreeItem::Favorites | TreeItem::Favorite(_) | TreeItem::SearchFolders | TreeItem::SearchFolder(_) => return None,
+            TreeItem::Unified(_) | TreeItem::Favorites | TreeItem::Outbox(_) | TreeItem::Favorite(_) | TreeItem::SearchFolders | TreeItem::SearchFolder(_) => return None,
             TreeItem::Account(acc) => folder_roots_by_account.get(&acc.account_id)?.clone(),
             TreeItem::Folder(node) => node.children.clone(),
         };

@@ -1702,6 +1702,11 @@ fn build_attachment_chip(attachments: &Rc<RefCell<Vec<PendingAttachment>>>, flow
     chip
 }
 
+/// What [`build_compose_view`] hands back: the composer root, its editor
+/// toolbar, the draft-save relays (success and failure), and the From-list
+/// refresh hook.
+type ComposeBuild = (gtk::Box, gtk::Box, async_channel::Sender<String>, async_channel::Sender<(String, String)>, Rc<dyn Fn()>);
+
 /// Builds a composer widget, meant to be embedded as a page in the reading
 /// pane's `gtk::Stack` (see `window.rs`'s
 /// `show_composer_in_reading_pane`) rather than presented as its own window.
@@ -1798,7 +1803,7 @@ pub fn build_compose_view(
     // toolbar dresses (and re-dresses) its controls exactly like the main
     // window's ribbon.
     ribbon_style: crate::ribbon::RibbonStyle,
-) -> (gtk::Box, gtk::Box, async_channel::Sender<String>, Rc<dyn Fn()>) {
+) -> ComposeBuild {
     // Chip-mode fields (UX-42): each recipient is a removable pill, so a
     // contact list picked from the address book can render as a single
     // expandable list chip (P-05). The To row has no caption label of its
@@ -2652,6 +2657,21 @@ pub fn build_compose_view(
             }
         });
     }
+    // Work Offline (M-40): Drafts live on the server, so an autosave while
+    // paused cannot land. The composer keeps its text (the send itself still
+    // queues in the outbox) and says why it wasn't saved.
+    let (draft_save_failed_tx, draft_save_failed_rx) = async_channel::bounded(8);
+    {
+        let draft_message_id = draft_message_id.clone();
+        let status_label = status_label.clone();
+        glib::spawn_future_local(async move {
+            while let Ok((message_id, _detail)) = draft_save_failed_rx.recv().await {
+                if message_id == *draft_message_id {
+                    status_label.set_label("Not saved — working offline");
+                }
+            }
+        });
+    }
 
     let cancel_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["user-trash-symbolic", "edit-delete-symbolic"]));
     cancel_button.add_css_class("destructive-action");
@@ -3101,7 +3121,7 @@ pub fn build_compose_view(
         });
     }
 
-    (content, editor_toolbar, draft_saved_tx, refresh_from_dropdown)
+    (content, editor_toolbar, draft_saved_tx, draft_save_failed_tx, refresh_from_dropdown)
 }
 
 #[cfg(test)]

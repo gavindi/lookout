@@ -81,6 +81,7 @@ pub async fn run_subscription_session(
     initial: Vec<WebcalSubscription>,
     commands: async_channel::Receiver<SubscriptionCommand>,
     events: async_channel::Sender<SubscriptionSessionEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let http = reqwest::Client::new();
     let mut subscriptions = initial;
@@ -90,56 +91,107 @@ pub async fn run_subscription_session(
     // month, emitted before any network activity; superseded by the live
     // sync below (see `CalendarCache`'s doc comment for why it's never
     // authoritative).
-    let mut cached_feeds = Vec::new();
-    for subscription in &subscriptions {
-        let feed = cached_feed(subscription, current_month);
-        cached_feeds.push(feed);
-    }
-    let _ = events
-        .send(SubscriptionSessionEvent::SubscriptionsUpdated {
-            month: current_month,
-            feeds: cached_feeds,
-        })
-        .await;
-    sync_all(&http, &subscriptions, current_month, &events).await;
+    emit_cached(&subscriptions, current_month, &events).await;
 
     loop {
-        enum Wake {
-            Poll,
-            Command(SubscriptionCommand),
-            ChannelClosed,
+        // Work Offline (M-40): the cached feeds above already painted. Park
+        // without fetching; month navigation still re-emits the cached month.
+        if *offline_rx.borrow() && !wait_offline(&mut subscriptions, &mut current_month, &commands, &events, &mut offline_rx).await {
+            return;
         }
-        let wake = tokio::select! {
-            _ = tokio::time::sleep(POLL_INTERVAL) => Wake::Poll,
-            c = commands.recv() => match c {
-                Ok(cmd) => Wake::Command(cmd),
-                Err(_) => Wake::ChannelClosed,
-            },
-        };
+        sync_all(&http, &subscriptions, current_month, &events).await;
 
-        let mut woke_on_command = None;
-        match wake {
-            Wake::Poll => sync_all(&http, &subscriptions, current_month, &events).await,
-            Wake::Command(cmd) => woke_on_command = Some(cmd),
-            Wake::ChannelClosed => return,
-        }
+        loop {
+            enum Wake {
+                Poll,
+                Command(SubscriptionCommand),
+                Offline,
+                ChannelClosed,
+            }
+            let wake = tokio::select! {
+                _ = tokio::time::sleep(POLL_INTERVAL) => Wake::Poll,
+                c = commands.recv() => match c {
+                    Ok(cmd) => Wake::Command(cmd),
+                    Err(_) => Wake::ChannelClosed,
+                },
+                changed = offline_rx.changed() => match changed {
+                    Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                    Ok(()) => Wake::Poll,
+                    Err(_) => Wake::ChannelClosed,
+                },
+            };
 
-        for command in woke_on_command.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
-            match command {
-                SubscriptionCommand::Shutdown => return,
-                SubscriptionCommand::Refresh => sync_all(&http, &subscriptions, current_month, &events).await,
-                SubscriptionCommand::SyncMonth(date) => {
-                    current_month = first_of_month(date);
-                    sync_all(&http, &subscriptions, current_month, &events).await;
-                }
-                SubscriptionCommand::FetchMonth(date) => {
-                    sync_all(&http, &subscriptions, first_of_month(date), &events).await;
-                }
-                SubscriptionCommand::Reload { subscriptions: new_list } => {
-                    subscriptions = new_list;
-                    sync_all(&http, &subscriptions, current_month, &events).await;
+            let mut woke_on_command = None;
+            let mut go_offline = false;
+            match wake {
+                Wake::Poll => sync_all(&http, &subscriptions, current_month, &events).await,
+                Wake::Command(cmd) => woke_on_command = Some(cmd),
+                Wake::Offline => go_offline = true,
+                Wake::ChannelClosed => return,
+            }
+            if go_offline {
+                break;
+            }
+
+            for command in woke_on_command.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
+                match command {
+                    SubscriptionCommand::Shutdown => return,
+                    SubscriptionCommand::Refresh => sync_all(&http, &subscriptions, current_month, &events).await,
+                    SubscriptionCommand::SyncMonth(date) => {
+                        current_month = first_of_month(date);
+                        sync_all(&http, &subscriptions, current_month, &events).await;
+                    }
+                    SubscriptionCommand::FetchMonth(date) => {
+                        sync_all(&http, &subscriptions, first_of_month(date), &events).await;
+                    }
+                    SubscriptionCommand::Reload { subscriptions: new_list } => {
+                        subscriptions = new_list;
+                        sync_all(&http, &subscriptions, current_month, &events).await;
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Re-emits every feed's cached occurrences for `month` with no network call.
+async fn emit_cached(subscriptions: &[WebcalSubscription], month: NaiveDate, events: &async_channel::Sender<SubscriptionSessionEvent>) {
+    let feeds: Vec<SubscriptionFeed> = subscriptions.iter().map(|subscription| cached_feed(subscription, month)).collect();
+    let _ = events.send(SubscriptionSessionEvent::SubscriptionsUpdated { month, feeds }).await;
+}
+
+/// Parks the feed session while Work Offline is on (M-40). Returns `false`
+/// when the app is shutting down, `true` when it is online again.
+async fn wait_offline(
+    subscriptions: &mut Vec<WebcalSubscription>,
+    current_month: &mut NaiveDate,
+    commands: &async_channel::Receiver<SubscriptionCommand>,
+    events: &async_channel::Sender<SubscriptionSessionEvent>,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            },
+            command = commands.recv() => match command {
+                Ok(SubscriptionCommand::Shutdown) | Err(_) => return false,
+                Ok(SubscriptionCommand::Refresh) => {}
+                Ok(SubscriptionCommand::SyncMonth(date)) => {
+                    *current_month = first_of_month(date);
+                    emit_cached(subscriptions, *current_month, events).await;
+                }
+                Ok(SubscriptionCommand::FetchMonth(date)) => emit_cached(subscriptions, first_of_month(date), events).await,
+                Ok(SubscriptionCommand::Reload { subscriptions: new_list }) => {
+                    *subscriptions = new_list;
+                    emit_cached(subscriptions, *current_month, events).await;
+                }
+            },
         }
     }
 }
@@ -261,6 +313,53 @@ mod tests {
         )
     }
 
+    /// Work Offline (M-40): a paused session paints the cache, re-emits the
+    /// requested month from that cache, and makes no HTTP request until the
+    /// signal goes back online.
+    #[tokio::test]
+    async fn offline_session_reemits_cached_month_without_fetching() {
+        let id = format!(
+            "offline-sub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let _ = crate::cache::remove_subscription_cache(&id);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed.ics"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ics_for(15)))
+            .mount(&server)
+            .await;
+        let subscription = WebcalSubscription {
+            id: id.clone(),
+            display_name: "Offline feed".to_string(),
+            url: format!("{}/feed.ics", server.uri()),
+        };
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+        let session = tokio::spawn(run_subscription_session(vec![subscription], cmd_rx, evt_tx, offline_rx));
+
+        let SubscriptionSessionEvent::SubscriptionsUpdated { month: current, feeds } = evt_rx.recv().await.unwrap();
+        assert_eq!(feeds.len(), 1);
+        let requested = first_of_month(current) + chrono::Months::new(1);
+        cmd_tx.send(SubscriptionCommand::SyncMonth(requested)).await.unwrap();
+        let SubscriptionSessionEvent::SubscriptionsUpdated { month, feeds } = evt_rx.recv().await.unwrap();
+        assert_eq!(month, requested, "the cached month is re-emitted locally");
+        assert_eq!(feeds.len(), 1);
+        assert!(feeds[0].error.is_none());
+        assert!(server.received_requests().await.unwrap_or_default().is_empty(), "an offline feed session must not fetch");
+
+        offline_tx.send(false).unwrap();
+        let SubscriptionSessionEvent::SubscriptionsUpdated { feeds, .. } = evt_rx.recv().await.unwrap();
+        assert!(feeds[0].error.is_none(), "going online fetches the feed");
+        assert!(!server.received_requests().await.unwrap_or_default().is_empty());
+
+        cmd_tx.send(SubscriptionCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), session).await;
+        let _ = crate::cache::remove_subscription_cache(&id);
+    }
+
     /// The session's full lifecycle against a local feed server: fast-paint
     /// (empty - no cache yet) then the live fetch, parsed and expanded into
     /// the current month's window.
@@ -283,7 +382,8 @@ mod tests {
         };
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let session = tokio::spawn(run_subscription_session(vec![subscription], cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let session = tokio::spawn(run_subscription_session(vec![subscription], cmd_rx, evt_tx, offline_rx));
 
         // 1: the fast first paint (nothing cached -> empty, no error).
         let SubscriptionSessionEvent::SubscriptionsUpdated { month: _, feeds } = evt_rx.recv().await.unwrap();
@@ -333,7 +433,8 @@ mod tests {
         };
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let session = tokio::spawn(run_subscription_session(vec![subscription], cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let session = tokio::spawn(run_subscription_session(vec![subscription], cmd_rx, evt_tx, offline_rx));
 
         // Fast paint first, then the failing live sync.
         let _ = evt_rx.recv().await.unwrap();

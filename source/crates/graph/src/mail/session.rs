@@ -112,12 +112,19 @@ impl GraphMailSessionConfig {
 /// user's message click is never queued behind a sync. Unlike IMAP a Graph
 /// error is per call, not per connection, so the actor keeps running and
 /// retries on its poll cadence; a consent failure is surfaced once.
+///
+/// `offline_rx` is the app-wide Work Offline signal (M-40). The cache replay
+/// always runs, so an offline launch paints the folders, open folder, flagged
+/// mail and outbox; while the signal reads `true` no Graph request is made and
+/// only the cache-only outbox commands are answered. Keep the sender alive for
+/// the session's lifetime (a dropped sender ends the wait rather than spinning).
 pub async fn run_graph_mail_session(
     config: GraphMailSessionConfig,
     client: super::MailClient,
     commands: async_channel::Receiver<AccountCommand>,
     interactive_commands: async_channel::Receiver<AccountCommand>,
     events: async_channel::Sender<AccountEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // Opening runs the file open, pragmas, DDL and migrations, so it goes to
     // the blocking pool like every other cache call (`cache_op`).
@@ -187,55 +194,106 @@ pub async fn run_graph_mail_session(
     session.replay_cache().await;
     session.emit_sieve_advertised().await;
 
-    let _ = session.events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-    session.initial_sync().await;
+    // Work Offline (M-40): the cache replay above always runs, so an offline
+    // launch paints the same folders and messages. Each online pass starts
+    // with a fresh `initial_sync`, so coming back online catches up at once.
+    'online: loop {
+        if *offline_rx.borrow() {
+            let _ = session.events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Offline)).await;
+            if session.run_offline(&commands, &interactive_commands, &mut offline_rx).await {
+                break;
+            }
+            // Online: the top of the loop announces Connecting and runs
+            // `initial_sync`, which catches up in one pass.
+            session.next_poll = Utc::now();
+            continue 'online;
+        }
 
-    loop {
-        // Drain whatever is already queued before waiting: interactive first,
-        // so a click is answered ahead of background work, and both ahead of
-        // the outbox drain, so a cancel queued before a row comes due wins.
+        let _ = session.events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
+        session.initial_sync().await;
+
         let mut shutdown = false;
-        while let Ok(command) = interactive_commands.try_recv() {
-            if !session.handle_command(command).await {
-                shutdown = true;
+        loop {
+            // Pause before answering anything queued: a command that needs
+            // the network must not run just because it landed with the toggle.
+            if *offline_rx.borrow() {
+                break;
+            }
+            // Drain whatever is already queued before waiting: interactive
+            // first, so a click is answered ahead of background work, and both
+            // ahead of the outbox drain, so a cancel queued before a row comes
+            // due wins.
+            while let Ok(command) = interactive_commands.try_recv() {
+                if !session.handle_command(command).await {
+                    shutdown = true;
+                    break;
+                }
+            }
+            if shutdown {
+                break;
+            }
+            while let Ok(command) = commands.try_recv() {
+                if !session.handle_command(command).await {
+                    shutdown = true;
+                    break;
+                }
+            }
+            if shutdown {
+                break;
+            }
+
+            // Checked before the drain, matching IMAP, so a toggle in the
+            // undo-send window prevents the send.
+            if *offline_rx.borrow() {
+                break;
+            }
+            session.service_due().await;
+
+            let sleep = session.next_sleep();
+            let mut go_offline = false;
+            tokio::select! {
+                biased;
+                changed = offline_rx.changed() => match changed {
+                    Ok(()) => go_offline = *offline_rx.borrow(),
+                    // The app holds the sender for its lifetime; treat a
+                    // dropped signal as teardown rather than spinning.
+                    Err(_) => {
+                        shutdown = true;
+                        break;
+                    }
+                },
+                received = interactive_commands.recv() => match received {
+                    Ok(command) => {
+                        if !session.handle_command(command).await {
+                            shutdown = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        shutdown = true;
+                        break;
+                    }
+                },
+                received = commands.recv() => match received {
+                    Ok(command) => {
+                        if !session.handle_command(command).await {
+                            shutdown = true;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        shutdown = true;
+                        break;
+                    }
+                },
+                _ = tokio::time::sleep(sleep) => session.on_deadline().await,
+            }
+            if shutdown || go_offline {
                 break;
             }
         }
         if shutdown {
-            break;
-        }
-        while let Ok(command) = commands.try_recv() {
-            if !session.handle_command(command).await {
-                shutdown = true;
-                break;
-            }
-        }
-        if shutdown {
-            break;
-        }
-
-        session.service_due().await;
-
-        let sleep = session.next_sleep();
-        tokio::select! {
-            biased;
-            received = interactive_commands.recv() => match received {
-                Ok(command) => {
-                    if !session.handle_command(command).await {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            },
-            received = commands.recv() => match received {
-                Ok(command) => {
-                    if !session.handle_command(command).await {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            },
-            _ = tokio::time::sleep(sleep) => session.on_deadline().await,
+            break 'online;
         }
     }
 
@@ -313,6 +371,95 @@ impl GraphMailSession {
         self.emit_outbox().await;
         self.next_outbox_due = cache_op(&self.cache, |cache| cache.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
         self.next_snooze_wake = cache_op(&self.cache, |cache| cache.next_snooze_wake()).await.and_then(|r| r.ok()).flatten();
+    }
+
+    /// Parks the session while Work Offline is on (M-40), keeping the cached
+    /// picture already painted and answering the cache-only outbox commands.
+    /// Returns `true` when the app is shutting down.
+    async fn run_offline(
+        &mut self,
+        commands: &async_channel::Receiver<AccountCommand>,
+        interactive_commands: &async_channel::Receiver<AccountCommand>,
+        offline_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> bool {
+        loop {
+            tokio::select! {
+                changed = offline_rx.changed() => match changed {
+                    Ok(()) => {
+                        if !*offline_rx.borrow() {
+                            return false;
+                        }
+                    }
+                    Err(_) => return true,
+                },
+                command = interactive_commands.recv() => match command {
+                    Ok(command) => {
+                        if !self.handle_offline_command(command).await {
+                            return true;
+                        }
+                    }
+                    Err(_) => return true,
+                },
+                command = commands.recv() => match command {
+                    Ok(command) => {
+                        if !self.handle_offline_command(command).await {
+                            return true;
+                        }
+                    }
+                    Err(_) => return true,
+                },
+            }
+        }
+    }
+
+    /// Answers one command while offline. Only the outbox and purely local
+    /// settings are honoured; a fetch or server write is answered with a
+    /// per-request failure where the UI can show it, and dropped otherwise
+    /// (the reconnect sync supersedes it).
+    async fn handle_offline_command(&mut self, command: AccountCommand) -> bool {
+        match command {
+            AccountCommand::Shutdown => return false,
+            AccountCommand::SendMessage {
+                message,
+                not_before,
+                client_token,
+            } => self.queue_send(*message, not_before, client_token).await,
+            AccountCommand::CancelOutbox { id } => self.cancel_outbox(id).await,
+            AccountCommand::RescheduleOutbox { id, not_before } => self.reschedule_outbox(id, not_before).await,
+            AccountCommand::FetchAttachment { mailbox, uid, part } => {
+                let _ = self
+                    .events
+                    .send(AccountEvent::PartFetchFailed {
+                        mailbox,
+                        uid,
+                        part_number: part.part_number,
+                        message: "You're working offline.".to_string(),
+                    })
+                    .await;
+            }
+            AccountCommand::FetchRawMessage { mailbox, uid } => {
+                let _ = self
+                    .events
+                    .send(AccountEvent::RawMessageFetchFailed {
+                        mailbox,
+                        uid,
+                        message: "You're working offline.".to_string(),
+                    })
+                    .await;
+            }
+            AccountCommand::SaveDraft { msg, .. } => {
+                let _ = self
+                    .events
+                    .send(AccountEvent::DraftSaveFailed {
+                        message_id: msg.message_id.clone().unwrap_or_default(),
+                        message: "You're working offline — the draft wasn't saved.".to_string(),
+                    })
+                    .await;
+            }
+            AccountCommand::ConfigureLocalFocus { .. } | AccountCommand::SetPrefetchPolicy(_) | AccountCommand::Reconnect | AccountCommand::PrefetchBodies => {}
+            other => tracing::debug!(?other, "dropping a Graph mail command that needs the network while offline"),
+        }
+        true
     }
 
     /// The first folder + message sync. A failure leaves the session running

@@ -51,16 +51,34 @@ pub async fn run_calendar_session(
     client: CalendarClient,
     commands: async_channel::Receiver<CalendarCommand>,
     events: async_channel::Sender<CalendarSessionEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
+        if *offline_rx.borrow() {
+            let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Offline)).await;
+            match wait_offline(&commands, &events, &mut offline_rx).await {
+                OfflineWait::Online => {
+                    backoff = Duration::from_secs(1);
+                    continue;
+                }
+                OfflineWait::Shutdown => {
+                    let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
+            }
+        }
         let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&account_id, &client, &commands, &events).await {
+        match connect_and_run(&account_id, &client, &commands, &events, &mut offline_rx).await {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
                 return;
+            }
+            Ok(ShutdownReason::Offline) => {
+                backoff = Duration::from_secs(1);
+                continue;
             }
             Err(e) => {
                 // A missing or revoked Graph consent can't fix itself by
@@ -93,6 +111,14 @@ pub async fn run_calendar_session(
         // honoured while down, so they answer with an explicit error.
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
+            changed = offline_rx.changed() => {
+                if changed.is_err() {
+                    let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
+                backoff = Duration::from_secs(1);
+                continue;
+            }
             cmd = commands.recv() => match cmd {
                 Ok(CalendarCommand::Shutdown) => {
                     let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
@@ -125,6 +151,105 @@ pub async fn run_calendar_session(
 
 enum ShutdownReason {
     Requested,
+    /// Work Offline turned on; the outer loop parks in `wait_offline`.
+    Offline,
+}
+
+enum OfflineWait {
+    Online,
+    Shutdown,
+}
+
+/// Parks a Graph calendar account while Work Offline is on (M-40): no
+/// list/poll call, and writes answer with the same offline failures as CalDAV.
+async fn wait_offline(
+    commands: &async_channel::Receiver<CalendarCommand>,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> OfflineWait {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return OfflineWait::Online;
+                    }
+                }
+                Err(_) => return OfflineWait::Shutdown,
+            },
+            command = commands.recv() => match command {
+                Ok(CalendarCommand::Shutdown) | Err(_) => return OfflineWait::Shutdown,
+                // Month requests only move what the app has already seeded
+                // from its cache; the reconnect sync catches up.
+                Ok(CalendarCommand::Refresh)
+                | Ok(CalendarCommand::SyncMonth(_))
+                | Ok(CalendarCommand::FetchMonth(_))
+                | Ok(CalendarCommand::SyncTasks) => {}
+                Ok(CalendarCommand::CreateEvent { event }) | Ok(CalendarCommand::UpdateEvent { event }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::EventSaveFailed {
+                            uid: event.uid.clone(),
+                            recurrence_id: event.recurrence_id,
+                            message: "You're working offline — the event was not saved".to_string(),
+                        })
+                        .await;
+                }
+                Ok(CalendarCommand::DeleteEvent { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the event was not deleted".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::CreateTask { task }) | Ok(CalendarCommand::UpdateTask { task }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error(format!(
+                            "You're working offline — the task \"{}\" was not saved",
+                            task.uid
+                        )))
+                        .await;
+                }
+                Ok(CalendarCommand::DeleteTask { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the task was not deleted".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::CreateCalendar { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the list was not created".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::UpdateCalendar { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the list was not renamed".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::DeleteCalendar { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the list was not deleted".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::FetchFreeBusy { request_id, .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::FreeBusyFailed {
+                            request_id,
+                            message: "You're working offline".to_string(),
+                        })
+                        .await;
+                }
+                Ok(CalendarCommand::FetchEventAttachment { request_id, .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                            request_id,
+                            message: "You're working offline".to_string(),
+                        })
+                        .await;
+                }
+                Ok(CalendarCommand::RespondInvitation { .. })
+                | Ok(CalendarCommand::SetSharedCalendars { .. })
+                | Ok(CalendarCommand::SetCalendarColor { .. })
+                | Ok(CalendarCommand::Reconnect) => {}
+            },
+        }
+    }
 }
 
 async fn connect_and_run(
@@ -132,8 +257,15 @@ async fn connect_and_run(
     client: &CalendarClient,
     commands: &async_channel::Receiver<CalendarCommand>,
     events: &async_channel::Sender<CalendarSessionEvent>,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<ShutdownReason, GraphError> {
+    if *offline_rx.borrow() {
+        return Ok(ShutdownReason::Offline);
+    }
     let mut calendars = client.list_calendars(account_id, None).await?;
+    if *offline_rx.borrow() {
+        return Ok(ShutdownReason::Offline);
+    }
     // The other users' mailboxes whose calendars this account also shows
     // (item 5.6 / CAL-25), from `CalendarCommand::SetSharedCalendars`.
     let mut shared_owners: Vec<String> = Vec::new();
@@ -155,17 +287,26 @@ async fn connect_and_run(
     let _ = events.send(CalendarSessionEvent::TasksUpdated(Vec::new())).await;
 
     loop {
+        if *offline_rx.borrow() {
+            return Ok(ShutdownReason::Offline);
+        }
         let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
         enum Wake {
             Poll,
             Command(CalendarCommand),
+            Offline,
             ChannelClosed,
         }
         let wake = tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => Wake::Poll,
             c = commands.recv() => match c {
                 Ok(cmd) => Wake::Command(cmd),
+                Err(_) => Wake::ChannelClosed,
+            },
+            changed = offline_rx.changed() => match changed {
+                Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                Ok(()) => Wake::Poll,
                 Err(_) => Wake::ChannelClosed,
             },
         };
@@ -176,6 +317,7 @@ async fn connect_and_run(
         match wake {
             Wake::Poll => sync_month(client, &calendars, current_month, events).await?,
             Wake::Command(cmd) => woke_on_command = Some(cmd),
+            Wake::Offline => return Ok(ShutdownReason::Offline),
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
 
@@ -599,7 +741,8 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx, offline_rx));
 
         let mut calendars = None;
         let mut scheduled = false;
@@ -659,7 +802,8 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx, offline_rx));
 
         let calendar = CalendarInfo {
             id: lookout_core::CalendarId("acct:cal1".to_string()),
@@ -740,7 +884,8 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx, offline_rx));
 
         let calendar_id = lookout_core::CalendarId("acct:cal1".to_string());
         let mut event = crate::calendar::event_from_graph(
@@ -793,7 +938,8 @@ mod tests {
         let client = CalendarClient::new(GraphClient::with_base_url(Arc::new(NoConsent), "https://example.invalid/v1.0"));
         let (_cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), client, cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), client, cmd_rx, evt_tx, offline_rx));
 
         let mut saw_non_retryable = false;
         for _ in 0..20 {
@@ -840,7 +986,8 @@ mod tests {
 
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx, offline_rx));
 
         // Wait for the initial list, then ask for the shared owner.
         let mut first = None;
@@ -878,6 +1025,77 @@ mod tests {
         let shared = merged.iter().find(|c| c.owner.is_some()).expect("a shared calendar");
         assert_eq!(shared.owner.as_deref(), Some("ada@example.com"));
         assert_eq!(shared.display_name, "ada@example.com · Ada's Calendar");
+
+        cmd_tx.send(CalendarCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Work Offline (M-40): a paused actor makes no request, refuses a write
+    /// with `EventSaveFailed`, and only connects after going online.
+    #[tokio::test]
+    async fn offline_calendar_session_makes_no_request_and_refuses_writes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/calendars"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "id": "cal1", "name": "Work" }] })))
+            .mount(&server)
+            .await;
+
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+        let handle = tokio::spawn(run_calendar_session(AccountId("acct".to_string()), test_client(&server), cmd_rx, evt_tx, offline_rx));
+
+        loop {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await,
+                Ok(Ok(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Offline)))
+            ) {
+                break;
+            }
+        }
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "an offline calendar actor must not reach Graph"
+        );
+
+        let calendar_id = lookout_core::CalendarId("acct:cal1".to_string());
+        let mut event = crate::calendar::event_from_graph(
+            &json!({ "id": "x", "subject": "New", "start": { "dateTime": "2026-10-15T09:00:00", "timeZone": "UTC" }, "end": { "dateTime": "2026-10-15T09:30:00", "timeZone": "UTC" } }),
+            &calendar_id,
+        )
+        .unwrap();
+        event.href = None;
+        event.etag = None;
+        cmd_tx.send(CalendarCommand::CreateEvent { event: Box::new(event) }).await.unwrap();
+        let mut refused = None;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(CalendarSessionEvent::EventSaveFailed { message, .. })) => {
+                    refused = Some(message);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(refused.as_deref().is_some_and(|message| message.contains("working offline")));
+        assert!(server.received_requests().await.unwrap_or_default().is_empty());
+
+        offline_tx.send(false).unwrap();
+        let mut connected = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(CalendarSessionEvent::CalendarsUpdated(_))) => {
+                    connected = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(connected, "going online lists the calendars");
+        assert!(!server.received_requests().await.unwrap_or_default().is_empty());
 
         cmd_tx.send(CalendarCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;

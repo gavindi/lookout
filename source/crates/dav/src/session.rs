@@ -43,6 +43,7 @@ pub async fn run_calendar_session(
     credentials: std::sync::Arc<dyn CalendarCredentialProvider>,
     commands: async_channel::Receiver<CalendarCommand>,
     events: async_channel::Sender<CalendarSessionEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let cache = match CalendarCache::open(&config.account_id) {
         Ok(cache) => Some(cache),
@@ -56,7 +57,7 @@ pub async fn run_calendar_session(
     // previous session before the network connection even starts. This is
     // immediately superseded by live data once the sync lands - the cache is
     // never treated as authoritative (see `CalendarCache`'s doc comment).
-    let current_month = first_of_month(chrono::Utc::now().date_naive());
+    let mut current_month = first_of_month(chrono::Utc::now().date_naive());
     if let Some(cache) = &cache {
         if let Ok(Some(occurrences)) = cache.load_month(current_month) {
             let _ = events
@@ -66,17 +67,44 @@ pub async fn run_calendar_session(
                 })
                 .await;
         }
+        // Tasks have no month window, so the whole cached set paints now -
+        // including an offline launch, where no sync will follow (T1).
+        if let Ok(Some(tasks)) = cache.load_tasks() {
+            if !tasks.is_empty() {
+                let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks)).await;
+            }
+        }
     }
 
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
+        // Work Offline (M-40): the cached month and tasks above already
+        // painted. Park without connecting; only local/month bookkeeping
+        // commands are answered until the signal goes back online.
+        if *offline_rx.borrow() {
+            let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Offline)).await;
+            match wait_offline(&commands, &events, cache.as_ref(), &mut current_month, &mut offline_rx).await {
+                OfflineWait::Online => {
+                    backoff = Duration::from_secs(1);
+                    continue;
+                }
+                OfflineWait::Shutdown => {
+                    let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
+            }
+        }
         let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
-        match connect_and_run(&config, credentials.as_ref(), &commands, &events, cache.as_ref()).await {
+        match connect_and_run(&config, credentials.as_ref(), &commands, &events, cache.as_ref(), &mut offline_rx).await {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
                 return;
+            }
+            Ok(ShutdownReason::Offline) => {
+                backoff = Duration::from_secs(1);
+                continue;
             }
             Err(e) => {
                 tracing::warn!("calendar session error, will reconnect: {e}");
@@ -98,6 +126,14 @@ pub async fn run_calendar_session(
         // received while disconnected exits immediately.
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
+            changed = offline_rx.changed() => {
+                if changed.is_err() {
+                    let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
+                backoff = Duration::from_secs(1);
+                continue;
+            }
             cmd = commands.recv() => {
                 match cmd {
                     Ok(CalendarCommand::Shutdown) => {
@@ -155,6 +191,127 @@ pub async fn run_calendar_session(
 
 enum ShutdownReason {
     Requested,
+    /// Work Offline turned on; the outer loop parks in `wait_offline`.
+    Offline,
+}
+
+/// How the parked CalDAV session ended.
+enum OfflineWait {
+    Online,
+    Shutdown,
+}
+
+/// Parks a CalDAV account while Work Offline is on (M-40). Writes are refused
+/// with the same per-request failures the UI already rolls optimistic changes
+/// back from; month requests only move the remembered month and re-emit the
+/// cached occurrences, never touching the network.
+async fn wait_offline(
+    commands: &async_channel::Receiver<CalendarCommand>,
+    events: &async_channel::Sender<CalendarSessionEvent>,
+    cache: Option<&CalendarCache>,
+    current_month: &mut NaiveDate,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> OfflineWait {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return OfflineWait::Online;
+                    }
+                }
+                Err(_) => return OfflineWait::Shutdown,
+            },
+            command = commands.recv() => match command {
+                Ok(CalendarCommand::Shutdown) | Err(_) => return OfflineWait::Shutdown,
+                Ok(CalendarCommand::SyncMonth(date)) => {
+                    *current_month = first_of_month(date);
+                    emit_cached_month(cache, *current_month, events).await;
+                }
+                Ok(CalendarCommand::FetchMonth(date)) => {
+                    emit_cached_month(cache, first_of_month(date), events).await;
+                }
+                Ok(CalendarCommand::SyncTasks) => emit_cached_tasks(cache, events).await,
+                Ok(CalendarCommand::Refresh) => {}
+                Ok(CalendarCommand::CreateEvent { event }) | Ok(CalendarCommand::UpdateEvent { event }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::EventSaveFailed {
+                            uid: event.uid.clone(),
+                            recurrence_id: event.recurrence_id,
+                            message: "You're working offline — the event was not saved".to_string(),
+                        })
+                        .await;
+                }
+                Ok(CalendarCommand::DeleteEvent { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the event was not deleted".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::CreateTask { task }) | Ok(CalendarCommand::UpdateTask { task }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error(format!(
+                            "You're working offline — the task \"{}\" was not saved",
+                            task.uid
+                        )))
+                        .await;
+                }
+                Ok(CalendarCommand::DeleteTask { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the task was not deleted".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::CreateCalendar { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the list was not created".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::UpdateCalendar { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the list was not renamed".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::DeleteCalendar { .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::Error("You're working offline — the list was not deleted".to_string()))
+                        .await;
+                }
+                Ok(CalendarCommand::FetchFreeBusy { request_id, .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::FreeBusyFailed {
+                            request_id,
+                            message: "You're working offline".to_string(),
+                        })
+                        .await;
+                }
+                Ok(CalendarCommand::FetchEventAttachment { request_id, .. }) => {
+                    let _ = events
+                        .send(CalendarSessionEvent::EventAttachmentFetchFailed {
+                            request_id,
+                            message: "You're working offline".to_string(),
+                        })
+                        .await;
+                }
+                // Colour and shared-calendar changes are already local-first;
+                // RSVP on CalDAV is an app-side iMIP reply, not this actor's.
+                Ok(CalendarCommand::SetCalendarColor { .. })
+                | Ok(CalendarCommand::SetSharedCalendars { .. })
+                | Ok(CalendarCommand::RespondInvitation { .. })
+                | Ok(CalendarCommand::Reconnect) => {}
+            },
+        }
+    }
+}
+
+async fn emit_cached_month(cache: Option<&CalendarCache>, month: NaiveDate, events: &async_channel::Sender<CalendarSessionEvent>) {
+    if let Some(Ok(Some(occurrences))) = cache.map(|cache| cache.load_month(month)) {
+        let _ = events.send(CalendarSessionEvent::OccurrencesUpdated { month, occurrences }).await;
+    }
+}
+
+async fn emit_cached_tasks(cache: Option<&CalendarCache>, events: &async_channel::Sender<CalendarSessionEvent>) {
+    if let Some(Ok(Some(tasks))) = cache.map(|cache| cache.load_tasks()) {
+        let _ = events.send(CalendarSessionEvent::TasksUpdated(tasks)).await;
+    }
 }
 
 async fn connect_and_run(
@@ -163,11 +320,19 @@ async fn connect_and_run(
     commands: &async_channel::Receiver<CalendarCommand>,
     events: &async_channel::Sender<CalendarSessionEvent>,
     cache: Option<&CalendarCache>,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<ShutdownReason> {
+    // The toggle can win the race between the outer check and this call.
+    if *offline_rx.borrow() {
+        return Ok(ShutdownReason::Offline);
+    }
     let credential = credentials.calendar_credential().await.map_err(Error::LoginFailed)?;
     let client = DavClient::new(&config.base_url, config.accept_ssl_errors, config.username.clone())?;
 
     let discovery = client.discover_calendar(&credential).await?;
+    if *offline_rx.borrow() {
+        return Ok(ShutdownReason::Offline);
+    }
     // The calendar-home href is kept for the list-lifecycle commands
     // (item 4.8 / T-01): a new collection is created under it, and the home is
     // re-listed after any create/rename/delete so the app's sidebar reflects
@@ -191,17 +356,26 @@ async fn connect_and_run(
     sync_tasks(&client, &calendars, &credential, events, cache).await?;
 
     loop {
+        if *offline_rx.borrow() {
+            return Ok(ShutdownReason::Offline);
+        }
         let _ = events.send(CalendarSessionEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
         enum Wake {
             Poll,
             Command(CalendarCommand),
+            Offline,
             ChannelClosed,
         }
         let wake = tokio::select! {
             _ = tokio::time::sleep(POLL_INTERVAL) => Wake::Poll,
             c = commands.recv() => match c {
                 Ok(cmd) => Wake::Command(cmd),
+                Err(_) => Wake::ChannelClosed,
+            },
+            changed = offline_rx.changed() => match changed {
+                Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                Ok(()) => Wake::Poll,
                 Err(_) => Wake::ChannelClosed,
             },
         };
@@ -215,6 +389,7 @@ async fn connect_and_run(
                 sync_tasks(&client, &calendars, &credential, events, cache).await?;
             }
             Wake::Command(cmd) => woke_on_command = Some(cmd),
+            Wake::Offline => return Ok(ShutdownReason::Offline),
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
 

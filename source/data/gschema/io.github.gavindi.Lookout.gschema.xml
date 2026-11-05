@@ -502,10 +502,22 @@
       <description>How much text the privacy blur hides for screenshots: 'off' blurs nothing, 'sensitive' blurs email addresses, account names and people's names, 'all' blurs content text including message bodies while leaving app chrome such as buttons, menus and headings readable. Intended for taking screenshots for demos and marketing, so personal details are not readable.</description>
     </key>
 
+    <!-- Work Offline (M-40) -->
+    <key name="work-offline" type="b">
+      <default>false</default>
+      <summary>Work offline</summary>
+      <description>Pauses all network activity without quitting Lookout: Mail (IMAP and Graph), Calendar (CalDAV and Graph), webcal feeds, People (CardDAV and Graph) and Tasks (CalDAV, Google Tasks and Microsoft To Do) stop syncing. Cached folders, messages, months, contacts, tasks and feeds remain readable; sends queue in the Outbox and calendar, contact and task writes are refused until the user goes back online.</description>
+    </key>
+
     <!-- Session memory -->
     <key name="last-view-unified" type="b">
       <default>false</default>
       <summary>Folder pane was on the unified view</summary>
+    </key>
+    <key name="last-view-outbox" type="b">
+      <default>false</default>
+      <summary>Folder pane was on the Outbox</summary>
+      <description>Whether the folder pane last reopened on the synthetic cross-account Outbox rather than a mailbox. The Outbox lists every account's queued sends.</description>
     </key>
     <key name="last-view-mailbox" type="s">
       <default>''</default>

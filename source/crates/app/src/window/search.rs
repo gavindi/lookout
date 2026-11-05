@@ -488,6 +488,9 @@ pub(crate) fn start_search(state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, me
         let mut st = state.borrow_mut();
         st.search_active = true;
         st.search_query = query.clone();
+        if st.mail_view != MailView::Search {
+            st.pre_search_view = Some(st.mail_view);
+        }
         st.mail_view = MailView::Search;
         // Drop any folders the *previous* query's live pass was waiting on.
         // An answer arriving for them is then both un-pending and (via the
@@ -568,11 +571,9 @@ pub(crate) fn exit_search(
         st.search_query.clear();
         st.search_results.clear();
         st.search_pending.clear();
-        if st.current_mailbox.is_some() {
-            MailView::Single
-        } else {
-            MailView::UnifiedInbox
-        }
+        st.pre_search_view
+            .take()
+            .unwrap_or_else(|| if st.current_mailbox.is_some() { MailView::Single } else { MailView::UnifiedInbox })
     };
     state.borrow_mut().mail_view = restored_view;
     // Restore the ribbon row the search replaced, and clear the refiner chips.
@@ -596,6 +597,10 @@ pub(crate) fn exit_search(
         let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
         let (key, descending) = current_sort(state);
         message_list.repopulate(all, key, descending);
+    } else if restored_view == MailView::Outbox {
+        // The page is already populated from `UiState::outbox`; just bring it
+        // back instead of leaving search results on screen.
+        message_list_stack.set_visible_child_name("outbox");
     } else {
         // Single view: paint from the mailbox's cache now so the list doesn't
         // linger on search results, then let the requested sync refresh it.
@@ -654,7 +659,14 @@ pub(crate) fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &M
         st.current_account = None;
         st.current_mailbox = None;
         st.restore_pending = false;
-        last_view::save(&st.settings, &LastSelection { unified: true, mailbox: None });
+        last_view::save(
+            &st.settings,
+            &LastSelection {
+                unified: true,
+                outbox: false,
+                mailbox: None,
+            },
+        );
     }
     for (account_id, inbox_id) in inboxes {
         request_mailbox_sync(state, &account_id, &inbox_id);
@@ -663,6 +675,29 @@ pub(crate) fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &M
     let (key, descending) = current_sort(state);
     message_list.repopulate(all, key, descending);
     refresh_message_loading_state(state, message_list, message_list_stack);
+}
+
+/// Enters the synthetic cross-account Outbox view (M-40): no mailbox owns it,
+/// the page is already populated from `UiState::outbox`, and the reading pane
+/// is cleared. Remembers the selection so a restart restores it.
+pub(crate) fn enter_outbox_view(state: &Rc<RefCell<UiState>>, message_list_stack: &gtk::Stack, reading_stack: &gtk::Stack) {
+    {
+        let mut st = state.borrow_mut();
+        st.mail_view = MailView::Outbox;
+        st.current_account = None;
+        st.current_mailbox = None;
+        st.restore_pending = false;
+        last_view::save(
+            &st.settings,
+            &LastSelection {
+                unified: false,
+                outbox: true,
+                mailbox: None,
+            },
+        );
+    }
+    message_list_stack.set_visible_child_name("outbox");
+    reading_stack.set_visible_child_name("empty");
 }
 
 /// Merges the unified view's per-mailbox snapshots into a single newest-first

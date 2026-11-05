@@ -45,6 +45,7 @@ type DeleteCallback = Rc<dyn Fn(CalendarId, TaskUid, Option<String>, Option<Stri
 pub fn show_task_editor(
     window: &adw::ApplicationWindow,
     prefill: TaskEditorPrefill,
+    is_offline: Rc<dyn Fn() -> bool>,
     on_save: impl Fn(CalendarId, CalendarTask) + 'static,
     on_delete: impl Fn(CalendarId, TaskUid, Option<String>, Option<String>) + 'static,
 ) {
@@ -339,8 +340,15 @@ pub fn show_task_editor(
         let reminder_values = reminder_values.clone();
         let series = series;
         let existing_meta = existing_meta.clone();
+        let is_offline = is_offline.clone();
         let on_save = on_save;
         move |_button: &gtk::Button| {
+            // Work Offline (M-40): refuse the write, keep the form open.
+            if is_offline() {
+                error_label.set_label("You're working offline — reconnect to save");
+                error_label.set_visible(true);
+                return;
+            }
             let selected = calendar_dropdown.selected() as usize;
             let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
                 error_label.set_label("No calendar selected.");
@@ -455,8 +463,14 @@ pub fn show_task_editor(
         let calendar_ids = calendar_ids.clone();
         let error_label = error_label.clone();
         let existing_meta = existing_meta.clone();
+        let is_offline = is_offline.clone();
         let on_delete = on_delete;
         delete_button.connect_clicked(move |_| {
+            if is_offline() {
+                error_label.set_label("You're working offline — reconnect to save");
+                error_label.set_visible(true);
+                return;
+            }
             let selected = calendar_dropdown.selected() as usize;
             let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
                 error_label.set_label("No calendar selected.");

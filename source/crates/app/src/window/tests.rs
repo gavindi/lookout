@@ -202,11 +202,27 @@ fn test_mailbox(account: &AccountId, name: &str, unread: u32) -> Mailbox {
 }
 
 #[test]
+fn outbox_view_title_names_all_accounts() {
+    let state = test_state(Vec::new());
+    state.borrow_mut().mail_view = MailView::Outbox;
+    assert_eq!(current_view_title(&state), ("Outbox".to_string(), "All accounts".to_string()));
+}
+
+#[test]
 fn folder_tree_signature_tracks_the_unread_count() {
     let account = AccountId("acc".into());
-    let before = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[], &HashMap::new());
-    let after = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 4)])], &[], &HashMap::new());
+    let before = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[], &HashMap::new(), 0);
+    let after = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 4)])], &[], &HashMap::new(), 0);
     assert_ne!(before, after, "a changed count must rebuild the tree - it's what the row draws");
+}
+
+#[test]
+fn folder_tree_signature_tracks_the_outbox_count() {
+    let account = AccountId("acc".into());
+    let accounts = [(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])];
+    let before = folder_tree_signature(&accounts, &[], &HashMap::new(), 0);
+    let after = folder_tree_signature(&accounts, &[], &HashMap::new(), 3);
+    assert_ne!(before, after, "a changed Outbox count must rebuild the pane");
 }
 
 #[test]
@@ -417,8 +433,8 @@ fn folder_tree_signature_ignores_fields_the_tree_never_draws() {
     noisy.uidnext = 999;
     noisy.uidvalidity = UidValidity(42);
     noisy.highest_modseq = Some(7);
-    let quiet = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[], &HashMap::new());
-    let churned = folder_tree_signature(&[(account.clone(), "Me".into(), vec![noisy])], &[], &HashMap::new());
+    let quiet = folder_tree_signature(&[(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 3)])], &[], &HashMap::new(), 0);
+    let churned = folder_tree_signature(&[(account.clone(), "Me".into(), vec![noisy])], &[], &HashMap::new(), 0);
     assert_eq!(quiet, churned);
 }
 
@@ -430,10 +446,10 @@ fn folder_tree_signature_tracks_totals_and_display_prefs() {
     let account = AccountId("acc".into());
     let inbox = test_mailbox(&account, "INBOX", 3);
     let accounts = vec![(account.clone(), "Me".to_string(), vec![inbox.clone()])];
-    let base = folder_tree_signature(&accounts, &[], &HashMap::new());
+    let base = folder_tree_signature(&accounts, &[], &HashMap::new(), 0);
     let mut grown = inbox.clone();
     grown.total += 1;
-    assert_ne!(base, folder_tree_signature(&[(account.clone(), "Me".into(), vec![grown])], &[], &HashMap::new()));
+    assert_ne!(base, folder_tree_signature(&[(account.clone(), "Me".into(), vec![grown])], &[], &HashMap::new(), 0));
     let colored = HashMap::from([(
         inbox.id.clone(),
         crate::ui_state_db::FolderPrefs {
@@ -441,15 +457,15 @@ fn folder_tree_signature_tracks_totals_and_display_prefs() {
             ..Default::default()
         },
     )]);
-    assert_ne!(base, folder_tree_signature(&accounts, &[], &colored));
+    assert_ne!(base, folder_tree_signature(&accounts, &[], &colored, 0));
 }
 
 #[test]
 fn folder_tree_signature_tracks_the_favorites_section() {
     let account = AccountId("acc".into());
     let accounts = [(account.clone(), "Me".into(), vec![test_mailbox(&account, "INBOX", 0)])];
-    let without = folder_tree_signature(&accounts, &[], &HashMap::new());
-    let with = folder_tree_signature(&accounts, &[test_mailbox(&account, "INBOX", 0)], &HashMap::new());
+    let without = folder_tree_signature(&accounts, &[], &HashMap::new(), 0);
+    let with = folder_tree_signature(&accounts, &[test_mailbox(&account, "INBOX", 0)], &HashMap::new(), 0);
     assert_ne!(without, with, "starring a folder adds a whole section and must rebuild");
 }
 
@@ -743,6 +759,12 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         desktop_contacts: Vec::new(),
         ui_db: None,
         settings: Rc::new(crate::settings::resolve()),
+        offline_tx: tokio::sync::watch::channel(false).0,
+        work_offline: false,
+        offline_indicator: None,
+        offline_toggle: None,
+        offline_banner: None,
+        reading_stack: None,
         app_config: Rc::new(RefCell::new(crate::app_config::AppConfig::default())),
         categories: Rc::new(RefCell::new(crate::categories::CategorySet::default())),
         deleted_contacts: HashMap::new(),
@@ -755,6 +777,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         current_mailbox: None,
         pending_message_selection: None,
         mail_view: MailView::Single,
+        pre_search_view: None,
         unified_snapshots: HashMap::new(),
         mailbox_sync_epoch: HashMap::new(),
         pending_optimistic_removals: HashMap::new(),
@@ -777,6 +800,8 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         rendered_follow_up: None,
         flagged_mail: HashMap::new(),
         outbox: HashMap::new(),
+        outbox_count: 0,
+        outbox_page: None,
         outbox_banner: None,
         outbox_dialog: None,
         sieve_support: HashMap::new(),
@@ -846,6 +871,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         trust_banner_dismissed: None,
         rendered_remote_scan: None,
         draft_saved_tx: None,
+        draft_save_failed_tx: None,
         composer_identities_refresh: None,
         manage_signatures: None,
         manage_templates: None,
@@ -892,6 +918,24 @@ fn request_mailbox_sync_dedupes_until_answered_or_reconnected() {
     state.borrow_mut().syncing.insert(inbox.clone());
     state.borrow_mut().syncing.retain(|mailbox| mailbox_account_id(mailbox).as_ref() != Some(&account_id));
     assert!(!state.borrow().syncing.contains(&inbox));
+}
+
+#[test]
+fn work_offline_refuses_mail_sync_requests_without_marking_spinners() {
+    let account_id = AccountId("acc".into());
+    let inbox = MailboxId("acc:INBOX".into());
+    let state = test_state(vec![(account_id.clone(), vec![test_mailbox(&account_id, "INBOX", 1)])]);
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    state.borrow_mut().accounts.get_mut(&account_id).unwrap().cmd_tx = cmd_tx;
+    state.borrow_mut().work_offline = true;
+
+    assert!(!request_mailbox_sync(&state, &account_id, &inbox), "no request is sent offline");
+    assert!(!state.borrow().syncing.contains(&inbox), "and no sync spinner is left to clear later");
+    assert!(state.borrow().refreshing.is_empty());
+
+    send_receive_all(&state);
+    assert!(cmd_rx.try_recv().is_err(), "Send/Receive All dispatches nothing while paused");
+    assert!(state.borrow().refreshing.is_empty());
 }
 
 /// `optimistic_remove_messages` hides a row (and its unified-view
@@ -1316,6 +1360,21 @@ fn account_row(model: &gtk::TreeListModel, id: &AccountId) -> gtk::TreeListRow {
 }
 
 /// The depth-0 Favorites section row of a freshly built tree.
+fn outbox_row(model: &gtk::TreeListModel) -> (gtk::TreeListRow, u32) {
+    for i in 0..model.n_items() {
+        let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
+        if row.depth() != 0 {
+            continue;
+        }
+        let Some(boxed) = row.item().and_downcast::<glib::BoxedAnyObject>() else { continue };
+        let tree_item = boxed.borrow::<TreeItem>();
+        if let TreeItem::Outbox(count) = &*tree_item {
+            return (row, *count);
+        }
+    }
+    panic!("no Outbox row");
+}
+
 fn favorites_row(model: &gtk::TreeListModel) -> gtk::TreeListRow {
     for i in 0..model.n_items() {
         let Some(row) = model.item(i).and_downcast::<gtk::TreeListRow>() else { continue };
@@ -1378,9 +1437,18 @@ fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
             ],
             vec![test_mailbox(&acc_a, "INBOX", 3)],
             Vec::new(),
+            0,
         )
     };
     let model = build();
+    // The synthetic Outbox row sits between Favorites and the accounts and
+    // carries the summed queue count.
+    let (outbox, _) = outbox_row(&model);
+    assert_eq!(outbox.position(), 2, "All Inboxes, Favorites, then Outbox");
+    let counted = build_multi_account_tree_model(vec![(acc_a.clone(), "A".into(), Vec::new())], vec![], Vec::new(), 7);
+    let (counted_row, count) = outbox_row(&counted);
+    assert_eq!(count, 7, "the badge sums every account's outbox");
+    assert_eq!(counted_row.position(), 1, "without Favorites the Outbox is the second row");
     apply_account_group_expansion(&model, &HashSet::new());
     assert!(account_row(&model, &acc_a).is_expanded(), "default: every account group expanded");
     assert!(account_row(&model, &acc_b).is_expanded());
@@ -1409,6 +1477,7 @@ fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
         vec![(acc_a.clone(), "A".into(), vec![test_mailbox(&acc_a, "INBOX", 3)]), (acc_b.clone(), "B".into(), Vec::new())],
         vec![],
         Vec::new(),
+        0,
     );
     apply_account_group_expansion(&waiting, &HashSet::new());
     let b_row = account_row(&waiting, &acc_b);
@@ -1427,6 +1496,7 @@ fn folder_tree_rebuild_preserves_collapse_state_and_scroll() {
         ],
         vec![],
         Vec::new(),
+        0,
     );
     apply_account_group_expansion(&connected, &collapsed);
     let b_row = account_row(&connected, &acc_b);
@@ -1655,7 +1725,7 @@ fn shutdown_signal_fires_with_tree_still_alive() {
     }
     let app = adw::Application::builder().application_id("org.example.lookout-shutdown-order-test").build();
     let win = gtk::ApplicationWindow::new(&app);
-    let model = build_multi_account_tree_model(Vec::new(), Vec::new(), Vec::new());
+    let model = build_multi_account_tree_model(Vec::new(), Vec::new(), Vec::new(), 0);
     let selection = gtk::SingleSelection::new(Some(model));
     let seen: Rc<RefCell<Option<bool>>> = Rc::new(RefCell::new(None));
     let seen2 = seen.clone();

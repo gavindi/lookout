@@ -10,7 +10,14 @@ It also cannot currently queue a send while the account is disconnected: the ses
 handles `SendMessage` inside a live connection, so the command waits for reconnect instead
 of landing in the outbox.
 
-**Status:** planned; nothing is implemented yet.
+**Status:** complete. Parts A–G are implemented (the shared signal and shell, Mail,
+Calendar/webcal, People, Tasks, the Outbox folder, and the docs close-out).
+
+**Progress:** A1–A5, B1–B5, C1–C5, P1–P2, T1–T4, F1–F6 and G1–G2 are complete. `cargo fmt --all`,
+`cargo check --workspace --all-targets` and
+`cargo clippy --workspace --all-targets -- -D warnings -A clippy::result_large_err`
+are clean. Tests written for the completed parts have been added but **not run** (see the
+Tests section). Nothing is committed and no version was bumped.
 
 **Effort:** `L` — roughly one to two weeks, because the approved scope pauses every
 network module, not just Mail.
@@ -64,7 +71,7 @@ The outbox table and every existing `PRAGMA user_version` stay untouched.
 
 ---
 
-## Current state by module
+## State before this work (for reference)
 
 | Module | Session / loop | Cache shown at startup | Offline write behaviour today |
 |---|---|---|---|
@@ -157,7 +164,7 @@ distinguish a user-requested pause from an error or a dropped connection.
 
 ## Part A — Signal, preference and shell
 
-### [ ] A1 — Persist the preference (`S`)
+### [x] A1 — Persist the preference (`S`)
 
 - Add `WORK_OFFLINE` (`work-offline`) to `source/crates/app/src/settings.rs`, seeded
   `false` in the in-memory defaults.
@@ -166,7 +173,7 @@ distinguish a user-requested pause from an error or a dropped connection.
   description naming all modules.
 - Read it once in `build_window` to seed the watch channel and `UiState::work_offline`.
 
-### [ ] A2 — Create and store the signal (`S`)
+### [x] A2 — Create and store the signal (`S`)
 
 - In `source/crates/app/src/window.rs` (near where the cache and settings are created):
   create `(offline_tx, offline_rx)`.
@@ -177,7 +184,7 @@ distinguish a user-requested pause from an error or a dropped connection.
   `state.borrow().offline_tx.subscribe()`. Every connect site uses it, so a new account
   inherits the current value.
 
-### [ ] A3 — App wiring (`M`)
+### [x] A3 — App wiring (`M`)
 
 - Add `set_work_offline(state, offline)` in a small `window/offline.rs` (or beside the
   outbox helpers):
@@ -199,7 +206,7 @@ distinguish a user-requested pause from an error or a dropped connection.
 - If a body fetch was pending when the toggle flipped, show the offline page
   (`show_body_fetch_error`) rather than leaving the reading pane spinning.
 
-### [ ] A4 — Toggle, indicator and banner (`S`)
+### [x] A4 — Toggle, indicator and banner (`S`)
 
 - `source/crates/app/src/window.rs`, Send / Receive band: add a **Preferences** group with
   a toggle via `RibbonGroup::toggle` (the shared ribbon already supports toggles), wired
@@ -209,7 +216,7 @@ distinguish a user-requested pause from an error or a dropped connection.
 - Message box: add the `adw::Banner` with **Go online**, revealed while offline. Keep the
   text markup-escaped and reusable for future status banners.
 
-### [ ] A5 — Editor and import guards (`M`)
+### [x] A5 — Editor and import guards (`M`)
 
 - `event_editor.rs`: take an `is_offline: Rc<dyn Fn() -> bool>` (or a shared
   `Rc<Cell<bool>>`) and, in the Save handler, show the error label and keep the dialog
@@ -225,7 +232,7 @@ distinguish a user-requested pause from an error or a dropped connection.
 
 ## Part B — Mail
 
-### [ ] B1 — Pass the signal into both mail sessions (`M`)
+### [x] B1 — Pass the signal into both mail sessions (`M`)
 
 - `run_account_session(config, credentials, commands, interactive_commands, events, offline_rx)`.
 - `run_graph_mail_session(config, client, commands, interactive_commands, events, offline_rx)`.
@@ -239,7 +246,7 @@ distinguish a user-requested pause from an error or a dropped connection.
   Each test creates `let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);`
   and keeps `_offline_tx` alive.
 
-### [ ] B2 — IMAP offline loop and command pump (`M`)
+### [x] B2 — IMAP offline loop and command pump (`M`)
 
 - `ConnectionState::Offline` in `source/crates/mail/src/session.rs`.
 - Outer loop in `run_account_session`:
@@ -267,7 +274,7 @@ distinguish a user-requested pause from an error or a dropped connection.
   the offline check must also run before the drain so a toggle during the undo-send
   window prevents the send.
 
-### [ ] B3 — Extract the cache-only outbox handlers (`S`)
+### [x] B3 — Extract the cache-only outbox handlers (`S`)
 
 - Factor the bodies of `SendMessage`, `CancelOutbox` and `RescheduleOutbox` out of the big
   `connect_and_run` match into helpers usable without a session:
@@ -279,7 +286,7 @@ distinguish a user-requested pause from an error or a dropped connection.
     `OutboxContents`.
 - The connected path calls the same helpers, so the behaviour cannot drift.
 
-### [ ] B4 — Graph mail offline mode (`M`)
+### [x] B4 — Graph mail offline mode (`M`)
 
 In `source/crates/graph/src/mail/session.rs`:
 
@@ -292,7 +299,7 @@ In `source/crates/graph/src/mail/session.rs`:
   so the next iteration catches up.
 - `ConnectionState::Offline` on entering, `Connecting`/`Idle` on leaving.
 
-### [ ] B5 — Composer status while offline (`S`)
+### [x] B5 — Composer status while offline (`S`)
 
 - Add `AccountEvent::DraftSaveFailed { message_id, message }` and handle it in the Graph
   session too (or emit it only from the offline pump and document the asymmetry).
@@ -304,7 +311,7 @@ In `source/crates/graph/src/mail/session.rs`:
 
 ## Part C — Calendar and webcal
 
-### [ ] C1 — CalDAV offline mode (`M`)
+### [x] C1 — CalDAV offline mode (`M`)
 
 `source/crates/dav/src/session.rs`:
 
@@ -329,7 +336,7 @@ In `source/crates/graph/src/mail/session.rs`:
 - Keep the offline wait alive across repeated commands (do not return on the first write
   failure).
 
-### [ ] C2 — Graph calendar offline mode (`M`)
+### [x] C2 — Graph calendar offline mode (`M`)
 
 `source/crates/graph/src/calendar/session.rs`:
 
@@ -340,7 +347,7 @@ In `source/crates/graph/src/mail/session.rs`:
 - Answer writes with the same offline errors as C1; a missing Graph consent still follows
   the existing non-retryable path.
 
-### [ ] C3 — Show cached calendar months offline (`M`)
+### [x] C3 — Show cached calendar months offline (`M`)
 
 The Graph calendar session has no cache replay, and the CalDAV session only replays the
 current month at startup. Add an app-side seed so both backends show the last synced month
@@ -362,7 +369,7 @@ and so navigating months offline still works:
 - For Graph, this is the only path that paints a month offline; for CalDAV it is a
   harmless second source that covers month navigation.
 
-### [ ] C4 — Answer offline scheduling and rooms (`S`)
+### [x] C4 — Answer offline scheduling and rooms (`S`)
 
 - The Scheduling Assistant's `FetchFreeBusy` fails as in C1; the tab already shows
   attendees as unknown, so add the "Working offline" prefix to that state.
@@ -372,7 +379,7 @@ and so navigating months offline still works:
   while offline, keep the toggle but explain that the join link will be created on save
   after reconnecting (or disable Save entirely per A5).
 
-### [ ] C5 — Webcal subscriptions (`S`)
+### [x] C5 — Webcal subscriptions (`S`)
 
 `source/crates/dav/src/subscription.rs`:
 
@@ -389,7 +396,7 @@ and so navigating months offline still works:
 
 ## Part D — People
 
-### [ ] P1 — Pause the contacts poll loop (`M`)
+### [x] P1 — Pause the contacts poll loop (`M`)
 
 `source/crates/app/src/contacts_view.rs`:
 
@@ -403,7 +410,7 @@ and so navigating months offline still works:
   - on going online, fall through to the normal resync (set `resync = true`).
 - Never launch a CardDAV/Graph request while offline.
 
-### [ ] P2 — Offline display and editors (`S`)
+### [x] P2 — Offline display and editors (`S`)
 
 - The People rail and list already render the cached `ContactsAccountSnapshot`, so no
   display change is needed once the loop stops polling.
@@ -415,14 +422,14 @@ and so navigating months offline still works:
 
 ## Part E — Tasks
 
-### [ ] T1 — Replay CalDAV tasks at startup (`S`)
+### [x] T1 — Replay CalDAV tasks at startup (`S`) — done with C1
 
 - `source/crates/dav/src/session.rs`: after the cached-month replay, load
   `CalendarCache::load_tasks()` and emit `CalendarSessionEvent::TasksUpdated` before
   connecting. The cache is already written by `sync_tasks`.
 - This gives the Tasks view CalDAV VTODOs offline with no new storage.
 
-### [ ] T2 — Google Tasks offline mode (`S`)
+### [x] T2 — Google Tasks offline mode (`S`)
 
 `source/crates/app/src/google_tasks.rs`:
 
@@ -435,7 +442,7 @@ and so navigating months offline still works:
   `GoogleTasksEvent::Error("You're working offline — …")`.
 - On going online, acquire a token, sync, and resume the poll loop.
 
-### [ ] T3 — Graph To Do cache and offline mode (`M`)
+### [x] T3 — Graph To Do cache and offline mode (`M`)
 
 `source/crates/graph/src/todo/`:
 
@@ -449,7 +456,7 @@ and so navigating months offline still works:
 - Without this cache, Microsoft To Do would be blank on an offline launch — the one module
   with no existing persistence.
 
-### [ ] T4 — Task editor and lists (`S`)
+### [x] T4 — Task editor and lists (`S`)
 
 - Guard `task_editor.rs` Save/Delete and `task_lists.rs` create/rename/delete as in A5.
 - The Tasks view's grouping/sorting and My Day pins are local and keep working.
@@ -460,7 +467,7 @@ and so navigating months offline still works:
 
 ## Part F — Outbox folder in the folder pane
 
-### [ ] F1 — Add the tree row (`S`)
+### [x] F1 — Add the tree row (`S`)
 
 - `source/crates/app/src/folder_tree.rs`:
   - add `TreeItem::Outbox(u32)`, documented as the synthetic cross-account sending queue;
@@ -471,7 +478,7 @@ and so navigating months offline still works:
   fallback), label **Outbox**, heading style like the other synthetic rows, and the count
   badge. No drop target, no folder ⋯ menu, no Empty button, no spinner.
 
-### [ ] F2 — Keep the count fresh (`S`)
+### [x] F2 — Keep the count fresh (`S`)
 
 - Include the outbox count in `folder_tree_signature` under a reserved pseudo-account key
   (the same pattern used for Favorites and Search Folders).
@@ -479,7 +486,7 @@ and so navigating months offline still works:
   when the total changes.
 - Count every row in every account's `UiState::outbox`, failed included.
 
-### [ ] F3 — Add the view (`M`)
+### [x] F3 — Add the view (`M`)
 
 - `source/crates/app/src/window/state.rs`: add `MailView::Outbox`.
 - Folder selection (`window.rs`): on `TreeItem::Outbox`, exit search, clear
@@ -492,7 +499,7 @@ and so navigating months offline still works:
 - `restore_or_default_initial_view`: add an `Outbox` selection target and a
   `find_outbox_index` helper.
 
-### [ ] F4 — Build the Outbox page (`M`)
+### [x] F4 — Build the Outbox page (`M`)
 
 - Add a `gtk::Stack` page named `outbox` in `message_list_stack`.
 - Factor the row builder out of `fill_outbox_dialog` in `window/undo.rs` into a shared
@@ -512,7 +519,7 @@ and so navigating months offline still works:
   existing banner → "Scheduled messages" dialog; sharing the row builder keeps actions
   consistent.
 
-### [ ] F5 — Restore the view across search and restart (`S`)
+### [x] F5 — Restore the view across search and restart (`S`)
 
 - Add `UiState::pre_search_view: Option<MailView>` and set it in `start_search`; use it in
   `exit_search` so search started from Outbox returns to Outbox (this also removes the
@@ -524,7 +531,7 @@ and so navigating months offline still works:
 - Save the selection when the Outbox row is chosen; restore it on first paint like the
   unified view.
 
-### [ ] F6 — Offline interaction (`S`)
+### [x] F6 — Offline interaction (`S`)
 
 - Any folder can still be selected while offline; cached mail paints from disk because
   A3's guard stops the sync request before it sets `syncing`.
@@ -537,13 +544,13 @@ and so navigating months offline still works:
 
 ## Part G — Docs and close-out
 
-### [ ] G1 — CHANGELOG entry (`S`)
+### [x] G1 — CHANGELOG entry (`S`)
 
 Follow the existing style and cite **M-40**. State that the mail cache format is unchanged,
 list the new GSettings keys and the Graph To Do task cache (the one new file), and
 describe the full-scope offline mode and the Outbox folder.
 
-### [ ] G2 — Update `OUTLOOK_PARITY.md` (`S`)
+### [x] G2 — Update `OUTLOOK_PARITY.md` (`S`)
 
 - Flip M-40 in §5.1 from 🟡 to ✅ and update its "Today" column.
 - Update §2.1: Mail ✅ 38 → 39, 🟡 5 → 4; total ✅ 124 → 125, 🟡 14 → 13; recompute the

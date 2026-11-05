@@ -87,7 +87,8 @@ async fn main() -> anyhow::Result<()> {
     let (_interactive_tx, interactive_rx) = async_channel::unbounded();
     let (evt_tx, evt_rx) = async_channel::unbounded();
 
-    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx));
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx, offline_rx));
 
     let mut got_folders = false;
     let mut got_messages = false;
@@ -157,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
                     AccountEvent::OutboxContents { items } => println!("outbox: {} item(s)", items.len()),
                     AccountEvent::OutboxCancelFailed { id } => println!("outbox cancel too late: {id}"),
                     AccountEvent::DraftSaved { message_id } => println!("draft saved: {message_id}"),
+                    AccountEvent::DraftSaveFailed { message, .. } => println!("draft not saved: {message}"),
                     AccountEvent::MessageMoved { .. } | AccountEvent::MessageSnoozed | AccountEvent::MailboxExpunged { .. } => {}
                     AccountEvent::FollowUpFailed { .. } | AccountEvent::FollowUpSet { .. } => {}
                     AccountEvent::CategoriesChanged { .. } | AccountEvent::ImportanceSet { .. } | AccountEvent::FocusedSet { .. } => {}

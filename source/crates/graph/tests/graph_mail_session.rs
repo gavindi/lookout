@@ -142,7 +142,9 @@ async fn the_graph_session_syncs_reads_and_writes_native_properties() {
     let (commands, command_rx) = async_channel::unbounded();
     let (interactive, interactive_rx) = async_channel::unbounded();
     let (events, event_rx) = async_channel::unbounded();
-    let session = tokio::spawn(run_graph_mail_session(config, client, command_rx, interactive_rx, events));
+    // Kept alive for the session's lifetime; see `window/offline.rs`.
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let session = tokio::spawn(run_graph_mail_session(config, client, command_rx, interactive_rx, events, offline_rx));
 
     // The initial sync ends with Idle (after the Inbox's MessagesUpdated).
     loop {
@@ -232,6 +234,93 @@ async fn the_graph_session_syncs_reads_and_writes_native_properties() {
     let reopened = Cache::open(&account_id).unwrap();
     assert!(reopened.graph_folder_cursor(&inbox).unwrap().is_some(), "the persisted cursor survives a reopen");
     drop(reopened);
+    let _ = remove_account_cache(&account_id);
+}
+
+/// Work Offline (M-40): a session started paused paints the cache, makes no
+/// HTTP request, queues a send into the local outbox, and only delivers it
+/// after the signal goes back online.
+#[tokio::test]
+async fn offline_graph_session_makes_no_request_and_queues_until_online() {
+    let account_id = temp_account();
+    let server = MockServer::start().await;
+    mount_graph(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1.0/me/sendMail"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+
+    let client = MailClient::new(GraphClient::with_base_url(Arc::new(StubTokens), format!("{}/v1.0", server.uri())));
+    let config = GraphMailSessionConfig {
+        account_id: account_id.clone(),
+        zone: None,
+        poll_interval: Duration::from_secs(60 * 60),
+        mention_addresses: Vec::new(),
+        mention_names: Vec::new(),
+    };
+    let (commands, command_rx) = async_channel::unbounded();
+    let (_interactive, interactive_rx) = async_channel::unbounded();
+    let (events, event_rx) = async_channel::unbounded();
+    let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+    let session = tokio::spawn(run_graph_mail_session(config, client, command_rx, interactive_rx, events, offline_rx));
+
+    // The cache replay (including the outbox) runs before the offline park.
+    loop {
+        if matches!(next_event(&event_rx).await, AccountEvent::OutboxContents { .. }) {
+            break;
+        }
+    }
+    assert!(
+        server.received_requests().await.unwrap_or_default().is_empty(),
+        "an offline session must not reach Graph at all"
+    );
+
+    let message = lookout_mail::ComposedMessage {
+        from: "adelev@contoso.com".to_string(),
+        display_name: None,
+        to: vec!["team@contoso.com".to_string()],
+        cc: vec![],
+        bcc: vec![],
+        reply_to: vec![],
+        subject: "Offline Graph send".to_string(),
+        text_body: "queued while offline".to_string(),
+        html_body: None,
+        attachments: vec![],
+        inline_images: vec![],
+        calendar_part: None,
+        read_receipt: None,
+        request_read_receipt: false,
+        request_delivery_receipt: false,
+        importance: lookout_core::Importance::Normal,
+        sensitivity: lookout_core::MessageSensitivity::Normal,
+        in_reply_to: None,
+        references: vec![],
+        message_id: None,
+    };
+    commands
+        .send(AccountCommand::SendMessage {
+            message: Box::new(message),
+            not_before: None,
+            client_token: Some(99),
+        })
+        .await
+        .unwrap();
+    let queued = loop {
+        if let AccountEvent::OutboxQueued { id, .. } = next_event(&event_rx).await {
+            break id;
+        }
+    };
+    assert!(server.received_requests().await.unwrap_or_default().is_empty(), "queueing a send offline is cache-only");
+
+    offline_tx.send(false).unwrap();
+    loop {
+        if matches!(next_event(&event_rx).await, AccountEvent::OutboxSent { id } if id == queued) {
+            break;
+        }
+    }
+    let _ = commands.send(AccountCommand::Shutdown).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), session).await;
     let _ = remove_account_cache(&account_id);
 }
 

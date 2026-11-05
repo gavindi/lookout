@@ -658,7 +658,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
         .ribbon_style
         .clone()
         .unwrap_or_else(|| crate::ribbon::RibbonStyle::new(crate::ribbon::RibbonMode::default()));
-    let (composer, editor_toolbar, draft_tx, identities_refresh) = crate::compose::build_compose_view(
+    let (composer, editor_toolbar, draft_tx, draft_failed_tx, identities_refresh) = crate::compose::build_compose_view(
         title,
         // The composer's From dropdown re-reads from here whenever the
         // Config → Mail accounts manage-identities dialog fires `on_changed`
@@ -752,6 +752,7 @@ pub(crate) fn show_composer_in_reading_pane_full(
     // exits), and hooking the Config manage-identities dialog into the new
     // composer's From dropdown.
     state.borrow_mut().draft_saved_tx = Some(draft_tx);
+    state.borrow_mut().draft_save_failed_tx = Some(draft_failed_tx);
     state.borrow_mut().composer_identities_refresh = Some(identities_refresh);
     // The composer is embedded, so its editor toolbar moves out of the
     // composer column and into the main window's action bar, replacing the

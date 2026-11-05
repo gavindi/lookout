@@ -27,7 +27,13 @@ pub enum ConnectionState {
     Connecting,
     Idle,
     Busy,
-    Error { message: String, retryable: bool },
+    /// Work Offline (M-40): the user paused calendar syncing. Distinct from
+    /// `Disconnected` (a dropped connection) and `Error` (a failure).
+    Offline,
+    Error {
+        message: String,
+        retryable: bool,
+    },
 }
 
 /// A response to a meeting invitation, as Graph's RSVP actions model it

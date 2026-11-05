@@ -113,6 +113,11 @@ fn reason_text(reason: &MatchReason) -> String {
 
 /// Shows the People screen's Merge duplicates dialog.
 pub(crate) fn show_merge_duplicates_dialog(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay) {
+    // Merge is a server write with no offline queue (M-40).
+    if state.borrow().work_offline {
+        toast_overlay.add_toast(adw::Toast::new("You're working offline — reconnect to save"));
+        return;
+    }
     let groups = {
         let st = state.borrow();
         scan_groups(&st.contacts_by_account)

@@ -92,7 +92,9 @@ async fn syncs_a_live_mailbox_read_only() {
     let (commands, command_rx) = async_channel::unbounded();
     let (_interactive, interactive_rx) = async_channel::unbounded();
     let (events, event_rx) = async_channel::unbounded();
-    let session = tokio::spawn(run_graph_mail_session(config, client, command_rx, interactive_rx, events));
+    // Kept alive for the session's lifetime; see `window/offline.rs`.
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let session = tokio::spawn(run_graph_mail_session(config, client, command_rx, interactive_rx, events, offline_rx));
 
     // The folder hierarchy must come back before anything else can be checked.
     let folders = loop {

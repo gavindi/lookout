@@ -18,14 +18,18 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::app_config::config_dir;
-use crate::settings::{LAST_VIEW_MAILBOX, LAST_VIEW_UNIFIED};
+use crate::settings::{LAST_VIEW_MAILBOX, LAST_VIEW_OUTBOX, LAST_VIEW_UNIFIED};
 
 /// The folder pane's last-selected view. `unified` marks the synthetic
-/// "All Inboxes" view; otherwise `mailbox` holds the selected `MailboxId`
-/// (whose `<account>:<path>` form doubles as the account key for routing).
+/// "All Inboxes" view and `outbox` the synthetic cross-account Outbox (M-40);
+/// otherwise `mailbox` holds the selected `MailboxId` (whose `<account>:<path>`
+/// form doubles as the account key for routing). `outbox` is defaulted so the
+/// one-time legacy `last-view.json` import still parses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastSelection {
     pub unified: bool,
+    #[serde(default)]
+    pub outbox: bool,
     pub mailbox: Option<String>,
 }
 
@@ -40,7 +44,17 @@ fn legacy_path() -> PathBuf {
 /// first-run behavior.
 pub fn load(store: &crate::settings::SettingsStore) -> Option<LastSelection> {
     if store.get_bool(LAST_VIEW_UNIFIED) {
-        Some(LastSelection { unified: true, mailbox: None })
+        Some(LastSelection {
+            unified: true,
+            outbox: false,
+            mailbox: None,
+        })
+    } else if store.get_bool(LAST_VIEW_OUTBOX) {
+        Some(LastSelection {
+            unified: false,
+            outbox: true,
+            mailbox: None,
+        })
     } else {
         let mailbox = store.get_string(LAST_VIEW_MAILBOX);
         if mailbox.is_empty() {
@@ -48,6 +62,7 @@ pub fn load(store: &crate::settings::SettingsStore) -> Option<LastSelection> {
         } else {
             Some(LastSelection {
                 unified: false,
+                outbox: false,
                 mailbox: Some(mailbox),
             })
         }
@@ -58,6 +73,7 @@ pub fn load(store: &crate::settings::SettingsStore) -> Option<LastSelection> {
 /// logs a warning - forgetting to remember the last view is harmless.
 pub fn save(store: &crate::settings::SettingsStore, selection: &LastSelection) {
     store.set_bool(LAST_VIEW_UNIFIED, selection.unified);
+    store.set_bool(LAST_VIEW_OUTBOX, selection.outbox);
     store.set_string(LAST_VIEW_MAILBOX, selection.mailbox.as_deref().unwrap_or(""));
 }
 
@@ -77,12 +93,13 @@ fn migrate_legacy_file_at(path: &std::path::Path, store: &crate::settings::Setti
         return;
     }
     let imported = (|| -> Option<LastSelection> {
-        if store.get_bool(LAST_VIEW_UNIFIED) || !store.get_string(LAST_VIEW_MAILBOX).is_empty() {
+        if store.get_bool(LAST_VIEW_UNIFIED) || store.get_bool(LAST_VIEW_OUTBOX) || !store.get_string(LAST_VIEW_MAILBOX).is_empty() {
             return None;
         }
         let text = std::fs::read_to_string(path).ok()?;
         let selection: LastSelection = serde_json::from_str(&text).ok()?;
         store.set_bool(LAST_VIEW_UNIFIED, selection.unified);
+        store.set_bool(LAST_VIEW_OUTBOX, selection.outbox);
         store.set_string(LAST_VIEW_MAILBOX, selection.mailbox.as_deref().unwrap_or(""));
         Some(selection)
     })();
@@ -101,13 +118,51 @@ mod tests {
         let store = crate::settings::resolve();
         assert_eq!(load(&store), None);
 
-        save(&store, &LastSelection { unified: true, mailbox: None });
-        assert_eq!(load(&store), Some(LastSelection { unified: true, mailbox: None }));
+        save(
+            &store,
+            &LastSelection {
+                unified: true,
+                outbox: false,
+                mailbox: None,
+            },
+        );
+        assert_eq!(
+            load(&store),
+            Some(LastSelection {
+                unified: true,
+                outbox: false,
+                mailbox: None,
+            })
+        );
 
         save(
             &store,
             &LastSelection {
                 unified: false,
+                outbox: true,
+                mailbox: None,
+            },
+        );
+        assert_eq!(
+            load(&store),
+            Some(LastSelection {
+                unified: false,
+                outbox: true,
+                mailbox: None,
+            })
+        );
+        // Precedence: unified wins, then outbox, then the mailbox.
+        store.set_bool(LAST_VIEW_UNIFIED, true);
+        assert!(load(&store).is_some_and(|selection| selection.unified));
+        store.set_bool(LAST_VIEW_UNIFIED, false);
+        store.set_string(LAST_VIEW_MAILBOX, "account_1:INBOX");
+        assert!(load(&store).is_some_and(|selection| selection.outbox && selection.mailbox.is_none()));
+
+        save(
+            &store,
+            &LastSelection {
+                unified: false,
+                outbox: false,
                 mailbox: Some("account_1:INBOX".into()),
             },
         );
@@ -115,6 +170,7 @@ mod tests {
             load(&store),
             Some(LastSelection {
                 unified: false,
+                outbox: false,
                 mailbox: Some("account_1:INBOX".into())
             })
         );
@@ -133,6 +189,7 @@ mod tests {
             load(&store),
             Some(LastSelection {
                 unified: false,
+                outbox: false,
                 mailbox: Some("old_account:INBOX".into())
             })
         );
@@ -145,6 +202,7 @@ mod tests {
             &store,
             &LastSelection {
                 unified: false,
+                outbox: false,
                 mailbox: Some("new_account:INBOX".into()),
             },
         );
@@ -153,6 +211,7 @@ mod tests {
             load(&store),
             Some(LastSelection {
                 unified: false,
+                outbox: false,
                 mailbox: Some("new_account:INBOX".into())
             })
         );

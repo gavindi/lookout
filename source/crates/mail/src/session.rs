@@ -310,7 +310,14 @@ pub enum ConnectionState {
     Connecting,
     Idle,
     Busy,
-    Error { message: String, retryable: bool },
+    /// Work Offline (M-40): the user paused this account. Distinct from
+    /// `Disconnected` (a dropped connection) and `Error` (a failure) so the UI
+    /// can say why nothing is syncing and offer "Go online".
+    Offline,
+    Error {
+        message: String,
+        retryable: bool,
+    },
 }
 
 /// How `AccountCommand::SaveDraft` should remove the copy its new draft
@@ -956,6 +963,15 @@ pub enum AccountEvent {
     DraftSaved {
         message_id: String,
     },
+    /// A `SaveDraft` couldn't reach the server - specifically, the account is
+    /// working offline (M-40), where there is no local draft store. The
+    /// composer keeps the text it holds and shows why it wasn't saved; the
+    /// queued send is unaffected (the outbox payload is independent of the
+    /// Drafts copy).
+    DraftSaveFailed {
+        message_id: String,
+        message: String,
+    },
     MessageMoved {
         role: MailboxRole,
     },
@@ -1215,6 +1231,84 @@ async fn emit_outbox_contents(cache: &CacheHandle, events: &async_channel::Sende
     }
 }
 
+/// Persists one composed message into the local outbox - the cache-only half
+/// of `AccountCommand::SendMessage`, shared by the connected loop and the
+/// offline pump so the two can never drift. Returns the row's due time when
+/// it was queued, so the caller can wake for it.
+async fn queue_outbox_message(
+    cache: &CacheHandle,
+    events: &async_channel::Sender<AccountEvent>,
+    account_id: &AccountId,
+    message: &ComposedMessage,
+    not_before: Option<chrono::DateTime<chrono::Utc>>,
+    client_token: Option<u64>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let queue_failed = |message: String| AccountEvent::OutboxFailed { id: 0, client_token, message };
+    let payload = match serde_json::to_vec(&OutboxMessage::from_composed(message)) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!("couldn't serialize outgoing message: {e}");
+            let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
+            return None;
+        }
+    };
+    let due = not_before.unwrap_or_else(chrono::Utc::now);
+    let queued = cache_op(cache, {
+        let account_id = account_id.clone();
+        move |c| c.enqueue_outbox(&account_id, due, &payload)
+    })
+    .await;
+    match queued {
+        Some(Ok(id)) => {
+            let _ = events
+                .send(AccountEvent::OutboxQueued {
+                    id,
+                    client_token,
+                    not_before: due,
+                })
+                .await;
+            emit_outbox_contents(cache, events).await;
+            Some(due)
+        }
+        Some(Err(e)) => {
+            tracing::warn!("couldn't queue outgoing message: {e}");
+            let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
+            None
+        }
+        None => {
+            tracing::warn!("no cache open; dropping outgoing message");
+            let _ = events.send(queue_failed("Couldn't queue message: no local cache".to_string())).await;
+            None
+        }
+    }
+}
+
+/// Withdraws a waiting outbox row - the cache-only half of
+/// `AccountCommand::CancelOutbox`, shared by the connected loop and the
+/// offline pump.
+async fn cancel_outbox_row(cache: &CacheHandle, events: &async_channel::Sender<AccountEvent>, id: i64) {
+    let withdrawn = cache_op(cache, move |c| c.cancel_outbox(id)).await.and_then(|r| r.ok()).flatten();
+    let event = match withdrawn {
+        Some(entry) => AccountEvent::OutboxCancelled {
+            id,
+            message: serde_json::from_slice::<OutboxMessage>(&entry.payload).ok().map(Box::new),
+        },
+        None => AccountEvent::OutboxCancelFailed { id },
+    };
+    let _ = events.send(event).await;
+    emit_outbox_contents(cache, events).await;
+}
+
+/// Moves a queued row's due time - the cache-only half of
+/// `AccountCommand::RescheduleOutbox`, shared by the connected loop and the
+/// offline pump.
+async fn reschedule_outbox_row(cache: &CacheHandle, events: &async_channel::Sender<AccountEvent>, id: i64, not_before: chrono::DateTime<chrono::Utc>) {
+    if let Some(Err(e)) = cache_op(cache, move |c| c.reschedule_outbox(id, not_before)).await {
+        tracing::warn!(id, "couldn't reschedule outbox row: {e}");
+    }
+    emit_outbox_contents(cache, events).await;
+}
+
 /// Runs `op` against the on-disk cache on the blocking thread pool, returning
 /// `None` when no cache is open (or the task was cancelled) and `Some(result)`
 /// otherwise. Every cache call in the session goes through here so no SQLite
@@ -1324,12 +1418,19 @@ fn take_mailbox_change(rx: &async_channel::Receiver<async_imap::types::Unsolicit
 /// the latter. The app crate routes user-facing fetches (`FetchBody`,
 /// `FetchAttachment`, `FetchRawMessage`) through the interactive sender so a
 /// message click is never queued behind a sync, search, or move.
+///
+/// `offline_rx` is the app-wide Work Offline signal (M-40). While it reads
+/// `true` the session parks without connecting: cached folders, messages and
+/// the outbox were already painted, and only the cache-only outbox commands
+/// (queue, cancel, reschedule) are answered. Keep the sender alive for the
+/// session's lifetime; a dropped sender makes `changed()` return `Err`.
 pub async fn run_account_session(
     config: AccountConfig,
     credentials: std::sync::Arc<dyn CredentialProvider>,
     commands: async_channel::Receiver<AccountCommand>,
     interactive_commands: async_channel::Receiver<AccountCommand>,
     events: async_channel::Sender<AccountEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     // Opening runs the file open, pragmas, DDL and migrations, so it goes to
     // the blocking pool like every other cache call (`cache_op`).
@@ -1455,7 +1556,8 @@ pub async fn run_account_session(
         }
     });
 
-    let mut backoff = Duration::from_secs(1);
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    let mut backoff = INITIAL_BACKOFF;
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     // A command that arrived while disconnected (see below) and must not be
@@ -1479,6 +1581,9 @@ pub async fn run_account_session(
         enabled: config.local_focus_enabled,
         contacts: config.local_focus_contacts.clone(),
     };
+    // The background prefetch policy outlives a reconnect (and an offline
+    // pause), so a setting changed while offline is in force on return.
+    let mut prefetch_policy = PrefetchPolicy::default();
     // Where this session's moves put each message, for undo (`RevertMove`).
     // Outlives a reconnect, like `prefetch_failures`: undo is offered for a
     // few seconds and a network blip in between mustn't defeat it.
@@ -1501,9 +1606,47 @@ pub async fn run_account_session(
     // mistaken for a shutdown signal.
     let (mailbox_tx, mailbox_rx) = tokio::sync::watch::channel(inbox_id.clone());
     let (idle_notify_tx, idle_notify_rx) = async_channel::unbounded::<MailboxId>();
-    let mut idle_task = tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone()));
+    // A launch that starts already offline must not even attempt the spare
+    // IDLE connection; it is spawned when the account first goes online.
+    let mut idle_task = (!*offline_rx.borrow()).then(|| tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_rx, idle_notify_tx.clone())));
 
     loop {
+        // Work Offline (M-40): no network module runs while the user has
+        // paused syncing. Park here, still answering the cache-only outbox
+        // commands, until the signal goes back online.
+        if *offline_rx.borrow() {
+            let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Offline)).await;
+            if let Some(task) = idle_task.take() {
+                task.abort();
+            }
+            match wait_offline(
+                &config,
+                &commands,
+                &interactive_commands,
+                &events,
+                &cache,
+                &mut local_focus,
+                &mut prefetch_policy,
+                &mut offline_rx,
+            )
+            .await
+            {
+                OfflineWait::Online => {
+                    backoff = INITIAL_BACKOFF;
+                    idle_task = Some(tokio::spawn(run_idle_supervisor(
+                        config.clone(),
+                        credentials.clone(),
+                        mailbox_tx.subscribe(),
+                        idle_notify_tx.clone(),
+                    )));
+                    continue;
+                }
+                OfflineWait::Shutdown => {
+                    let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    return;
+                }
+            }
+        }
         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Connecting)).await;
         match connect_and_run(
             &config,
@@ -1517,6 +1660,8 @@ pub async fn run_account_session(
             carried_command.take(),
             &mut prefetch_failures,
             &mut local_focus,
+            &mut prefetch_policy,
+            &mut offline_rx,
             &mut move_ledger,
             &mut copy_ledger,
         )
@@ -1524,8 +1669,19 @@ pub async fn run_account_session(
         {
             Ok(ShutdownReason::Requested) => {
                 let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                idle_task.abort();
+                if let Some(task) = idle_task.take() {
+                    task.abort();
+                }
                 return;
+            }
+            Ok(ShutdownReason::Offline) => {
+                // The toggle won inside the connection: drop the IDLE
+                // supervisor now and park on the next pass without a backoff.
+                if let Some(task) = idle_task.take() {
+                    task.abort();
+                }
+                backoff = INITIAL_BACKOFF;
+                continue;
             }
             Err(e) => {
                 tracing::warn!("account session error, will reconnect: {e}");
@@ -1544,10 +1700,22 @@ pub async fn run_account_session(
                 // otherwise awaits it, respawn here so a silently-dead IDLE
                 // connection doesn't linger unnoticed for the rest of the
                 // session.
-                if idle_task.is_finished() {
-                    idle_task = tokio::spawn(run_idle_supervisor(config.clone(), credentials.clone(), mailbox_tx.subscribe(), idle_notify_tx.clone()));
+                if idle_task.as_ref().is_none_or(|task| task.is_finished()) {
+                    idle_task = Some(tokio::spawn(run_idle_supervisor(
+                        config.clone(),
+                        credentials.clone(),
+                        mailbox_tx.subscribe(),
+                        idle_notify_tx.clone(),
+                    )));
                 }
             }
+        }
+
+        // The toggle may have flipped while the connection was failing; park
+        // now instead of waiting out a backoff first.
+        if *offline_rx.borrow() {
+            backoff = INITIAL_BACKOFF;
+            continue;
         }
 
         // Wait out the backoff delay, but cut it short if a command arrives
@@ -1564,11 +1732,28 @@ pub async fn run_account_session(
         // fetch carries just as faithfully as a background command.
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
+            changed = offline_rx.changed() => {
+                // A signal that never fires again is a shutdown, not a reason
+                // to spin; otherwise re-evaluate at the top, where a newly
+                // offline state parks immediately and an online one retries
+                // without waiting out the backoff.
+                if changed.is_err() {
+                    let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
+                    if let Some(task) = idle_task.take() {
+                        task.abort();
+                    }
+                    return;
+                }
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
             cmd = commands.recv() => {
                 match cmd {
                     Ok(AccountCommand::Shutdown) => {
                         let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Disconnected)).await;
-                        idle_task.abort();
+                        if let Some(task) = idle_task.take() {
+                            task.abort();
+                        }
                         return;
                     }
                     Ok(other) => carried_command = Some(other),
@@ -1587,6 +1772,133 @@ pub async fn run_account_session(
 
 enum ShutdownReason {
     Requested,
+    /// The user turned Work Offline on; the outer loop parks the account in
+    /// `wait_offline` until it is turned back off.
+    Offline,
+}
+
+/// How a parked `wait_offline` ended.
+enum OfflineWait {
+    /// The signal went back to online; reconnect.
+    Online,
+    /// The app is shutting down (a command channel closed or `Shutdown`).
+    Shutdown,
+}
+
+/// Parks an offline account without a connection (M-40). Cached folders and
+/// messages are already painted; this only keeps the outbox usable and
+/// refuses everything that would need the network. The session stays parked
+/// across repeated commands, so one refused write doesn't drop the account
+/// back into a reconnect loop.
+#[allow(clippy::too_many_arguments)]
+async fn wait_offline(
+    config: &AccountConfig,
+    commands: &async_channel::Receiver<AccountCommand>,
+    interactive_commands: &async_channel::Receiver<AccountCommand>,
+    events: &async_channel::Sender<AccountEvent>,
+    cache: &CacheHandle,
+    local_focus: &mut LocalFocusSettings,
+    prefetch_policy: &mut PrefetchPolicy,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
+) -> OfflineWait {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return OfflineWait::Online;
+                    }
+                }
+                // The app holds the sender for its whole lifetime, so this
+                // only happens at teardown. Returning beats spinning.
+                Err(_) => return OfflineWait::Shutdown,
+            },
+            cmd = interactive_commands.recv() => match cmd {
+                Ok(command) => {
+                    if !handle_offline_command(config, events, cache, local_focus, prefetch_policy, command).await {
+                        return OfflineWait::Shutdown;
+                    }
+                }
+                Err(_) => return OfflineWait::Shutdown,
+            },
+            cmd = commands.recv() => match cmd {
+                Ok(command) => {
+                    if !handle_offline_command(config, events, cache, local_focus, prefetch_policy, command).await {
+                        return OfflineWait::Shutdown;
+                    }
+                }
+                Err(_) => return OfflineWait::Shutdown,
+            },
+        }
+    }
+}
+
+/// Answers one command while offline. Returns `false` for `Shutdown`.
+///
+/// Only the outbox operations and purely local settings are honoured; a fetch
+/// or a server write is answered with a per-request failure where the UI has
+/// a place to show it, and dropped otherwise (the reconnect sync supersedes
+/// it, and the app's own guards keep most of these from being sent at all).
+async fn handle_offline_command(
+    config: &AccountConfig,
+    events: &async_channel::Sender<AccountEvent>,
+    cache: &CacheHandle,
+    local_focus: &mut LocalFocusSettings,
+    prefetch_policy: &mut PrefetchPolicy,
+    command: AccountCommand,
+) -> bool {
+    match command {
+        AccountCommand::Shutdown => return false,
+        AccountCommand::SendMessage {
+            message,
+            not_before,
+            client_token,
+        } => {
+            // The cache-only queue path: it lands in the Outbox and the
+            // reconnect's drain sends it.
+            queue_outbox_message(cache, events, &config.account_id, &message, not_before, client_token).await;
+        }
+        AccountCommand::CancelOutbox { id } => cancel_outbox_row(cache, events, id).await,
+        AccountCommand::RescheduleOutbox { id, not_before } => reschedule_outbox_row(cache, events, id, not_before).await,
+        AccountCommand::FetchAttachment { mailbox, uid, part } => {
+            let _ = events
+                .send(AccountEvent::PartFetchFailed {
+                    mailbox,
+                    uid,
+                    part_number: part.part_number,
+                    message: "You're working offline.".to_string(),
+                })
+                .await;
+        }
+        AccountCommand::FetchRawMessage { mailbox, uid } => {
+            let _ = events
+                .send(AccountEvent::RawMessageFetchFailed {
+                    mailbox,
+                    uid,
+                    message: "You're working offline.".to_string(),
+                })
+                .await;
+        }
+        AccountCommand::SaveDraft { msg, .. } => {
+            // There is no local draft store: the composer keeps its text and
+            // reports that it wasn't saved. The send itself still queues.
+            let _ = events
+                .send(AccountEvent::DraftSaveFailed {
+                    message_id: msg.message_id.clone().unwrap_or_default(),
+                    message: "You're working offline — the draft wasn't saved.".to_string(),
+                })
+                .await;
+        }
+        AccountCommand::SetPrefetchPolicy(policy) => *prefetch_policy = policy,
+        AccountCommand::ConfigureLocalFocus { enabled, contacts, .. } => {
+            local_focus.enabled = enabled;
+            local_focus.contacts = contacts;
+        }
+        // Already parked; nothing to reconnect to.
+        AccountCommand::Reconnect => {}
+        other => tracing::debug!(?other, "dropping a command that needs the network while offline"),
+    }
+    true
 }
 
 // The two dedicated-IDLE-connection parameters (`mailbox_tx`/`idle_notify`)
@@ -1605,9 +1917,16 @@ async fn connect_and_run(
     mut carried_command: Option<AccountCommand>,
     prefetch_failures: &mut HashMap<MailboxId, u32>,
     local_focus: &mut LocalFocusSettings,
+    prefetch_policy: &mut PrefetchPolicy,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
     move_ledger: &mut MoveLedger,
     copy_ledger: &mut MoveLedger,
 ) -> Result<ShutdownReason> {
+    // The outer loop normally parks before calling us, but the toggle can win
+    // the race between that check and this call; don't log in at all then.
+    if *offline_rx.borrow() {
+        return Ok(ShutdownReason::Offline);
+    }
     let credential = credentials.imap_credential().await.map_err(Error::LoginFailed)?;
     let (mut session, caps) = match login(config, credential).await {
         Ok(connected) => connected,
@@ -1633,6 +1952,13 @@ async fn connect_and_run(
         has_idle: _,
         sieve,
     } = caps;
+
+    // The toggle may have flipped while login was in flight; leave cleanly
+    // instead of starting a full folder and Inbox sync.
+    if *offline_rx.borrow() {
+        let _ = session.logout().await;
+        return Ok(ShutdownReason::Offline);
+    }
 
     // Tell the app whether the Sieve rules backend is available for this
     // account (item 2.5).
@@ -1744,10 +2070,9 @@ async fn connect_and_run(
     };
 
     // The background prefetch's behavior, live-updatable from the app via
-    // `SetPrefetchPolicy` (Config → Advanced → "Aggressive prefetch"). Starts
-    // at the cooperative default; the app re-sends the stored policy on
-    // startup, on every settings change, and on every (re)connect.
-    let mut prefetch_policy = PrefetchPolicy::default();
+    // `SetPrefetchPolicy` (Config → Advanced → "Aggressive prefetch"). Owned
+    // by `run_account_session` so a policy set while offline survives the
+    // reconnect, and re-sent by the app on every settings change and connect.
 
     // What ended a main-loop iteration's wait. Declared outside the loop
     // because the wait itself is now conditional - a command already sitting
@@ -1767,6 +2092,8 @@ async fn connect_and_run(
         /// open mailbox's `UIDNEXT` had moved. Resynced exactly like an
         /// IDLE wake.
         ServerChanged,
+        /// Work Offline turned on while waiting in IDLE.
+        Offline,
         ChannelClosed,
     }
 
@@ -1796,6 +2123,13 @@ async fn connect_and_run(
     let mut next_scheduled_scan = chrono::Utc::now();
 
     loop {
+        // Work Offline (M-40): checked before the outbox drain so a toggle
+        // during the undo-send window prevents the send, not after it. Log out
+        // best-effort and let the outer loop park the account.
+        if *offline_rx.borrow() {
+            let _ = session.logout().await;
+            return Ok(ShutdownReason::Offline);
+        }
         // Deliver any queued outbox message whose time has arrived (item 0.3).
         // This runs before the IDLE wait on every iteration, so a message the
         // command drain just queued goes out on the next pass and a scheduled
@@ -2209,6 +2543,17 @@ async fn connect_and_run(
                                             Ok(cmd) => Wake::Command(cmd),
                                             Err(_) => Wake::ChannelClosed,
                                         },
+                                        // Work Offline must interrupt a long
+                                        // IDLE slice immediately, not after the
+                                        // keepalive elapses.
+                                        changed = offline_rx.changed() => match changed {
+                                            Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                                            // Online-to-online (or a spurious
+                                            // notification) is not a change
+                                            // worth leaving IDLE for.
+                                            Ok(()) => Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)),
+                                            Err(_) => Wake::ChannelClosed,
+                                        },
                                     };
 
                                     // How long a command that arrived while we were entering
@@ -2309,6 +2654,10 @@ async fn connect_and_run(
                 }
             },
             Wake::Command(cmd) => woke_on_command = Some(cmd),
+            Wake::Offline => {
+                let _ = session.logout().await;
+                return Ok(ShutdownReason::Offline);
+            }
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
 
@@ -2735,41 +3084,8 @@ async fn connect_and_run(
                     // same path backs undo send, schedule send and the offline
                     // outbox (items 1.13/1.14). The raw message is built once,
                     // here.
-                    let queue_failed = |message: String| AccountEvent::OutboxFailed { id: 0, client_token, message };
-                    let payload = match serde_json::to_vec(&OutboxMessage::from_composed(&msg)) {
-                        Ok(payload) => payload,
-                        Err(e) => {
-                            tracing::warn!("couldn't serialize outgoing message: {e}");
-                            let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
-                            continue;
-                        }
-                    };
-                    let due = not_before.unwrap_or_else(chrono::Utc::now);
-                    let queued = cache_op(cache, {
-                        let account_id = account_id.clone();
-                        move |c| c.enqueue_outbox(&account_id, due, &payload)
-                    })
-                    .await;
-                    match queued {
-                        Some(Ok(id)) => {
-                            next_outbox_due = Some(next_outbox_due.map_or(due, |next| next.min(due)));
-                            let _ = events
-                                .send(AccountEvent::OutboxQueued {
-                                    id,
-                                    client_token,
-                                    not_before: due,
-                                })
-                                .await;
-                            emit_outbox_contents(cache, events).await;
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!("couldn't queue outgoing message: {e}");
-                            let _ = events.send(queue_failed(format!("Couldn't queue message: {e}"))).await;
-                        }
-                        None => {
-                            tracing::warn!("no cache open; dropping outgoing message");
-                            let _ = events.send(queue_failed("Couldn't queue message: no local cache".to_string())).await;
-                        }
+                    if let Some(due) = queue_outbox_message(cache, events, &account_id, &msg, not_before, client_token).await {
+                        next_outbox_due = Some(next_outbox_due.map_or(due, |next| next.min(due)));
                     }
                 }
                 AccountCommand::CancelOutbox { id } => {
@@ -2777,24 +3093,12 @@ async fn connect_and_run(
                     // withdrawn and handed back; one already delivered is gone
                     // from the table, and the drain can't be mid-send here
                     // because commands and the drain share this loop.
-                    let withdrawn = cache_op(cache, move |c| c.cancel_outbox(id)).await.and_then(|r| r.ok()).flatten();
+                    cancel_outbox_row(cache, events, id).await;
                     next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
-                    let event = match withdrawn {
-                        Some(entry) => AccountEvent::OutboxCancelled {
-                            id,
-                            message: serde_json::from_slice::<OutboxMessage>(&entry.payload).ok().map(Box::new),
-                        },
-                        None => AccountEvent::OutboxCancelFailed { id },
-                    };
-                    let _ = events.send(event).await;
-                    emit_outbox_contents(cache, events).await;
                 }
                 AccountCommand::RescheduleOutbox { id, not_before } => {
-                    if let Some(Err(e)) = cache_op(cache, move |c| c.reschedule_outbox(id, not_before)).await {
-                        tracing::warn!(id, "couldn't reschedule outbox row: {e}");
-                    }
+                    reschedule_outbox_row(cache, events, id, not_before).await;
                     next_outbox_due = cache_op(cache, |c| c.next_outbox_not_before()).await.and_then(|r| r.ok()).flatten();
-                    emit_outbox_contents(cache, events).await;
                 }
                 AccountCommand::SaveDraft { msg, replace } => {
                     let had_drafts_folder = drafts_path(&folders, &account_id).is_some();
@@ -2939,7 +3243,7 @@ async fn connect_and_run(
                 // connection attempts, see `run_account_session`.
                 AccountCommand::Reconnect => {}
                 AccountCommand::SetPrefetchPolicy(policy) => {
-                    prefetch_policy = policy;
+                    *prefetch_policy = policy;
                 }
                 AccountCommand::MoveMessage { mailbox, uid, role } => {
                     let Some(path) = mailbox.0.strip_prefix(&format!("{}:", account_id.0)).map(str::to_string) else {

@@ -63,7 +63,7 @@ pub const WELL_KNOWN_FLAGGED_EMAIL: &str = "flaggedEmail";
 /// for colour/grouping purposes. `id` is the Graph list id - the write target
 /// and the synthetic calendar id's suffix. `well_known` is Graph's
 /// `wellknownListName` (`defaultList`, `flaggedEmails`, `unknown`), or `None`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TodoList {
     pub id: String,
     pub display_name: String,

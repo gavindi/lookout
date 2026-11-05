@@ -687,6 +687,10 @@ pub fn show_contact_editor_for(window: &adw::ApplicationWindow, state: &Rc<RefCe
             href: entry.href(),
             etag: entry.etag(),
         },
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
+        },
         // A create callback for an edit is unreachable; the dialog only
         // fires it on the blank form.
         move |_book_href, _card| {},
@@ -731,6 +735,10 @@ pub fn show_new_contact_editor(window: &adw::ApplicationWindow, state: &Rc<RefCe
             prefill: None,
             href: "",
             etag: None,
+        },
+        {
+            let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
         },
         {
             let state = state.clone();
@@ -911,6 +919,10 @@ fn show_create_contact_with_seed(
         },
         {
             let state = state.clone();
+            Rc::new(move || state.borrow().work_offline)
+        },
+        {
+            let state = state.clone();
             let toast_overlay = toast_overlay.clone();
             move |book_href, card| {
                 let account_id = book_accounts.get(&book_href).cloned().unwrap_or_else(|| fallback_account.clone());
@@ -966,6 +978,11 @@ fn contact_cards(format: ContactFileFormat, text: &str) -> Vec<Result<VCard, ()>
 /// the account already has is skipped and counted; anything else is created.
 /// One summary toast reports the three counts when every write has answered.
 pub fn show_contacts_import_dialog(window: &adw::ApplicationWindow, state: &Rc<RefCell<UiState>>, toast_overlay: &adw::ToastOverlay) {
+    // Import writes into address books; there is no offline queue (M-40).
+    if state.borrow().work_offline {
+        toast_overlay.add_toast(adw::Toast::new("You're working offline — reconnect to save"));
+        return;
+    }
     // Target books: every writable address book across every connected
     // account, labelled "account · book" like the event editor's calendar
     // picker (book names alone repeat across accounts).
@@ -2325,6 +2342,7 @@ pub fn spawn_contacts_discovery(
                         account,
                         cmd_rx,
                         refresh_contacts_ui.clone(),
+                        crate::window::offline_receiver(&state),
                     );
                     started.insert(id);
                 }
@@ -2353,6 +2371,7 @@ pub fn spawn_contacts_discovery(
                         account,
                         cmd_rx,
                         refresh_contacts_ui.clone(),
+                        crate::window::offline_receiver(&state),
                     );
                 }
                 // The desktop's address books (E1.5) are read once the
@@ -2394,6 +2413,40 @@ pub fn spawn_contacts_discovery(
     });
 }
 
+/// Parks one contacts account while Work Offline is on (M-40). Writes are
+/// refused on their reply channel, Refresh is ignored, and `true` means the
+/// signal went back online (so the caller can resync at once); `false` means
+/// the app is shutting down.
+async fn wait_offline(cmd_rx: &async_channel::Receiver<ContactCommand>, offline_rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            },
+            command = cmd_rx.recv() => match command {
+                Ok(ContactCommand::Create { reply, .. }) | Ok(ContactCommand::Update { reply, .. }) => {
+                    let _ = reply
+                        .send(Err("You're working offline — the contact was not saved".to_string()))
+                        .await;
+                }
+                Ok(ContactCommand::Delete { reply, .. }) => {
+                    let _ = reply
+                        .send(Err("You're working offline — the contact was not deleted".to_string()))
+                        .await;
+                }
+                Ok(ContactCommand::Refresh) => {}
+                Err(_) => return false,
+            },
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn sync_contacts_account(
     worker: Rc<Worker>,
     state: Rc<RefCell<UiState>>,
@@ -2402,6 +2455,7 @@ pub fn sync_contacts_account(
     account: GoaContactsAccount,
     cmd_rx: async_channel::Receiver<ContactCommand>,
     refresh_contacts_ui: Rc<dyn Fn(Option<i32>)>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let account_id = account.account_id.clone();
     let label = account.display_name.clone();
@@ -2431,12 +2485,24 @@ pub fn sync_contacts_account(
             }
         }
         loop {
+            // Work Offline (M-40): the cached snapshot above already painted.
+            // Park before the first poll or any write, answer write commands
+            // with the offline error, and resync as soon as the signal goes
+            // back online.
+            let mut force_resync = false;
+            if *offline_rx.borrow() {
+                if !wait_offline(&cmd_rx, &mut offline_rx).await {
+                    break;
+                }
+                force_resync = true;
+            }
             // Interleave the poll cadence with write commands: a poll tick
             // wakes a fetch, a command is executed with a fresh credential
             // right away (the same pattern as `run_calendar_session`'s
             // select), and a successful write forces an immediate resync so
             // the change renders before the next poll.
-            let wake = if first {
+            let mut go_offline = false;
+            let wake = if first || force_resync {
                 None
             } else {
                 tokio::select! {
@@ -2445,10 +2511,20 @@ pub fn sync_contacts_account(
                         Ok(cmd) => Some(cmd),
                         Err(_) => break,
                     },
+                    changed = offline_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        go_offline = true;
+                        None
+                    }
                 }
             };
+            if go_offline {
+                continue;
+            }
 
-            let mut resync = wake.is_none();
+            let mut resync = force_resync || wake.is_none();
             // Process the command that woke us (if any), then drain any
             // further commands queued while we were mid-fetch.
             for command in wake.into_iter().chain(std::iter::from_fn(|| cmd_rx.try_recv().ok())) {
@@ -2490,6 +2566,11 @@ pub fn sync_contacts_account(
             }
 
             if !resync {
+                continue;
+            }
+            // A toggle during command handling must not start a poll: the
+            // cache already has the last snapshot, and the reconnect resyncs.
+            if *offline_rx.borrow() {
                 continue;
             }
             let result = match &graph {
@@ -3220,6 +3301,33 @@ fn toast_contact_batch(toast_overlay: adw::ToastOverlay, replies: Vec<async_chan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work Offline (M-40): a parked contacts loop answers a write on its
+    /// reply channel instead of fetching, and wakes as soon as the signal goes
+    /// back online.
+    #[tokio::test]
+    async fn offline_contact_writes_reply_without_fetching() {
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        cmd_tx
+            .send(ContactCommand::Delete {
+                href: "/b/ann.vcf".to_string(),
+                etag: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let waiter = tokio::spawn(async move {
+            let mut offline_rx = offline_rx;
+            wait_offline(&cmd_rx, &mut offline_rx).await
+        });
+        let error = reply_rx.recv().await.unwrap().unwrap_err();
+        assert!(error.contains("working offline"), "unexpected reply: {error}");
+        assert!(!waiter.is_finished(), "the loop stays parked across a refused write");
+        offline_tx.send(false).unwrap();
+        assert!(waiter.await.unwrap(), "going online wakes the loop for a resync");
+    }
 
     fn record(card: VCard) -> lookout_dav::ContactRecord {
         lookout_dav::ContactRecord {

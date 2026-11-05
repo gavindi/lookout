@@ -73,13 +73,35 @@ pub enum TodoEvent {
 /// onto the shared worker, as `run_calendar_session` is). Reconnects with
 /// backoff on any transient error; returns when the account's consent is gone
 /// or the command channel closes.
-pub async fn run_todo_session(account_id: AccountId, client: TodoClient, commands: async_channel::Receiver<TodoCommand>, events: async_channel::Sender<TodoEvent>) {
+pub async fn run_todo_session(
+    account_id: AccountId,
+    client: TodoClient,
+    commands: async_channel::Receiver<TodoCommand>,
+    events: async_channel::Sender<TodoEvent>,
+    mut offline_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // Fast first paint from the last successful sync, before any Graph call,
+    // so Microsoft To Do is not blank on an offline launch (M-40 / T3).
+    if let Some(cache) = load_cache(&account_id) {
+        if !cache.lists.is_empty() {
+            let _ = events.send(TodoEvent::ListsUpdated(cache.lists)).await;
+        }
+        let _ = events.send(TodoEvent::TasksUpdated(cache.tasks)).await;
+    }
+
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
-        match connect_and_run(&account_id, &client, &commands, &events).await {
+        if *offline_rx.borrow() && !wait_offline(&commands, &events, &mut offline_rx).await {
+            return;
+        }
+        match connect_and_run(&account_id, &client, &commands, &events, &mut offline_rx).await {
             Ok(ShutdownReason::Requested) => return,
+            Ok(ShutdownReason::Offline) => {
+                backoff = Duration::from_secs(1);
+                continue;
+            }
             Err(e) => {
                 if fatal(&e) {
                     // Non-retryable: surface once and stop. Config's
@@ -103,6 +125,13 @@ pub async fn run_todo_session(account_id: AccountId, client: TodoClient, command
         // (which means the app dropped this account's handle).
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
+            changed = offline_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                backoff = Duration::from_secs(1);
+                continue;
+            }
             cmd = commands.recv() => match cmd {
                 Ok(_) => {
                     let _ = events.send(TodoEvent::Error("not connected - the task change was not saved".to_string())).await;
@@ -116,6 +145,58 @@ pub async fn run_todo_session(account_id: AccountId, client: TodoClient, command
 
 enum ShutdownReason {
     Requested,
+    /// Work Offline turned on; the outer loop parks in `wait_offline`.
+    Offline,
+}
+
+/// Parks a Microsoft To Do account while Work Offline is on (M-40). Writes
+/// answer with the same `TodoEvent::Error` the UI already toasts; `Refresh` is
+/// ignored. Returns `true` when the signal goes back online.
+async fn wait_offline(commands: &async_channel::Receiver<TodoCommand>, events: &async_channel::Sender<TodoEvent>, offline_rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    loop {
+        tokio::select! {
+            changed = offline_rx.changed() => match changed {
+                Ok(()) => {
+                    if !*offline_rx.borrow() {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            },
+            command = commands.recv() => match command {
+                Ok(TodoCommand::Refresh) => {}
+                Ok(TodoCommand::CreateTask { task, .. }) | Ok(TodoCommand::UpdateTask { task, .. }) => {
+                    let _ = events
+                        .send(TodoEvent::Error(format!(
+                            "You're working offline — the task \"{}\" was not saved",
+                            task.uid.0
+                        )))
+                        .await;
+                }
+                Ok(TodoCommand::DeleteTask { .. }) => {
+                    let _ = events
+                        .send(TodoEvent::Error("You're working offline — the task was not deleted".to_string()))
+                        .await;
+                }
+                Ok(TodoCommand::CreateList { .. }) => {
+                    let _ = events
+                        .send(TodoEvent::Error("You're working offline — the list was not created".to_string()))
+                        .await;
+                }
+                Ok(TodoCommand::UpdateList { .. }) => {
+                    let _ = events
+                        .send(TodoEvent::Error("You're working offline — the list was not renamed".to_string()))
+                        .await;
+                }
+                Ok(TodoCommand::DeleteList { .. }) => {
+                    let _ = events
+                        .send(TodoEvent::Error("You're working offline — the list was not deleted".to_string()))
+                        .await;
+                }
+                Err(_) => return false,
+            },
+        }
+    }
 }
 
 /// Whether an error can never fix itself by retrying: a missing/revoked Graph
@@ -130,13 +211,21 @@ async fn connect_and_run(
     client: &TodoClient,
     commands: &async_channel::Receiver<TodoCommand>,
     events: &async_channel::Sender<TodoEvent>,
+    offline_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<ShutdownReason, GraphError> {
-    sync(client, events).await?;
+    if *offline_rx.borrow() {
+        return Ok(ShutdownReason::Offline);
+    }
+    sync(account_id, client, events).await?;
 
     loop {
+        if *offline_rx.borrow() {
+            return Ok(ShutdownReason::Offline);
+        }
         enum Wake {
             Poll,
             Command(TodoCommand),
+            Offline,
             ChannelClosed,
         }
         let wake = tokio::select! {
@@ -145,10 +234,15 @@ async fn connect_and_run(
                 Ok(cmd) => Wake::Command(cmd),
                 Err(_) => Wake::ChannelClosed,
             },
+            changed = offline_rx.changed() => match changed {
+                Ok(()) if *offline_rx.borrow() => Wake::Offline,
+                Ok(()) => Wake::Poll,
+                Err(_) => Wake::ChannelClosed,
+            },
         };
 
         match wake {
-            Wake::Poll => sync(client, events).await?,
+            Wake::Poll => sync(account_id, client, events).await?,
             Wake::Command(cmd) => {
                 handle_command(account_id, client, cmd, events).await?;
                 // Drain anything else already queued before sleeping again.
@@ -156,6 +250,7 @@ async fn connect_and_run(
                     handle_command(account_id, client, cmd, events).await?;
                 }
             }
+            Wake::Offline => return Ok(ShutdownReason::Offline),
             Wake::ChannelClosed => return Ok(ShutdownReason::Requested),
         }
     }
@@ -212,13 +307,14 @@ async fn handle_command(account_id: &AccountId, client: &TodoClient, command: To
             }
         }
     }
-    sync(client, events).await
+    sync(account_id, client, events).await
 }
 
-/// One full resync: the lists, then every list's tasks, emitted as events. A
-/// single list's failure is logged and skipped; consent/unauthorized errors
-/// propagate so the outer loop reconnects.
-async fn sync(client: &TodoClient, events: &async_channel::Sender<TodoEvent>) -> Result<(), GraphError> {
+/// One full resync: the lists, then every list's tasks, emitted as events and
+/// written to the per-account offline cache. A single list's failure is logged
+/// and skipped; consent/unauthorized errors propagate so the outer loop
+/// reconnects.
+async fn sync(account_id: &AccountId, client: &TodoClient, events: &async_channel::Sender<TodoEvent>) -> Result<(), GraphError> {
     let lists = client.list_lists().await?;
     let _ = events.send(TodoEvent::ListsUpdated(lists.clone())).await;
 
@@ -237,8 +333,64 @@ async fn sync(client: &TodoClient, events: &async_channel::Sender<TodoEvent>) ->
             Err(e) => tracing::warn!("failed to fetch To Do list {:?}: {e}", list.display_name),
         }
     }
+    store_cache(account_id, &lists, &tasks);
     let _ = events.send(TodoEvent::TasksUpdated(tasks)).await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// On-disk cache (lists + tasks, fast first paint)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TodoCache {
+    lists: Vec<TodoList>,
+    tasks: Vec<CalendarTask>,
+}
+
+fn cache_path(account_id: &AccountId) -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("lookout").join("graphtodo").join(format!("{}.json", sanitize_key(&account_id.0)))
+}
+
+fn load_cache(account_id: &AccountId) -> Option<TodoCache> {
+    let data = std::fs::read(cache_path(account_id)).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+fn store_cache(account_id: &AccountId, lists: &[TodoList], tasks: &[CalendarTask]) {
+    let path = cache_path(account_id);
+    let Ok(data) = serde_json::to_vec(&TodoCache {
+        lists: lists.to_vec(),
+        tasks: tasks.to_vec(),
+    }) else {
+        return;
+    };
+    if let Err(e) = lookout_core::fsutil::write_atomic(&path, &data, 0o600) {
+        tracing::warn!("couldn't write the Microsoft To Do cache {}: {e}", path.display());
+    }
+}
+
+/// Emails and account ids are usually path-safe already, but a GOA id can
+/// contain separators - be defensive, as the Google Tasks cache is.
+fn sanitize_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn remove_cache(account_id: &AccountId) {
+    let _ = std::fs::remove_file(cache_path(account_id));
 }
 
 #[cfg(test)]
@@ -276,6 +428,14 @@ mod tests {
 
     fn client(server: &MockServer, consent: bool) -> TodoClient {
         TodoClient::new(GraphClient::with_base_url(Arc::new(StubTokens { consent }), format!("{}/v1.0", server.uri())))
+    }
+
+    fn test_account() -> AccountId {
+        AccountId(format!(
+            "a1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
     }
 
     #[test]
@@ -316,9 +476,12 @@ mod tests {
             .mount(&server)
             .await;
 
+        let account_id = test_account();
+        remove_cache(&account_id);
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_todo_session(AccountId("a1".into()), client(&server, true), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_todo_session(account_id.clone(), client(&server, true), cmd_rx, evt_tx, offline_rx));
 
         // Close the command channel so the actor returns instead of polling.
         drop(cmd_tx);
@@ -336,14 +499,18 @@ mod tests {
 
         assert_eq!(lists.unwrap().len(), 1);
         assert_eq!(tasks.unwrap().len(), 1);
+        remove_cache(&account_id);
     }
 
     #[tokio::test]
     async fn a_consent_failure_surfaces_once_and_stops() {
         let server = MockServer::start().await;
+        let account_id = test_account();
+        remove_cache(&account_id);
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_todo_session(AccountId("a1".into()), client(&server, false), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_todo_session(account_id.clone(), client(&server, false), cmd_rx, evt_tx, offline_rx));
         drop(cmd_tx);
 
         let event = evt_rx.recv().await.expect("an error event");
@@ -369,9 +536,12 @@ mod tests {
             .mount(&server)
             .await;
 
+        let account_id = test_account();
+        remove_cache(&account_id);
         let (cmd_tx, cmd_rx) = async_channel::unbounded();
         let (evt_tx, evt_rx) = async_channel::unbounded();
-        let handle = tokio::spawn(run_todo_session(AccountId("a1".into()), client(&server, true), cmd_rx, evt_tx));
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(run_todo_session(account_id.clone(), client(&server, true), cmd_rx, evt_tx, offline_rx));
 
         let task = CalendarTask {
             uid: lookout_core::TaskUid("t-new".to_string()),
@@ -408,5 +578,87 @@ mod tests {
         }
         tokio::time::timeout(Duration::from_secs(5), handle).await.expect("the actor returns").unwrap();
         assert!(saw_task_snapshot);
+        remove_cache(&account_id);
+    }
+
+    /// Work Offline (M-40 / T3): the cache round-trips, and a session started
+    /// paused paints it without making any Graph request.
+    #[tokio::test]
+    async fn offline_start_paints_cache_and_makes_no_request() {
+        let account_id = test_account();
+        remove_cache(&account_id);
+        let lists = vec![TodoList {
+            id: "l1".to_string(),
+            display_name: "Cached list".to_string(),
+            well_known: None,
+        }];
+        let tasks = vec![CalendarTask {
+            uid: lookout_core::TaskUid("cached-task".to_string()),
+            calendar_id: crate::todo::graph_todo_calendar_id("l1"),
+            summary: Some("Cached task".to_string()),
+            description: None,
+            due: None,
+            start: None,
+            rrule: None,
+            created: None,
+            completed: None,
+            status: lookout_core::TaskStatus::NeedsAction,
+            priority: lookout_core::TaskPriority(0),
+            percent_complete: None,
+            reminder_minutes_before: None,
+            categories: Vec::new(),
+            href: None,
+            etag: None,
+        }];
+        store_cache(&account_id, &lists, &tasks);
+        let cached = load_cache(&account_id).expect("the cache round-trips");
+        assert_eq!(cached.lists, lists);
+        assert_eq!(cached.tasks.len(), 1);
+
+        let server = MockServer::start().await;
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let (evt_tx, evt_rx) = async_channel::unbounded();
+        let (_offline_tx, offline_rx) = tokio::sync::watch::channel(true);
+        let handle = tokio::spawn(run_todo_session(account_id.clone(), client(&server, true), cmd_rx, evt_tx, offline_rx));
+
+        let mut saw_lists = false;
+        let mut saw_tasks = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                Ok(Ok(TodoEvent::ListsUpdated(value))) => saw_lists = value.len() == 1,
+                Ok(Ok(TodoEvent::TasksUpdated(value))) => saw_tasks = value.len() == 1,
+                Ok(Ok(TodoEvent::Error(message))) => panic!("unexpected error: {message}"),
+                _ => break,
+            }
+            if saw_lists && saw_tasks {
+                break;
+            }
+        }
+        assert!(saw_lists && saw_tasks, "the cache fast-paint must emit lists and tasks");
+        assert!(
+            server.received_requests().await.unwrap_or_default().is_empty(),
+            "an offline To Do actor must not reach Graph"
+        );
+
+        // A write is refused locally, still with no request.
+        cmd_tx
+            .send(TodoCommand::DeleteTask {
+                list_id: "l1".to_string(),
+                task_id: "t1".to_string(),
+                etag: None,
+            })
+            .await
+            .unwrap();
+        let refused = loop {
+            if let Ok(Ok(TodoEvent::Error(message))) = tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+                break message;
+            }
+        };
+        assert!(refused.contains("working offline"), "unexpected refusal: {refused}");
+        assert!(server.received_requests().await.unwrap_or_default().is_empty());
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        remove_cache(&account_id);
     }
 }

@@ -16,6 +16,7 @@ lookout-core.workspace = true
 # The Graph mail session (MAIL_GRAPH_OVERVIEW.md item 5.7.5) speaks the mail
 # crate's `AccountCommand`/`AccountEvent` contract and stores into its `Cache`.
 lookout-mail.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

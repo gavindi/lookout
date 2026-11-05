@@ -693,6 +693,7 @@ pub fn build_contact_form(seed: Option<&VCard>, books: Option<&[(String, String)
 pub fn show_contact_editor(
     window: &adw::ApplicationWindow,
     prefill: ContactEditorPrefill,
+    is_offline: Rc<dyn Fn() -> bool>,
     on_save: impl Fn(String, VCard) + 'static,
     on_update: impl Fn(String, Option<String>, VCard) + 'static,
     on_delete: impl Fn(String, Option<String>) + 'static,
@@ -731,6 +732,20 @@ pub fn show_contact_editor(
         .build();
     let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(6).build();
     content.append(&scroller);
+    // Inline refusal for Work Offline (M-40): People has no mutation queue, so
+    // the form stays open with an explanation instead of closing on a write
+    // that can never reach the server.
+    let error_label = gtk::Label::builder()
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .margin_start(12)
+        .margin_end(12)
+        .css_classes(["error"])
+        .visible(false)
+        .build();
+    crate::privacy::mark_ui(&error_label);
+    content.append(&error_label);
 
     // --- Footer.
     let cancel_button = gtk::Button::with_label("Cancel");
@@ -768,7 +783,14 @@ pub fn show_contact_editor(
         let dialog = dialog.clone();
         let href_owned = href_owned.clone();
         let etag_owned = etag_owned.clone();
+        let is_offline = is_offline.clone();
+        let error_label = error_label.clone();
         move |_| {
+            if is_offline() {
+                error_label.set_label("You're working offline — reconnect to save");
+                error_label.set_visible(true);
+                return;
+            }
             let Some(card) = build_card() else { return };
             if has_existing {
                 on_update(href_owned.clone(), etag_owned.clone(), card);
@@ -789,7 +811,14 @@ pub fn show_contact_editor(
         let dialog = dialog.clone();
         let href_owned = href_owned.clone();
         let etag_owned = etag_owned.clone();
+        let is_offline = is_offline.clone();
+        let error_label = error_label.clone();
         move |_| {
+            if is_offline() {
+                error_label.set_label("You're working offline — reconnect to save");
+                error_label.set_visible(true);
+                return;
+            }
             on_delete(href_owned.clone(), etag_owned.clone());
             dialog.close();
         }

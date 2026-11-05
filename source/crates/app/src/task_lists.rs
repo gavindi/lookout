@@ -262,6 +262,12 @@ fn create_list(
     target: TaskListTarget,
     name: &str,
 ) {
+    // Work Offline (M-40): list lifecycle changes are refused rather than
+    // queued, like every other Calendar/People/Tasks write.
+    if state.borrow().work_offline {
+        toast(toast_overlay, "You're working offline");
+        return;
+    }
     match target {
         TaskListTarget::Local => {
             add_local_list(state, calendar_state, name);
@@ -305,6 +311,10 @@ fn rename_list(
     calendar_id: &CalendarId,
     name: &str,
 ) {
+    if state.borrow().work_offline {
+        toast(toast_overlay, "You're working offline");
+        return;
+    }
     if let Some(list_id) = crate::window::local_task_list_id(calendar_id) {
         rename_local_list(state, calendar_state, list_id, name);
         crate::window::refresh_tasks_view(calendar_state, tasks_view);
@@ -355,6 +365,10 @@ fn delete_list(
     toast_overlay: &adw::ToastOverlay,
     calendar_id: &CalendarId,
 ) {
+    if state.borrow().work_offline {
+        toast(toast_overlay, "You're working offline");
+        return;
+    }
     if let Some(list_id) = crate::window::local_task_list_id(calendar_id) {
         delete_local_list(state, calendar_state, list_id);
         crate::window::refresh_tasks_view(calendar_state, tasks_view);

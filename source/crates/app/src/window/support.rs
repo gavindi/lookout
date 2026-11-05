@@ -220,6 +220,9 @@ pub(crate) fn current_view_title(state: &Rc<RefCell<UiState>>) -> (String, Strin
     if matches!(st.mail_view, MailView::UnifiedInbox) {
         return ("All Inboxes".to_string(), "All accounts".to_string());
     }
+    if matches!(st.mail_view, MailView::Outbox) {
+        return ("Outbox".to_string(), "All accounts".to_string());
+    }
     let Some(mailbox_id) = st.current_mailbox.as_ref() else {
         return ("Inbox".to_string(), String::new());
     };
@@ -255,7 +258,7 @@ pub(crate) fn refresh_list_header(state: &Rc<RefCell<UiState>>, header: &ListHea
         // Search results span folders (and accounts), so the star - which
         // favorites the *open folder* - is meaningless while searching.
         match (st.mail_view, st.current_mailbox.as_ref()) {
-            (MailView::Search, _) => (false, false),
+            (MailView::Search | MailView::Outbox, _) => (false, false),
             (_, Some(mailbox)) => (true, st.favorites.contains(mailbox)),
             (_, None) => (false, false),
         }
@@ -585,6 +588,39 @@ pub(crate) fn spawn_calendar_cache_search(
             }
         };
         let _ = reply_tx.send(hits).await;
+    });
+    reply_rx
+}
+
+/// Loads one cached month for an account off the GTK thread - the app-side
+/// seed used while Work Offline (M-40), where the Graph calendar session has
+/// no replay of its own and CalDAV only replays the startup month.
+pub(crate) fn spawn_calendar_cache_load_month(
+    worker: &Worker,
+    slot: Arc<CalendarCacheSlot>,
+    account_id: AccountId,
+    month: chrono::NaiveDate,
+) -> async_channel::Receiver<Option<Vec<lookout_core::EventOccurrence>>> {
+    let (reply_tx, reply_rx) = async_channel::bounded(1);
+    let warn_id = account_id.clone();
+    worker.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || match slot.open(&account_id) {
+            Some(cache) => cache.load_month(month),
+            None => Ok(None),
+        })
+        .await;
+        let occurrences = match result {
+            Ok(Ok(occurrences)) => occurrences,
+            Ok(Err(e)) => {
+                tracing::warn!("calendar cache load failed for {warn_id}: {e}");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("calendar cache load for {warn_id} panicked: {e}");
+                None
+            }
+        };
+        let _ = reply_tx.send(occurrences).await;
     });
     reply_rx
 }

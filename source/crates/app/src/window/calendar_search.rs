@@ -173,6 +173,11 @@ pub(crate) fn backfill_calendar_search(calendar_state: &Rc<RefCell<CalendarUiSta
         if st.calendar_search_backfilled {
             return;
         }
+        // Work Offline (M-40): searching still reads the local caches, but
+        // the one-shot fetch window waits until the app is back online.
+        if st.work_offline {
+            return;
+        }
         let mut targets: Vec<BackfillTarget> = st
             .accounts
             .iter()

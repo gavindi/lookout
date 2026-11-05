@@ -4383,6 +4383,7 @@ pub fn calendar_account_status_text(connection_state: &CalendarConnectionState, 
     let text = match connection_state {
         CalendarConnectionState::Connecting => "Connecting…".to_string(),
         CalendarConnectionState::Disconnected => "Disconnected".to_string(),
+        CalendarConnectionState::Offline => "Working offline".to_string(),
         CalendarConnectionState::Idle | CalendarConnectionState::Busy => "No calendars found".to_string(),
         CalendarConnectionState::Error { message, .. } => message.clone(),
     };
@@ -5670,6 +5671,7 @@ mod tests {
             CalendarConnectionState::Connecting,
             CalendarConnectionState::Idle,
             CalendarConnectionState::Busy,
+            CalendarConnectionState::Offline,
             CalendarConnectionState::Error {
                 message: "boom".to_string(),
                 retryable: true,
@@ -5683,6 +5685,7 @@ mod tests {
     fn account_status_maps_connecting_and_disconnected() {
         assert_eq!(calendar_account_status_text(&CalendarConnectionState::Connecting, false).as_deref(), Some("Connecting…"));
         assert_eq!(calendar_account_status_text(&CalendarConnectionState::Disconnected, false).as_deref(), Some("Disconnected"));
+        assert_eq!(calendar_account_status_text(&CalendarConnectionState::Offline, false).as_deref(), Some("Working offline"));
     }
 
     #[test]
