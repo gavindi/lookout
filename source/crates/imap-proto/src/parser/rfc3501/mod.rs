@@ -395,20 +395,15 @@ fn mailbox_data(i: &[u8]) -> IResult<&[u8], MailboxDatum<'_>> {
 fn address(i: &[u8]) -> IResult<&[u8], Address<'_>> {
     paren_delimited(map(
         tuple((
-            nstring,
+            nstring_unescaped,
             tag(" "),
-            nstring,
+            nstring_unescaped,
             tag(" "),
-            nstring,
+            nstring_unescaped,
             tag(" "),
-            nstring,
+            nstring_unescaped,
         )),
-        |(name, _, adl, _, mailbox, _, host)| Address {
-            name: name.map(Cow::Borrowed),
-            adl: adl.map(Cow::Borrowed),
-            mailbox: mailbox.map(Cow::Borrowed),
-            host: host.map(Cow::Borrowed),
-        },
+        |(name, _, adl, _, mailbox, _, host)| Address { name, adl, mailbox, host },
     ))(i)
 }
 
@@ -448,11 +443,9 @@ fn opt_addresses(i: &[u8]) -> IResult<&[u8], Option<Vec<Address<'_>>>> {
 pub(crate) fn envelope(i: &[u8]) -> IResult<&[u8], Envelope<'_>> {
     paren_delimited(map(
         tuple((
-            nstring,
+            nstring_unescaped,
             tag(" "),
-            nstring,
-            tag(" "),
-            opt_addresses,
+            nstring_unescaped,
             tag(" "),
             opt_addresses,
             tag(" "),
@@ -464,9 +457,11 @@ pub(crate) fn envelope(i: &[u8]) -> IResult<&[u8], Envelope<'_>> {
             tag(" "),
             opt_addresses,
             tag(" "),
-            nstring,
+            opt_addresses,
             tag(" "),
-            nstring,
+            nstring_unescaped,
+            tag(" "),
+            nstring_unescaped,
         )),
         |(
             date,
@@ -489,16 +484,16 @@ pub(crate) fn envelope(i: &[u8]) -> IResult<&[u8], Envelope<'_>> {
             _,
             message_id,
         )| Envelope {
-            date: date.map(Cow::Borrowed),
-            subject: subject.map(Cow::Borrowed),
+            date,
+            subject,
             from,
             sender,
             reply_to,
             to,
             cc,
             bcc,
-            in_reply_to: in_reply_to.map(Cow::Borrowed),
-            message_id: message_id.map(Cow::Borrowed),
+            in_reply_to,
+            message_id,
         },
     ))(i)
 }

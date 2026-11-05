@@ -298,6 +298,102 @@ fn index_preserving_body(conn: &rusqlite::Connection, msg: &EmailSummary, is_new
     }
 }
 
+/// One-time repair for envelopes cached before the IMAP parser resolved
+/// quoted-string escapes. The old parser kept the escape characters, so a
+/// subject/display name/message ID that contained `"` or `\` was stored with
+/// the IMAP-level backslashes (`\"`, `\\`). A normal sync only fetches
+/// envelopes for *new* UIDs, so those rows would otherwise keep the
+/// backslashes forever.
+///
+/// This rewrites values in place rather than wiping `messages`: bodies,
+/// snoozes and the search index stay valid, and the user does not pay a full
+/// re-sync. The candidate prefilter is one `LIKE` pass; only rows whose JSON
+/// contains two consecutive backslashes (which every JSON-encoded backslash
+/// does) are parsed, so a subject with an ordinary quote - which JSON encodes
+/// as a single `\"` - is not even deserialized. The repair is the exact
+/// inverse of the old parser for the escapes it left in place, and it doubles
+/// as the migration marker (the caller bumps `user_version` in the same
+/// transaction), so it cannot run twice.
+///
+/// Once a value is cached, its provenance is gone: a `\"` that came from a
+/// literal IMAP string, a MIME encoded-word payload, or a non-IMAP backend is
+/// indistinguishable from an IMAP escape. Those rare values would lose one
+/// backslash here. Re-fetching the envelopes instead would be exact, but the
+/// in-place repair is the deliberate trade-off for not re-downloading every
+/// affected message.
+fn repair_quoted_envelope_strings(conn: &Connection) -> Result<()> {
+    let mut select = conn.prepare("SELECT mailbox_id, uid, data FROM messages WHERE data LIKE ?1")?;
+    let mut rows = select.query([r"%\\%"])?;
+    let mut updates: Vec<(String, u32, String)> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mailbox_id: String = row.get(0)?;
+        let uid: u32 = row.get(1)?;
+        let data: String = row.get(2)?;
+        let Ok(mut summary) = serde_json::from_str::<EmailSummary>(&data) else {
+            continue;
+        };
+        let mut changed = false;
+        changed |= unescape_quoted_option(&mut summary.subject);
+        for addresses in [&mut summary.from, &mut summary.to, &mut summary.cc] {
+            for address in addresses.iter_mut() {
+                changed |= unescape_quoted_option(&mut address.name);
+            }
+        }
+        changed |= unescape_quoted_option(&mut summary.message_id);
+        changed |= unescape_quoted_option(&mut summary.in_reply_to);
+        if changed {
+            updates.push((mailbox_id, uid, serde_json::to_string(&summary)?));
+        }
+    }
+    drop(rows);
+    drop(select);
+    let mut update = conn.prepare("UPDATE messages SET data = ?3 WHERE mailbox_id = ?1 AND uid = ?2")?;
+    for (mailbox_id, uid, data) in updates {
+        update.execute(rusqlite::params![mailbox_id, uid, data])?;
+    }
+    Ok(())
+}
+
+fn unescape_quoted_option(value: &mut Option<String>) -> bool {
+    let Some(current) = value.as_ref() else {
+        return false;
+    };
+    let repaired = unescape_imap_quoted(current);
+    if repaired == current.as_str() {
+        false
+    } else {
+        *value = Some(repaired);
+        true
+    }
+}
+
+/// Resolve the `\"` and `\\` escapes in an already-extracted IMAP quoted
+/// string. A backslash before any other character is preserved verbatim,
+/// matching the parser's lenient `quoted_unescaped`.
+fn unescape_imap_quoted(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Re-indexes `(mailbox_id, uid)` with the full text of its just-stored (or,
 /// for `store_partial_messages`, already-cached) `body`, but only if the
 /// envelope is cached - a stray body for a wiped envelope has no
@@ -893,8 +989,8 @@ impl Cache {
         // Messages/envelope cache version. The shared `user_version` PRAGMA is
         // a single monotonic high-water mark (see `BODY_CACHE_VERSION` below),
         // so a new messages-format change must raise this *above* every other
-        // constant to trigger its wipe - a value below the stored maximum would
-        // silently never fire.
+        // constant to trigger its migration - a value below the stored maximum
+        // would silently never fire.
         //
         // Version 1: pre-full-sync builds kept only a folder's newest ~200
         // messages, so their `messages` rows held a *subset* of the mailbox and
@@ -910,7 +1006,20 @@ impl Cache {
         // wiping forces one full re-sync whose preview pass re-inspects every
         // body. Each version subsumes the earlier ones. Snoozes, addresses and
         // the mailbox list are untouched.
-        const ENVELOPE_CACHE_VERSION: i64 = 7;
+        // Version 9: the vendored IMAP parser now resolves the escapes in
+        // quoted strings (`\"` -> `"`, `\\` -> `\`). Cached envelopes written
+        // by older builds still carry the raw backslashes in the subject,
+        // display names and message IDs, and a normal sync only fetches
+        // envelopes for *new* UIDs - so existing rows would never be corrected.
+        // Version 9 repairs those rows in place (see
+        // `repair_quoted_envelope_strings`) instead of wiping them, preserving
+        // bodies, snoozes and the search index. Version 7 and older still take
+        // the full wipe below, because those rows are missing fields that can
+        // only be filled by re-fetching.
+        const ENVELOPE_CACHE_VERSION: i64 = 9;
+        /// The last envelope format that still needs a full wipe rather than
+        /// the in-place quoted-string repair.
+        const ENVELOPE_LEGACY_WIPE_VERSION: i64 = 7;
         // One-time body-cache migration: `bodies` rows changed format from
         // raw RFC 5322 bytes to serialized `EmailBody` JSON (the partial-fetch
         // path never assembles a whole raw message), so pre-partial-fetch
@@ -921,10 +1030,10 @@ impl Cache {
         // Authentication-Results verdicts, item 6.1). Old rows decode with it
         // `None`, and since it is *derived* from the raw headers at assembly
         // time it can't be back-filled from the stored JSON, so bodies are
-        // wiped once and reassembled. A *body* bump must stay above
-        // `ENVELOPE_CACHE_VERSION`, or the shared `user_version` high-water
-        // mark would swallow it (the envelope bump to 7 already exceeds this
-        // value).
+        // wiped once and reassembled. A *body* bump must stay above every
+        // envelope version, or the shared `user_version` high-water mark would
+        // swallow it; the envelope repair bumped to 9 without touching this
+        // value, so the next body-format change must use a number above 9.
         // Version 8: `EmailBody` gained `dsn` (the parsed RFC 3464 delivery
         // status notification, M-27). Those rows were fetched before the
         // `message/delivery-status`/`text/rfc822-headers` parts were
@@ -943,19 +1052,33 @@ impl Cache {
         // calendar part was requested - a cached invitation would never show
         // its banner. Wipe bodies once so every message is re-fetched with
         // the calendar part included.
+        // The outer read keeps a current cache off the write path entirely.
         let stored: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-        if stored < ENVELOPE_CACHE_VERSION {
-            conn.execute("DELETE FROM messages", [])?;
-            // A Graph folder cursor describes the rows that were just wiped;
-            // keeping it would let the next incremental page skip the
-            // messages the wipe removed from the cache. Force a snapshot.
-            conn.execute("DELETE FROM graph_folder_cursors", [])?;
-        }
-        if stored < BODY_CACHE_VERSION {
-            conn.execute("DELETE FROM bodies", [])?;
-        }
         if stored < BODY_CACHE_VERSION || stored < ENVELOPE_CACHE_VERSION {
-            conn.pragma_update(None, "user_version", BODY_CACHE_VERSION.max(ENVELOPE_CACHE_VERSION))?;
+            // Run the migration under an immediate transaction and re-read the
+            // version inside it. Two `Cache` handles (the sync session and the
+            // UI thread's read handle) can open the same file at once; the
+            // in-place repair must run exactly once, or it would unescape
+            // already-repaired values a second time.
+            let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+            let stored: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+            if stored < ENVELOPE_LEGACY_WIPE_VERSION {
+                tx.execute("DELETE FROM messages", [])?;
+                // A Graph folder cursor describes the rows that were just
+                // wiped; keeping it would let the next incremental page skip
+                // the messages the wipe removed from the cache. Force a
+                // snapshot.
+                tx.execute("DELETE FROM graph_folder_cursors", [])?;
+            } else if stored < ENVELOPE_CACHE_VERSION {
+                repair_quoted_envelope_strings(&tx)?;
+            }
+            if stored < BODY_CACHE_VERSION {
+                tx.execute("DELETE FROM bodies", [])?;
+            }
+            if stored < BODY_CACHE_VERSION || stored < ENVELOPE_CACHE_VERSION {
+                tx.pragma_update(None, "user_version", BODY_CACHE_VERSION.max(ENVELOPE_CACHE_VERSION))?;
+            }
+            tx.commit()?;
         }
 
         // NOTE: the one-time FTS backfill is *not* run here. `Cache::open` is
@@ -3851,10 +3974,10 @@ mod tests {
         assert!(cache.load_messages(&mailbox_id).unwrap().is_empty(), "a pre-migration cache must be wiped");
         assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "a pre-migration body must be wiped");
 
-        // Simulate a version-7 database (envelopes current at
-        // `ENVELOPE_CACHE_VERSION`, bodies one behind): the body rows are
-        // wiped so each message is re-fetched with the delivery-report parts
-        // (M-27), while the envelope rows survive.
+        // Simulate a version-7 database (envelopes predate the quoted-string
+        // repair, bodies one behind): the body rows are wiped so each message
+        // is re-fetched with the delivery-report parts (M-27), while the
+        // envelope rows are repaired in place rather than wiped.
         cache.replace_messages(&mailbox_id, UidValidity(1), &[sample_summary(&mailbox_id, 3, None)]).unwrap();
         cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &sample_body("kept body")).unwrap();
         {
@@ -3871,6 +3994,78 @@ mod tests {
             !cache.has_body(&mailbox_id, Uid(3), UidValidity(1)).unwrap(),
             "a version-7 cache's bodies must be wiped for the delivery-report field"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Envelopes cached before the IMAP quoted-string parser resolved escapes
+    /// are repaired in place: the subject, display names and message IDs lose
+    /// their IMAP-level backslashes, while a genuine backslash (a literal
+    /// string or a non-IMAP backend) is preserved. Bodies survive, and a
+    /// second open must not unescape the already-repaired values again.
+    #[test]
+    fn quoted_string_repair_unescapes_cached_envelopes_in_place() {
+        let account_id = temp_account_id();
+        let mailbox_id = MailboxId::new(&account_id, "INBOX");
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let cache = Cache::open(&account_id).unwrap();
+
+        let mut escaped = sample_summary(&mailbox_id, 1, Some("preview"));
+        escaped.subject = Some(r#"Re: \"Window Positioner\""#.to_string());
+        escaped.from = vec![EmailAddress {
+            name: Some(r#"Ada \"The Countess\" Lovelace"#.to_string()),
+            address: "ada@example.com".to_string(),
+        }];
+        escaped.to = vec![EmailAddress {
+            name: Some(r#"Bob \\ Builder"#.to_string()),
+            address: "bob@example.com".to_string(),
+        }];
+        escaped.message_id = Some(r#"<\"id\"@example.com>"#.to_string());
+        escaped.in_reply_to = Some(r#"<\"parent\"@example.com>"#.to_string());
+
+        // A value that merely contains a backslash is not an IMAP escape.
+        let mut literal = sample_summary(&mailbox_id, 2, None);
+        literal.subject = Some(r#"C:\Users\alice"#.to_string());
+
+        // A plain quote (from a literal or a non-IMAP backend) is already
+        // correct and must stay that way.
+        let mut plain_quote = sample_summary(&mailbox_id, 3, None);
+        plain_quote.subject = Some(r#"He said "hi""#.to_string());
+
+        cache.replace_messages(&mailbox_id, UidValidity(1), &[escaped, literal, plain_quote]).unwrap();
+        cache.store_body(&mailbox_id, Uid(1), UidValidity(1), &sample_body("body survives")).unwrap();
+
+        // A cache written by the build immediately before the parser fix.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+        let cache = Cache::open(&account_id).unwrap();
+        let messages = cache.load_messages(&mailbox_id).unwrap();
+        let repaired = messages.iter().find(|m| m.uid == Uid(1)).unwrap();
+        assert_eq!(repaired.subject.as_deref(), Some(r#"Re: "Window Positioner""#));
+        assert_eq!(repaired.from[0].name.as_deref(), Some(r#"Ada "The Countess" Lovelace"#));
+        assert_eq!(repaired.to[0].name.as_deref(), Some(r#"Bob \ Builder"#));
+        assert_eq!(repaired.message_id.as_deref(), Some(r#"<"id"@example.com>"#));
+        assert_eq!(repaired.in_reply_to.as_deref(), Some(r#"<"parent"@example.com>"#));
+
+        let untouched = messages.iter().find(|m| m.uid == Uid(2)).unwrap();
+        assert_eq!(untouched.subject.as_deref(), Some(r#"C:\Users\alice"#));
+        let plain = messages.iter().find(|m| m.uid == Uid(3)).unwrap();
+        assert_eq!(plain.subject.as_deref(), Some(r#"He said "hi""#));
+        assert_eq!(
+            cache.load_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap().map(|b| b.text_body.unwrap()),
+            Some("body survives".to_string()),
+            "the repair must preserve cached bodies"
+        );
+
+        // The migration bumped the version, so a second open is a no-op: a
+        // double unescape would turn `Bob \ Builder` into `Bob Builder`.
+        let cache = Cache::open(&account_id).unwrap();
+        let messages = cache.load_messages(&mailbox_id).unwrap();
+        let repaired = messages.iter().find(|m| m.uid == Uid(1)).unwrap();
+        assert_eq!(repaired.to[0].name.as_deref(), Some(r#"Bob \ Builder"#));
+        assert_eq!(repaired.subject.as_deref(), Some(r#"Re: "Window Positioner""#));
 
         let _ = std::fs::remove_file(path);
     }

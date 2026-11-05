@@ -83,9 +83,12 @@ pub fn string_utf8(i: &[u8]) -> IResult<&[u8], &str> {
 /// fixed for ENVELOPE subjects). Lossy decoding keeps the message and the
 /// session alive; callers already handle non-ASCII text as `Cow<str>`.
 pub fn string_lossy(i: &[u8]) -> IResult<&[u8], Cow<'_, str>> {
-    map(string, |bytes| match from_utf8(bytes) {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(String::from_utf8_lossy(bytes).into_owned()),
+    map(string_unescaped, |bytes| match bytes {
+        Cow::Borrowed(bytes) => match from_utf8(bytes) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(String::from_utf8_lossy(bytes).into_owned()),
+        },
+        Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(bytes.as_slice()).into_owned()),
     })(i)
 }
 
@@ -100,6 +103,75 @@ pub fn quoted(i: &[u8]) -> IResult<&[u8], &[u8]> {
         ),
         char('"'),
     )(i)
+}
+
+/// [`quoted`], but resolving the escapes the grammar defines: `\"` becomes `"`
+/// and `\\` becomes `\`. Borrows the content when it contains no escapes and
+/// allocates only when it does.
+///
+/// A backslash before anything else is kept literally (backslash and byte)
+/// rather than rejected. RFC 3501 only permits escaping `"` and `\`, but a
+/// non-conforming server that emits, say, a bare `C:\Users` path inside a
+/// subject would otherwise abort the whole FETCH response - and because the
+/// reconnect re-fetches the same message, loop the session forever. Preserving
+/// the bytes keeps that mail visible.
+pub fn quoted_unescaped(i: &[u8]) -> IResult<&[u8], Cow<'_, [u8]>> {
+    let (rest, _) = char('"')(i)?;
+    let start = rest;
+    let mut idx = 0;
+    let mut out: Option<Vec<u8>> = None;
+    loop {
+        let Some(&byte) = rest.get(idx) else {
+            return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+        };
+        if byte == b'"' {
+            let value = match out {
+                Some(bytes) => Cow::Owned(bytes),
+                None => Cow::Borrowed(&start[..idx]),
+            };
+            return Ok((&rest[idx + 1..], value));
+        }
+        if !is_text_char(byte) {
+            return Err(nom::Err::Error(nom::error::make_error(
+                &rest[idx..],
+                nom::error::ErrorKind::Char,
+            )));
+        }
+        if byte == b'\\' {
+            let Some(&escaped) = rest.get(idx + 1) else {
+                return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+            };
+            if !is_text_char(escaped) {
+                return Err(nom::Err::Error(nom::error::make_error(
+                    &rest[idx..],
+                    nom::error::ErrorKind::Char,
+                )));
+            }
+            let bytes = out.get_or_insert_with(|| start[..idx].to_vec());
+            if escaped == b'"' || escaped == b'\\' {
+                bytes.push(escaped);
+            } else {
+                bytes.push(b'\\');
+                bytes.push(escaped);
+            }
+            idx += 2;
+        } else {
+            if let Some(bytes) = out.as_mut() {
+                bytes.push(byte);
+            }
+            idx += 1;
+        }
+    }
+}
+
+// string = quoted / literal, with IMAP quoted-string escapes resolved.
+pub fn string_unescaped(i: &[u8]) -> IResult<&[u8], Cow<'_, [u8]>> {
+    alt((quoted_unescaped, map(literal, Cow::Borrowed)))(i)
+}
+
+// nstring = string / nil, with IMAP quoted-string escapes resolved.
+pub fn nstring_unescaped(i: &[u8]) -> IResult<&[u8], Option<Cow<'_, [u8]>>> {
+    alt((map(nil, |_| None), map(string_unescaped, Some)))(i)
 }
 
 // quoted bytes as utf8
@@ -320,6 +392,54 @@ mod tests {
 
         // Test Error
         assert_matches!(quoted(br"\"), Err(nom::Err::Error(_)));
+    }
+
+    #[test]
+    fn test_quoted_unescaped_resolves_escapes() {
+        // No escapes: borrowed, unchanged.
+        let (rem, val) = quoted_unescaped(br#""Hello"???"#).unwrap();
+        assert_eq!(rem, b"???");
+        assert!(matches!(val, Cow::Borrowed(_)));
+        assert_eq!(val.as_ref(), b"Hello");
+
+        // Escaped quotes and backslashes are resolved.
+        let (rem, val) = quoted_unescaped(br#""Hello \"World\""???"#).unwrap();
+        assert_eq!(rem, b"???");
+        assert!(matches!(val, Cow::Owned(_)));
+        assert_eq!(val.as_ref(), br#"Hello "World""#);
+
+        let (_, val) = quoted_unescaped(br#""Hello \\ "???"#).unwrap();
+        assert_eq!(val.as_ref(), br#"Hello \ "#);
+
+        // Backslash + escaped backslash + escaped quote (a literal `\"`).
+        let (_, val) = quoted_unescaped(br#""a\\\"b""#).unwrap();
+        assert_eq!(val.as_ref(), br#"a\"b"#);
+
+        // An empty quoted string is valid, unlike `quoted`'s `take_while1`.
+        let (rem, val) = quoted_unescaped(b"\"\"rest").unwrap();
+        assert_eq!(rem, b"rest");
+        assert_eq!(val.as_ref(), b"");
+
+        // A non-conforming escape is preserved rather than aborting the parse.
+        let (_, val) = quoted_unescaped(br#""C:\Users\alice""#).unwrap();
+        assert_eq!(val.as_ref(), br#"C:\Users\alice"#);
+
+        // Control characters can't appear in a quoted string.
+        assert_matches!(quoted_unescaped(b"\"a\0b\""), Err(nom::Err::Error(_)));
+        assert_matches!(quoted_unescaped(b"\"a\rb\""), Err(nom::Err::Error(_)));
+
+        // Streaming: an unterminated string waits for more input.
+        assert_matches!(quoted_unescaped(br#""Hello"#), Err(nom::Err::Incomplete(_)));
+        assert_matches!(quoted_unescaped(br#""\"#), Err(nom::Err::Incomplete(_)));
+    }
+
+    #[test]
+    fn test_nstring_unescaped() {
+        let (_, val) = nstring_unescaped(br#""Re: \"Hi\"""#).unwrap();
+        assert_eq!(val.as_deref(), Some(&br#"Re: "Hi""#[..]));
+
+        let (_, val) = nstring_unescaped(b"NIL").unwrap();
+        assert!(val.is_none());
     }
 
     #[test]

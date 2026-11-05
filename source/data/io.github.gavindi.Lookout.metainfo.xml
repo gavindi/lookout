@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.312" date="2026-11-06">
+      <description>
+        <p>Messages whose subject contains a double quote showed a stray backslash before it, in both the message list and the reply or forward composer. Subjects, sender and recipient display names, and message IDs now display their quoted text correctly, and messages already cached by an earlier build are repaired in place on the next start without a full re-sync.</p>
+      </description>
+    </release>
     <release version="0.9.311" date="2026-11-06">
       <description>
         <p>Mail accounts that use STARTTLS now connect. Lookout follows the encryption chosen in GNOME Online Accounts or imported from Evolution, and the Add mail account dialog lets you pick SSL/TLS, STARTTLS or no encryption for receiving and sending. Contributed by Christian Lauinger.</p>

@@ -290,6 +290,40 @@ mod tests {
     }
 
     #[test]
+    fn envelope_unescapes_quoted_subject_and_sender_name() {
+        use async_imap::imap_proto::types::{AttributeValue, Response};
+        // A server quoting a subject and display name that themselves contain
+        // double quotes: IMAP escapes each one as `\"`. The parser must return
+        // the display text, not the wire escaping.
+        let raw = concat!(
+            r#"* 5 FETCH (UID 5 FLAGS () ENVELOPE ("Wed, 10 Jun 2026 19:31:00 +0000" "Re: \"Window Positioner\"" (("Ada \"The Countess\" Lovelace" NIL "ada" "example.com")) (("Ada \"The Countess\" Lovelace" NIL "ada" "example.com")) (("Ada \"The Countess\" Lovelace" NIL "ada" "example.com")) (("Jordan Casey" NIL "jordan" "example.com")) NIL NIL NIL "<id@example.com>"))"#,
+            "\r\n"
+        )
+        .as_bytes();
+        let (remaining, response) = async_imap::imap_proto::parser::parse_response(raw).expect("escaped ENVELOPE fields should parse");
+        assert!(remaining.is_empty());
+        let Response::Fetch(_, attrs) = response else {
+            panic!("expected a FETCH response, got {response:?}");
+        };
+        let envelope = attrs
+            .iter()
+            .find_map(|a| match a {
+                AttributeValue::Envelope(e) => Some(e),
+                _ => None,
+            })
+            .expect("FETCH should carry an ENVELOPE");
+        let subject = envelope.subject.as_deref().map(|s| std::str::from_utf8(s).unwrap());
+        assert_eq!(subject, Some(r#"Re: "Window Positioner""#));
+        let sender_name = envelope
+            .from
+            .as_ref()
+            .and_then(|a| a.first())
+            .and_then(|a| a.name.as_deref())
+            .map(|n| std::str::from_utf8(n).unwrap());
+        assert_eq!(sender_name, Some(r#"Ada "The Countess" Lovelace"#));
+    }
+
+    #[test]
     fn selected_headers_parse_importance_sensitivity_and_list_id() {
         let raw = b"Importance: High\r\nX-Priority: 1 (Highest)\r\nSensitivity: Private\r\nList-Id: Announcements <announce.example.com>\r\nSubject: ignored\r\n\r\n";
         let headers = selected_headers(Some(raw));
