@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use gtk::glib;
 use lookout_core::AccountId;
 use lookout_mail::session::CredentialProvider;
-use lookout_mail::Credential;
+use lookout_mail::{Credential, Protocol, Security};
 use secret_service::{EncryptionType, SecretService};
 
 use crate::app_config::{AppConfig, OtherAccount, OTHER_ACCOUNT_ID_PREFIX};
@@ -241,6 +241,7 @@ pub fn show_add_account_dialog(
     let imap_host_entry = gtk::Entry::builder().placeholder_text("imap.example.com").build();
     let imap_port_spin = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
     imap_port_spin.set_value(993.0);
+    let imap_security_dropdown = security_dropdown(Security::ImplicitTls);
     let imap_username_entry = gtk::Entry::builder().placeholder_text("username").build();
 
     // SMTP defaults to mirroring IMAP (the overwhelmingly common case for
@@ -250,6 +251,7 @@ pub fn show_add_account_dialog(
     let smtp_host_entry = gtk::Entry::builder().placeholder_text("smtp.example.com").build();
     let smtp_port_spin = gtk::SpinButton::with_range(1.0, 65535.0, 1.0);
     smtp_port_spin.set_value(587.0);
+    let smtp_security_dropdown = security_dropdown(Security::StartTls);
     let smtp_username_entry = gtk::Entry::builder().placeholder_text("username").build();
     let smtp_fields_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(8).build();
 
@@ -266,11 +268,13 @@ pub fn show_add_account_dialog(
         email_entry.set_text(&account.email);
         imap_host_entry.set_text(&account.imap_host);
         imap_port_spin.set_value(account.imap_port as f64);
+        imap_security_dropdown.set_selected(security_position(account.resolved_imap_security()));
         imap_username_entry.set_text(&account.imap_username);
         let same_server = account.smtp_host == account.imap_host && account.smtp_username == account.imap_username;
         same_server_switch.set_active(same_server);
         smtp_host_entry.set_text(&account.smtp_host);
         smtp_port_spin.set_value(account.smtp_port as f64);
+        smtp_security_dropdown.set_selected(security_position(account.resolved_smtp_security()));
         smtp_username_entry.set_text(&account.smtp_username);
         same_password_switch.set_active(account.use_same_password);
     }
@@ -302,14 +306,8 @@ pub fn show_add_account_dialog(
     form.attach(&field_label("IMAP username"), 0, row, 1, 1);
     form.attach(&imap_username_entry, 1, row, 1, 1);
     row += 1;
-    let tls_note = gtk::Label::builder()
-        .label("Connections are encrypted (SSL/TLS), like the accounts GNOME Online Accounts provides.")
-        .wrap(true)
-        .halign(gtk::Align::Start)
-        .css_classes(["dim-label"])
-        .build();
-    crate::privacy::mark_ui(&tls_note);
-    form.attach(&tls_note, 1, row, 3, 1);
+    form.attach(&field_label("IMAP security"), 0, row, 1, 1);
+    form.attach(&imap_security_dropdown, 1, row, 1, 1);
     row += 1;
 
     let same_server_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).hexpand(true).build();
@@ -333,6 +331,18 @@ pub fn show_add_account_dialog(
     smtp_fields_box.append(&smtp_username_row);
     form.attach(&field_label("SMTP"), 0, row, 1, 1);
     form.attach(&smtp_fields_box, 1, row, 3, 1);
+    row += 1;
+    form.attach(&field_label("SMTP security"), 0, row, 1, 1);
+    form.attach(&smtp_security_dropdown, 1, row, 1, 1);
+    row += 1;
+    let plain_note = gtk::Label::builder()
+        .label("Without encryption, your password and mail cross the network unprotected.")
+        .wrap(true)
+        .halign(gtk::Align::Start)
+        .css_classes(["warning"])
+        .build();
+    crate::privacy::mark_ui(&plain_note);
+    form.attach(&plain_note, 1, row, 3, 1);
     row += 1;
 
     let same_password_row = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(12).hexpand(true).build();
@@ -389,6 +399,26 @@ pub fn show_add_account_dialog(
     smtp_fields_box.set_sensitive(same_server_switch.is_active());
     smtp_password_box.set_visible(same_password_switch.is_active());
 
+    // Changing the security mode moves a standard port to the new mode's
+    // (993 <-> 143, 465 <-> 587); a custom port is left alone. Hooked up after
+    // the seed above so an edit keeps its saved port.
+    follow_standard_port(&imap_security_dropdown, &imap_port_spin, Protocol::Imap);
+    follow_standard_port(&smtp_security_dropdown, &smtp_port_spin, Protocol::Smtp);
+    let sync_plain_note = {
+        let plain_note = plain_note.clone();
+        let imap_security_dropdown = imap_security_dropdown.clone();
+        let smtp_security_dropdown = smtp_security_dropdown.clone();
+        move || {
+            let plain = [&imap_security_dropdown, &smtp_security_dropdown].iter().any(|d| selected_security(d) == Security::Plain);
+            plain_note.set_visible(plain);
+        }
+    };
+    sync_plain_note();
+    for dropdown in [&imap_security_dropdown, &smtp_security_dropdown] {
+        let sync_plain_note = sync_plain_note.clone();
+        dropdown.connect_selected_notify(move |_| sync_plain_note());
+    }
+
     // -- footer: Cancel / Save --
     let footer = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -431,6 +461,8 @@ pub fn show_add_account_dialog(
             let email = email_entry.text().trim().to_string();
             let imap_host = imap_host_entry.text().trim().to_string();
             let imap_port = imap_port_spin.value_as_int().clamp(1, 65535) as u16;
+            let imap_security = selected_security(&imap_security_dropdown);
+            let smtp_security = selected_security(&smtp_security_dropdown);
             let imap_username = imap_username_entry.text().trim().to_string();
             let same_server = same_server_switch.is_active();
             let smtp_host = if same_server { imap_host.clone() } else { smtp_host_entry.text().trim().to_string() };
@@ -455,17 +487,15 @@ pub fn show_add_account_dialog(
                 email,
                 imap_host,
                 imap_port,
-                // The mail engine always connects IMAP over TLS (see
-                // `lookout-mail`'s `connection.rs`) and drives SMTP TLS by
-                // port (465 = implicit, otherwise STARTTLS); the flags are
-                // stored for display parity with GOA accounts.
-                imap_use_tls: true,
+                imap_use_tls: imap_security.is_encrypted(),
                 imap_username,
                 smtp_host,
                 smtp_port,
-                smtp_use_tls: true,
+                smtp_use_tls: smtp_security.is_encrypted(),
                 smtp_username,
                 use_same_password,
+                imap_security: Some(imap_security),
+                smtp_security: Some(smtp_security),
             };
 
             // -- validate --
@@ -583,6 +613,62 @@ pub(crate) fn account_problems(account: &OtherAccount, check_smtp: bool) -> Vec<
     problems
 }
 
+/// The security modes the account dialog offers, in dropdown order.
+const SECURITY_CHOICES: [Security; 3] = [Security::ImplicitTls, Security::StartTls, Security::Plain];
+
+/// The dropdown label for `security`.
+fn security_label(security: Security) -> &'static str {
+    match security {
+        Security::ImplicitTls => "SSL/TLS",
+        Security::StartTls => "STARTTLS",
+        Security::Plain => "None",
+    }
+}
+
+/// `security`'s position in [`SECURITY_CHOICES`].
+fn security_position(security: Security) -> u32 {
+    SECURITY_CHOICES.iter().position(|s| *s == security).unwrap_or(0) as u32
+}
+
+/// A security dropdown listing [`SECURITY_CHOICES`], with `initial` selected.
+fn security_dropdown(initial: Security) -> gtk::DropDown {
+    let labels: Vec<&str> = SECURITY_CHOICES.iter().map(|s| security_label(*s)).collect();
+    let dropdown = gtk::DropDown::from_strings(&labels);
+    dropdown.set_halign(gtk::Align::Start);
+    dropdown.set_selected(security_position(initial));
+    dropdown
+}
+
+/// The mode selected in a [`security_dropdown`].
+fn selected_security(dropdown: &gtk::DropDown) -> Security {
+    SECURITY_CHOICES.get(dropdown.selected() as usize).copied().unwrap_or(Security::ImplicitTls)
+}
+
+/// The port to show after switching `protocol` to `security`: the new mode's
+/// standard port when `port` is one of the protocol's standard ports,
+/// otherwise `port` unchanged.
+fn port_for_security(protocol: Protocol, security: Security, port: u16) -> u16 {
+    let is_standard = SECURITY_CHOICES.iter().any(|s| protocol.default_port(*s) == port);
+    if is_standard {
+        protocol.default_port(security)
+    } else {
+        port
+    }
+}
+
+/// Keeps `spin` on the standard port of the mode chosen in `dropdown`, unless
+/// the user typed a custom one (see [`port_for_security`]).
+fn follow_standard_port(dropdown: &gtk::DropDown, spin: &gtk::SpinButton, protocol: Protocol) {
+    let spin = spin.clone();
+    dropdown.connect_selected_notify(move |dropdown| {
+        let port = spin.value_as_int().clamp(1, 65535) as u16;
+        let next = port_for_security(protocol, selected_security(dropdown), port);
+        if next != port {
+            spin.set_value(f64::from(next));
+        }
+    });
+}
+
 /// A fresh, stable `other:<uuid>` id for a new manual account.
 pub(crate) fn new_other_account_id() -> String {
     format!("{OTHER_ACCOUNT_ID_PREFIX}{}", uuid::Uuid::new_v4())
@@ -683,6 +769,20 @@ mod tests {
                 _ => panic!(),
             }
         });
+    }
+
+    #[test]
+    fn switching_security_moves_only_a_standard_port() {
+        assert_eq!(port_for_security(Protocol::Imap, Security::StartTls, 993), 143);
+        assert_eq!(port_for_security(Protocol::Imap, Security::ImplicitTls, 143), 993);
+        assert_eq!(port_for_security(Protocol::Imap, Security::Plain, 993), 143);
+        assert_eq!(port_for_security(Protocol::Smtp, Security::ImplicitTls, 587), 465);
+        assert_eq!(port_for_security(Protocol::Smtp, Security::StartTls, 465), 587);
+        assert_eq!(port_for_security(Protocol::Imap, Security::StartTls, 1993), 1993);
+        assert_eq!(port_for_security(Protocol::Smtp, Security::ImplicitTls, 2525), 2525);
+        for security in SECURITY_CHOICES {
+            assert_eq!(SECURITY_CHOICES[security_position(security) as usize], security);
+        }
     }
 
     #[test]

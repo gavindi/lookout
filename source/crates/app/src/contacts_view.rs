@@ -3602,14 +3602,16 @@ mod tests {
             imap: lookout_goa::EndpointConfig {
                 host: "outlook.office365.com".to_string(),
                 port: None,
-                use_tls: true,
+                use_ssl: true,
+                use_starttls: false,
                 accept_ssl_errors: false,
                 username: "work@contoso.com".to_string(),
             },
             smtp: lookout_goa::EndpointConfig {
                 host: "smtp.office365.com".to_string(),
                 port: None,
-                use_tls: true,
+                use_ssl: false,
+                use_starttls: true,
                 accept_ssl_errors: false,
                 username: "work@contoso.com".to_string(),
             },

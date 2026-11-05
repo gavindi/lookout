@@ -14,7 +14,7 @@ use lookout_dav::subscription::SubscriptionSessionEvent;
 use lookout_dav::CalendarAccountConfig;
 use lookout_goa::{GoaCalendarAccount, GoaClient};
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
-use lookout_mail::{AccountConfig, EndpointConfig};
+use lookout_mail::{AccountConfig, EndpointConfig, Protocol};
 
 use crate::calendar_colors;
 use crate::calendar_view::{self, CalendarMain};
@@ -249,18 +249,22 @@ pub(crate) fn connect_account(
         // the very first sync classifies with them (item 2.12).
         local_focus_enabled: false,
         local_focus_contacts: local_focus_contacts.clone(),
-        imap: EndpointConfig {
-            host: account.imap.host.clone(),
-            port: account.imap.port.unwrap_or(993),
-            use_tls: account.imap.use_tls,
-            username: account.imap.username.clone(),
-        },
-        smtp: EndpointConfig {
-            host: account.smtp.host.clone(),
-            port: account.smtp.port.unwrap_or(587),
-            use_tls: account.smtp.use_tls,
-            username: account.smtp.username.clone(),
-        },
+        imap: EndpointConfig::from_goa(
+            Protocol::Imap,
+            &account.imap.host,
+            account.imap.port,
+            account.imap.use_ssl,
+            account.imap.use_starttls,
+            &account.imap.username,
+        ),
+        smtp: EndpointConfig::from_goa(
+            Protocol::Smtp,
+            &account.smtp.host,
+            account.smtp.port,
+            account.smtp.use_ssl,
+            account.smtp.use_starttls,
+            &account.smtp.username,
+        ),
     };
     // A shared mailbox (item 5.6 / M-42) is an Exchange Online mailbox the
     // user has Full Access to; it borrows the *parent* account's OAuth token
@@ -1589,13 +1593,13 @@ pub(crate) fn connect_other_account(
         imap: EndpointConfig {
             host: account.imap_host.clone(),
             port: account.imap_port,
-            use_tls: account.imap_use_tls,
+            security: account.resolved_imap_security(),
             username: account.imap_username.clone(),
         },
         smtp: EndpointConfig {
             host: account.smtp_host.clone(),
             port: account.smtp_port,
-            use_tls: account.smtp_use_tls,
+            security: account.resolved_smtp_security(),
             username: account.smtp_username.clone(),
         },
     };

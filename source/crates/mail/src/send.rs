@@ -14,7 +14,7 @@ use mail_builder::mime::{BodyPart as MimeBodyPart, MimePart};
 use mail_builder::MessageBuilder;
 use std::sync::Arc;
 
-use crate::config::{Credential, EndpointConfig};
+use crate::config::{Credential, EndpointConfig, Security};
 use crate::error::{Error, Result};
 
 /// An RFC 8098 read-receipt (MDN) to attach to a message: the receipt body is
@@ -491,11 +491,9 @@ fn raw_header(value: impl Into<String>) -> HeaderType<'static> {
     HeaderType::Raw(Raw::new(value.into()))
 }
 
-/// Submits `raw` over SMTP. `port == 465` is treated as implicit TLS
-/// (SMTPS); anything else uses STARTTLS, which covers the common 587/25
-/// configurations - GOA's `SmtpUseSsl`/`SmtpUseTls` flags don't map cleanly
-/// enough onto lettre's implicit-vs-STARTTLS split to trust directly (Gmail
-/// reports both as true), so the port is the more reliable signal here.
+/// Submits `raw` over SMTP, secured as the endpoint's [`Security`] says:
+/// implicit TLS, a required STARTTLS upgrade, or (only when configured that
+/// way) no encryption at all.
 ///
 /// `request_delivery_receipt` asks for an RFC 3461 delivery status
 /// notification (M-27 / C-07). It is an envelope parameter, so requesting one
@@ -523,10 +521,10 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
         return send_smtp_with_delivery_receipt(endpoint, credential, &envelope, raw).await;
     }
 
-    let builder = if endpoint.port == 465 {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host)
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&endpoint.host)
+    let builder = match endpoint.security {
+        Security::ImplicitTls => AsyncSmtpTransport::<Tokio1Executor>::relay(&endpoint.host),
+        Security::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&endpoint.host),
+        Security::Plain => Ok(AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&endpoint.host)),
     }
     .map_err(|e| Error::LoginFailed(e.to_string()))?
     .port(endpoint.port);
@@ -559,7 +557,7 @@ pub async fn send_smtp(endpoint: &EndpointConfig, credential: Credential, from: 
 async fn send_smtp_with_delivery_receipt(endpoint: &EndpointConfig, credential: Credential, envelope: &Envelope, raw: &[u8]) -> Result<()> {
     let hello = ClientId::default();
     let tls_parameters = || TlsParameters::new(endpoint.host.clone()).map_err(|e| Error::LoginFailed(format!("invalid SMTP host name: {e}")));
-    let implicit_tls = (endpoint.port == 465).then(tls_parameters).transpose()?;
+    let implicit_tls = (endpoint.security == Security::ImplicitTls).then(tls_parameters).transpose()?;
 
     let mut connection = AsyncSmtpConnection::connect_tokio1(
         (endpoint.host.as_str(), endpoint.port),
@@ -571,7 +569,7 @@ async fn send_smtp_with_delivery_receipt(endpoint: &EndpointConfig, credential: 
     .await
     .map_err(|e| Error::LoginFailed(format!("SMTP connection to {} failed: {e}", endpoint.host)))?;
 
-    if !connection.is_encrypted() {
+    if endpoint.security == Security::StartTls && !connection.is_encrypted() {
         if !connection.can_starttls() {
             connection.abort().await;
             return Err(Error::LoginFailed("SMTP server does not offer STARTTLS".to_string()));

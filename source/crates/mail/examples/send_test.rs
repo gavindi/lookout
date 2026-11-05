@@ -12,7 +12,7 @@ use std::time::Duration;
 use lookout_core::AccountId;
 use lookout_goa::{AuthMethod, GoaClient, GoaMailAccount};
 use lookout_mail::session::{AccountCommand, AccountEvent, CredentialProvider};
-use lookout_mail::{AccountConfig, ComposedMessage, Credential, EndpointConfig};
+use lookout_mail::{AccountConfig, ComposedMessage, Credential, EndpointConfig, Protocol};
 
 struct GoaCredentialProvider {
     client: GoaClient,
@@ -59,18 +59,22 @@ async fn main() -> anyhow::Result<()> {
         mention_names: vec![account.display_name.clone()],
         local_focus_enabled: false,
         local_focus_contacts: Vec::new(),
-        imap: EndpointConfig {
-            host: account.imap.host.clone(),
-            port: account.imap.port.unwrap_or(993),
-            use_tls: account.imap.use_tls,
-            username: account.imap.username.clone(),
-        },
-        smtp: EndpointConfig {
-            host: account.smtp.host.clone(),
-            port: account.smtp.port.unwrap_or(587),
-            use_tls: account.smtp.use_tls,
-            username: account.smtp.username.clone(),
-        },
+        imap: EndpointConfig::from_goa(
+            Protocol::Imap,
+            &account.imap.host,
+            account.imap.port,
+            account.imap.use_ssl,
+            account.imap.use_starttls,
+            &account.imap.username,
+        ),
+        smtp: EndpointConfig::from_goa(
+            Protocol::Smtp,
+            &account.smtp.host,
+            account.smtp.port,
+            account.smtp.use_ssl,
+            account.smtp.use_starttls,
+            &account.smtp.username,
+        ),
     };
     let self_address = account.email.clone();
     let credentials: Arc<dyn CredentialProvider> = Arc::new(GoaCredentialProvider { client: goa, account });

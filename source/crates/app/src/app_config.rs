@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use lookout_core::{AccountId, CalendarId, Identity, MailboxRole, QuickStep, Rule, Signature, WebcalSubscription};
+use lookout_mail::{Protocol, Security};
 use serde::{Deserialize, Serialize};
 
 use crate::categories::CategoryDef;
@@ -98,16 +99,43 @@ pub struct OtherAccount {
     pub email: String,
     pub imap_host: String,
     pub imap_port: u16,
+    /// Whether IMAP is encrypted at all. Kept beside [`Self::imap_security`]
+    /// (and always written to match it) so an older Lookout can still read
+    /// the file; the engine connects by `imap_security`.
     pub imap_use_tls: bool,
     pub imap_username: String,
     pub smtp_host: String,
     pub smtp_port: u16,
+    /// Whether SMTP is encrypted at all; see [`Self::imap_use_tls`].
     pub smtp_use_tls: bool,
     pub smtp_username: String,
     /// Whether the dialog stored one password for both protocols (the common
     /// case) or distinct IMAP/SMTP passwords. The keyring always holds both
     /// slots either way - the flag only drives the edit dialog's prefill.
     pub use_same_password: bool,
+    /// How IMAP is secured. `None` for an account saved before Lookout had
+    /// the setting, which keeps connecting as it did then (see
+    /// [`Self::resolved_imap_security`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap_security: Option<Security>,
+    /// How SMTP is secured; `None` as for [`Self::imap_security`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp_security: Option<Security>,
+}
+
+impl OtherAccount {
+    /// The IMAP security to connect with: the saved mode, or for an account
+    /// saved without one, implicit TLS (all Lookout supported then).
+    pub fn resolved_imap_security(&self) -> Security {
+        self.imap_security.unwrap_or_else(|| Security::legacy_for_port(Protocol::Imap, self.imap_port))
+    }
+
+    /// The SMTP security to connect with: the saved mode, or for an account
+    /// saved without one, the old choice by port (465 implicit TLS,
+    /// otherwise STARTTLS).
+    pub fn resolved_smtp_security(&self) -> Security {
+        self.smtp_security.unwrap_or_else(|| Security::legacy_for_port(Protocol::Smtp, self.smtp_port))
+    }
 }
 
 /// One shared mailbox added by address (OUTLOOK_PARITY.md item 5.6 / M-42).
@@ -844,6 +872,8 @@ mod tests {
                 smtp_use_tls: true,
                 smtp_username: "work".into(),
                 use_same_password: true,
+                imap_security: Some(Security::ImplicitTls),
+                smtp_security: Some(Security::StartTls),
             }],
             shared_mailboxes: vec![SharedMailbox {
                 id: "shared:abc".into(),
@@ -1033,6 +1063,8 @@ mod tests {
             smtp_use_tls: true,
             smtp_username: "me".into(),
             use_same_password: false,
+            imap_security: Some(Security::StartTls),
+            smtp_security: Some(Security::Plain),
         };
         let mut config = AppConfig::default();
         config.upsert_other_account(account.clone());
@@ -1049,6 +1081,49 @@ mod tests {
         assert_eq!(config.other_account("other:nope"), None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An account saved before the security setting existed loads with none
+    /// and keeps connecting as before: IMAP over implicit TLS whatever its
+    /// port or stored flag, SMTP by port. A saved mode wins over both.
+    #[test]
+    fn other_account_without_a_security_mode_keeps_the_old_behaviour() {
+        let legacy = |imap_port: u16, imap_use_tls: bool, smtp_port: u16| -> OtherAccount {
+            serde_json::from_value(serde_json::json!({
+                "id": "other:legacy",
+                "display_name": "Legacy",
+                "email": "me@example.com",
+                "imap_host": "mail.example.com",
+                "imap_port": imap_port,
+                "imap_use_tls": imap_use_tls,
+                "imap_username": "me",
+                "smtp_host": "mail.example.com",
+                "smtp_port": smtp_port,
+                "smtp_use_tls": true,
+                "smtp_username": "me",
+                "use_same_password": true,
+            }))
+            .unwrap()
+        };
+        let account = legacy(993, true, 587);
+        assert_eq!((account.imap_security, account.smtp_security), (None, None));
+        assert_eq!(account.resolved_imap_security(), Security::ImplicitTls);
+        assert_eq!(account.resolved_smtp_security(), Security::StartTls);
+        assert_eq!(legacy(143, false, 465).resolved_imap_security(), Security::ImplicitTls);
+        assert_eq!(legacy(143, false, 465).resolved_smtp_security(), Security::ImplicitTls);
+
+        // Saving a legacy account doesn't invent a mode, so the file stays
+        // readable by the version that wrote it.
+        let json = serde_json::to_value(&account).unwrap();
+        assert!(json.get("imap_security").is_none() && json.get("smtp_security").is_none());
+
+        let mut explicit = account;
+        explicit.imap_security = Some(Security::StartTls);
+        explicit.smtp_security = Some(Security::ImplicitTls);
+        assert_eq!(explicit.resolved_imap_security(), Security::StartTls);
+        assert_eq!(explicit.resolved_smtp_security(), Security::ImplicitTls);
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert_eq!((json["imap_security"].as_str(), json["smtp_security"].as_str()), (Some("start_tls"), Some("implicit_tls")));
     }
 
     #[test]

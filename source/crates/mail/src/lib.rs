@@ -31,7 +31,7 @@ mod structure;
 // go through the account session - a keystroke can't wait behind whatever
 // IMAP round trip that actor is mid-way through.
 pub use cache::{cache_info, clear_all_caches, remove_account_cache, Cache, OutboxState, RemoteMailProperties};
-pub use config::{AccountConfig, Credential, EndpointConfig};
+pub use config::{AccountConfig, Credential, EndpointConfig, Protocol, Security};
 pub use error::{Error, Result};
 pub use search_query::{parse as parse_search_query, Cmp, ReceivedFilter, SearchQuery, SearchScope, SizeFilter};
 pub use send::{build_draft_raw_message, new_message_id, Attachment, ComposedMessage, InlineImage, OutboxMessage, ReadReceipt};

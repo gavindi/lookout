@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.311" date="2026-11-06">
+      <description>
+        <p>Mail accounts that use STARTTLS now connect. Lookout follows the encryption chosen in GNOME Online Accounts or imported from Evolution, and the Add mail account dialog lets you pick SSL/TLS, STARTTLS or no encryption for receiving and sending. Contributed by Christian Lauinger.</p>
+      </description>
+    </release>
     <release version="0.9.310" date="2026-11-05">
       <description>
         <p>Packaging fix. The Flatpak release build failed while updating its GNOME SDK and now completes again. Lookout itself is unchanged from 0.9.309.</p>

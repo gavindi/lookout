@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use gtk::glib;
 use lookout_core::AccountId;
 use lookout_eds::{Eds, EvolutionMailAccount, MailSecurity};
+use lookout_mail::{Protocol, Security};
 use secret_service::{EncryptionType, SecretService};
 
 use crate::app_config::{AppConfig, OtherAccount};
@@ -64,7 +65,8 @@ pub(crate) struct OtherAccountDraft {
     /// Evolution's transport source, whose keyring item holds the SMTP
     /// password. `None` when SMTP was left blank.
     pub smtp_source_uid: Option<String>,
-    /// How Evolution secures each connection, for [`Self::connection_warning`].
+    /// How Evolution secures each connection; the saved account connects the
+    /// same way, and [`Self::connection_warning`] flags a plain one.
     pub imap_security: MailSecurity,
     pub smtp_security: Option<MailSecurity>,
 }
@@ -85,6 +87,11 @@ impl OtherAccountDraft {
             smtp_use_tls: self.smtp_use_tls,
             smtp_username: self.smtp_username,
             use_same_password: self.use_same_password,
+            imap_security: Some(engine_security(self.imap_security)),
+            smtp_security: Some(
+                self.smtp_security
+                    .map_or_else(|| Security::legacy_for_port(Protocol::Smtp, self.smtp_port), engine_security),
+            ),
         }
     }
 
@@ -100,33 +107,27 @@ impl OtherAccountDraft {
         }) || known_addresses.iter().any(|address| same_address(address))
     }
 
-    /// Why the account may not work in Lookout the way it does in Evolution,
-    /// or `None`. The mail engine always connects IMAP with implicit TLS and
-    /// picks SMTP's TLS mode by port (465 implicit, otherwise STARTTLS), so
-    /// IMAP over STARTTLS or without encryption won't connect, and SMTP's
-    /// mode has to agree with its port.
+    /// A note for the import list when Evolution connects without
+    /// encryption, or `None`. The saved account connects exactly as Evolution
+    /// does, so a plain connection sends the password unencrypted.
     pub fn connection_warning(&self) -> Option<String> {
-        match self.imap_security {
-            MailSecurity::Tls => {}
-            MailSecurity::StartTls => {
-                return Some(format!(
-                    "Evolution uses STARTTLS for IMAP (port {}), but Lookout connects with SSL/TLS only, so it may not connect",
-                    self.imap_port
-                ));
+        match (self.imap_security, self.smtp_security) {
+            (MailSecurity::None, Some(MailSecurity::None)) => {
+                Some("Evolution reads and sends mail without encryption, so Lookout will too and your password is sent unencrypted".to_string())
             }
-            MailSecurity::None => return Some("Evolution reads mail without encryption, but Lookout connects with SSL/TLS only, so it may not connect".to_string()),
-        }
-        match self.smtp_security? {
-            MailSecurity::Tls if self.smtp_port != 465 => Some(format!(
-                "Evolution sends with SSL/TLS on port {}, but Lookout uses SSL/TLS only on port 465, so sending may fail",
-                self.smtp_port
-            )),
-            MailSecurity::StartTls if self.smtp_port == 465 => {
-                Some("Evolution sends with STARTTLS on port 465, but Lookout uses SSL/TLS on that port, so sending may fail".to_string())
-            }
-            MailSecurity::None => Some("Evolution sends without encryption, but Lookout always encrypts, so sending may fail".to_string()),
+            (MailSecurity::None, _) => Some("Evolution reads mail without encryption, so Lookout will too and your password is sent unencrypted".to_string()),
+            (_, Some(MailSecurity::None)) => Some("Evolution sends mail without encryption, so Lookout will too and your password is sent unencrypted".to_string()),
             _ => None,
         }
+    }
+}
+
+/// The engine's mode for Evolution's security setting.
+fn engine_security(security: MailSecurity) -> Security {
+    match security {
+        MailSecurity::None => Security::Plain,
+        MailSecurity::StartTls => Security::StartTls,
+        MailSecurity::Tls => Security::ImplicitTls,
     }
 }
 
@@ -134,12 +135,10 @@ impl OtherAccountDraft {
 ///
 /// - The name is the identity's sender name, else the account's name in
 ///   Evolution; the address is the identity's, or blank.
-/// - Each `*_use_tls` flag is true for STARTTLS and implicit TLS and false
-///   only for a plain connection. Like the add-account dialog, these flags are
-///   descriptive: the mail engine always connects IMAP with implicit TLS, and
-///   picks SMTP's TLS mode by port (465 implicit, otherwise STARTTLS).
-/// - With no usable transport, SMTP is left blank (port 587, TLS on) for the
-///   user to fill in.
+/// - Each connection keeps Evolution's security mode (implicit TLS, STARTTLS
+///   or none); each `*_use_tls` flag is true unless the mode is none.
+/// - With no usable transport, SMTP is left blank (port 587, STARTTLS) for
+///   the user to fill in.
 /// - `use_same_password` starts on, as in the dialog; [`apply_found_passwords`]
 ///   turns it off when Evolution stored two different passwords.
 pub(crate) fn to_other_account_draft(account: &EvolutionMailAccount) -> OtherAccountDraft {
@@ -805,7 +804,27 @@ mod tests {
     }
 
     #[test]
-    fn connection_warnings_follow_the_engines_tls_rules() {
+    fn a_saved_draft_keeps_evolutions_security_modes() {
+        for (security, expected) in [
+            (MailSecurity::Tls, Security::ImplicitTls),
+            (MailSecurity::StartTls, Security::StartTls),
+            (MailSecurity::None, Security::Plain),
+        ] {
+            let mut account = evolution_account();
+            account.imap.security = security;
+            account.smtp.as_mut().unwrap().security = security;
+            let saved = to_other_account_draft(&account).into_new_account();
+            assert_eq!((saved.imap_security, saved.smtp_security), (Some(expected), Some(expected)), "{security:?}");
+            assert_eq!((saved.imap_use_tls, saved.smtp_use_tls), (expected.is_encrypted(), expected.is_encrypted()));
+        }
+        // No usable transport: SMTP is left at port 587 with STARTTLS.
+        let mut account = evolution_account();
+        account.smtp = None;
+        assert_eq!(to_other_account_draft(&account).into_new_account().smtp_security, Some(Security::StartTls));
+    }
+
+    #[test]
+    fn connection_warnings_flag_only_unencrypted_connections() {
         let draft = |imap: MailSecurity, smtp: Option<(MailSecurity, u16)>| {
             let mut account = evolution_account();
             account.imap.security = imap;
@@ -815,12 +834,15 @@ mod tests {
         assert_eq!(draft(MailSecurity::Tls, Some((MailSecurity::StartTls, 587))).connection_warning(), None);
         assert_eq!(draft(MailSecurity::Tls, Some((MailSecurity::Tls, 465))).connection_warning(), None);
         assert_eq!(draft(MailSecurity::Tls, None).connection_warning(), None);
+        // Modes the engine used to reject now connect as Evolution does.
+        assert_eq!(draft(MailSecurity::StartTls, Some((MailSecurity::StartTls, 587))).connection_warning(), None);
+        assert_eq!(draft(MailSecurity::Tls, Some((MailSecurity::Tls, 587))).connection_warning(), None);
+        assert_eq!(draft(MailSecurity::Tls, Some((MailSecurity::StartTls, 465))).connection_warning(), None);
         for (imap, smtp, mentions) in [
-            (MailSecurity::StartTls, None, "STARTTLS for IMAP"),
-            (MailSecurity::None, None, "without encryption"),
-            (MailSecurity::Tls, Some((MailSecurity::Tls, 587)), "port 587"),
-            (MailSecurity::Tls, Some((MailSecurity::StartTls, 465)), "port 465"),
-            (MailSecurity::Tls, Some((MailSecurity::None, 25)), "sends without encryption"),
+            (MailSecurity::None, None, "reads mail without encryption"),
+            (MailSecurity::None, Some((MailSecurity::StartTls, 587)), "reads mail without encryption"),
+            (MailSecurity::Tls, Some((MailSecurity::None, 25)), "sends mail without encryption"),
+            (MailSecurity::None, Some((MailSecurity::None, 25)), "reads and sends mail without encryption"),
         ] {
             let warning = draft(imap, smtp).connection_warning().unwrap_or_else(|| panic!("{imap:?} {smtp:?} should warn"));
             assert!(warning.contains(mentions), "{warning}");

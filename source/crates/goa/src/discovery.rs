@@ -38,7 +38,12 @@ pub struct EndpointConfig {
     /// override in the host string itself (`host:port`) only when it differs
     /// from the default.
     pub port: Option<u16>,
-    pub use_tls: bool,
+    /// GOA's `*UseSsl`: TLS from the first byte on a dedicated port (993/465).
+    pub use_ssl: bool,
+    /// GOA's `*UseTls`: a standard-port connection upgraded with STARTTLS.
+    /// Some providers set both flags; `lookout_mail::Security::from_goa_flags`
+    /// resolves the pair.
+    pub use_starttls: bool,
     pub accept_ssl_errors: bool,
     pub username: String,
 }
@@ -222,7 +227,8 @@ impl GoaClient {
             EndpointConfig {
                 host: "outlook.office365.com".to_string(),
                 port: Some(993),
-                use_tls: true,
+                use_ssl: true,
+                use_starttls: false,
                 accept_ssl_errors: false,
                 username: email.clone(),
             }
@@ -231,7 +237,8 @@ impl GoaClient {
             EndpointConfig {
                 host: imap_host,
                 port: imap_port,
-                use_tls: get_bool(mail_props, "ImapUseSsl").unwrap_or(false) || get_bool(mail_props, "ImapUseTls").unwrap_or(false),
+                use_ssl: get_bool(mail_props, "ImapUseSsl").unwrap_or(false),
+                use_starttls: get_bool(mail_props, "ImapUseTls").unwrap_or(false),
                 accept_ssl_errors: get_bool(mail_props, "ImapAcceptSslErrors").unwrap_or(false),
                 username: get_string(mail_props, "ImapUserName").unwrap_or_default(),
             }
@@ -240,7 +247,8 @@ impl GoaClient {
             EndpointConfig {
                 host: "smtp.office365.com".to_string(),
                 port: Some(587),
-                use_tls: true,
+                use_ssl: false,
+                use_starttls: true,
                 accept_ssl_errors: false,
                 username: email.clone(),
             }
@@ -249,7 +257,8 @@ impl GoaClient {
             EndpointConfig {
                 host: smtp_host,
                 port: smtp_port,
-                use_tls: get_bool(mail_props, "SmtpUseSsl").unwrap_or(false) || get_bool(mail_props, "SmtpUseTls").unwrap_or(false),
+                use_ssl: get_bool(mail_props, "SmtpUseSsl").unwrap_or(false),
+                use_starttls: get_bool(mail_props, "SmtpUseTls").unwrap_or(false),
                 accept_ssl_errors: get_bool(mail_props, "SmtpAcceptSslErrors").unwrap_or(false),
                 username: get_string(mail_props, "SmtpUserName").unwrap_or_default(),
             }

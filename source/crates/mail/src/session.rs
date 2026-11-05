@@ -12,8 +12,8 @@ use lookout_core::{AccountId, BodyPart, EmailBody, EmailSummary, Mailbox, Mailbo
 
 use crate::auth::XOAuth2Authenticator;
 use crate::body::{parse_body, preview_from_raw};
-use crate::config::{AccountConfig, Credential};
-use crate::connection::{connect_tls, SessionStream};
+use crate::config::{AccountConfig, Credential, Security};
+use crate::connection::{connect_plain, connect_tls, tls_connect_over, SessionStream};
 use crate::envelope::{flags_from_fetch, summary_from_fetch};
 use crate::error::{Error, Result};
 use crate::search_query::{imap_quote, SearchQuery};
@@ -6439,11 +6439,27 @@ fn is_authentication_rejection(error: &async_imap::error::Error) -> bool {
 }
 
 async fn login(config: &AccountConfig, credential: Credential) -> Result<(Session<SessionStream>, ServerCapabilities)> {
-    let stream = connect_tls(&config.imap.host, config.imap.port).await?;
-    tracing::debug!("login: creating client, reading greeting");
+    let security = config.imap.security;
+    tracing::debug!("login: connecting to {}:{} ({security:?})", config.imap.host, config.imap.port);
+    let stream: SessionStream = match security {
+        Security::ImplicitTls => Box::new(connect_tls(&config.imap.host, config.imap.port).await?),
+        Security::StartTls | Security::Plain => Box::new(connect_plain(&config.imap.host, config.imap.port).await?),
+    };
     let mut client = async_imap::Client::new(stream);
-    let greeting = client.read_response().await;
-    tracing::debug!("login: greeting = {greeting:?}");
+    client
+        .read_response()
+        .await?
+        .ok_or_else(|| Error::LoginFailed("server closed before IMAP greeting".into()))?;
+    if security == Security::StartTls {
+        // Credentials go out only after the upgrade and certificate check
+        // succeed; a refused STARTTLS fails the login instead of continuing
+        // in plaintext. `into_inner` drops anything the server sent after
+        // its OK, so nothing injected before the handshake is read as TLS-
+        // protected (RFC 3501 §6.2.1).
+        client.run_command_and_check_ok("STARTTLS", None).await?;
+        let tls = tls_connect_over(client.into_inner(), &config.imap.host).await?;
+        client = async_imap::Client::new(Box::new(tls) as SessionStream);
+    }
 
     tracing::debug!("login: authenticating as {}", config.imap.username);
     let session = match credential {
@@ -8322,6 +8338,122 @@ async fn fetch_body_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejected_starttls_never_sends_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"* OK test server\r\n").await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            let tag = command.split_whitespace().next().unwrap();
+            assert_eq!(command.trim_end(), format!("{tag} STARTTLS"));
+            reader.get_mut().write_all(format!("{tag} NO TLS unavailable\r\n").as_bytes()).await.unwrap();
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).await.unwrap();
+            assert!(rest.is_empty(), "client sent data after rejected STARTTLS");
+        });
+        let endpoint = crate::EndpointConfig {
+            host: "127.0.0.1".into(),
+            port,
+            security: Security::StartTls,
+            username: "test-user".into(),
+        };
+        let config = AccountConfig {
+            account_id: AccountId("test".into()),
+            display_name: "Test".into(),
+            email: "test@example.com".into(),
+            mention_addresses: Vec::new(),
+            mention_names: Vec::new(),
+            local_focus_enabled: false,
+            local_focus_contacts: Vec::new(),
+            imap: endpoint.clone(),
+            smtp: endpoint,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert!(login(&config, Credential::Password("secret".into())).await.is_err());
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A STARTTLS account upgrades the connection before it logs in: the
+    /// server sees `STARTTLS` in plaintext, completes a TLS handshake, and
+    /// only then receives the credentials. Uses a throwaway CA and a
+    /// `127.0.0.1` certificate from `testdata/` (`openssl`, P-256, 100 years).
+    #[tokio::test]
+    async fn starttls_upgrades_before_sending_credentials() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        crate::connection::ensure_crypto_provider_installed();
+        let ca = CertificateDer::from_pem_slice(include_bytes!("testdata/test-ca.pem")).unwrap();
+        let _ = crate::connection::TEST_ROOT_CERTIFICATE.set(ca);
+        let server_cert = CertificateDer::from_pem_slice(include_bytes!("testdata/test-server.pem")).unwrap();
+        let server_key = PrivateKeyDer::from_pem_slice(include_bytes!("testdata/test-server.key")).unwrap();
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"* OK test server\r\n").await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut command = String::new();
+            reader.read_line(&mut command).await.unwrap();
+            let tag = command.split_whitespace().next().unwrap().to_string();
+            assert_eq!(command.trim_end(), format!("{tag} STARTTLS"));
+            reader.get_mut().write_all(format!("{tag} OK Begin TLS negotiation now\r\n").as_bytes()).await.unwrap();
+            assert!(reader.buffer().is_empty(), "client sent data before the TLS handshake");
+            let tls = acceptor.accept(reader.into_inner()).await.expect("TLS handshake");
+            let mut reader = BufReader::new(tls);
+            let mut login = String::new();
+            reader.read_line(&mut login).await.unwrap();
+            let tag = login.split_whitespace().next().unwrap().to_string();
+            reader
+                .get_mut()
+                .write_all(format!("{tag} NO [AUTHENTICATIONFAILED] test server\r\n").as_bytes())
+                .await
+                .unwrap();
+            reader.get_mut().flush().await.unwrap();
+            login
+        });
+        let endpoint = crate::EndpointConfig {
+            host: "127.0.0.1".into(),
+            port,
+            security: Security::StartTls,
+            username: "test-user".into(),
+        };
+        let config = AccountConfig {
+            account_id: AccountId("test".into()),
+            display_name: "Test".into(),
+            email: "test@example.com".into(),
+            mention_addresses: Vec::new(),
+            mention_names: Vec::new(),
+            local_focus_enabled: false,
+            local_focus_contacts: Vec::new(),
+            imap: endpoint.clone(),
+            smtp: endpoint,
+        };
+        let login = tokio::time::timeout(Duration::from_secs(5), async {
+            let result = login(&config, Credential::Password("secret".into())).await;
+            assert!(matches!(result, Err(Error::AuthRejected(_))), "{:?}", result.err());
+            server.await.unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(login.contains("LOGIN") && login.contains("test-user") && login.contains("secret"), "{login:?}");
+    }
 
     /// `OutboxContents` rows (item 1.14): decoded display fields, Bcc kept
     /// out of the visible recipients, failed state carried, oldest due first,

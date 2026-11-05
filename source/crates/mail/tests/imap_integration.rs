@@ -14,7 +14,7 @@
 //! providers), so this talks to GreenMail's IMAPS/SMTPS ports (3993/3465,
 //! included in its default `-Dgreenmail.setup.test.all` setup) with the
 //! `test-utils`-gated insecure certificate verifier (see
-//! `connection::connect_tls_insecure_for_tests`) to accept its self-signed
+//! `connection::insecure_connector_for_tests`) to accept its self-signed
 //! cert - `LOOKOUT_INSECURE_TLS_FOR_TESTS` opts into that path. The raw
 //! APPEND (below) uses GreenMail's plain IMAP port (3143) over plain TCP
 //! instead - the same container, no TLS needed.
@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use lookout_core::{AccountId, MailboxId};
 use lookout_mail::session::{AccountCommand, AccountEvent, CredentialProvider, DraftReplace};
-use lookout_mail::{AccountConfig, ComposedMessage, Credential, EndpointConfig};
+use lookout_mail::{AccountConfig, ComposedMessage, Credential, EndpointConfig, Security};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
@@ -87,13 +87,13 @@ async fn logs_in_syncs_and_sends_against_a_real_imap_smtp_server() {
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,
-            use_tls: true,
+            security: Security::ImplicitTls,
             username: "testuser".to_string(),
         },
         smtp: EndpointConfig {
             host: host.clone(),
             port: smtps_port,
-            use_tls: true,
+            security: Security::ImplicitTls,
             username: "testuser".to_string(),
         },
     };
@@ -738,13 +738,13 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,
-            use_tls: true,
+            security: Security::ImplicitTls,
             username: "testuser".to_string(),
         },
         smtp: EndpointConfig {
             host: host.clone(),
             port: smtps_port,
-            use_tls: true,
+            security: Security::ImplicitTls,
             username: "testuser".to_string(),
         },
     };
@@ -859,13 +859,13 @@ async fn queues_cancels_and_delivers_while_offline() {
         imap: EndpointConfig {
             host: host.clone(),
             port: imaps_port,
-            use_tls: true,
+            security: Security::ImplicitTls,
             username: "testuser".to_string(),
         },
         smtp: EndpointConfig {
             host,
             port: smtps_port,
-            use_tls: true,
+            security: Security::ImplicitTls,
             username: "testuser".to_string(),
         },
     };
