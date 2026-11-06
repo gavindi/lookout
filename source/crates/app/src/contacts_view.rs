@@ -2329,6 +2329,12 @@ pub fn spawn_contacts_discovery(
                         tracing::debug!("Microsoft 365 contacts {id} has no Outlook-sync consent yet; skipping until enabled in Config");
                         continue;
                     }
+                    // Already syncing: the GOA watcher connected it while
+                    // this listing ran.
+                    if state.borrow().contact_cmd_tx.contains_key(&id) {
+                        started.insert(id);
+                        continue;
+                    }
                     // Each account's session gets its own command channel,
                     // stored so the People screen's editor/import/group flows
                     // can route writes to the right account.
@@ -2350,6 +2356,12 @@ pub fn spawn_contacts_discovery(
                 // report is still served by the Graph contacts backend (item
                 // 5.2 / A-04); synthesise its contacts account so the People
                 // screen gains it as soon as Graph is consented.
+                // One the GOA watcher already connected counts as started.
+                for mail in &m365_mail {
+                    if state.borrow().contact_cmd_tx.contains_key(&mail.account_id) {
+                        started.insert(mail.account_id.clone());
+                    }
+                }
                 let fallback: Vec<GoaContactsAccount> = m365_mail
                     .into_iter()
                     .filter(|mail| !started.contains(&mail.account_id))

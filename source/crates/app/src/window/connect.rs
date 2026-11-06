@@ -12,7 +12,7 @@ use lookout_core::calendar_protocol::{CalendarCommand, CalendarSessionEvent, Con
 use lookout_core::{AccountId, CalendarId, CalendarInfo, Mailbox, MailboxId, MailboxRole, SchedulingInfo, Uid};
 use lookout_dav::subscription::SubscriptionSessionEvent;
 use lookout_dav::CalendarAccountConfig;
-use lookout_goa::{GoaCalendarAccount, GoaClient};
+use lookout_goa::{GoaCalendarAccount, GoaClient, GoaContactsAccount};
 use lookout_mail::session::{AccountCommand, AccountEvent, ConnectionState};
 use lookout_mail::{AccountConfig, EndpointConfig, Protocol};
 
@@ -134,6 +134,11 @@ pub(crate) fn spawn_account_discovery(
                     // rather than opening a redundant one each time.
                     for account in enabled_accounts {
                         let parent_id = AccountId(account.account_id.0.clone());
+                        // The GOA watcher may have connected it already, if
+                        // GNOME Settings changed while this listing ran.
+                        if state.borrow().accounts.contains_key(&parent_id) {
+                            continue;
+                        }
                         connect_account(
                             worker.clone(),
                             state.clone(),
@@ -368,6 +373,9 @@ pub(crate) fn connect_account(
             uses_graph_mail,
         },
     );
+    // Show the account in the sidebar now, under its name, rather than only
+    // once its first folder list arrives, which can take a while.
+    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     resume_launcher_compose(&state, &app);
     if graph_own {
@@ -1650,6 +1658,9 @@ pub(crate) fn connect_other_account(
             uses_graph_mail: false,
         },
     );
+    // Show the account in the sidebar now, under its name, rather than only
+    // once its first folder list arrives, which can take a while.
+    rebuild_folder_tree(&state, &folder_selection, &folder_scroller);
     message_list.set_viewer_addresses(viewer_addresses(&state.borrow()));
     resume_launcher_compose(&state, &app);
     {
@@ -1747,18 +1758,52 @@ pub(crate) fn teardown_mail_account(
     dashboard_refresh();
 }
 
-/// Tears a GOA account down after the user disables it in Config → Accounts:
-/// every running service (mail, calendar, Google Tasks, contacts) stops by
-/// dropping its handle - which closes the session's command channel, the
-/// same clean-shutdown convention the other-account Remove path relies on -
-/// per-account state is pruned, and every view is repainted so nothing from
-/// the account remains visible. The on-disk caches are deliberately kept: a
-/// re-enable reconnects to them immediately (see `connect_goa_account`).
+/// Which of a GOA account's services an operation covers: mail (with its
+/// shared mailboxes), calendar (with Google Tasks, Microsoft To Do and
+/// reminders), and contacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct GoaServices {
+    pub(crate) mail: bool,
+    pub(crate) calendar: bool,
+    pub(crate) contacts: bool,
+}
+
+impl GoaServices {
+    pub(crate) const ALL: GoaServices = GoaServices {
+        mail: true,
+        calendar: true,
+        contacts: true,
+    };
+
+    /// The services a discovered account advertises.
+    pub(crate) fn of(account: &DiscoveredGoaAccount) -> Self {
+        GoaServices {
+            mail: account.mail.is_some(),
+            calendar: account.calendar.is_some(),
+            contacts: account.contacts.is_some(),
+        }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.mail || self.calendar || self.contacts
+    }
+}
+
+/// Tears down a GOA account's `services`: when the user disables it in
+/// Config → Accounts (all of them), and when GNOME Settings removes the
+/// account or switches one of its services off (see `spawn_goa_watcher`).
+/// Every running service stops by dropping its handle - which closes the
+/// session's command channel, the same clean-shutdown convention the
+/// other-account Remove path relies on - per-account state is pruned, and
+/// every view is repainted so nothing from the account remains visible. The
+/// on-disk caches are deliberately kept: a re-enable reconnects to them
+/// immediately (see `connect_goa_account`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn teardown_goa_account(
     state: &Rc<RefCell<UiState>>,
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     account_id: &AccountId,
+    services: GoaServices,
     email: Option<&str>,
     folder_selection: &gtk::SingleSelection,
     folder_scroller: &gtk::ScrolledWindow,
@@ -1772,18 +1817,42 @@ pub(crate) fn teardown_goa_account(
     refresh_contacts_ui: &Rc<dyn Fn(Option<i32>)>,
     dashboard_refresh: &Rc<dyn Fn()>,
 ) {
-    teardown_mail_account(
-        state,
-        account_id,
-        folder_selection,
-        folder_scroller,
-        message_list,
-        message_list_stack,
-        list_header,
-        dashboard_refresh,
-    );
+    if services.mail {
+        teardown_mail_account(
+            state,
+            account_id,
+            folder_selection,
+            folder_scroller,
+            message_list,
+            message_list_stack,
+            list_header,
+            dashboard_refresh,
+        );
+    }
+    if services.calendar {
+        teardown_goa_calendar(calendar_state, account_id, email, calendar_main, calendar_list_box, reminders_engine, tasks_view);
+    }
+    if services.contacts {
+        let mut st = state.borrow_mut();
+        st.contacts_by_account.remove(account_id);
+        st.deleted_contacts.remove(account_id);
+        st.contact_cmd_tx.remove(account_id);
+        drop(st);
+        refresh_contacts_ui(None);
+    }
+}
 
-    // -- calendar, Google Tasks, reminders --
+/// The calendar half of [`teardown_goa_account`]: calendars, Google Tasks,
+/// Microsoft To Do and reminders.
+fn teardown_goa_calendar(
+    calendar_state: &Rc<RefCell<CalendarUiState>>,
+    account_id: &AccountId,
+    email: Option<&str>,
+    calendar_main: &Rc<CalendarMain>,
+    calendar_list_box: &gtk::Box,
+    reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
+    tasks_view: &Rc<crate::tasks_view::TasksView>,
+) {
     {
         let mut st = calendar_state.borrow_mut();
         st.accounts.remove(account_id);
@@ -1802,21 +1871,15 @@ pub(crate) fn teardown_goa_account(
     refresh_calendar_checklist(calendar_state, calendar_list_box, calendar_main);
     refresh_displayed_calendar_view(calendar_state, calendar_main);
     refresh_tasks_view(calendar_state, tasks_view);
-
-    // -- contacts --
-    {
-        let mut st = state.borrow_mut();
-        st.contacts_by_account.remove(account_id);
-        st.deleted_contacts.remove(account_id);
-        st.contact_cmd_tx.remove(account_id);
-    }
-    refresh_contacts_ui(None);
 }
 
-/// Reconnects every service a GOA account advertises after the user
-/// re-enables it in Config → Accounts, from the account's stored discovery
-/// structs (`UiState::goa_accounts`) - no discovery re-run needed. Also
-/// flips the relevant pages back from their empty states, since a re-enabled
+/// Connects every service a GOA account advertises that isn't already
+/// running, from the account's stored discovery structs
+/// (`UiState::goa_accounts`) - no discovery re-run needed. Used when the user
+/// re-enables an account in Config → Accounts, and when GNOME Settings adds
+/// an account or switches one of its services on (see `spawn_goa_watcher`).
+/// Services already running are left alone, so calling it again is harmless.
+/// Also flips the relevant pages back from their empty states, since the
 /// account is live again the moment its sessions spawn.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_goa_account(
@@ -1861,7 +1924,8 @@ pub(crate) fn connect_goa_account(
         return;
     };
     let account_id = account_id.clone();
-    if let Some(mail) = &account.mail {
+    let mail_running = state.borrow().accounts.contains_key(&account_id);
+    if let Some(mail) = account.mail.as_ref().filter(|_| !mail_running) {
         connect_account(
             worker.clone(),
             state.clone(),
@@ -1908,7 +1972,14 @@ pub(crate) fn connect_goa_account(
             root_stack.set_visible_child_name("mail");
         }
     }
-    if let Some(calendar) = &account.calendar {
+    // A Microsoft 365 calendar waits for Outlook-sync consent, as at startup
+    // (`spawn_calendar_discovery`).
+    let calendar_running = calendar_state.borrow().accounts.contains_key(&account_id);
+    if let Some(calendar) = account
+        .calendar
+        .as_ref()
+        .filter(|calendar| !calendar_running && (!calendar.is_microsoft_365() || crate::microsoft_oauth::MicrosoftOAuth::for_account(&calendar.account_id).graph_consented()))
+    {
         connect_calendar_account(
             worker.clone(),
             calendar_state.clone(),
@@ -1937,7 +2008,13 @@ pub(crate) fn connect_goa_account(
     // contacts backend for a Microsoft 365 mailbox that didn't get one (item
     // 5.2 / A-04), so a re-enabled account comes back online the same way. A
     // Microsoft 365 account still needs Graph consent.
-    if let Some(contacts) = account.contacts.clone().or_else(|| microsoft_graph_contacts_account(account, &account_id)) {
+    let contacts_running = state.borrow().contact_cmd_tx.contains_key(&account_id);
+    if let Some(contacts) = account
+        .contacts
+        .clone()
+        .or_else(|| microsoft_graph_contacts_account(account, &account_id))
+        .filter(|_| !contacts_running)
+    {
         if contacts_account_usable(&contacts) {
             let (cmd_tx, cmd_rx) = async_channel::unbounded();
             state.borrow_mut().contact_cmd_tx.insert(account_id.clone(), cmd_tx);
@@ -1970,6 +2047,201 @@ pub(crate) fn connect_goa_account(
             root_stack.set_visible_child_name("lookout");
         }
     }
+}
+
+/// Every GOA account with at least one service Lookout uses, as one
+/// re-listing found them (see `spawn_goa_watcher`).
+pub(crate) struct GoaSnapshot {
+    pub(crate) mail: Vec<lookout_goa::GoaMailAccount>,
+    pub(crate) calendar: Vec<GoaCalendarAccount>,
+    pub(crate) contacts: Vec<GoaContactsAccount>,
+}
+
+impl GoaSnapshot {
+    async fn list(client: &GoaClient) -> lookout_goa::Result<Self> {
+        Ok(GoaSnapshot {
+            mail: client.list_mail_accounts().await?,
+            calendar: client.list_calendar_accounts().await?,
+            contacts: client.list_contacts_accounts().await?,
+        })
+    }
+
+    /// Folds the three listings into one entry per account, as the startup
+    /// discoveries fill `UiState::goa_accounts`. The mail listing names the
+    /// account last, since it alone carries the real address.
+    pub(crate) fn into_accounts(self) -> HashMap<AccountId, DiscoveredGoaAccount> {
+        let mut accounts: HashMap<AccountId, DiscoveredGoaAccount> = HashMap::new();
+        for account in self.contacts {
+            let slot = accounts
+                .entry(account.account_id.clone())
+                .or_insert_with(|| empty_discovered(&account.display_name, &account.display_name, &account.provider_type));
+            slot.contacts = Some(account);
+        }
+        for account in self.calendar {
+            let slot = accounts.entry(account.account_id.clone()).or_insert_with(|| empty_discovered("", "", &None));
+            slot.display_name = account.display_name.clone();
+            slot.email = account.display_name.clone();
+            slot.provider_type = account.provider_type.clone();
+            slot.calendar = Some(account);
+        }
+        for account in self.mail {
+            let slot = accounts.entry(account.account_id.clone()).or_insert_with(|| empty_discovered("", "", &None));
+            slot.display_name = account.display_name.clone();
+            slot.email = account.email.clone();
+            slot.provider_type = account.provider_type.clone();
+            slot.mail = Some(account);
+        }
+        accounts
+    }
+}
+
+fn empty_discovered(display_name: &str, email: &str, provider_type: &Option<String>) -> DiscoveredGoaAccount {
+    DiscoveredGoaAccount {
+        display_name: display_name.to_string(),
+        email: email.to_string(),
+        provider_type: provider_type.clone(),
+        mail: None,
+        calendar: None,
+        contacts: None,
+    }
+}
+
+/// What a GOA re-listing changed, from each account's services before and
+/// after (see [`goa_account_changes`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GoaAccountChanges {
+    /// New accounts, and known ones with a service switched on: connect
+    /// whatever of theirs isn't running (`connect_goa_account` skips the rest).
+    pub(crate) connect: Vec<AccountId>,
+    /// Known accounts with services switched off: stop just those.
+    pub(crate) teardown: Vec<(AccountId, GoaServices)>,
+    /// Accounts removed from GNOME Settings: stop everything and forget them.
+    pub(crate) removed: Vec<AccountId>,
+}
+
+impl GoaAccountChanges {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.connect.is_empty() && self.teardown.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Compares each account's services before and after a GOA re-listing.
+/// Pure, so the add/remove/toggle rules are unit-tested without D-Bus. Each
+/// list is sorted, so the outcome doesn't depend on hash order.
+pub(crate) fn goa_account_changes(before: &HashMap<AccountId, GoaServices>, after: &HashMap<AccountId, GoaServices>) -> GoaAccountChanges {
+    let mut changes = GoaAccountChanges::default();
+    for (id, now) in after {
+        let was = before.get(id).copied().unwrap_or_default();
+        let added = GoaServices {
+            mail: now.mail && !was.mail,
+            calendar: now.calendar && !was.calendar,
+            contacts: now.contacts && !was.contacts,
+        };
+        let dropped = GoaServices {
+            mail: was.mail && !now.mail,
+            calendar: was.calendar && !now.calendar,
+            contacts: was.contacts && !now.contacts,
+        };
+        if added.any() {
+            changes.connect.push(id.clone());
+        }
+        if dropped.any() {
+            changes.teardown.push((id.clone(), dropped));
+        }
+    }
+    changes.removed = before.keys().filter(|id| !after.contains_key(*id)).cloned().collect();
+    changes.connect.sort_by(|a, b| a.0.cmp(&b.0));
+    changes.teardown.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    changes.removed.sort_by(|a, b| a.0.cmp(&b.0));
+    changes
+}
+
+/// Connects whatever of one GOA account's services isn't running (see
+/// `connect_goa_account`), looked up in `UiState::goa_accounts`.
+pub(crate) type GoaConnectFn = Rc<dyn Fn(&AccountId)>;
+/// Stops some of one GOA account's services (see `teardown_goa_account`).
+pub(crate) type GoaTeardownFn = Rc<dyn Fn(&AccountId, GoaServices)>;
+
+/// How long GOA must stay quiet after a change before the accounts are
+/// re-listed: adding one account exports several interfaces in a burst.
+const GOA_CHANGE_SETTLE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Watches GNOME Online Accounts for the life of the app, so an account added
+/// or removed in GNOME Settings - or one of its services switched on or off -
+/// takes effect without restarting Lookout (which, closed to the background,
+/// may otherwise never restart). The startup discoveries still do the first
+/// listing; this only reacts to changes after it subscribes.
+///
+/// Each settled change re-lists every account on the worker, and the GTK side
+/// diffs the result against `UiState::goa_accounts` with
+/// [`goa_account_changes`]. Accounts the user disabled in Config are
+/// recorded but not connected. A session connected here starts paused while
+/// Work Offline is on, like any other.
+pub(crate) fn spawn_goa_watcher(worker: &Rc<Worker>, state: Rc<RefCell<UiState>>, goa_connect: GoaConnectFn, goa_teardown: GoaTeardownFn, refresh_config: Rc<dyn Fn()>) {
+    let (snapshot_tx, snapshot_rx) = async_channel::unbounded::<(GoaClient, GoaSnapshot)>();
+    worker.spawn(async move {
+        let client = match GoaClient::connect().await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::debug!("GOA account watcher: no session bus: {e}");
+                return;
+            }
+        };
+        let mut changes = match client.account_changes().await {
+            Ok(changes) => changes,
+            Err(e) => {
+                tracing::debug!("GOA account watcher: can't subscribe: {e}");
+                return;
+            }
+        };
+        while changes.next_settled(GOA_CHANGE_SETTLE).await {
+            match GoaSnapshot::list(&client).await {
+                Ok(snapshot) => {
+                    if snapshot_tx.send((client.clone(), snapshot)).await.is_err() {
+                        break;
+                    }
+                }
+                // A failed listing (goa-daemon restarting, say) is retried on
+                // the next change; startup already reported GOA problems.
+                Err(e) => tracing::warn!("GOA account watcher: couldn't list accounts: {e}"),
+            }
+        }
+    });
+
+    glib::spawn_future_local(async move {
+        while let Ok((client, snapshot)) = snapshot_rx.recv().await {
+            let fresh = snapshot.into_accounts();
+            let before: HashMap<AccountId, GoaServices> = state.borrow().goa_accounts.iter().map(|(id, account)| (id.clone(), GoaServices::of(account))).collect();
+            let after: HashMap<AccountId, GoaServices> = fresh.iter().map(|(id, account)| (id.clone(), GoaServices::of(account))).collect();
+            let changes = goa_account_changes(&before, &after);
+            if changes.is_empty() {
+                continue;
+            }
+            tracing::info!("GNOME Online Accounts changed: {changes:?}");
+            {
+                let mut st = state.borrow_mut();
+                st.goa_client.get_or_insert(client);
+                st.goa_unavailable = false;
+            }
+            // Removed accounts first, while their entries still name the
+            // email Google Tasks is keyed by.
+            for id in &changes.removed {
+                goa_teardown(id, GoaServices::ALL);
+                state.borrow_mut().goa_accounts.remove(id);
+            }
+            // Fresh entries next, so a reconnect uses the current settings.
+            state.borrow_mut().goa_accounts.extend(fresh);
+            for (id, services) in &changes.teardown {
+                goa_teardown(id, *services);
+            }
+            for id in &changes.connect {
+                if state.borrow().account_enabled(id) {
+                    goa_connect(id);
+                }
+            }
+            refresh_config();
+        }
+    });
 }
 
 /// Mirrors `spawn_account_discovery` 1:1 for Calendar - a fully independent
@@ -2072,6 +2344,11 @@ pub(crate) fn spawn_calendar_discovery(
                     show_tasks_page("tasks");
                     show_lookout_page("lookout");
                     for account in enabled_accounts {
+                        // Already connected by the GOA watcher (see the mail
+                        // discovery).
+                        if calendar_state.borrow().accounts.contains_key(&account.account_id) {
+                            continue;
+                        }
                         let shared_owners = shared_owners_for(&state, &account.account_id);
                         connect_calendar_account(
                             worker.clone(),

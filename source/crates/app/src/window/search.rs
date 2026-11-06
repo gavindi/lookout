@@ -769,3 +769,85 @@ pub(crate) fn mention_identity_lists(identities: &[lookout_core::Identity]) -> (
     }
     (addresses, names)
 }
+
+/// Installs the title-bar search's recent-search list (Outlook's history
+/// dropdown): a popover anchored to `search_entry`, shown when the entry
+/// gains focus while empty. Returns the popover (tests).
+///
+/// The popover is deliberately not autohide. An autohide popover takes an
+/// input grab, so while it was up the rest of the window ignored clicks, and
+/// when the grab ended focus returned to the entry, which reopened it. The
+/// list instead follows the entry: it closes when the entry loses focus, when
+/// its text changes (typing, or picking a query), and on Escape.
+pub(crate) fn install_search_history(state: &Rc<RefCell<UiState>>, search_entry: &gtk::SearchEntry) -> gtk::Popover {
+    let history_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let history_popover = gtk::Popover::new();
+    history_popover.set_autohide(false);
+    history_popover.set_child(Some(&history_box));
+    history_popover.set_parent(search_entry);
+    let refresh_history: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let entry = search_entry.clone();
+        let history_box = history_box.clone();
+        Rc::new(move || {
+            while let Some(child) = history_box.first_child() {
+                history_box.remove(&child);
+            }
+            let recent = state.borrow().recent_searches.clone();
+            if recent.is_empty() {
+                let empty = gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build();
+                crate::privacy::mark_ui(&empty);
+                history_box.append(&empty);
+                return;
+            }
+            for query in recent {
+                let button = gtk::Button::with_label(&query);
+                // A previous search is content: blurred by privacy mode.
+                crate::privacy::mark_content(&button);
+                button.add_css_class("flat");
+                button.set_halign(gtk::Align::Start);
+                // Keep focus in the entry, or the focus-leave below would
+                // close the list before the click lands.
+                button.set_focus_on_click(false);
+                {
+                    let entry = entry.clone();
+                    // Setting the text closes the list (`connect_changed`).
+                    button.connect_clicked(move |_| entry.set_text(&query));
+                }
+                history_box.append(&button);
+            }
+        })
+    };
+    let focus = gtk::EventControllerFocus::new();
+    {
+        let popover = history_popover.clone();
+        let entry = search_entry.clone();
+        focus.connect_enter(move |_| {
+            if entry.text().is_empty() {
+                refresh_history();
+                popover.popup();
+            }
+        });
+    }
+    {
+        let popover = history_popover.clone();
+        focus.connect_leave(move |_| popover.popdown());
+    }
+    search_entry.add_controller(focus);
+    {
+        let popover = history_popover.clone();
+        search_entry.connect_changed(move |_| popover.popdown());
+    }
+    {
+        let popover = history_popover.clone();
+        search_entry.connect_stop_search(move |_| popover.popdown());
+    }
+    history_popover
+}

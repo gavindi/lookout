@@ -1596,11 +1596,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The conversation this row heads, when it's a conversation header.
         let bound_thread: Rc<RefCell<Option<ThreadId>>> = Rc::new(RefCell::new(None));
 
-        // The profile card (Phase 4.2 / UX-67): hovering or clicking a row's
-        // sender name/avatar opens the person's card. Installed once per row
-        // (not per bind), resolving the row's message lazily from `bound`.
-        {
-            let provider = profile_card_provider_for_rows.clone();
+        // The profile card (Phase 4.2 / UX-67): hovering a row's avatar opens
+        // the person's card, or hovering the sender name when the row shows
+        // no avatar (sender images off, or Select mode). Clicks never open
+        // it - they select and open the message - and a press anywhere on the
+        // row closes it. Installed once per row (not per bind), resolving the
+        // row's message lazily from `bound`; unbind closes the card.
+        let person_hover = {
             let resolve: crate::profile_card::PersonResolver = {
                 let bound = bound.clone();
                 Rc::new(move || {
@@ -1610,10 +1612,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                         .and_then(|summary| summary.from.first().map(|sender| (sender.clone(), mailbox_account_id(&summary.mailbox))))
                 })
             };
-            crate::profile_card::attach_person_trigger(provider.clone(), &sender_label, false, resolve.clone());
-            crate::profile_card::attach_person_trigger(provider.clone(), &single_sender, false, resolve.clone());
-            crate::profile_card::attach_person_trigger(provider, &avatar, false, resolve);
-        }
+            let hover = crate::profile_card::PersonHover::new(profile_card_provider_for_rows.clone(), &overlay, resolve);
+            hover.add_trigger(&avatar, Rc::new(|| true));
+            let no_avatar: crate::profile_card::HoverEnabled = {
+                let avatar = avatar.downgrade();
+                Rc::new(move || avatar.upgrade().is_none_or(|avatar| !avatar.is_mapped()))
+            };
+            hover.add_trigger(&sender_label, no_avatar.clone());
+            hover.add_trigger(&single_sender, no_avatar);
+            hover
+        };
 
         let checkbox_suppress: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         {
@@ -2027,6 +2035,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                     pin_btn,
                     bound_thread,
                     bound,
+                    person_hover,
                 },
             );
         }
@@ -2329,6 +2338,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             return;
         };
         let widgets = unsafe { widgets.as_ref() };
+        widgets.person_hover.close();
         *widgets.bound.borrow_mut() = None;
         *widgets.bound_thread.borrow_mut() = None;
         *widgets.thread_row.borrow_mut() = None;
@@ -6010,66 +6020,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             search_clear_button.connect_clicked(move |_| entry.set_text(""));
         }
 
-        // The history popover, anchored to the entry and shown on focus while
-        // the entry is empty (Outlook's recent-search list).
-        let history_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .margin_top(6)
-            .margin_bottom(6)
-            .margin_start(6)
-            .margin_end(6)
-            .build();
-        let history_popover = gtk::Popover::new();
-        history_popover.set_child(Some(&history_box));
-        history_popover.set_parent(&search_entry);
-        let refresh_history: Rc<dyn Fn()> = {
-            let state = state.clone();
-            let entry = search_entry.clone();
-            let history_box = history_box.clone();
-            let popover = history_popover.clone();
-            Rc::new(move || {
-                while let Some(child) = history_box.first_child() {
-                    history_box.remove(&child);
-                }
-                let recent = state.borrow().recent_searches.clone();
-                if recent.is_empty() {
-                    let empty = gtk::Label::builder().label("No recent searches").xalign(0.0).css_classes(["dim-label"]).build();
-                    crate::privacy::mark_ui(&empty);
-                    history_box.append(&empty);
-                    return;
-                }
-                for query in recent {
-                    let button = gtk::Button::with_label(&query);
-                    // A previous search is content: blurred by privacy mode.
-                    crate::privacy::mark_content(&button);
-                    button.add_css_class("flat");
-                    button.set_halign(gtk::Align::Start);
-                    {
-                        let entry = entry.clone();
-                        let popover = popover.clone();
-                        button.connect_clicked(move |_| {
-                            entry.set_text(&query);
-                            popover.popdown();
-                        });
-                    }
-                    history_box.append(&button);
-                }
-            })
-        };
-        let focus = gtk::EventControllerFocus::new();
-        {
-            let popover = history_popover.clone();
-            let entry = search_entry.clone();
-            let refresh_history = refresh_history.clone();
-            focus.connect_enter(move |_| {
-                if entry.text().is_empty() {
-                    refresh_history();
-                    popover.popup();
-                }
-            });
-        }
-        search_entry.add_controller(focus);
+        install_search_history(&state, &search_entry);
     }
 
     // The nav rail runs the full height *below the title bar* - it sits
@@ -10296,6 +10247,127 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // slot: it's filled with `refresh_config` right after that closure is
     // built below (a dialog's `on_changed` can't capture the closure that
     // built its anchor row - that would be a self-reference).
+    // Connecting and tearing down one GOA account's services, shared by
+    // Config's enable switch and the GOA watcher (`spawn_goa_watcher`), which
+    // follows accounts added, removed or changed in GNOME Settings.
+    let goa_connect: GoaConnectFn = {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let worker = worker.clone();
+        let window = window.clone();
+        let app = app.clone();
+        let toast_overlay = toast_overlay.clone();
+        let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
+        let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        let message_header = message_header.clone();
+        let reading_stack = reading_stack.clone();
+        let list_header = list_header.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        let mark_read_icon = mark_read_icon.clone();
+        let pin_icon = pin_icon.clone();
+        let root_stack = root_stack.clone();
+        let current_mail_page = current_mail_page.clone();
+        let mail_view_button = mail_view_button.clone();
+        let current_calendar_page = current_calendar_page.clone();
+        let calendar_view_button = calendar_view_button.clone();
+        let current_tasks_page = current_tasks_page.clone();
+        let tasks_view_button = tasks_view_button.clone();
+        let current_lookout_page = current_lookout_page.clone();
+        let lookout_view_button = lookout_view_button.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
+        let mini_calendar = calendar_sidebar.mini_calendar.clone();
+        let mail_overview_day = mail_overview_day.clone();
+        let mail_overview_day_list = mail_overview_day_list.clone();
+        let reminders_engine = reminders_engine.clone();
+        let tasks_view = tasks_view.clone();
+        let refresh_contacts_ui = refresh_contacts_ui.clone();
+        Rc::new(move |id: &AccountId| {
+            let discovered = state.borrow().goa_accounts.get(id).cloned();
+            let Some(discovered) = discovered else { return };
+            connect_goa_account(
+                worker.clone(),
+                state.clone(),
+                calendar_state.clone(),
+                id,
+                &discovered,
+                root_stack.clone(),
+                current_mail_page.clone(),
+                mail_view_button.clone(),
+                current_calendar_page.clone(),
+                calendar_view_button.clone(),
+                current_tasks_page.clone(),
+                tasks_view_button.clone(),
+                current_lookout_page.clone(),
+                lookout_view_button.clone(),
+                folder_selection.clone(),
+                folder_scroller.clone(),
+                message_list.clone(),
+                message_list_stack.clone(),
+                message_header.clone(),
+                reading_stack.clone(),
+                toast_overlay.clone(),
+                window.clone(),
+                app.clone(),
+                list_header.clone(),
+                dashboard_refresh.clone(),
+                mark_read_icon.clone(),
+                pin_icon.clone(),
+                calendar_main.clone(),
+                calendar_list_box.clone(),
+                mini_calendar.clone(),
+                mail_overview_day.clone(),
+                mail_overview_day_list.clone(),
+                reminders_engine.clone(),
+                tasks_view.clone(),
+                refresh_contacts_ui.clone(),
+            );
+        })
+    };
+    let goa_teardown: GoaTeardownFn = {
+        let state = state.clone();
+        let calendar_state = calendar_state.clone();
+        let worker = worker.clone();
+        let folder_selection = folder_selection.clone();
+        let folder_scroller = folder_scroller.clone();
+        let message_list = message_list.clone();
+        let message_list_stack = message_list_stack.clone();
+        let list_header = list_header.clone();
+        let dashboard_refresh = dashboard_refresh.clone();
+        let calendar_main = calendar_main.clone();
+        let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
+        let reminders_engine = reminders_engine.clone();
+        let tasks_view = tasks_view.clone();
+        let refresh_contacts_ui = refresh_contacts_ui.clone();
+        Rc::new(move |id: &AccountId, services: GoaServices| {
+            let email = state.borrow().goa_accounts.get(id).map(|a| a.email.clone());
+            teardown_goa_account(
+                &state,
+                &calendar_state,
+                id,
+                services,
+                email.as_deref(),
+                &folder_selection,
+                &folder_scroller,
+                &message_list,
+                &message_list_stack,
+                &list_header,
+                &calendar_main,
+                &calendar_list_box,
+                &reminders_engine,
+                &tasks_view,
+                &refresh_contacts_ui,
+                &dashboard_refresh,
+            );
+            // A stopped calendar's events leave the desktop mirror straight
+            // away (EDS_TODO.md E2.4).
+            if services.calendar {
+                crate::eds_mirror::request_sync(&calendar_state, &worker, None);
+            }
+        })
+    };
     let refresh_hook: Rc<RefCell<Rc<dyn Fn()>>> = Rc::new(RefCell::new(Rc::new(|| {})));
     let refresh_config: Rc<dyn Fn()> = Rc::new({
         let refresh_hook = refresh_hook.clone();
@@ -10322,20 +10394,11 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let dashboard_refresh = dashboard_refresh.clone();
         let mark_read_icon = mark_read_icon.clone();
         let pin_icon = pin_icon.clone();
-        // Everything the GOA enable/disable toggle needs beyond the mail
-        // set above: the calendar/tasks/contacts wiring, and the page-state
-        // cells the re-enable path flips back from their empty states.
+        // The calendar/tasks/contacts wiring and page-state cells the
+        // Config closures below still use directly.
         let root_stack = root_stack.clone();
-        let current_mail_page = current_mail_page.clone();
-        let mail_view_button = mail_view_button.clone();
-        let current_calendar_page = current_calendar_page.clone();
-        let calendar_view_button = calendar_view_button.clone();
         let current_contacts_page = current_contacts_page.clone();
         let contacts_view_button = contacts_view_button.clone();
-        let current_tasks_page = current_tasks_page.clone();
-        let tasks_view_button = tasks_view_button.clone();
-        let current_lookout_page = current_lookout_page.clone();
-        let lookout_view_button = lookout_view_button.clone();
         let calendar_main = calendar_main.clone();
         let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
         let mini_calendar = calendar_sidebar.mini_calendar.clone();
@@ -10345,6 +10408,8 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let tasks_view = tasks_view.clone();
         let refresh_contacts_ui = refresh_contacts_ui.clone();
         let run_directory_search = run_directory_search.clone();
+        let goa_connect = goa_connect.clone();
+        let goa_teardown = goa_teardown.clone();
         move || {
             let st = state.borrow();
             // The GOA enable/disable list - every account the discoveries
@@ -10827,105 +10892,16 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             // down and hide everything (disable).
             let toggle_goa: crate::config_view::AccountToggle = {
                 let state = state.clone();
-                let calendar_state = calendar_state.clone();
-                let worker = worker.clone();
-                let window = window.clone();
-                let app = app.clone();
-                let toast_overlay = toast_overlay.clone();
-                let folder_selection = folder_selection.clone();
-                let folder_scroller = folder_scroller.clone();
-                let message_list = message_list.clone();
-                let message_list_stack = message_list_stack.clone();
-                let message_header = message_header.clone();
-                let reading_stack = reading_stack.clone();
-                let list_header = list_header.clone();
-                let dashboard_refresh = dashboard_refresh.clone();
-                let mark_read_icon = mark_read_icon.clone();
-                let pin_icon = pin_icon.clone();
-                let root_stack = root_stack.clone();
-                let current_mail_page = current_mail_page.clone();
-                let mail_view_button = mail_view_button.clone();
-                let current_calendar_page = current_calendar_page.clone();
-                let calendar_view_button = calendar_view_button.clone();
-                let current_tasks_page = current_tasks_page.clone();
-                let tasks_view_button = tasks_view_button.clone();
-                let current_lookout_page = current_lookout_page.clone();
-                let lookout_view_button = lookout_view_button.clone();
-                let calendar_main = calendar_main.clone();
-                let calendar_list_box = calendar_list_box.clone();
-                let mini_calendar = mini_calendar.clone();
-                let mail_overview_day = mail_overview_day.clone();
-                let mail_overview_day_list = mail_overview_day_list.clone();
-                let reminders_engine = reminders_engine.clone();
-                let tasks_view = tasks_view.clone();
-                let refresh_contacts_ui = refresh_contacts_ui.clone();
+                let goa_connect = goa_connect.clone();
+                let goa_teardown = goa_teardown.clone();
                 let refresh_hook = refresh_hook.clone();
                 Rc::new(move |account_id: &str, enabled: bool| {
                     let id = AccountId(account_id.to_string());
                     state.borrow().set_account_enabled(&id, enabled);
                     if enabled {
-                        let discovered = state.borrow().goa_accounts.get(&id).cloned();
-                        if let Some(discovered) = discovered {
-                            connect_goa_account(
-                                worker.clone(),
-                                state.clone(),
-                                calendar_state.clone(),
-                                &id,
-                                &discovered,
-                                root_stack.clone(),
-                                current_mail_page.clone(),
-                                mail_view_button.clone(),
-                                current_calendar_page.clone(),
-                                calendar_view_button.clone(),
-                                current_tasks_page.clone(),
-                                tasks_view_button.clone(),
-                                current_lookout_page.clone(),
-                                lookout_view_button.clone(),
-                                folder_selection.clone(),
-                                folder_scroller.clone(),
-                                message_list.clone(),
-                                message_list_stack.clone(),
-                                message_header.clone(),
-                                reading_stack.clone(),
-                                toast_overlay.clone(),
-                                window.clone(),
-                                app.clone(),
-                                list_header.clone(),
-                                dashboard_refresh.clone(),
-                                mark_read_icon.clone(),
-                                pin_icon.clone(),
-                                calendar_main.clone(),
-                                calendar_list_box.clone(),
-                                mini_calendar.clone(),
-                                mail_overview_day.clone(),
-                                mail_overview_day_list.clone(),
-                                reminders_engine.clone(),
-                                tasks_view.clone(),
-                                refresh_contacts_ui.clone(),
-                            );
-                        }
+                        goa_connect(&id);
                     } else {
-                        let email = state.borrow().goa_accounts.get(&id).map(|a| a.email.clone());
-                        teardown_goa_account(
-                            &state,
-                            &calendar_state,
-                            &id,
-                            email.as_deref(),
-                            &folder_selection,
-                            &folder_scroller,
-                            &message_list,
-                            &message_list_stack,
-                            &list_header,
-                            &calendar_main,
-                            &calendar_list_box,
-                            &reminders_engine,
-                            &tasks_view,
-                            &refresh_contacts_ui,
-                            &dashboard_refresh,
-                        );
-                        // A disabled account's events leave the desktop
-                        // mirror straight away (EDS_TODO.md E2.4).
-                        crate::eds_mirror::request_sync(&calendar_state, &worker, None);
+                        goa_teardown(&id, GoaServices::ALL);
                     }
                     // Repaint the Config account list so the switch's new
                     // state and the service lists underneath stay current.
@@ -13614,6 +13590,13 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         mark_read_icon.clone(),
         pin_icon.clone(),
     );
+    spawn_goa_watcher(&worker, state.clone(), goa_connect, goa_teardown, {
+        let refresh_hook = refresh_hook.clone();
+        Rc::new(move || {
+            let refresh = refresh_hook.borrow().clone();
+            refresh();
+        })
+    });
     spawn_contacts_discovery(
         worker.clone(),
         state.clone(),

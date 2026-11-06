@@ -307,6 +307,9 @@ pub(crate) struct MessageRowWidgets {
     /// The conversation this row heads, when it's a conversation header -
     /// what its right-click menu acts on (item 1.17).
     pub(crate) bound_thread: Rc<RefCell<Option<ThreadId>>>,
+    /// The row's hover-only profile card, closed when the row is unbound so
+    /// a recycled row never keeps a card for the previous sender.
+    pub(crate) person_hover: crate::profile_card::PersonHover,
 }
 
 /// One category chip on a message row (UX-28): Outlook's preset-coloured dot

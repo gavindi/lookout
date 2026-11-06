@@ -3131,3 +3131,251 @@ fn each_mail_ribbon_tab_shows_its_own_band() {
     }
     assert_eq!(ribbon_stack_name("mail", "unknown"), "mail-home");
 }
+
+// --- GOA account watcher (ports GitHub PR #5). ---
+
+fn services(mail: bool, calendar: bool, contacts: bool) -> GoaServices {
+    GoaServices { mail, calendar, contacts }
+}
+
+#[test]
+fn goa_changes_connect_new_accounts_and_forget_removed_ones() {
+    let kept = AccountId("kept".into());
+    let gone = AccountId("gone".into());
+    let added = AccountId("added".into());
+    let before = HashMap::from([(kept.clone(), services(true, true, true)), (gone.clone(), services(true, false, false))]);
+    let after = HashMap::from([(kept.clone(), services(true, true, true)), (added.clone(), services(true, true, false))]);
+    let changes = goa_account_changes(&before, &after);
+    assert_eq!(changes.connect, vec![added]);
+    assert!(changes.teardown.is_empty(), "an unchanged account is left alone");
+    assert_eq!(changes.removed, vec![gone]);
+}
+
+#[test]
+fn goa_changes_follow_a_service_switched_on_or_off() {
+    let id = AccountId("account".into());
+    let before = HashMap::from([(id.clone(), services(true, false, true))]);
+    // Calendar switched on, Contacts switched off, in GNOME Settings.
+    let after = HashMap::from([(id.clone(), services(true, true, false))]);
+    let changes = goa_account_changes(&before, &after);
+    assert_eq!(changes.connect, vec![id.clone()], "the new calendar connects");
+    assert_eq!(changes.teardown, vec![(id, services(false, false, true))], "only contacts stop; mail keeps running");
+    assert!(changes.removed.is_empty());
+}
+
+#[test]
+fn goa_changes_are_empty_when_nothing_changed() {
+    let id = AccountId("account".into());
+    let both = HashMap::from([(id, services(true, true, true))]);
+    assert!(goa_account_changes(&both, &both).is_empty());
+    assert!(goa_account_changes(&HashMap::new(), &HashMap::new()).is_empty());
+}
+
+#[test]
+fn goa_services_any_is_false_only_for_none() {
+    assert!(!GoaServices::default().any());
+    assert!(GoaServices::ALL.any());
+    assert!(services(false, false, true).any());
+}
+
+// --- Title-bar search history, sidebar and hover cards (ports GitHub PR #5). ---
+
+#[test]
+fn search_history_keeps_entry_focus_and_dismisses_on_edit_escape_and_navigation() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let state = test_state(Vec::new());
+    state.borrow_mut().recent_searches = vec!["from:alice".into()];
+    let entry = gtk::SearchEntry::new();
+    let other = gtk::Button::with_label("Inbox");
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.append(&entry);
+    content.append(&other);
+    let window = gtk::Window::builder().child(&content).build();
+    let popover = install_search_history(&state, &entry);
+    window.present();
+    let drain = || {
+        let context = glib::MainContext::default();
+        while context.pending() {
+            context.iteration(false);
+        }
+    };
+    let refocus = || {
+        other.grab_focus();
+        entry.grab_focus();
+        drain();
+    };
+    entry.grab_focus();
+    drain();
+    assert!(!popover.is_autohide(), "history must never grab input from the window");
+    assert!(popover.is_visible());
+    let focus = gtk::prelude::GtkWindowExt::focus(&window).unwrap();
+    assert!(focus == entry || focus.is_ancestor(&entry));
+
+    entry.set_text("test");
+    assert!(!popover.is_visible(), "typing dismisses suggestions");
+    entry.set_text("");
+    refocus();
+    assert!(popover.is_visible());
+    entry.emit_by_name::<()>("stop-search", &[]);
+    drain();
+    assert!(!popover.is_visible(), "Escape must leave history closed");
+
+    refocus();
+    assert!(popover.is_visible());
+    let history = popover.child().unwrap().downcast::<gtk::Box>().unwrap();
+    let query = history.first_child().unwrap().downcast::<gtk::Button>().unwrap();
+    assert!(!query.gets_focus_on_click(), "clicking a query keeps focus in the entry");
+    query.emit_clicked();
+    assert_eq!(entry.text(), "from:alice");
+    assert!(!popover.is_visible());
+
+    entry.set_text("");
+    refocus();
+    assert!(popover.is_visible());
+    other.grab_focus();
+    drain();
+    assert!(!popover.is_visible(), "other controls must remain reachable");
+    assert!(other.has_focus());
+    window.destroy();
+    popover.unparent();
+}
+
+#[test]
+fn folder_sidebar_includes_accounts_awaiting_their_first_folder_sync() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let ids: Vec<AccountId> = (0..4).map(|n| AccountId(format!("account-{n}"))).collect();
+    let state = test_state(ids.iter().map(|id| (id.clone(), Vec::new())).collect());
+    let selection = gtk::SingleSelection::new(None::<gtk::gio::ListModel>);
+    let scroller = gtk::ScrolledWindow::new();
+    rebuild_folder_tree(&state, &selection, &scroller);
+    let model = selection.model().unwrap().downcast::<gtk::TreeListModel>().unwrap();
+    let mut visible = Vec::new();
+    for index in 0..model.n_items() {
+        let row = model.row(index).unwrap();
+        let item = row.item().unwrap().downcast::<glib::BoxedAnyObject>().unwrap();
+        if let TreeItem::Account(account) = &*item.borrow::<TreeItem>() {
+            visible.push(account.account_id.clone());
+        };
+    }
+    assert_eq!(visible.len(), 4);
+    assert!(ids.iter().all(|id| visible.contains(id)));
+}
+
+#[test]
+fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let state = test_state(Vec::new());
+    let context = Rc::new(crate::profile_card::ProfileCardContext {
+        state,
+        worker: Rc::new(Worker::new()),
+        actions: crate::profile_card::ProfileCardActions {
+            send_email: Rc::new(|_, _| {}),
+            schedule_meeting: Rc::new(|_| {}),
+            add_contact: Rc::new(|_| {}),
+            edit_contact: Rc::new(|_| {}),
+            open_message: Rc::new(|_| {}),
+            open_event: Rc::new(|_| {}),
+            events_for_person: Rc::new(|_| Vec::new()),
+        },
+    });
+    let avatar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    avatar.set_size_request(32, 32);
+    let sender = gtk::Label::new(Some("Alice"));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(&avatar);
+    row.append(&sender);
+    let window = gtk::Window::builder().child(&row).build();
+    let hover = crate::profile_card::PersonHover::new(
+        Rc::new(move || Some(context.clone())),
+        &row,
+        Rc::new(|| Some((EmailAddress::new("alice@example.com"), None))),
+    );
+    hover.add_trigger(&avatar, Rc::new(|| true));
+    {
+        let avatar = avatar.downgrade();
+        hover.add_trigger(&sender, Rc::new(move || avatar.upgrade().is_none_or(|avatar| !avatar.is_mapped())));
+    }
+    let motion_for = |widget: &gtk::Widget| {
+        let controllers = widget.observe_controllers();
+        (0..controllers.n_items())
+            .find_map(|i| controllers.item(i)?.downcast::<gtk::EventControllerMotion>().ok())
+            .unwrap()
+    };
+    let enter = |motion: &gtk::EventControllerMotion| motion.emit_by_name::<()>("enter", &[&0.0_f64, &0.0_f64]);
+    let leave = |motion: &gtk::EventControllerMotion| motion.emit_by_name::<()>("leave", &[]);
+    let wait = |ms| glib::MainContext::default().block_on(glib::timeout_future(std::time::Duration::from_millis(ms)));
+    window.present();
+    wait(50);
+    let avatar_motion = motion_for(avatar.upcast_ref());
+    let sender_motion = motion_for(sender.upcast_ref());
+    for widget in [avatar.upcast_ref::<gtk::Widget>(), sender.upcast_ref()] {
+        let controllers = widget.observe_controllers();
+        assert!(
+            (0..controllers.n_items()).all(|i| !controllers.item(i).unwrap().is::<gtk::GestureClick>()),
+            "a click on a row's sender or avatar must open the message, not a card"
+        );
+    }
+
+    // While the avatar shows, the sender name doesn't open a card.
+    enter(&sender_motion);
+    wait(450);
+    assert!(hover.card().is_none(), "the name defers to the visible avatar");
+    leave(&sender_motion);
+
+    // A quick pass over the avatar must not leave a delayed popup behind.
+    enter(&avatar_motion);
+    leave(&avatar_motion);
+    wait(450);
+    assert!(hover.card().is_none());
+
+    enter(&avatar_motion);
+    wait(450);
+    let card = hover.card().expect("resting on the avatar opens the card");
+    assert!(card.is_visible());
+    assert!(!card.is_autohide(), "hover must not grab input from the message list");
+
+    // Returning to the avatar cancels a pending dismissal.
+    leave(&avatar_motion);
+    enter(&avatar_motion);
+    wait(250);
+    assert!(card.is_visible());
+
+    // Crossing onto the card keeps its actions reachable; leaving it closes.
+    leave(&avatar_motion);
+    let card_motion = motion_for(card.upcast_ref());
+    enter(&card_motion);
+    wait(250);
+    assert!(card.is_visible());
+    leave(&card_motion);
+    wait(250);
+    assert!(!card.is_visible());
+    assert!(hover.card().is_none(), "a closed card frees its slot");
+
+    // The fired timer and closed card must not block the next hover.
+    enter(&avatar_motion);
+    wait(450);
+    let reopened = hover.card().expect("hover reopens the card");
+    assert!(reopened.is_visible());
+    // Unbinding the row (or pressing it) closes the card.
+    hover.close();
+    wait(50);
+    assert!(!reopened.is_visible());
+    assert!(hover.card().is_none());
+    leave(&avatar_motion);
+
+    // With no avatar (sender images off, Select mode) the name takes over.
+    avatar.set_visible(false);
+    wait(50);
+    enter(&sender_motion);
+    wait(450);
+    let card = hover.card().expect("the name opens the card when no avatar shows");
+    assert!(card.parent().is_some_and(|parent| parent == sender));
+    window.destroy();
+    wait(50);
+}

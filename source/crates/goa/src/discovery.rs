@@ -6,7 +6,9 @@ use lookout_core::AccountId;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 use zbus::Connection;
 
-use crate::proxies::{AccountProxy, ManagedObjects, OAuth2BasedProxy, ObjectManagerProxy, PasswordBasedProxy};
+use futures_util::StreamExt;
+
+use crate::proxies::{AccountProxy, InterfacesAddedStream, InterfacesRemovedStream, ManagedObjects, OAuth2BasedProxy, ObjectManagerProxy, PasswordBasedProxy};
 use crate::{Error, Result};
 
 const IFACE_ACCOUNT: &str = "org.gnome.OnlineAccounts.Account";
@@ -178,6 +180,18 @@ impl GoaClient {
     pub async fn connect() -> Result<Self> {
         let connection = Connection::session().await?;
         Ok(GoaClient { connection })
+    }
+
+    /// Subscribes to GOA's account changes: an account added or removed in
+    /// GNOME Settings, or one of its services (Mail, Calendar, Contacts)
+    /// switched on or off. goa-daemon reports each of these as interfaces
+    /// added to or removed from an account object.
+    pub async fn account_changes(&self) -> Result<AccountChanges> {
+        let manager = ObjectManagerProxy::new(&self.connection).await?;
+        Ok(AccountChanges {
+            added: manager.receive_interfaces_added().await?,
+            removed: manager.receive_interfaces_removed().await?,
+        })
     }
 
     /// Lists every GOA account that has Mail enabled (`Account.MailDisabled`
@@ -604,6 +618,41 @@ fn normalize_dav_base_url(uri: String, provider_type: Option<&str>) -> String {
         format!("{scheme}://{authority}{tail}")
     } else {
         format!("{scheme}://{authority}{path}/{query}")
+    }
+}
+
+/// A subscription to GOA account changes, from [`GoaClient::account_changes`].
+/// Signals that arrive while the caller is busy (re-listing accounts, say)
+/// queue up, so none is missed between two [`AccountChanges::next_settled`]
+/// calls.
+pub struct AccountChanges {
+    added: InterfacesAddedStream,
+    removed: InterfacesRemovedStream,
+}
+
+impl AccountChanges {
+    /// Waits for the next change, then for `quiet` to pass with no further
+    /// signal, so a burst - adding one account exports several interfaces -
+    /// yields one wakeup. Returns `false` once the subscription has ended.
+    pub async fn next_settled(&mut self, quiet: std::time::Duration) -> bool {
+        if !self.next_signal().await {
+            return false;
+        }
+        loop {
+            match tokio::time::timeout(quiet, self.next_signal()).await {
+                Ok(true) => continue,
+                Ok(false) => return false,
+                Err(_elapsed) => return true,
+            }
+        }
+    }
+
+    /// One signal of either kind; `false` when both streams have ended.
+    async fn next_signal(&mut self) -> bool {
+        tokio::select! {
+            added = self.added.next() => added.is_some(),
+            removed = self.removed.next() => removed.is_some(),
+        }
     }
 }
 

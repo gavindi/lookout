@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.313" date="2026-11-06">
+      <description>
+        <p>Accounts added or removed in GNOME Settings, or with Mail, Calendar or Contacts switched on or off, now take effect while Lookout is running, and a new account appears in the folder list straight away. The recent-searches list no longer blocks the rest of the window. In the message list, clicking a sender or picture always opens the message, and the contact card appears when you rest the pointer on the sender's picture (or name, when pictures are hidden). Based on a contribution by genrichh93-ui.</p>
+      </description>
+    </release>
     <release version="0.9.312" date="2026-11-06">
       <description>
         <p>Messages whose subject contains a double quote showed a stray backslash before it, in both the message list and the reply or forward composer. Subjects, sender and recipient display names, and message IDs now display their quoted text correctly, and messages already cached by an earlier build are repaired in place on the next start without a full re-sync.</p>

@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-util = "0.3"
 lookout-core.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
