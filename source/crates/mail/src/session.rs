@@ -72,7 +72,7 @@ const PREVIEW_FETCH_LIMIT: usize = 50;
 /// only - steady-state resyncs fetch just the newly-arrived uids.
 const PREVIEW_FETCH_BYTES: u32 = 16384;
 
-/// How many full message bodies to fetch per IDLE cycle during background
+/// How many full message bodies to fetch per round trip during background
 /// prefetch. A batch's `UID FETCH` round trip can't be interrupted once sent,
 /// since the connection is one-command-at-a-time, so this is also the
 /// worst-case delay a user command (a folder switch, an open message) can
@@ -82,6 +82,20 @@ const PREVIEW_FETCH_BYTES: u32 = 16384;
 /// per batch") for faster warm-ups on connections where a click's response
 /// time doesn't matter as much.
 const PREFETCH_BATCH_SIZE: usize = 1;
+
+/// The longest the session runs prefetch batches back to back, skipping
+/// IDLE, before it returns to the open folder for one short IDLE wait
+/// (`PREFETCH_DRAIN_PAUSE`). That return trip re-SELECTs the open folder and
+/// checks its `UIDNEXT`, so new mail is still noticed promptly on a server
+/// that refuses the dedicated IDLE connection. Draining never delays a user
+/// action by more than one batch, because `no_work_pending` is checked
+/// before every round trip.
+const PREFETCH_DRAIN_SLICE: Duration = Duration::from_secs(10);
+
+/// The IDLE wait between two drain slices while a prefetch pass still has
+/// work left. Short, because it exists only to give the open folder a
+/// moment of IDLE (and its arrival check), not to pace the prefetch.
+const PREFETCH_DRAIN_PAUSE: Duration = Duration::from_secs(1);
 
 /// Prefetched messages whose whole raw size exceeds this many bytes are
 /// skipped: a prefetch round trip must never be able to hold the connection
@@ -248,6 +262,20 @@ fn queue_new_prefetch_mailboxes(prefetch: &mut Option<PrefetchState>, folders: &
     }
 }
 
+/// Whether the main loop should skip IDLE and run the next prefetch batch at
+/// once: the pass has work left and the current drain slice (begun at
+/// `drain_started`, which this starts on the first call of a slice) is
+/// younger than `PREFETCH_DRAIN_SLICE`. Only consulted once every command
+/// queue is empty. The caller clears `drain_started` when it really enters
+/// IDLE, which starts the next slice.
+fn prefetch_drain_due(prefetch: Option<&PrefetchState>, drain_started: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    if !prefetch.is_some_and(|pf| !pf.is_done()) {
+        return false;
+    }
+    let started = *drain_started.get_or_insert(now);
+    now.saturating_duration_since(started) < PREFETCH_DRAIN_SLICE
+}
+
 /// Records a failed background-prefetch envelope fetch for `mailbox_id` and
 /// returns the error unchanged so the caller can still tear the (desynced)
 /// connection down. The count persists across reconnects, so once a folder
@@ -268,17 +296,19 @@ fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &Ma
 
 /// The background body prefetch's behavior, settable live from the app (Config
 /// → Advanced → "Aggressive prefetch") via [`AccountCommand::SetPrefetchPolicy`].
-/// `Default` is the app's original cooperative pass: one batch per main-loop
-/// iteration paced by IDLE wakes, the newest [`INITIAL_FETCH_LIMIT`] messages
-/// per folder, [`PREFETCH_BATCH_SIZE`] bodies per round trip, no re-scans.
+/// `Default` is the cooperative pass: batches drain back to back while the
+/// session has nothing else to do (see `prefetch_drain_due`), the newest
+/// [`INITIAL_FETCH_LIMIT`] messages per folder, [`PREFETCH_BATCH_SIZE`] bodies
+/// per round trip, no re-scans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PrefetchPolicy {
     /// Whether the aggressive mode is on. Off means `Default` behavior even
     /// if the other fields carry non-default values.
     pub aggressive: bool,
-    /// How long the session waits between prefetch batches while aggressive
-    /// (the IDLE slice during the pass) - a quiet session wakes this often to
-    /// run the next batch instead of waiting for user activity.
+    /// How long a quiet session's IDLE slice lasts while aggressive and the
+    /// pass is done, so it wakes this often to see whether the re-scan
+    /// (`refresh_interval`) is due. A pass with work left drains back to back
+    /// in either mode, so this no longer paces the batches themselves.
     pub batch_interval: std::time::Duration,
     /// How many of a folder's newest messages the prefetch warms up. Replaces
     /// [`INITIAL_FETCH_LIMIT`] when aggressive.
@@ -710,7 +740,7 @@ pub enum AccountCommand {
         backfill: bool,
     },
     /// Kick off background body prefetch for all mailboxes. The prefetch
-    /// runs cooperatively in batches between IDLE cycles, fetching full
+    /// runs cooperatively in batches whenever the session is otherwise idle, fetching full
     /// message bodies and caching them on disk so subsequent message views
     /// are instant. Triggered automatically after the initial sync.
     PrefetchBodies,
@@ -2056,7 +2086,7 @@ async fn connect_and_run(
     // Build the initial prefetch list from all selectable mailboxes except
     // INBOX (already synced above) and any a previous session gave up on
     // (`prefetch_failures` - see `PREFETCH_FAILURE_LIMIT`). The prefetch will
-    // run cooperatively in batches between IDLE cycles.
+    // run cooperatively in batches whenever the session is otherwise idle.
     let prefetch_mailboxes: Vec<MailboxId> = folders
         .iter()
         .filter(|m| m.id != inbox_id && prefetch_failures.get(&m.id).copied().unwrap_or(0) < PREFETCH_FAILURE_LIMIT)
@@ -2094,8 +2124,18 @@ async fn connect_and_run(
         ServerChanged,
         /// Work Offline turned on while waiting in IDLE.
         Offline,
+        /// Nothing is queued and the background prefetch still has work, so
+        /// the iteration skips IDLE entirely and runs the next prefetch batch
+        /// straight away (see `prefetch_drain_due`).
+        PrefetchTick,
         ChannelClosed,
     }
+
+    // When the current run of back-to-back prefetch batches began, or `None`
+    // while the session isn't draining. Cleared each time the loop really
+    // enters IDLE, so every `PREFETCH_DRAIN_SLICE` of draining is followed by
+    // one pass through the pre-IDLE reselect and its arrival check.
+    let mut drain_started: Option<std::time::Instant> = None;
 
     // Consecutive `Wake::ServerChanged` syncs since the session last reached
     // an IDLE wait - see `MAX_CHANGE_RESYNCS`.
@@ -2411,7 +2451,9 @@ async fn connect_and_run(
                     Err(async_channel::TryRecvError::Closed) | Err(async_channel::TryRecvError::Empty) => match commands.try_recv() {
                         Ok(cmd) => Wake::Command(cmd),
                         Err(async_channel::TryRecvError::Closed) => return Ok(ShutdownReason::Requested),
+                        Err(async_channel::TryRecvError::Empty) if prefetch_drain_due(prefetch.as_ref(), &mut drain_started, std::time::Instant::now()) => Wake::PrefetchTick,
                         Err(async_channel::TryRecvError::Empty) => {
+                            drain_started = None;
                             let idle_entry_started = std::time::Instant::now();
                             let _ = events.send(AccountEvent::ConnectionStateChanged(ConnectionState::Idle)).await;
 
@@ -2488,13 +2530,19 @@ async fn connect_and_run(
                                     Wake::ServerChanged
                                 } else {
                                     change_resyncs = 0;
-                                    // Aggressive prefetch paces the session with a short IDLE
-                                    // slice so batches keep flowing on a quiet session (a
-                                    // timeout wake runs the next prefetch batch), and the
-                                    // short slice also keeps the periodic re-scan tick alive
-                                    // once a pass is done. Otherwise the wait is the usual
-                                    // keepalive slice.
-                                    let slice = if prefetch_policy.aggressive { prefetch_policy.batch_interval } else { IDLE_SLICE };
+                                    // While a prefetch pass still has work, this IDLE is only
+                                    // the short breather between drain slices (see
+                                    // `prefetch_drain_due`). Once the pass is done, aggressive
+                                    // prefetch keeps a short slice so its periodic re-scan tick
+                                    // stays alive on a quiet session; otherwise the wait is the
+                                    // usual keepalive slice.
+                                    let slice = if prefetch.as_ref().is_some_and(|pf| !pf.is_done()) {
+                                        PREFETCH_DRAIN_PAUSE
+                                    } else if prefetch_policy.aggressive {
+                                        prefetch_policy.batch_interval
+                                    } else {
+                                        IDLE_SLICE
+                                    };
                                     // Wake early if a scheduled outbox send is
                                     // due sooner than the keepalive slice.
                                     // So is a snooze wake (item 1.15), or the
@@ -2592,7 +2640,7 @@ async fn connect_and_run(
             // the currently-selected mailbox changed; re-sync it. When
             // CONDSTORE is enabled this is a `CHANGEDSINCE` delta, not a
             // full flag re-fetch - see `sync_mailbox`.
-            Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) => {}
+            Wake::Idle(Ok(async_imap::extensions::idle::IdleResponse::Timeout)) | Wake::PrefetchTick => {}
             Wake::Idle(Ok(_)) | Wake::ServerChanged => {
                 // `sync_mailbox` derives the open folder's count fields from what
                 // this sync already fetched (the flag list for `unread`, SELECT
@@ -5055,11 +5103,12 @@ async fn connect_and_run(
         }
 
         // --- background body prefetch batch ---
-        // Run a small batch of body fetches between IDLE cycles when no user
+        // Run a small batch of body fetches when no user
         // commands are in flight. This is cooperative: every batch yields
         // back to IDLE, so user actions (message clicks, folder switches)
-        // are never starved.
-        let mut did_prefetch_work = false;
+        // are never starved. While a pass has work left the main loop skips
+        // IDLE between batches (see `prefetch_drain_due`), so a quiet session
+        // drains a folder in minutes instead of one body per keepalive slice.
 
         // Aggressive prefetch re-scans on a timer: once a pass is done and
         // `refresh_interval` has elapsed since it started, restart it over
@@ -5247,7 +5296,6 @@ async fn connect_and_run(
                     );
                     pf.pending_uids = uids;
                     pf.envelopes_fetched = true;
-                    did_prefetch_work = true;
                 }
 
                 // Fetch up to the policy's batch size bodies in **one** `UID
@@ -5260,6 +5308,24 @@ async fn connect_and_run(
                     // Check before starting the batch fetch.
                     if !no_work_pending(commands, interactive_commands, idle_notify) {
                         continue;
+                    }
+                    // `UID FETCH` acts on whichever folder is SELECTed, and
+                    // anything since the envelope pass - a command, an IDLE
+                    // slice on the open folder - may have moved the session.
+                    // Without this the batch would fetch another folder's
+                    // messages that happen to share these uids and cache them
+                    // under this one.
+                    if session_selected != pf.mailboxes[pf.current] {
+                        let meta = session.select(&pf.current_folder_name).await?;
+                        session_selected = pf.mailboxes[pf.current].clone();
+                        if meta.uid_validity.is_some_and(|validity| UidValidity(validity) != pf.uidvalidity) {
+                            // Recreated since the envelope pass: its uids now
+                            // name different messages, so learn them again.
+                            pf.pending_uids.clear();
+                            pf.structures.clear();
+                            pf.envelopes_fetched = false;
+                            continue;
+                        }
                     }
                     let batch: Vec<Uid> = pf.pending_uids.drain(..pf.pending_uids.len().min(prefetch_policy.batch_size)).collect();
                     let batch_len = batch.len();
@@ -5285,9 +5351,6 @@ async fn connect_and_run(
                         elapsed_ms = started.elapsed().as_millis(),
                         "prefetch: batch complete"
                     );
-                    if fetched > 0 {
-                        did_prefetch_work = true;
-                    }
                 }
 
                 // If all UIDs for this mailbox are done, advance to the next.
@@ -5302,16 +5365,11 @@ async fn connect_and_run(
             }
         }
 
-        // Re-select the user's current mailbox before re-entering IDLE so the
-        // next IDLE wait operates on the right folder. Only needed when
-        // prefetch actually changed the selected mailbox (SELECT for envelope
-        // fetch or body fetches). Skip if a user command is pending — the
-        // command handler will SELECT the folder it needs, and the top-of-loop
-        // check re-selects the user's folder anyway.
-        if did_prefetch_work && no_work_pending(commands, interactive_commands, idle_notify) {
-            session.select(&current_mailbox_name).await?;
-            session_selected = current_mailbox_id.clone();
-        }
+        // No re-SELECT of the user's folder here: a command handler SELECTs
+        // the folder it needs (tracked in `session_selected`), the next
+        // prefetch batch SELECTs its own, and the pre-IDLE path puts the
+        // session back on the open folder - with the `UIDNEXT` check that
+        // notices mail which landed while the session was elsewhere.
     }
 }
 
@@ -9283,6 +9341,33 @@ mod tests {
         assert!(plan_create_mailbox(Some(&id("Work")), "a/b", &account, &folders).is_err(), "delimiter in the name");
         folders.iter_mut().find(|m| m.id == id("Old")).unwrap().flags.push("NoInferiors".into());
         assert!(plan_create_mailbox(Some(&id("Old")), "Child", &account, &folders).is_err(), "\\Noinferiors parent");
+    }
+
+    #[test]
+    fn prefetch_drains_back_to_back_only_within_a_slice_and_while_work_is_left() {
+        let account = AccountId("acct".to_string());
+        let start = std::time::Instant::now();
+        let mut drain_started = None;
+
+        assert!(!prefetch_drain_due(None, &mut drain_started, start), "no pass, nothing to drain");
+        let done = PrefetchState::new(Vec::new());
+        assert!(!prefetch_drain_due(Some(&done), &mut drain_started, start), "a finished pass idles");
+        assert_eq!(drain_started, None, "a pass with nothing left never starts a slice");
+
+        let pass = PrefetchState::new(vec![MailboxId::new(&account, "Abode")]);
+        assert!(prefetch_drain_due(Some(&pass), &mut drain_started, start), "work left: skip IDLE");
+        assert_eq!(drain_started, Some(start), "the first tick starts the slice");
+        assert!(prefetch_drain_due(Some(&pass), &mut drain_started, start + PREFETCH_DRAIN_SLICE - Duration::from_millis(1)));
+        assert!(
+            !prefetch_drain_due(Some(&pass), &mut drain_started, start + PREFETCH_DRAIN_SLICE),
+            "an expired slice goes back to IDLE on the open folder"
+        );
+
+        // Entering IDLE clears the slice, so the next tick starts a new one.
+        drain_started = None;
+        let later = start + PREFETCH_DRAIN_SLICE * 2;
+        assert!(prefetch_drain_due(Some(&pass), &mut drain_started, later));
+        assert_eq!(drain_started, Some(later));
     }
 
     #[test]

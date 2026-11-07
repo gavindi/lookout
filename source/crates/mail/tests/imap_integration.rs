@@ -32,7 +32,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lookout_core::{AccountId, MailboxId};
+use lookout_core::{AccountId, MailboxId, Uid};
 use lookout_mail::session::{AccountCommand, AccountEvent, CredentialProvider, DraftReplace};
 use lookout_mail::{AccountConfig, ComposedMessage, Credential, EndpointConfig, Security};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -816,6 +816,121 @@ async fn notices_new_mail_promptly_while_prefetch_is_in_flight() {
         "List-Id must come from the header block"
     );
     tracing::info!(elapsed_ms = started.elapsed().as_millis(), "new mail noticed while prefetch was in flight");
+
+    let _ = cmd_tx.send(AccountCommand::Shutdown).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// Regression test for the background prefetch on a quiet session. The
+/// default pass used to run one body per IDLE wake (a 25-minute keepalive
+/// slice), so a folder never finished and its folder-pane spinner never
+/// stopped. And after its first batch the session went back to INBOX, while
+/// later batches `UID FETCH`ed without SELECTing the prefetch folder again,
+/// so INBOX messages that shared a uid were cached as that folder's bodies.
+/// INBOX and "Big" are seeded with the same uids and different bodies. The
+/// pass must finish on its own, and every Big body it cached (`FetchBody`
+/// answers from the cache) must be Big's own.
+#[tokio::test]
+#[ignore = "requires Docker; run explicitly with `cargo test -- --ignored`"]
+async fn prefetch_drains_an_idle_folder_and_caches_its_own_bodies() {
+    std::env::set_var("LOOKOUT_INSECURE_TLS_FOR_TESTS", "1");
+
+    let container = GenericImage::new("greenmail/standalone", "2.1.11")
+        .with_wait_for(WaitFor::message_on_stdout("Starting GreenMail standalone"))
+        .with_exposed_port(3993.tcp())
+        .with_exposed_port(3465.tcp())
+        .with_exposed_port(3143.tcp())
+        .start()
+        .await
+        .expect("failed to start GreenMail container - is Docker running?");
+
+    let host = container.get_host().await.unwrap().to_string();
+    let imaps_port = container.get_host_port_ipv4(3993).await.unwrap();
+    let smtps_port = container.get_host_port_ipv4(3465).await.unwrap();
+    let imap_plain_port = container.get_host_port_ipv4(3143).await.unwrap();
+
+    {
+        let tcp = tokio::net::TcpStream::connect((host.as_str(), imap_plain_port)).await.expect("plain IMAP connect");
+        let client = async_imap::Client::new(tcp);
+        let mut session = client.login("testuser", "testpass").await.map_err(|e| e.0).expect("plain IMAP login");
+        session.create("Big").await.expect("CREATE Big");
+        session.logout().await.expect("plain IMAP logout");
+    }
+    // Same count in both folders, so both number their messages 1..=N.
+    const SEEDED_MESSAGES: usize = 30;
+    for i in 0..SEEDED_MESSAGES {
+        let inbox = format!("From: sender@example.com\r\nTo: testuser@localhost\r\nMessage-ID: <inbox-{i}@example.com>\r\nSubject: inbox {i}\r\n\r\ninbox body {i}\r\n");
+        append_raw_to(&host, imap_plain_port, "INBOX", inbox.as_bytes()).await;
+        let big = format!("From: sender@example.com\r\nTo: testuser@localhost\r\nMessage-ID: <big-{i}@example.com>\r\nSubject: big {i}\r\n\r\nbig body {i}\r\n");
+        append_raw_to(&host, imap_plain_port, "Big", big.as_bytes()).await;
+    }
+
+    // A fresh account id per run, so no earlier run's cache can answer.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let account_id = AccountId(format!("test-prefetch-{nonce}"));
+    let config = AccountConfig {
+        account_id: account_id.clone(),
+        display_name: "Test Account".to_string(),
+        email: "testuser@localhost".to_string(),
+        mention_addresses: vec!["testuser@localhost".to_string()],
+        mention_names: vec!["Test Account".to_string()],
+        local_focus_enabled: false,
+        local_focus_contacts: Vec::new(),
+        imap: EndpointConfig {
+            host: host.clone(),
+            port: imaps_port,
+            security: Security::ImplicitTls,
+            username: "testuser".to_string(),
+        },
+        smtp: EndpointConfig {
+            host: host.clone(),
+            port: smtps_port,
+            security: Security::ImplicitTls,
+            username: "testuser".to_string(),
+        },
+    };
+
+    let (cmd_tx, cmd_rx) = async_channel::unbounded();
+    let (interactive_tx, interactive_rx) = async_channel::unbounded();
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let credentials: Arc<dyn CredentialProvider> = Arc::new(FixedCredentialProvider);
+    let (_offline_tx, offline_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(lookout_mail::session::run_account_session(config, credentials, cmd_rx, interactive_rx, evt_tx, offline_rx));
+
+    let folders = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::FoldersUpdated(f) if f.iter().any(|m| m.name == "Big"))).await;
+    let AccountEvent::FoldersUpdated(folders) = folders else { unreachable!() };
+    let big_id = folders.iter().find(|m| m.name == "Big").expect("Big folder missing from list").id.clone();
+
+    // No user activity at all: the pass has to finish by itself, well inside
+    // the old 25-minute keepalive that paced it before.
+    wait_for_event_within(
+        &evt_rx,
+        |e| matches!(e, AccountEvent::PrefetchFinished { mailbox } if *mailbox == big_id),
+        Duration::from_secs(60),
+    )
+    .await;
+
+    // Every one of these is a cache hit after the pass, so a body misfiled
+    // from INBOX would come back here.
+    for uid in 1..=SEEDED_MESSAGES as u32 {
+        interactive_tx
+            .send(AccountCommand::FetchBody {
+                mailbox: big_id.clone(),
+                uid: Uid(uid),
+            })
+            .await
+            .unwrap();
+    }
+    let mut seen = std::collections::HashSet::new();
+    while seen.len() < SEEDED_MESSAGES {
+        let event = wait_for_event(&evt_rx, |e| matches!(e, AccountEvent::BodyFetched { mailbox, .. } if *mailbox == big_id)).await;
+        let AccountEvent::BodyFetched { uid, body, .. } = event else { unreachable!() };
+        let text = body.text_body.unwrap_or_default();
+        assert!(text.contains("big body"), "Big uid {} came back with another folder's body: {text:?}", uid.0);
+        let id = lookout_core::header_value(&body.headers, "message-id").unwrap_or_default();
+        assert!(id.contains("<big-"), "Big uid {} carries a foreign Message-ID {id:?}", uid.0);
+        seen.insert(uid);
+    }
 
     let _ = cmd_tx.send(AccountCommand::Shutdown).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;

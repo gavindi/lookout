@@ -544,7 +544,7 @@ pub struct ConfigView {
     /// rows below are disabled while it's off, so the cooperative default is
     /// always what an off switch means.
     pub aggressive_prefetch_row: adw::SwitchRow,
-    /// "Batch interval" spin row (Config → Advanced), exposed so the caller
+    /// "Re-scan check interval" spin row (Config → Advanced), exposed so the caller
     /// can wire its value into the policy's `batch_interval`.
     pub prefetch_interval_row: adw::SpinRow,
     /// "Messages per folder" spin row (Config → Advanced), exposed so the
@@ -1226,20 +1226,20 @@ pub fn build() -> ConfigView {
 
     let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
 
-    // Background body prefetch: the cooperative default (one pass, one small
-    // batch per activity, newest 200 per folder) vs. the user-tuned
+    // Background body prefetch: the cooperative default (one pass, one body
+    // per round trip while idle, newest 200 per folder) vs. the user-tuned
     // "aggressive" mode. The frequency/limit rows sit under a switch so an
     // off switch always means exactly the default behavior.
     let prefetch_group = adw::PreferencesGroup::builder().title("Mail prefetch").build();
     let aggressive_prefetch_row = adw::SwitchRow::builder()
         .title("Aggressive prefetch")
-        .subtitle("Download message bodies more eagerly: batches run on a timer, more of each folder is warmed, and folders re-scan periodically. Uses more bandwidth")
+        .subtitle("Download message bodies more eagerly: larger batches, more of each folder is warmed, and folders re-scan periodically. Uses more bandwidth")
         .build();
     prefetch_group.add(&aggressive_prefetch_row);
     let prefetch_interval_row = adw::SpinRow::with_range(5.0, 300.0, 5.0);
     prefetch_interval_row.set_value(30.0);
-    prefetch_interval_row.set_title("Batch interval");
-    prefetch_interval_row.set_subtitle("Seconds between prefetch batches");
+    prefetch_interval_row.set_title("Re-scan check interval");
+    prefetch_interval_row.set_subtitle("Seconds between checks for a due re-scan once a pass has finished");
     prefetch_group.add(&prefetch_interval_row);
     let prefetch_limit_row = adw::SpinRow::with_range(10.0, 5000.0, 10.0);
     prefetch_limit_row.set_value(200.0);

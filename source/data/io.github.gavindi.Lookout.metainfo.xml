@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.314" date="2026-11-08">
+      <description>
+        <p>Background downloading of message bodies now finishes in minutes while Lookout is idle, so a folder's activity spinner no longer keeps spinning for days. It also fixes a fault that could store another folder's message under a message in a folder being prepared, so opening it showed the wrong email. Messages affected by this are repaired the next time Lookout starts.</p>
+      </description>
+    </release>
     <release version="0.9.313" date="2026-11-06">
       <description>
         <p>Accounts added or removed in GNOME Settings, or with Mail, Calendar or Contacts switched on or off, now take effect while Lookout is running, and a new account appears in the folder list straight away. The recent-searches list no longer blocks the rest of the window. In the message list, clicking a sender or picture always opens the message, and the contact card appears when you rest the pointer on the sender's picture (or name, when pictures are hidden). Based on a contribution by genrichh93-ui.</p>

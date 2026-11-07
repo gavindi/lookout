@@ -354,6 +354,82 @@ fn repair_quoted_envelope_strings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The one part of a cached `EmailBody` that `repair_misfiled_bodies` reads.
+/// Deserializing only this skips building every body's text, HTML and part
+/// list while the repair scans the whole table.
+#[derive(serde::Deserialize)]
+struct BodyHeadersOnly {
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+}
+
+/// A Message-ID reduced to what two copies of one message's ID always share:
+/// surrounding whitespace and the angle brackets dropped.
+fn normalized_message_id(id: &str) -> &str {
+    let id = id.trim();
+    let id = id.strip_prefix('<').unwrap_or(id);
+    let id = id.strip_suffix('>').unwrap_or(id);
+    id.trim()
+}
+
+/// One-time repair for bodies the background prefetch cached under the wrong
+/// folder. Builds before the fix ran a prefetch body batch without first
+/// SELECTing the prefetch folder again, so after the first batch its `UID
+/// FETCH` read whatever folder the session had moved to (usually the open
+/// one) and stored a message that merely shared the uid under the prefetch
+/// folder's row - opening that message then showed someone else's mail.
+///
+/// A cached body's own `Message-ID` header names the message it really is,
+/// and the envelope row it is stored against names the message it should
+/// be. Where both are known and disagree the body is deleted, to be fetched
+/// again on demand or by the next prefetch. The same batch also wrote the
+/// wrong body's text into the search index and, for a never-opened
+/// (`partial`) folder's row with no preview yet, into the row's preview, so
+/// a partial row's preview is cleared and the row is re-indexed from what
+/// remains. Rows where either ID is missing are left alone. Runs inside the
+/// migration transaction that also bumps `user_version`, so it runs once.
+fn repair_misfiled_bodies(conn: &Connection) -> Result<()> {
+    let mut misfiled: Vec<(EmailSummary, bool)> = Vec::new();
+    {
+        let mut select = conn.prepare("SELECT b.data, m.data, m.partial FROM bodies b JOIN messages m ON m.mailbox_id = b.mailbox_id AND m.uid = b.uid")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let body: Vec<u8> = row.get(0)?;
+            let Ok(body) = serde_json::from_slice::<BodyHeadersOnly>(&body) else {
+                continue;
+            };
+            let Some(body_id) = lookout_core::header_value(&body.headers, "message-id").map(normalized_message_id) else {
+                continue;
+            };
+            let envelope: String = row.get(1)?;
+            let Ok(summary) = serde_json::from_str::<EmailSummary>(&envelope) else {
+                continue;
+            };
+            let Some(envelope_id) = summary.message_id.as_deref().map(normalized_message_id) else {
+                continue;
+            };
+            if body_id.is_empty() || envelope_id.is_empty() || body_id == envelope_id {
+                continue;
+            }
+            let partial: bool = row.get(2)?;
+            misfiled.push((summary, partial));
+        }
+    }
+    for (mut summary, partial) in misfiled {
+        tracing::info!(mailbox = %summary.mailbox, uid = summary.uid.0, "cache: dropping a body cached from another folder");
+        conn.execute("DELETE FROM bodies WHERE mailbox_id = ?1 AND uid = ?2", rusqlite::params![summary.mailbox.0, summary.uid.0])?;
+        if partial && summary.preview.is_some() {
+            summary.preview = None;
+            conn.execute(
+                "UPDATE messages SET data = ?1 WHERE mailbox_id = ?2 AND uid = ?3",
+                rusqlite::params![serde_json::to_string(&summary)?, summary.mailbox.0, summary.uid.0],
+            )?;
+        }
+        index_upsert_message(conn, &summary, summary.preview.as_deref().unwrap_or(""))?;
+    }
+    Ok(())
+}
+
 fn unescape_quoted_option(value: &mut Option<String>) -> bool {
     let Some(current) = value.as_ref() else {
         return false;
@@ -1039,7 +1115,16 @@ impl Cache {
         // `message/delivery-status`/`text/rfc822-headers` parts were
         // requested, so a cached bounce would never show its card; wiping
         // bodies makes the next open re-fetch them.
-        const BODY_CACHE_VERSION: i64 = 8;
+        // Version 10: the background prefetch could cache another folder's
+        // message under a prefetch folder's uid (it skipped re-SELECTing its
+        // folder between batches). Those bodies are found by their own
+        // `Message-ID` and dropped in place (see `repair_misfiled_bodies`)
+        // rather than wiping every body; caches older than version 8 still
+        // take the full wipe below, which removes them anyway.
+        const BODY_CACHE_VERSION: i64 = 10;
+        /// The last body format that still needs a full wipe rather than the
+        /// in-place misfiled-body repair.
+        const BODY_LEGACY_WIPE_VERSION: i64 = 8;
         // Version 3: the whole-message fallback path (`parse_body`) used to
         // number attachment parts by enumerate counter ("0", "1", ...) instead
         // of their IMAP section paths, so cached bodies from those builds
@@ -1072,8 +1157,12 @@ impl Cache {
             } else if stored < ENVELOPE_CACHE_VERSION {
                 repair_quoted_envelope_strings(&tx)?;
             }
-            if stored < BODY_CACHE_VERSION {
+            if stored < BODY_LEGACY_WIPE_VERSION {
                 tx.execute("DELETE FROM bodies", [])?;
+            } else if stored < BODY_CACHE_VERSION {
+                // After the envelope repair above, so both sides compare
+                // unescaped message IDs.
+                repair_misfiled_bodies(&tx)?;
             }
             if stored < BODY_CACHE_VERSION || stored < ENVELOPE_CACHE_VERSION {
                 tx.pragma_update(None, "user_version", BODY_CACHE_VERSION.max(ENVELOPE_CACHE_VERSION))?;
@@ -4066,6 +4155,85 @@ mod tests {
         let repaired = messages.iter().find(|m| m.uid == Uid(1)).unwrap();
         assert_eq!(repaired.to[0].name.as_deref(), Some(r#"Bob \ Builder"#));
         assert_eq!(repaired.subject.as_deref(), Some(r#"Re: "Window Positioner""#));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Bodies an older prefetch cached from the wrong folder (one batch per
+    /// uid, read while the session sat on another folder) carry a foreign
+    /// `Message-ID`. The version-10 migration drops exactly those, clears the
+    /// preview the wrong body gave a never-opened folder's row, and removes
+    /// its text from the search index; everything it can't compare survives.
+    #[test]
+    fn misfiled_body_repair_drops_mismatched_bodies_in_place() {
+        let account_id = temp_account_id();
+        let mailbox_id = MailboxId::new(&account_id, "Abode");
+        let path = cache_dir().join(format!("{}.sqlite3", sanitize_filename(&account_id)));
+        let cache = Cache::open(&account_id).unwrap();
+
+        let with_id = |uid: u32, id: Option<&str>| {
+            let mut summary = sample_summary(&mailbox_id, uid, None);
+            summary.message_id = id.map(str::to_string);
+            summary
+        };
+        let body_with_id = |text: &str, id: Option<&str>| {
+            let mut body = sample_body(text);
+            if let Some(id) = id {
+                body.headers.push(("Message-Id".to_string(), format!(" {id}")));
+            }
+            body
+        };
+        // 1: misfiled (the body is a different message). 2: the body's own ID,
+        // spelled without brackets. 3: a body with no Message-ID header.
+        // 4: an envelope with no Message-ID.
+        let summaries = [
+            with_id(1, Some("<invoice@power.example>")),
+            with_id(2, Some("<receipt@shop.example>")),
+            with_id(3, Some("<plain@shop.example>")),
+            with_id(4, None),
+        ];
+        cache.store_partial_messages(&mailbox_id, UidValidity(1), &summaries).unwrap();
+        cache
+            .store_body(
+                &mailbox_id,
+                Uid(1),
+                UidValidity(1),
+                &body_with_id("doctorwho chat from sent mail", Some("<reply@home.example>")),
+            )
+            .unwrap();
+        cache
+            .store_body(&mailbox_id, Uid(2), UidValidity(1), &body_with_id("receipt body", Some("receipt@shop.example")))
+            .unwrap();
+        cache.store_body(&mailbox_id, Uid(3), UidValidity(1), &body_with_id("headerless body", None)).unwrap();
+        cache
+            .store_body(&mailbox_id, Uid(4), UidValidity(1), &body_with_id("unknown envelope", Some("<other@x.example>")))
+            .unwrap();
+        // `load_messages` hides partial rows; the by-uid load includes them.
+        let preview_of = |cache: &Cache, uid: u32| cache.load_messages_by_uid(&mailbox_id, UidValidity(1)).unwrap().remove(&Uid(uid)).unwrap().preview;
+        assert!(preview_of(&cache, 1).is_some(), "storing a partial row's body gives it a preview");
+        assert_eq!(cache.search("doctorwho", 10).unwrap().len(), 1);
+
+        // A cache written by the build immediately before the prefetch fix.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+        let cache = Cache::open(&account_id).unwrap();
+        assert!(!cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "the misfiled body is dropped");
+        assert_eq!(preview_of(&cache, 1), None, "its preview came from the wrong body");
+        assert_eq!(cache.search("doctorwho", 10).unwrap().len(), 0, "its text leaves the search index");
+        assert_eq!(cache.search("subject 1", 10).unwrap().len(), 1, "the row itself stays searchable");
+        for uid in 2..=4 {
+            assert!(cache.has_body(&mailbox_id, Uid(uid), UidValidity(1)).unwrap(), "body {uid} survives");
+        }
+
+        // The version moved on, so a body misfiled now (as a test stand-in)
+        // is not touched by a second open.
+        cache
+            .store_body(&mailbox_id, Uid(1), UidValidity(1), &body_with_id("again", Some("<reply@home.example>")))
+            .unwrap();
+        let cache = Cache::open(&account_id).unwrap();
+        assert!(cache.has_body(&mailbox_id, Uid(1), UidValidity(1)).unwrap(), "the repair runs once");
 
         let _ = std::fs::remove_file(path);
     }

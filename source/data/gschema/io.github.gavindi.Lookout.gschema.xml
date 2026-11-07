@@ -470,13 +470,13 @@
     <key name="prefetch-aggressive" type="b">
       <default>false</default>
       <summary>Aggressive background prefetch</summary>
-      <description>When on, the background body prefetch runs more eagerly: batches fire on a short timer instead of waiting for activity, more of each folder is warmed, and the whole pass re-scans periodically. Uses more bandwidth and server connections.</description>
+      <description>When on, the background body prefetch runs more eagerly: each round trip downloads more bodies, more of each folder is warmed, and the whole pass re-scans periodically. Uses more bandwidth and server connections.</description>
     </key>
     <key name="prefetch-batch-interval-seconds" type="i">
       <range min="5" max="300"/>
       <default>30</default>
-      <summary>Seconds between prefetch batches</summary>
-      <description>How often the background body prefetch runs a batch while aggressive prefetch is enabled. Lower values download bodies faster but use more bandwidth.</description>
+      <summary>Seconds between re-scan checks</summary>
+      <description>While aggressive prefetch is enabled and a pass has finished, how often a quiet session wakes to see whether the periodic re-scan is due. Batches themselves run back to back whenever the session is otherwise idle.</description>
     </key>
     <key name="prefetch-folder-limit" type="i">
       <range min="10" max="5000"/>

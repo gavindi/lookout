@@ -242,11 +242,12 @@ pub const LAST_VIEW_UNIFIED: &str = "last-view-unified";
 pub const LAST_VIEW_OUTBOX: &str = "last-view-outbox";
 pub const LAST_VIEW_MAILBOX: &str = "last-view-mailbox";
 /// Config → Advanced → "Aggressive prefetch": whether the background body
-/// prefetch runs eagerly (short batch timer, larger per-folder warm-up,
+/// prefetch runs eagerly (larger batches, larger per-folder warm-up,
 /// periodic full-pass re-scans) instead of one cooperative pass per session.
 pub const PREFETCH_AGGRESSIVE: &str = "prefetch-aggressive";
-/// Config → Advanced → "Aggressive prefetch" → "Batch interval": seconds
-/// between prefetch batches while aggressive prefetch is enabled.
+/// Config → Advanced → "Aggressive prefetch" → "Re-scan check interval":
+/// once a pass is done, how often a quiet aggressive session wakes to see
+/// whether the periodic re-scan is due.
 pub const PREFETCH_BATCH_INTERVAL_SECONDS: &str = "prefetch-batch-interval-seconds";
 /// Config → Advanced → "Aggressive prefetch" → "Messages per folder": how
 /// many of a folder's newest messages the prefetch warms up.
