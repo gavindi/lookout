@@ -720,9 +720,16 @@ pub(crate) fn run_message_menu_action(
             };
             let folders = state.borrow().accounts.get(&account_id).map(|handle| handle.folders.clone()).unwrap_or_default();
             let current = targets.iter().all(|s| s.mailbox == targets[0].mailbox).then(|| targets[0].mailbox.clone());
-            // Folders that can't hold messages (`\Noselect`) aren't offered.
+            // Folders that can't hold messages (`\Noselect`, or Gmail's
+            // `\NonExistent` hierarchy placeholders such as `[Gmail]`) aren't
+            // offered. `flags` holds the vendored parser's debug spelling
+            // (e.g. `Extension("\\NonExistent")`), so match loosely.
             let rows = crate::folder_menu::folder_picker_rows(folders, &account_id, |folder| {
-                Some(&folder.id) == current.as_ref() || folder.flags.iter().any(|flag| flag.eq_ignore_ascii_case("Noselect"))
+                let unselectable = folder.flags.iter().any(|flag| {
+                    let flag = flag.to_ascii_lowercase();
+                    flag.contains("noselect") || flag.contains("nonexistent")
+                });
+                Some(&folder.id) == current.as_ref() || unselectable
             });
             let moving = matches!(action, A::MoveOther);
             let noun = if targets.len() == 1 { "item" } else { "items" };

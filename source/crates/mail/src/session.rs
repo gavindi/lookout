@@ -106,15 +106,17 @@ const PREFETCH_DRAIN_PAUSE: Duration = Duration::from_secs(1);
 /// `RFC822.SIZE` value comes free with the prefetch's envelope pass.
 const PREFETCH_SIZE_CAP_BYTES: u64 = 4 * 1024 * 1024;
 
-/// How many times in a row a folder's background-prefetch envelope `FETCH`
-/// may fail before the prefetch stops trying it for the rest of the process's
-/// lifetime. A malformed message that aborts the IMAP response stream takes
-/// the whole connection down with it, and the reconnect re-fetches the same
-/// message - an infinite loop that starves the entire account. Two strikes
-/// (not one) so a transient network blip during a prefetch never permanently
-/// sidelines a folder; once skipped the folder is only left out of the
-/// *background* pass, and opening it still fetches it on demand. The count is
-/// cleared whenever a prefetch fetch for the folder succeeds.
+/// How many times in a row a folder's background-prefetch `SELECT` or envelope
+/// `FETCH` may fail before the prefetch stops trying it for the rest of the
+/// process's lifetime. A malformed message that aborts the IMAP response
+/// stream takes the whole connection down with it, and the reconnect
+/// re-fetches the same message - an infinite loop that starves the entire
+/// account; a folder that has vanished from the server behaves the same way
+/// for its `SELECT`. Two strikes (not one) so a transient network blip during
+/// a prefetch never permanently sidelines a folder; once skipped the folder is
+/// only left out of the *background* pass, and opening it still fetches it on
+/// demand. The count is cleared whenever a prefetch fetch for the folder
+/// succeeds.
 const PREFETCH_FAILURE_LIMIT: u32 = 2;
 
 /// How many of a sync's genuinely-new messages get their bodies fetched
@@ -276,12 +278,13 @@ fn prefetch_drain_due(prefetch: Option<&PrefetchState>, drain_started: &mut Opti
     now.saturating_duration_since(started) < PREFETCH_DRAIN_SLICE
 }
 
-/// Records a failed background-prefetch envelope fetch for `mailbox_id` and
-/// returns the error unchanged so the caller can still tear the (desynced)
-/// connection down. The count persists across reconnects, so once a folder
-/// reaches [`PREFETCH_FAILURE_LIMIT`] consecutive failures the rebuilt
-/// prefetch pass skips it instead of looping the account on the one message
-/// that can't be parsed.
+/// Records a failed background-prefetch step (a folder `SELECT` or its
+/// envelope `FETCH`) for `mailbox_id` and returns the error unchanged so a
+/// caller whose connection is genuinely broken can still tear it down. The
+/// count persists across reconnects, so once a folder reaches
+/// [`PREFETCH_FAILURE_LIMIT`] consecutive failures the rebuilt prefetch pass
+/// skips it instead of looping the account on the one message - or the one
+/// name - that can never be prepared.
 fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &MailboxId, error: Error) -> Error {
     let count = failures.entry(mailbox_id.clone()).or_insert(0);
     *count += 1;
@@ -289,9 +292,19 @@ fn note_prefetch_failure(failures: &mut HashMap<MailboxId, u32>, mailbox_id: &Ma
         mailbox = %mailbox_id,
         failures = *count,
         limit = PREFETCH_FAILURE_LIMIT,
-        "prefetch: envelope fetch failed for {mailbox_id}; the account will keep working and skip this folder in the background once it reaches the limit: {error}"
+        "prefetch failed for {mailbox_id}; the account will keep working and skip this folder in the background once it reaches the limit: {error}"
     );
     error
+}
+
+/// Whether a failed `SELECT` is a tagged server rejection (`NO`/`BAD`) rather
+/// than a broken connection. A rejection means the command stream is still in
+/// sync - the folder vanished, was renamed, or isn't selectable - so the
+/// caller can skip that mailbox and carry on with the same session. IO,
+/// connection-loss and parse failures leave the connection unusable and must
+/// still propagate to the reconnect loop.
+fn is_recoverable_select_error(error: &async_imap::error::Error) -> bool {
+    matches!(error, async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_))
 }
 
 /// The background body prefetch's behavior, settable live from the app (Config
@@ -5170,7 +5183,23 @@ async fn connect_and_run(
                         continue;
                     }
                     let folder_name = pf.current_folder_name.clone();
-                    let mailbox_meta = session.select(&folder_name).await?;
+                    let mailbox_id = pf.mailboxes[pf.current].clone();
+                    let mailbox_meta = match session.select(&folder_name).await {
+                        Ok(meta) => meta,
+                        // A tagged NO/BAD leaves the connection usable: the
+                        // folder vanished or was renamed since LIST, or (the
+                        // Gmail case `\NonExistent` exists for) the name is a
+                        // non-selectable hierarchy placeholder. Skip it like
+                        // any other prefetch failure instead of taking the
+                        // whole account down to reconnect on every pass.
+                        Err(e) if is_recoverable_select_error(&e) => {
+                            let _ = note_prefetch_failure(prefetch_failures, &mailbox_id, e.into());
+                            let _ = events.send(AccountEvent::PrefetchFinished { mailbox: mailbox_id }).await;
+                            pf.advance();
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     session_selected = pf.mailboxes[pf.current].clone();
                     // The prefetch is the first SELECT most folders ever get
                     // (only the open folder and STATUS-dirty ones go through
@@ -5195,7 +5224,6 @@ async fn connect_and_run(
                     // rows (see `Cache::store_partial_messages`), so the
                     // global search finds its recent mail. An opened folder's
                     // own syncs already keep its full snapshot indexed.
-                    let mailbox_id = pf.mailboxes[pf.current].clone();
                     let index_envelopes = !cache_op(cache, {
                         let mailbox_id = mailbox_id.clone();
                         move |c| c.has_messages(&mailbox_id)
@@ -5316,7 +5344,21 @@ async fn connect_and_run(
                     // messages that happen to share these uids and cache them
                     // under this one.
                     if session_selected != pf.mailboxes[pf.current] {
-                        let meta = session.select(&pf.current_folder_name).await?;
+                        let mailbox_id = pf.mailboxes[pf.current].clone();
+                        let meta = match session.select(&pf.current_folder_name).await {
+                            Ok(meta) => meta,
+                            // Same reasoning as the envelope pass's SELECT:
+                            // the folder may have vanished since it was listed.
+                            // Its queued uids can't be fetched here any more,
+                            // so drop them and move on rather than reconnecting.
+                            Err(e) if is_recoverable_select_error(&e) => {
+                                let _ = note_prefetch_failure(prefetch_failures, &mailbox_id, e.into());
+                                let _ = events.send(AccountEvent::PrefetchFinished { mailbox: mailbox_id }).await;
+                                pf.advance();
+                                continue;
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
                         session_selected = pf.mailboxes[pf.current].clone();
                         if meta.uid_validity.is_some_and(|validity| UidValidity(validity) != pf.uidvalidity) {
                             // Recreated since the envelope pass: its uids now
@@ -6634,15 +6676,33 @@ async fn login(config: &AccountConfig, credential: Credential) -> Result<(Sessio
     ))
 }
 
+/// Whether a `LIST` attribute says the name can't be `SELECT`ed. `\Noselect`
+/// is the standard one, but Gmail marks its placeholder hierarchy nodes -
+/// `[Gmail]` and the parent of any nested label - with the RFC 5258
+/// `\NonExistent` extension attribute instead. Treating only `\Noselect` as
+/// unselectable let `[Gmail]` into the folder list, where the prefetch sent
+/// `SELECT [Gmail]`, the server answered `NONEXISTENT`, and the whole account
+/// session reconnected in an endless loop.
+fn list_entry_is_unselectable(attributes: &[NameAttribute]) -> bool {
+    attributes.iter().any(|attribute| match attribute {
+        NameAttribute::NoSelect => true,
+        // The vendored parser maps anything outside RFC 3501/6154 to
+        // `Extension`, which keeps the leading backslash.
+        NameAttribute::Extension(name) => name.eq_ignore_ascii_case("\\NonExistent") || name.eq_ignore_ascii_case("\\NoSelect"),
+        _ => false,
+    })
+}
+
 /// Builds a `Mailbox` from one LIST response entry, minus the count fields
 /// (filled from the STATUS items a LIST-STATUS response pairs with it, or by
-/// a later SELECT/STATUS). `None` for a `\NoSelect` name - those aren't
-/// selectable mailboxes and get no STATUS items (RFC 5819 §2).
+/// a later SELECT/STATUS). `None` for an unselectable name (`\NoSelect` or
+/// `\NonExistent`) - those get no STATUS items (RFC 5819 §2) and can't be
+/// SELECTed, so every caller must treat them as absent.
 fn mailbox_from_list_parts(account_id: &AccountId, name: &str, delimiter: Option<&str>, attributes: &[NameAttribute]) -> Option<Mailbox> {
-    let attrs: Vec<String> = attributes.iter().map(|a| format!("{a:?}")).collect();
-    if attrs.iter().any(|a| a.contains("NoSelect")) {
+    if list_entry_is_unselectable(attributes) {
         return None;
     }
+    let attrs: Vec<String> = attributes.iter().map(|a| format!("{a:?}")).collect();
     let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('/');
     // The id keeps the raw wire path; only the displayed segment is decoded
     // from modified UTF-7, so a non-ASCII folder name reads as typed.
@@ -9223,11 +9283,31 @@ mod tests {
         let account = AccountId("acc".into());
         assert!(mailbox_from_list_parts(&account, "INBOX", Some("/"), &[]).is_some());
         assert!(mailbox_from_list_parts(&account, "NoAccess", Some("/"), &[NameAttribute::NoSelect]).is_none());
+        // Gmail's non-selectable hierarchy nodes use the RFC 5258 extension
+        // attribute instead of `\Noselect`. Letting these through put
+        // `[Gmail]` in the prefetch list, where `SELECT` answered
+        // NONEXISTENT and took the account session down with it.
+        assert!(mailbox_from_list_parts(
+            &account,
+            "[Gmail]",
+            Some("/"),
+            &[NameAttribute::Extension("\\HasChildren".into()), NameAttribute::Extension("\\NonExistent".into())]
+        )
+        .is_none());
+        assert!(mailbox_from_list_parts(&account, "Registrations", Some("/"), &[NameAttribute::Extension("\\nonexistent".into())]).is_none());
         let m = mailbox_from_list_parts(&account, "Work/Sent", Some("/"), &[NameAttribute::Sent]).unwrap();
         assert_eq!(m.id, MailboxId::new(&account, "Work/Sent"));
         assert_eq!(m.name, "Sent");
         assert_eq!(m.delimiter, '/');
         assert_eq!(m.role, MailboxRole::Sent);
+    }
+
+    #[test]
+    fn tagged_select_rejections_are_recoverable_but_connection_failures_are_not() {
+        assert!(is_recoverable_select_error(&async_imap::error::Error::No("[NONEXISTENT] Unknown Mailbox: [Gmail]".into())));
+        assert!(is_recoverable_select_error(&async_imap::error::Error::Bad("bad command".into())));
+        assert!(!is_recoverable_select_error(&async_imap::error::Error::ConnectionLost));
+        assert!(!is_recoverable_select_error(&async_imap::error::Error::Io(std::io::Error::other("broken pipe"))));
     }
 
     #[test]
