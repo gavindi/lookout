@@ -23,15 +23,17 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 | Phase | State | Release |
 |---|---|---|
 | 0: measure | Done: a real leak, mostly the calendar sidebar | measured on 0.9.315 |
-| 1: break widget reference cycles | Done, except the composer and the event editor | 0.9.316 (memory steady at ~600 MB, user report) |
+| 1: break widget reference cycles | Done, except the event editor | 0.9.316 (memory steady at ~600 MB, user report); composer done after 0.9.317, not yet released |
 | 2: stop rebuilding when nothing changed | Not started | |
 | 3: bound the Rust collections | Done; not yet run in the real app | 0.9.317 |
 | 4: cut duplicate copies | Not started | |
-| 5: stop tests polluting the real cache | Not started | |
+| 5: stop tests polluting the real cache | Code not started. This machine's leftovers were deleted on 2026-11-15: 6,735 entries, 1.2 GB; `~/.cache/lookout` went from ~2.1 GB to 901 MB | |
 
-**Next step: the composer.**
-1. Write a GTK test that opens and closes a composer (`build_compose_view`, with a WebKit view under Broadway) and asserts that its widgets are freed. That shows which cycles really remain.
-2. Break them by disconnecting the composer's handlers when it closes (`on_done`), rather than restructuring how `AutosaveCtx` is shared.
+**Next step:** review the event editor (`event_editor.rs`, `recurrence.rs`, `room_finder.rs`), with a "closed editor is freed" test like the composer's. Two cycles are already known there:
+- `event_editor.rs:689` and `:1237`: the attendees field's `connect_addresses_changed` callbacks capture the field itself. That is a plain `Rc` cycle, because the callback is stored inside the field.
+- `recurrence.rs:934` and `room_finder.rs:297`, `:496`, `:553`, `:586`: handlers that capture their own popover.
+
+After that, Phase 4 is where most of the remaining memory is.
 
 **Open side item:** this machine's clippy (1.92) flags `nonminimal_bool` at `crates/mail/src/session.rs:274`, which is older than this work. Until it is fixed, the clippy command needs `-A clippy::nonminimal_bool`.
 
@@ -105,6 +107,21 @@ With the old swatch capture put back, the checklist test fails with exactly the 
 - The composer may still leak as a whole: `AutosaveCtx` holds ~20 composer widgets and is captured by many handlers inside it. This needs an instance-count check in the running app, or a teardown that breaks the handlers.
 - The event editor (`recurrence.rs`, `room_finder.rs`) was not reviewed.
 - The ribbon's More / Move to / Quick steps popovers hold themselves too, but they are singletons whose rebuilt contents free normally, so they were left alone.
+
+## Composer results (2026-11-15, after 0.9.317; not yet released or run in the real app)
+
+**Measured first:** a new test, `compose::tests::closed_composer_is_freed`, opens a composer in a window with pop-out enabled, clicks Close and lets `on_done` remove it, as the compose host does. Before the fix, about 500 widgets and the WebView survived. A temporary reference-count probe then showed which widgets the closures were holding.
+
+**Fixed:**
+- **`ComposerHandlers` (`compose.rs`):** records the 25 handlers `build_compose_view` connects on the composer's own widgets, plus the autosave tick task. They are disconnected (and the task aborted) when the composer ends, so the handlers can keep their plain strong captures. The trigger is the existing `root-notify` "unrooted and not moving" path, which already stopped autosave, so it covers Close, Send, Cancel, displacement and a popped-out window closing. Root `destroy` is a fallback for a composer that was never shown. The baseline `load_changed` handler went back to a once-only flag and is now tracked.
+- **Schedule-send menu:** its callback holds `send_composed` weakly. The popover belongs to the Send button, and `send_composed` holds that button.
+- **`RecipientEntry`:** its own handlers capture a new `WeakRecipientEntry`: widgets weak, plain state strong. The suggestion popover, added with `set_parent(&entry)`, is now unparented on the entry's `destroy`. This affects every recipient field (composer, event editor, invitation replies).
+- **`install_web_view_zoom` (`window/reading.rs`):** the key and scroll controllers use `controller.widget()` instead of capturing the WebView. This affects every composer and pop-out message window.
+- **Compose host:** `on_done` also clears `draft_save_failed_tx`, whose consumer held the composer's status label until the next composer opened.
+
+**Test-environment finding:** under Broadway, GTK's default input-method module keeps every `GtkText`/`GtkTextView` alive after it is dropped, even a bare one with no app code involved. With `gtk-im-context-simple` they are freed at once. `gtk_test::gtk_ready()` now sets that module through `gtk::Settings`, so the leak tests measure the app rather than the backend. Whether the Wayland IM module behaves the same in the real app is not known; the Phase 0 probe's `GtkText` counts would show it.
+
+**Check:** with the two `disconnect_all()` calls disabled, the composer test fails again (the whole composer survives).
 
 ## Phase 3 results (2026-11-15, released as 0.9.317, not yet run in the real app)
 

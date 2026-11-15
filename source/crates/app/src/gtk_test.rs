@@ -35,7 +35,17 @@ pub fn gtk_ready() -> bool {
     if gtk::is_initialized() {
         return gtk::is_initialized_main_thread();
     }
-    gtk::init().is_ok()
+    if gtk::init().is_err() {
+        return false;
+    }
+    // The headless Broadway backend's default input-method module keeps every
+    // `GtkText`/`GtkTextView` alive after it is dropped, which would fail the
+    // leak tests (`assert_freed`) for reasons outside the app. The built-in
+    // simple module behaves like a desktop session's.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_im_module(Some("gtk-im-context-simple"));
+    }
+    true
 }
 
 /// Asserts that every object in `weak` has been finalized, after letting the

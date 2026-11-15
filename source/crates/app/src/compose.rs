@@ -998,6 +998,56 @@ fn sensitivity_index(sensitivity: MessageSensitivity) -> u32 {
     }
 }
 
+/// One recorded handler: the object it is connected on, and its id.
+type TrackedHandler = (glib::WeakRef<glib::Object>, glib::SignalHandlerId);
+
+/// The signal handlers a composer connects on its own widgets, disconnected
+/// together when the composer ends (see [`ComposerHandlers::disconnect_all`]).
+///
+/// Many of them hold `AutosaveCtx`, the send closure or clones of the
+/// composer's fields, and those hold widgets of the composer, including the
+/// very widgets the handlers sit on. Each such handler is a reference cycle,
+/// and together they kept every closed composer alive - its widgets, the rich
+/// editor's WebView and the attachment bytes (MEMORY_OPTIMISATION1.md finding
+/// 6). Disconnecting them when the composer ends breaks every cycle at once,
+/// so the handlers can keep their plain strong captures.
+#[derive(Clone, Default)]
+struct ComposerHandlers {
+    handlers: Rc<RefCell<Vec<TrackedHandler>>>,
+    /// Long-running tasks to cancel too (the autosave tick, which would
+    /// otherwise hold the composer's fields until its next 30 s wake-up).
+    tasks: Rc<RefCell<Vec<glib::JoinHandle<()>>>>,
+}
+
+impl ComposerHandlers {
+    /// Records a handler `object` connected, returning nothing so a
+    /// `connect_*` call can be wrapped in place.
+    fn track(&self, object: &impl IsA<glib::Object>, id: glib::SignalHandlerId) {
+        self.handlers.borrow_mut().push((object.upcast_ref::<glib::Object>().downgrade(), id));
+    }
+
+    /// Records a task to cancel when the composer ends.
+    fn track_task(&self, task: glib::JoinHandle<()>) {
+        self.tasks.borrow_mut().push(task);
+    }
+
+    /// Disconnects every recorded handler whose object is still alive and
+    /// cancels the recorded tasks. Safe to call more than once, and from
+    /// inside one of the handlers (GLib keeps a running handler's closure
+    /// until it returns).
+    fn disconnect_all(&self) {
+        let handlers = std::mem::take(&mut *self.handlers.borrow_mut());
+        for (object, id) in handlers {
+            if let Some(object) = object.upgrade() {
+                object.disconnect(id);
+            }
+        }
+        for task in std::mem::take(&mut *self.tasks.borrow_mut()) {
+            task.abort();
+        }
+    }
+}
+
 /// Everything the draft autosave touches, in one clonable bundle. This exists
 /// because reading the rich editor is `async` (see `read_content`) and an
 /// `Rc<dyn Fn()>` closure can't hold an `async` body - each caller clones a
@@ -1804,6 +1854,9 @@ pub fn build_compose_view(
     // window's ribbon.
     ribbon_style: crate::ribbon::RibbonStyle,
 ) -> ComposeBuild {
+    // Every handler connected on the composer's own widgets is recorded here
+    // and disconnected when the composer ends (see `ComposerHandlers`).
+    let handlers = ComposerHandlers::default();
     // Chip-mode fields (UX-42): each recipient is a removable pill, so a
     // contact list picked from the address book can render as a single
     // expandable list chip (P-05). The To row has no caption label of its
@@ -1848,13 +1901,16 @@ pub fn build_compose_view(
     to_row.add_header_suffix(&bcc_button);
     {
         let to_row = to_row.clone();
-        to_button.connect_clicked(move |button| {
-            let on_add = {
-                let to_row = to_row.clone();
-                Rc::new(move |picked: Vec<Suggestion>| to_row.append_suggestions(&picked))
-            };
-            open_contact_picker(button.clone().upcast(), on_add);
-        });
+        handlers.track(
+            &to_button,
+            to_button.connect_clicked(move |button| {
+                let on_add = {
+                    let to_row = to_row.clone();
+                    Rc::new(move |picked: Vec<Suggestion>| to_row.append_suggestions(&picked))
+                };
+                open_contact_picker(button.clone().upcast(), on_add);
+            }),
+        );
     }
     cc_row.widget().set_visible(cc_prefilled);
     cc_button.set_visible(!cc_prefilled);
@@ -1864,17 +1920,23 @@ pub fn build_compose_view(
     // captured clone would be a cycle that keeps the closed composer alive.
     {
         let cc_row = cc_row.clone();
-        cc_button.connect_clicked(move |button| {
-            cc_row.widget().set_visible(true);
-            button.set_visible(false);
-        });
+        handlers.track(
+            &cc_button,
+            cc_button.connect_clicked(move |button| {
+                cc_row.widget().set_visible(true);
+                button.set_visible(false);
+            }),
+        );
     }
     {
         let bcc_row = bcc_row.clone();
-        bcc_button.connect_clicked(move |button| {
-            bcc_row.widget().set_visible(true);
-            button.set_visible(false);
-        });
+        handlers.track(
+            &bcc_button,
+            bcc_button.connect_clicked(move |button| {
+                bcc_row.widget().set_visible(true);
+                button.set_visible(false);
+            }),
+        );
     }
     let subject_row = adw::EntryRow::builder().title("Subject").build();
     if let Some(subject) = &prefill.subject {
@@ -1915,7 +1977,7 @@ pub fn build_compose_view(
     };
     {
         let update_identity_hint = update_identity_hint.clone();
-        from_dropdown.connect_selected_notify(move |_| update_identity_hint());
+        handlers.track(&from_dropdown, from_dropdown.connect_selected_notify(move |_| update_identity_hint()));
     }
     let refresh_from_dropdown: Rc<dyn Fn()> = {
         let identities = identities.clone();
@@ -2008,19 +2070,25 @@ pub fn build_compose_view(
     let low_importance_toggle = gtk::ToggleButton::builder().icon_name("go-down-symbolic").tooltip_text("Low importance").build();
     {
         let other = low_importance_toggle.clone();
-        high_importance_toggle.connect_toggled(move |toggle| {
-            if toggle.is_active() {
-                other.set_active(false);
-            }
-        });
+        handlers.track(
+            &high_importance_toggle,
+            high_importance_toggle.connect_toggled(move |toggle| {
+                if toggle.is_active() {
+                    other.set_active(false);
+                }
+            }),
+        );
     }
     {
         let other = high_importance_toggle.clone();
-        low_importance_toggle.connect_toggled(move |toggle| {
-            if toggle.is_active() {
-                other.set_active(false);
-            }
-        });
+        handlers.track(
+            &low_importance_toggle,
+            low_importance_toggle.connect_toggled(move |toggle| {
+                if toggle.is_active() {
+                    other.set_active(false);
+                }
+            }),
+        );
     }
     // A reopened draft restores its saved Importance and read-receipt
     // request; every other prefill leaves both at Normal/off. The toggles'
@@ -2126,34 +2194,40 @@ pub fn build_compose_view(
         );
         let appended = Rc::new(Cell::new(false));
         let appended_for_handler = appended.clone();
-        rich_web_view.connect_load_changed(move |view, event| {
-            // `load_html` is async; the append must wait for the document.
-            // The guard keeps a stray second load from appending twice.
-            if event != webkit::LoadEvent::Finished || appended_for_handler.get() {
-                return;
-            }
-            appended_for_handler.set(true);
-            let view = view.clone();
-            let script = script.clone();
-            glib::spawn_future_local(async move {
-                let _ = view.evaluate_javascript_future(&script, None, None).await;
-            });
-        });
+        handlers.track(
+            rich_web_view.as_ref(),
+            rich_web_view.connect_load_changed(move |view, event| {
+                // `load_html` is async; the append must wait for the document.
+                // The guard keeps a stray second load from appending twice.
+                if event != webkit::LoadEvent::Finished || appended_for_handler.get() {
+                    return;
+                }
+                appended_for_handler.set(true);
+                let view = view.clone();
+                let script = script.clone();
+                glib::spawn_future_local(async move {
+                    let _ = view.evaluate_javascript_future(&script, None, None).await;
+                });
+            }),
+        );
     } else if has_prefill_body {
         let script = caret_to_top_script.to_string();
         let placed = Rc::new(Cell::new(false));
         let placed_for_handler = placed.clone();
-        rich_web_view.connect_load_changed(move |view, event| {
-            if event != webkit::LoadEvent::Finished || placed_for_handler.get() {
-                return;
-            }
-            placed_for_handler.set(true);
-            let view = view.clone();
-            let script = script.clone();
-            glib::spawn_future_local(async move {
-                let _ = view.evaluate_javascript_future(&script, None, None).await;
-            });
-        });
+        handlers.track(
+            rich_web_view.as_ref(),
+            rich_web_view.connect_load_changed(move |view, event| {
+                if event != webkit::LoadEvent::Finished || placed_for_handler.get() {
+                    return;
+                }
+                placed_for_handler.set(true);
+                let view = view.clone();
+                let script = script.clone();
+                glib::spawn_future_local(async move {
+                    let _ = view.evaluate_javascript_future(&script, None, None).await;
+                });
+            }),
+        );
     }
 
     // The plain/rich switch lives in a shared toolbar row above the body,
@@ -2171,20 +2245,23 @@ pub fn build_compose_view(
     {
         let attachments = attachments.clone();
         let attachment_flow = attachment_flow.clone();
-        attach_button.connect_clicked(move |button| {
-            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
-            let attachments = attachments.clone();
-            let attachment_flow = attachment_flow.clone();
-            glib::spawn_future_local(async move {
-                let dialog = gtk::FileDialog::builder().title("Attach files").build();
-                let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
-                for i in 0..files.n_items() {
-                    let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
-                    add_attachment_from_file(&file, &attachments).await;
-                }
-                rebuild_attachment_chips(&attachments, &attachment_flow);
-            });
-        });
+        handlers.track(
+            &attach_button,
+            attach_button.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                let attachments = attachments.clone();
+                let attachment_flow = attachment_flow.clone();
+                glib::spawn_future_local(async move {
+                    let dialog = gtk::FileDialog::builder().title("Attach files").build();
+                    let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
+                    for i in 0..files.n_items() {
+                        let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
+                        add_attachment_from_file(&file, &attachments).await;
+                    }
+                    rebuild_attachment_chips(&attachments, &attachment_flow);
+                });
+            }),
+        );
     }
     // --- Signature menu: a "Signature" button that drops down the global
     // signature list (Config → Accounts → Signatures), one row per
@@ -2241,12 +2318,15 @@ pub fn build_compose_view(
     {
         let manage_signatures = manage_signatures.clone();
         let signature_popover = signature_popover.clone();
-        manage_button.connect_clicked(move |_| {
-            signature_popover.popdown();
-            if let Some(manage) = &manage_signatures {
-                manage();
-            }
-        });
+        handlers.track(
+            &manage_button,
+            manage_button.connect_clicked(move |_| {
+                signature_popover.popdown();
+                if let Some(manage) = &manage_signatures {
+                    manage();
+                }
+            }),
+        );
     }
     signature_menu_box.append(&manage_button);
     signature_popover.set_child(Some(&signature_menu_box));
@@ -2286,16 +2366,19 @@ pub fn build_compose_view(
         let rebuild_handle = rebuild_signature_menu.clone();
         let signature_scroller = signature_scroller.clone();
         let fields_group = fields_group.clone();
-        signature_popover.connect_map(move |_| {
-            // Match the dropdown's width to half the composer's field rows
-            // (the To/Cc/Bcc/Subject entries): the fields group spans
-            // exactly the entries' width. Runs while the popover is
-            // mapping, before its size is measured, so the new width lands
-            // on the menu that's about to open.
-            let width = (fields_group.width() / 2).max(240);
-            signature_scroller.set_min_content_width(width);
-            (rebuild_handle.borrow())();
-        });
+        handlers.track(
+            &signature_popover,
+            signature_popover.connect_map(move |_| {
+                // Match the dropdown's width to half the composer's field rows
+                // (the To/Cc/Bcc/Subject entries): the fields group spans
+                // exactly the entries' width. Runs while the popover is
+                // mapping, before its size is measured, so the new width lands
+                // on the menu that's about to open.
+                let width = (fields_group.width() / 2).max(240);
+                signature_scroller.set_min_content_width(width);
+                (rebuild_handle.borrow())();
+            }),
+        );
     }
     // One activation handler for the whole list, like the recipient
     // suggestions: the index is resolved against the *current* signature
@@ -2307,27 +2390,29 @@ pub fn build_compose_view(
         let rich_web_view = rich_web_view.clone();
         let body_view = body_view.clone();
         let rich_toggle = rich_toggle.clone();
-        signature_list.connect_row_activated(move |_, row| {
-            let index = row.index() as usize;
-            signature_popover.popdown();
-            let signatures = signatures_source();
-            let Some(signature) = signatures.get(index) else { return };
-            if rich_toggle.is_active() {
-                // Rich mode: insert the signature's HTML at the editor's
-                // cursor. `webkit_web_view_execute_editing_command_with_argument`
-                // doesn't reliably resolve WebKit's "InsertHTML" editing
-                // command (the paste handler's `document.execCommand` JS
-                // path is the proven one - same round trip, minus the C
-                // command-name translation), so the insertion goes through
-                // `evaluate_javascript` like the paste path. The script
-                // restores the editor's focus (the popover click blurred
-                // it), keeps the user's caret/selection when one exists,
-                // and falls back to appending at the end of the body when
-                // the selection was cleared - an insertion must never
-                // silently vanish.
-                let html_json = serde_json::to_string(&signature.html).unwrap_or_else(|_| "\"\"".to_string());
-                let script = format!(
-                    r#"(function () {{
+        handlers.track(
+            &signature_list,
+            signature_list.connect_row_activated(move |_, row| {
+                let index = row.index() as usize;
+                signature_popover.popdown();
+                let signatures = signatures_source();
+                let Some(signature) = signatures.get(index) else { return };
+                if rich_toggle.is_active() {
+                    // Rich mode: insert the signature's HTML at the editor's
+                    // cursor. `webkit_web_view_execute_editing_command_with_argument`
+                    // doesn't reliably resolve WebKit's "InsertHTML" editing
+                    // command (the paste handler's `document.execCommand` JS
+                    // path is the proven one - same round trip, minus the C
+                    // command-name translation), so the insertion goes through
+                    // `evaluate_javascript` like the paste path. The script
+                    // restores the editor's focus (the popover click blurred
+                    // it), keeps the user's caret/selection when one exists,
+                    // and falls back to appending at the end of the body when
+                    // the selection was cleared - an insertion must never
+                    // silently vanish.
+                    let html_json = serde_json::to_string(&signature.html).unwrap_or_else(|_| "\"\"".to_string());
+                    let script = format!(
+                        r#"(function () {{
                         document.body.focus();
                         var sel = window.getSelection();
                         if (!sel || sel.rangeCount === 0) {{
@@ -2339,15 +2424,16 @@ pub fn build_compose_view(
                         }}
                         document.execCommand('insertHTML', false, {html_json});
                     }})()"#
-                );
-                let web_view = rich_web_view.clone();
-                glib::spawn_future_local(async move {
-                    let _ = web_view.evaluate_javascript_future(&script, None, None).await;
-                });
-            } else {
-                body_view.buffer().insert_at_cursor(&signature.text);
-            }
-        });
+                    );
+                    let web_view = rich_web_view.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+                    });
+                } else {
+                    body_view.buffer().insert_at_cursor(&signature.text);
+                }
+            }),
+        );
     }
     // --- My Templates menu (item 2.10 / C-17): like the signature menu, a
     // button dropping down the global template list, one row per template
@@ -2382,12 +2468,15 @@ pub fn build_compose_view(
     {
         let manage_templates = manage_templates.clone();
         let templates_popover = templates_popover.clone();
-        manage_templates_button.connect_clicked(move |_| {
-            templates_popover.popdown();
-            if let Some(manage) = &manage_templates {
-                manage();
-            }
-        });
+        handlers.track(
+            &manage_templates_button,
+            manage_templates_button.connect_clicked(move |_| {
+                templates_popover.popdown();
+                if let Some(manage) = &manage_templates {
+                    manage();
+                }
+            }),
+        );
     }
     templates_menu_box.append(&manage_templates_button);
     templates_popover.set_child(Some(&templates_menu_box));
@@ -2423,11 +2512,14 @@ pub fn build_compose_view(
         let rebuild_handle = rebuild_templates_menu.clone();
         let templates_scroller = templates_scroller.clone();
         let fields_group = fields_group.clone();
-        templates_popover.connect_map(move |_| {
-            let width = (fields_group.width() / 2).max(240);
-            templates_scroller.set_min_content_width(width);
-            (rebuild_handle.borrow())();
-        });
+        handlers.track(
+            &templates_popover,
+            templates_popover.connect_map(move |_| {
+                let width = (fields_group.width() / 2).max(240);
+                templates_scroller.set_min_content_width(width);
+                (rebuild_handle.borrow())();
+            }),
+        );
     }
     // One activation handler for the whole list, like the signature menu: the
     // index is resolved against the *current* template list at click time.
@@ -2437,17 +2529,19 @@ pub fn build_compose_view(
         let rich_web_view = rich_web_view.clone();
         let body_view = body_view.clone();
         let rich_toggle = rich_toggle.clone();
-        templates_list.connect_row_activated(move |_, row| {
-            let index = row.index() as usize;
-            templates_popover.popdown();
-            let templates = templates_source();
-            let Some(template) = templates.get(index) else { return };
-            if rich_toggle.is_active() {
-                // Same `document.execCommand('insertHTML')` path as the
-                // signature menu, which restores focus and keeps the caret.
-                let html_json = serde_json::to_string(&template.html).unwrap_or_else(|_| "\"\"".to_string());
-                let script = format!(
-                    r#"(function () {{
+        handlers.track(
+            &templates_list,
+            templates_list.connect_row_activated(move |_, row| {
+                let index = row.index() as usize;
+                templates_popover.popdown();
+                let templates = templates_source();
+                let Some(template) = templates.get(index) else { return };
+                if rich_toggle.is_active() {
+                    // Same `document.execCommand('insertHTML')` path as the
+                    // signature menu, which restores focus and keeps the caret.
+                    let html_json = serde_json::to_string(&template.html).unwrap_or_else(|_| "\"\"".to_string());
+                    let script = format!(
+                        r#"(function () {{
                         document.body.focus();
                         var sel = window.getSelection();
                         if (!sel || sel.rangeCount === 0) {{
@@ -2459,15 +2553,16 @@ pub fn build_compose_view(
                         }}
                         document.execCommand('insertHTML', false, {html_json});
                     }})()"#
-                );
-                let web_view = rich_web_view.clone();
-                glib::spawn_future_local(async move {
-                    let _ = web_view.evaluate_javascript_future(&script, None, None).await;
-                });
-            } else {
-                body_view.buffer().insert_at_cursor(&template.text);
-            }
-        });
+                    );
+                    let web_view = rich_web_view.clone();
+                    glib::spawn_future_local(async move {
+                        let _ = web_view.evaluate_javascript_future(&script, None, None).await;
+                    });
+                } else {
+                    body_view.buffer().insert_at_cursor(&template.text);
+                }
+            }),
+        );
     }
     // --- The composer's command ribbon. The controls were built above; the
     // ribbon dresses each with an icon and a label and groups them like
@@ -2538,15 +2633,18 @@ pub fn build_compose_view(
         let web_view = rich_web_view.clone();
         let stack_for_toggle = body_stack.clone();
         let format_controls = format_controls.clone();
-        rich_toggle.connect_toggled(move |toggle| {
-            format_controls.set_sensitive(toggle.is_active());
-            if toggle.is_active() {
-                stack_for_toggle.set_visible_child_name("rich");
-                web_view.grab_focus();
-            } else {
-                stack_for_toggle.set_visible_child_name("text");
-            }
-        });
+        handlers.track(
+            &rich_toggle,
+            rich_toggle.connect_toggled(move |toggle| {
+                format_controls.set_sensitive(toggle.is_active());
+                if toggle.is_active() {
+                    stack_for_toggle.set_visible_child_name("rich");
+                    web_view.grab_focus();
+                } else {
+                    stack_for_toggle.set_visible_child_name("text");
+                }
+            }),
+        );
     }
     // Wire the Config → Mail preference into the composer's opening mode. The
     // toggled handler above is connected first, so `set_active` also routes
@@ -2610,7 +2708,7 @@ pub fn build_compose_view(
     {
         let autosave = autosave.clone();
         let closed = closed.clone();
-        glib::spawn_future_local(async move {
+        handlers.track_task(glib::spawn_future_local(async move {
             loop {
                 glib::timeout_future(DRAFT_AUTOSAVE_INTERVAL).await;
                 if closed.get() {
@@ -2618,7 +2716,7 @@ pub fn build_compose_view(
                 }
                 autosave.attempt(false).await;
             }
-        });
+        }));
     }
 
     // The opening baseline the tick compares against before the first save.
@@ -2630,26 +2728,21 @@ pub fn build_compose_view(
     // queued behind their scripts and sees the finished document. Nothing
     // can be typed into the editor before it loads, so no edit is absorbed.
     if rich_toggle.is_active() {
-        // A one-shot: the handler disconnects itself once it has fired. It
-        // holds `autosave`, which holds this very WebView, so leaving it
-        // connected would keep the closed composer (WebView, fields and
-        // attachment bytes) alive for good.
+        // Fires once (the flag guards a stray second load). It holds
+        // `autosave`, which holds this very WebView, so it is one of the
+        // handlers the composer disconnects when it ends.
         let autosave = autosave.clone();
-        let handler: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::new(Cell::new(None));
-        let id = {
-            let handler = handler.clone();
-            rich_web_view.connect_load_changed(move |view, event| {
-                if event != webkit::LoadEvent::Finished {
+        let captured = Cell::new(false);
+        handlers.track(
+            rich_web_view.as_ref(),
+            rich_web_view.connect_load_changed(move |_, event| {
+                if event != webkit::LoadEvent::Finished || captured.replace(true) {
                     return;
-                }
-                if let Some(id) = handler.take() {
-                    view.disconnect(id);
                 }
                 let autosave = autosave.clone();
                 glib::spawn_future_local(async move { autosave.capture_baseline().await });
-            })
-        };
-        handler.set(Some(id));
+            }),
+        );
     } else {
         let autosave = autosave.clone();
         glib::spawn_future_local(async move { autosave.capture_baseline().await });
@@ -2735,10 +2828,13 @@ pub fn build_compose_view(
     sync_light_view_button(&light_view_button);
     {
         let web_view = rich_web_view.clone();
-        light_view_button.connect_toggled(move |button| {
-            sync_light_view_button(button);
-            set_light_view(&web_view, button.is_active());
-        });
+        handlers.track(
+            &light_view_button,
+            light_view_button.connect_toggled(move |button| {
+                sync_light_view_button(button);
+                set_light_view(&web_view, button.is_active());
+            }),
+        );
     }
     rich_toggle.bind_property("active", &light_view_button, "sensitive").sync_create().build();
     let pop_out_button = gtk::Button::from_icon_name(crate::window::themed_icon_name(&["popout1", "window-new-symbolic", "view-restore-symbolic"]));
@@ -2792,32 +2888,41 @@ pub fn build_compose_view(
         let closed = closed.clone();
         let cmd_tx = cmd_tx.clone();
         let draft_message_id = draft_message_id.clone();
-        cancel_button.connect_clicked(move |_| {
-            // Discard (UX-08): remove any autosaved copy from Drafts, then
-            // close without the final save the old "Cancel" action performed.
-            // Setting `closed` first stops the autosave tick; a save already
-            // queued ahead of this delete stays ahead of it on the account's
-            // command channel, so the delete still wins.
-            closed.set(true);
-            let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
-                message_id: (*draft_message_id).clone(),
-            });
-            on_done();
-        });
+        handlers.track(
+            &cancel_button,
+            cancel_button.connect_clicked(move |_| {
+                // Discard (UX-08): remove any autosaved copy from Drafts, then
+                // close without the final save the old "Cancel" action performed.
+                // Setting `closed` first stops the autosave tick; a save already
+                // queued ahead of this delete stays ahead of it on the account's
+                // command channel, so the delete still wins.
+                closed.set(true);
+                let _ = cmd_tx.send_blocking(AccountCommand::DeleteDraft {
+                    message_id: (*draft_message_id).clone(),
+                });
+                on_done();
+            }),
+        );
     }
     // The ribbon's Send, Save Draft and Close.
     {
         let send_button = send_button.clone();
-        ribbon_send_button.connect_clicked(move |_| send_button.emit_by_name::<()>("clicked", &[]));
+        handlers.track(
+            &ribbon_send_button,
+            ribbon_send_button.connect_clicked(move |_| send_button.emit_by_name::<()>("clicked", &[])),
+        );
     }
     {
         let autosave = autosave.clone();
         // An explicit save: waits out an in-flight tick rather than doing
         // nothing, and stores even an untouched reply or forward.
-        save_draft_button.connect_clicked(move |_| {
-            let autosave = autosave.clone();
-            glib::spawn_future_local(async move { autosave.flush(true).await });
-        });
+        handlers.track(
+            &save_draft_button,
+            save_draft_button.connect_clicked(move |_| {
+                let autosave = autosave.clone();
+                glib::spawn_future_local(async move { autosave.flush(true).await });
+            }),
+        );
     }
     {
         // Close keeps the draft (its tooltip says so): one last save, then
@@ -2829,20 +2934,23 @@ pub fn build_compose_view(
         let on_done = on_done.clone();
         let autosave = autosave.clone();
         let closed = closed.clone();
-        close_button.connect_clicked(move |_| {
-            // `closed` only stops the autosave tick here; teardown happens in
-            // `on_done` after the flush. Setting it first also makes a second
-            // Close click a no-op rather than starting a parallel save.
-            if closed.replace(true) {
-                return;
-            }
-            let autosave = autosave.clone();
-            let on_done = on_done.clone();
-            glib::spawn_future_local(async move {
-                autosave.flush(false).await;
-                on_done();
-            });
-        });
+        handlers.track(
+            &close_button,
+            close_button.connect_clicked(move |_| {
+                // `closed` only stops the autosave tick here; teardown happens in
+                // `on_done` after the flush. Setting it first also makes a second
+                // Close click a no-op rather than starting a parallel save.
+                if closed.replace(true) {
+                    return;
+                }
+                let autosave = autosave.clone();
+                let on_done = on_done.clone();
+                glib::spawn_future_local(async move {
+                    autosave.flush(false).await;
+                    on_done();
+                });
+            }),
+        );
     }
     {
         let in_reply_to = prefill.in_reply_to;
@@ -3038,9 +3146,19 @@ pub fn build_compose_view(
         });
         {
             let send_composed = send_composed.clone();
-            send_button.connect_clicked(move |_| send_composed(None));
+            handlers.track(&send_button, send_button.connect_clicked(move |_| send_composed(None)));
         }
-        send_button.set_popover(Some(&build_schedule_popover(Rc::new(move |at| send_composed(Some(at))))));
+        // Weak: the popover belongs to the Send button, and `send_composed`
+        // holds that button, so a strong handle here would be a cycle the
+        // handler teardown can't reach (the popover's own handlers are
+        // connected in `datetime_picker`). The Send button's click handler
+        // holds the strong one until the composer ends.
+        let send_composed_weak = Rc::downgrade(&send_composed);
+        send_button.set_popover(Some(&build_schedule_popover(Rc::new(move |at| {
+            if let Some(send_composed) = send_composed_weak.upgrade() {
+                send_composed(Some(at));
+            }
+        }))));
     }
 
     // --- Pop-out button wiring: hand the composer (still alive) to the
@@ -3066,31 +3184,34 @@ pub fn build_compose_view(
         let light_view_button = light_view_button.clone();
         let editor_toolbar = editor_toolbar.clone();
         let attachment_flow = attachment_flow.clone();
-        pop_out_button.connect_clicked(move |_| {
-            if popped_out.get() {
-                return;
-            }
-            moving.set(true);
-            popped_out.set(true);
-            on_pop_out(PopOutHandle {
-                widget: content.clone(),
-                editor_toolbar: editor_toolbar.clone(),
-                toolbar_anchor: attachment_flow.clone().into(),
-                cancel_button: cancel_button.clone(),
-                send_button: send_button.clone(),
-                from_dropdown: from_dropdown.clone(),
-                read_receipt_toggle: read_receipt_toggle.clone(),
-                delivery_receipt_toggle: delivery_receipt_toggle.clone(),
-                light_view_button: light_view_button.clone(),
-                top_row: top_row.clone(),
-                title_label: title_label.clone(),
-                status_label: status_label.clone(),
-                moving: moving.clone(),
-                popped_out: popped_out.clone(),
-                done: closed.clone(),
-            });
-            moving.set(false);
-        });
+        handlers.track(
+            &pop_out_button,
+            pop_out_button.connect_clicked(move |_| {
+                if popped_out.get() {
+                    return;
+                }
+                moving.set(true);
+                popped_out.set(true);
+                on_pop_out(PopOutHandle {
+                    widget: content.clone(),
+                    editor_toolbar: editor_toolbar.clone(),
+                    toolbar_anchor: attachment_flow.clone().into(),
+                    cancel_button: cancel_button.clone(),
+                    send_button: send_button.clone(),
+                    from_dropdown: from_dropdown.clone(),
+                    read_receipt_toggle: read_receipt_toggle.clone(),
+                    delivery_receipt_toggle: delivery_receipt_toggle.clone(),
+                    light_view_button: light_view_button.clone(),
+                    top_row: top_row.clone(),
+                    title_label: title_label.clone(),
+                    status_label: status_label.clone(),
+                    moving: moving.clone(),
+                    popped_out: popped_out.clone(),
+                    done: closed.clone(),
+                });
+                moving.set(false);
+            }),
+        );
         // "Edit response before sending" (CAL-15) opens straight into the
         // window: run the exact pop-out path once the composer has been
         // embedded, without waiting for a click on a button the user would
@@ -3116,22 +3237,40 @@ pub fn build_compose_view(
         let popped_out = popped_out.clone();
         let pop_out_button = pop_out_button.clone();
         let top_row = top_row.clone();
-        content.connect_root_notify(move |widget| {
-            if widget.root().is_none() {
-                if !moving.get() {
-                    closed.set(true);
+        let teardown = handlers.clone();
+        handlers.track(
+            &content,
+            content.connect_root_notify(move |widget| {
+                if widget.root().is_none() {
+                    if !moving.get() {
+                        closed.set(true);
+                        // The composer has ended (closed, sent, cancelled or
+                        // displaced): drop its handlers so it can be freed.
+                        teardown.disconnect_all();
+                    }
+                } else {
+                    // While popped out the window's own title bar replaces the
+                    // composer's header row entirely - it shows the title,
+                    // hosts Cancel/Send (and the status label, relocated there
+                    // by the window layer), and makes the pop-out button a
+                    // no-op - so the row is hidden; it comes back with the
+                    // whole composer on pop-back-in.
+                    let shown = !popped_out.get();
+                    pop_out_button.set_visible(shown);
+                    top_row.set_visible(shown);
                 }
-            } else {
-                // While popped out the window's own title bar replaces the
-                // composer's header row entirely - it shows the title,
-                // hosts Cancel/Send (and the status label, relocated there
-                // by the window layer), and makes the pop-out button a
-                // no-op - so the row is hidden; it comes back with the
-                // whole composer on pop-back-in.
-                let shown = !popped_out.get();
-                pop_out_button.set_visible(shown);
-                top_row.set_visible(shown);
-            }
+            }),
+        );
+    }
+
+    // Fallback for a composer that is dropped without ever leaving a window
+    // (never shown, or its window destroyed with it): `destroy` still runs
+    // when its root widget is disposed.
+    {
+        let closed = closed.clone();
+        content.connect_destroy(move |_| {
+            closed.set(true);
+            handlers.disconnect_all();
         });
     }
 
@@ -3739,5 +3878,89 @@ mod tests {
         assert!(looks_like_missing_attachment("", "RE-ATTACHED for reference"));
         assert!(!looks_like_missing_attachment("", "I detached the cable."));
         assert!(!looks_like_missing_attachment("Meeting notes", "No files here."));
+    }
+
+    fn collect_widget_tree(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        out.push(root.clone());
+        let mut child = root.first_child();
+        while let Some(current) = child {
+            collect_widget_tree(&current, out);
+            child = current.next_sibling();
+        }
+    }
+
+    /// A composer closed with its Close button is freed with everything in it:
+    /// its widgets, both editors, the rich editor's WebView and its menus.
+    /// Many handlers inside the composer hold `AutosaveCtx` or the send
+    /// closure, which hold its widgets, so a single handler left connected
+    /// would keep the whole composer alive after it closes
+    /// (MEMORY_OPTIMISATION1.md finding 6). Run the way the app runs it: in a
+    /// window, with pop-out available, and `on_done` taking it out of the
+    /// window as the compose host does.
+    #[test]
+    fn closed_composer_is_freed() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let window = gtk::Window::new();
+        let (cmd_tx, _cmd_rx) = async_channel::unbounded::<AccountCommand>();
+        let done = Rc::new(Cell::new(false));
+        let on_done: Rc<dyn Fn()> = {
+            let done = done.clone();
+            let window = window.downgrade();
+            Rc::new(move || {
+                if let Some(window) = window.upgrade() {
+                    window.set_child(None::<&gtk::Widget>);
+                }
+                done.set(true);
+            })
+        };
+        let (composer, editor_toolbar, draft_tx, draft_failed_tx, identities_refresh) = build_compose_view(
+            "New Message",
+            Rc::new(Vec::new),
+            Rc::new(Vec::new),
+            None,
+            Rc::new(Vec::new),
+            None,
+            None,
+            cmd_tx,
+            ComposePrefill::default(),
+            on_done,
+            true,
+            false,
+            Vec::new(),
+            false,
+            Rc::new(|_, _| {}),
+            Rc::new(|_, _| {}),
+            Some(Rc::new(|_| {})),
+            Rc::new(|_, _| (None, None)),
+            None,
+            false,
+            crate::ribbon::RibbonStyle::new(crate::ribbon::RibbonMode::default()),
+        );
+        window.set_child(Some(&composer));
+        let mut widgets = Vec::new();
+        collect_widget_tree(composer.upcast_ref::<gtk::Widget>(), &mut widgets);
+        assert!(widgets.iter().any(|w| w.is::<webkit::WebView>()), "the rich editor is in the composer");
+        assert!(widgets.iter().any(|w| w.is::<gtk::Popover>()), "the composer's menus are in its tree");
+        let close = widgets
+            .iter()
+            .find(|w| w.tooltip_text().as_deref() == Some("Close (the draft is kept)"))
+            .and_then(|w| w.clone().downcast::<gtk::Button>().ok())
+            .expect("the composer has a Close button");
+        let watched: Vec<(&str, gtk::glib::WeakRef<gtk::glib::Object>)> = widgets.iter().map(|w| (w.type_().name(), crate::gtk_test::weak(w))).collect();
+        drop(widgets);
+
+        close.emit_clicked();
+        drop(close);
+        let context = gtk::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done.get() && std::time::Instant::now() < deadline {
+            context.iteration(true);
+        }
+        assert!(done.get(), "Close reached on_done");
+        drop((composer, editor_toolbar, draft_tx, draft_failed_tx, identities_refresh));
+        crate::gtk_test::assert_freed(&watched);
+        window.destroy();
     }
 }

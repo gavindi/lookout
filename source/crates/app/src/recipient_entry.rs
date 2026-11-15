@@ -217,6 +217,54 @@ pub struct RecipientEntry {
     person_card: Rc<RefCell<Option<PersonCardHook>>>,
 }
 
+/// A [`RecipientEntry`] that doesn't keep its widgets alive: what the field's
+/// own handlers capture. They sit on the field's widgets (the entry, the
+/// completion list, each chip's buttons), so a full clone in them was a
+/// reference cycle that kept every closed composer's To/Cc/Bcc fields alive
+/// (MEMORY_OPTIMISATION1.md finding 6). The widget-free state is shared
+/// strongly, so the field behaves the same while it exists.
+#[derive(Clone)]
+struct WeakRecipientEntry {
+    root: glib::WeakRef<gtk::Box>,
+    header: glib::WeakRef<gtk::Box>,
+    flow: Option<glib::WeakRef<gtk::FlowBox>>,
+    entry: glib::WeakRef<gtk::Text>,
+    plain: bool,
+    tokens: Rc<RefCell<Vec<Chip>>>,
+    popover: glib::WeakRef<gtk::Popover>,
+    suggestion_list: glib::WeakRef<gtk::ListBox>,
+    suggestions: Rc<RefCell<Vec<Suggestion>>>,
+    source: Rc<RefCell<Option<SuggestionSource>>>,
+    suggestion_generation: Rc<Cell<u64>>,
+    changed: Rc<RefCell<Option<AddressesChangedCallback>>>,
+    person_card: Rc<RefCell<Option<PersonCardHook>>>,
+}
+
+impl WeakRecipientEntry {
+    /// The field again, while its widgets are alive.
+    fn upgrade(&self) -> Option<RecipientEntry> {
+        let flow = match &self.flow {
+            Some(flow) => Some(flow.upgrade()?),
+            None => None,
+        };
+        Some(RecipientEntry {
+            root: self.root.upgrade()?,
+            header: self.header.upgrade()?,
+            flow,
+            entry: self.entry.upgrade()?,
+            plain: self.plain,
+            tokens: self.tokens.clone(),
+            popover: self.popover.upgrade()?,
+            suggestion_list: self.suggestion_list.upgrade()?,
+            suggestions: self.suggestions.clone(),
+            source: self.source.clone(),
+            suggestion_generation: self.suggestion_generation.clone(),
+            changed: self.changed.clone(),
+            person_card: self.person_card.clone(),
+        })
+    }
+}
+
 /// Callback slot for [`RecipientEntry::set_person_card_hook`]: the chip's
 /// name label and the address behind it.
 pub type PersonCardHook = Rc<dyn Fn(&gtk::Label, &EmailAddress)>;
@@ -308,6 +356,17 @@ impl RecipientEntry {
             .has_arrow(false)
             .build();
         popover.set_parent(&entry);
+        // GTK only unparents a widget's own children when it is disposed, so
+        // the popover (a child we added) is detached here, or it outlives the
+        // field with the parent's reference never released.
+        {
+            let popover = popover.downgrade();
+            entry.connect_destroy(move |_| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.unparent();
+                }
+            });
+        }
 
         let this = RecipientEntry {
             root,
@@ -499,6 +558,25 @@ impl RecipientEntry {
         self.notify_changed();
     }
 
+    /// A handle for the field's own handlers (see [`WeakRecipientEntry`]).
+    fn downgrade(&self) -> WeakRecipientEntry {
+        WeakRecipientEntry {
+            root: self.root.downgrade(),
+            header: self.header.downgrade(),
+            flow: self.flow.as_ref().map(|flow| flow.downgrade()),
+            entry: self.entry.downgrade(),
+            plain: self.plain,
+            tokens: self.tokens.clone(),
+            popover: self.popover.downgrade(),
+            suggestion_list: self.suggestion_list.downgrade(),
+            suggestions: self.suggestions.clone(),
+            source: self.source.clone(),
+            suggestion_generation: self.suggestion_generation.clone(),
+            changed: self.changed.clone(),
+            person_card: self.person_card.clone(),
+        }
+    }
+
     fn connect_handlers(&self) {
         // Enter commits either the highlighted completion or the typed text.
         // Chip mode turns it into a chip; plain mode normalizes the trailing
@@ -506,8 +584,9 @@ impl RecipientEntry {
         // confirmed, or picked from the popover - ends up comma-separated
         // from whatever comes next.
         {
-            let this = self.clone();
+            let this = self.downgrade();
             self.entry.connect_activate(move |_| {
+                let Some(this) = this.upgrade() else { return };
                 if this.take_selected_suggestion() {
                     return;
                 }
@@ -526,8 +605,9 @@ impl RecipientEntry {
         // comma/semicolon), since there's no separate pending-text buffer to
         // consult.
         {
-            let this = self.clone();
+            let this = self.downgrade();
             self.entry.connect_changed(move |entry| {
+                let Some(this) = this.upgrade() else { return };
                 this.notify_changed();
                 let text = entry.text().to_string();
                 if this.plain {
@@ -545,45 +625,50 @@ impl RecipientEntry {
         }
 
         {
-            let this = self.clone();
+            let this = self.downgrade();
             let keys = gtk::EventControllerKey::new();
-            keys.connect_key_pressed(move |_, key, _, _| match key {
-                gtk::gdk::Key::BackSpace if !this.plain && this.entry.text().is_empty() => {
-                    this.tokens.borrow_mut().pop();
-                    this.rebuild_chips();
-                    this.notify_changed();
-                    glib::Propagation::Stop
+            keys.connect_key_pressed(move |_, key, _, _| {
+                let Some(this) = this.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
+                match key {
+                    gtk::gdk::Key::BackSpace if !this.plain && this.entry.text().is_empty() => {
+                        this.tokens.borrow_mut().pop();
+                        this.rebuild_chips();
+                        this.notify_changed();
+                        glib::Propagation::Stop
+                    }
+                    // Tab would otherwise move focus with a token half-entered
+                    // (chip mode) or a completion left un-accepted (plain mode).
+                    gtk::gdk::Key::Tab if !this.plain && !this.entry.text().trim().is_empty() => {
+                        this.commit_entry_text();
+                        glib::Propagation::Stop
+                    }
+                    gtk::gdk::Key::Tab if this.plain && this.popover.is_visible() => {
+                        this.take_selected_suggestion();
+                        glib::Propagation::Stop
+                    }
+                    // Tabbing away from a manually typed (not suggestion-picked)
+                    // address still comma-separates it, same as Enter - but lets
+                    // focus actually move on, unlike Enter.
+                    gtk::gdk::Key::Tab if this.plain && !this.entry.text().trim().is_empty() => {
+                        this.finish_plain_segment();
+                        glib::Propagation::Proceed
+                    }
+                    gtk::gdk::Key::Down => {
+                        this.move_suggestion_selection(1);
+                        glib::Propagation::Stop
+                    }
+                    gtk::gdk::Key::Up => {
+                        this.move_suggestion_selection(-1);
+                        glib::Propagation::Stop
+                    }
+                    gtk::gdk::Key::Escape if this.popover.is_visible() => {
+                        this.popover.popdown();
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
                 }
-                // Tab would otherwise move focus with a token half-entered
-                // (chip mode) or a completion left un-accepted (plain mode).
-                gtk::gdk::Key::Tab if !this.plain && !this.entry.text().trim().is_empty() => {
-                    this.commit_entry_text();
-                    glib::Propagation::Stop
-                }
-                gtk::gdk::Key::Tab if this.plain && this.popover.is_visible() => {
-                    this.take_selected_suggestion();
-                    glib::Propagation::Stop
-                }
-                // Tabbing away from a manually typed (not suggestion-picked)
-                // address still comma-separates it, same as Enter - but lets
-                // focus actually move on, unlike Enter.
-                gtk::gdk::Key::Tab if this.plain && !this.entry.text().trim().is_empty() => {
-                    this.finish_plain_segment();
-                    glib::Propagation::Proceed
-                }
-                gtk::gdk::Key::Down => {
-                    this.move_suggestion_selection(1);
-                    glib::Propagation::Stop
-                }
-                gtk::gdk::Key::Up => {
-                    this.move_suggestion_selection(-1);
-                    glib::Propagation::Stop
-                }
-                gtk::gdk::Key::Escape if this.popover.is_visible() => {
-                    this.popover.popdown();
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
             });
             self.entry.add_controller(keys);
         }
@@ -591,9 +676,11 @@ impl RecipientEntry {
         // Clicking a completion is equivalent to highlighting it and pressing
         // Enter.
         {
-            let this = self.clone();
+            let this = self.downgrade();
             self.suggestion_list.connect_row_activated(move |_, row| {
-                this.accept_suggestion(row.index());
+                if let Some(this) = this.upgrade() {
+                    this.accept_suggestion(row.index());
+                }
             });
         }
 
@@ -702,8 +789,9 @@ impl RecipientEntry {
             .tooltip_text("Remove recipient")
             .build();
         {
-            let this = self.clone();
+            let this = self.downgrade();
             remove.connect_clicked(move |_| {
+                let Some(this) = this.upgrade() else { return };
                 // Read the index at click time from the position the chip was
                 // built at: a rebuild recreates every chip, so a handler can
                 // never outlive its own row.
@@ -762,8 +850,9 @@ impl RecipientEntry {
             .tooltip_text(if expanded { "Collapse contact list" } else { "Expand contact list" })
             .build();
         {
-            let this = self.clone();
+            let this = self.downgrade();
             toggle.connect_clicked(move |_| {
+                let Some(this) = this.upgrade() else { return };
                 let mut tokens = this.tokens.borrow_mut();
                 if let Some(Chip::List { expanded, .. }) = tokens.get_mut(index) {
                     *expanded = !*expanded;
@@ -778,8 +867,9 @@ impl RecipientEntry {
             .tooltip_text("Remove contact list")
             .build();
         {
-            let this = self.clone();
+            let this = self.downgrade();
             remove.connect_clicked(move |_| {
+                let Some(this) = this.upgrade() else { return };
                 let mut tokens = this.tokens.borrow_mut();
                 if index < tokens.len() {
                     tokens.remove(index);
@@ -816,8 +906,9 @@ impl RecipientEntry {
             .tooltip_text("Remove from list")
             .build();
         {
-            let this = self.clone();
+            let this = self.downgrade();
             remove.connect_clicked(move |_| {
+                let Some(this) = this.upgrade() else { return };
                 let mut tokens = this.tokens.borrow_mut();
                 if let Some(Chip::List { members, .. }) = tokens.get_mut(list_index) {
                     if member_index < members.len() {
@@ -858,11 +949,19 @@ impl RecipientEntry {
             self.apply_suggestions(generation, Vec::new());
             return;
         }
-        let this = self.clone();
+        let this = self.downgrade();
         // Multi-shot: a `source` may deliver the stored-contact half at once
         // and the merged stored-plus-directory result afterwards. Both carry
         // the same generation, so the later delivery simply rebuilds the list.
-        source(&prefix, Rc::new(move |matches| this.apply_suggestions(generation, matches)));
+        // Weak, so a slow lookup can't keep a closed field alive.
+        source(
+            &prefix,
+            Rc::new(move |matches| {
+                if let Some(this) = this.upgrade() {
+                    this.apply_suggestions(generation, matches);
+                }
+            }),
+        );
     }
 
     /// The "apply results to the popover" half of a suggestion lookup,

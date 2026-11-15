@@ -751,40 +751,44 @@ pub(crate) const WEB_VIEW_ZOOM_STEP: f64 = 0.1;
 /// controller, so it works in the reading pane, the popped-out message window
 /// and the composer - and only while that view has focus.
 pub(crate) fn install_web_view_zoom(web_view: &webkit::WebView) {
+    // Both controllers reach the view through `controller.widget()`: the view
+    // owns them, so a captured clone would be a cycle that keeps every closed
+    // composer's and message window's WebView alive.
+    let view_of = |controller: &gtk::EventController| controller.widget().and_downcast::<webkit::WebView>();
     let key = gtk::EventControllerKey::new();
-    {
-        let web_view = web_view.clone();
-        key.connect_key_pressed(move |_controller, keyval, _keycode, state| {
-            use gtk::gdk::Key;
-            if !state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-                return glib::Propagation::Proceed;
-            }
-            let current = web_view.zoom_level();
-            let next = match keyval {
-                Key::equal | Key::plus | Key::KP_Add => current + WEB_VIEW_ZOOM_STEP,
-                Key::minus | Key::KP_Subtract => current - WEB_VIEW_ZOOM_STEP,
-                Key::_0 | Key::KP_0 => 1.0,
-                _ => return glib::Propagation::Proceed,
-            };
-            web_view.set_zoom_level(next.clamp(WEB_VIEW_MIN_ZOOM, WEB_VIEW_MAX_ZOOM));
-            glib::Propagation::Stop
-        });
-    }
+    key.connect_key_pressed(move |controller, keyval, _keycode, state| {
+        use gtk::gdk::Key;
+        if !state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(web_view) = view_of(controller.upcast_ref()) else {
+            return glib::Propagation::Proceed;
+        };
+        let current = web_view.zoom_level();
+        let next = match keyval {
+            Key::equal | Key::plus | Key::KP_Add => current + WEB_VIEW_ZOOM_STEP,
+            Key::minus | Key::KP_Subtract => current - WEB_VIEW_ZOOM_STEP,
+            Key::_0 | Key::KP_0 => 1.0,
+            _ => return glib::Propagation::Proceed,
+        };
+        web_view.set_zoom_level(next.clamp(WEB_VIEW_MIN_ZOOM, WEB_VIEW_MAX_ZOOM));
+        glib::Propagation::Stop
+    });
     web_view.add_controller(key);
 
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
-    {
-        let web_view = web_view.clone();
-        scroll.connect_scroll(move |controller, _dx, dy| {
-            if dy == 0.0 || !controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
-                return glib::Propagation::Proceed;
-            }
-            let current = web_view.zoom_level();
-            let next = if dy < 0.0 { current + WEB_VIEW_ZOOM_STEP } else { current - WEB_VIEW_ZOOM_STEP };
-            web_view.set_zoom_level(next.clamp(WEB_VIEW_MIN_ZOOM, WEB_VIEW_MAX_ZOOM));
-            glib::Propagation::Stop
-        });
-    }
+    scroll.connect_scroll(move |controller, _dx, dy| {
+        if dy == 0.0 || !controller.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(web_view) = view_of(controller.upcast_ref()) else {
+            return glib::Propagation::Proceed;
+        };
+        let current = web_view.zoom_level();
+        let next = if dy < 0.0 { current + WEB_VIEW_ZOOM_STEP } else { current - WEB_VIEW_ZOOM_STEP };
+        web_view.set_zoom_level(next.clamp(WEB_VIEW_MIN_ZOOM, WEB_VIEW_MAX_ZOOM));
+        glib::Propagation::Stop
+    });
     web_view.add_controller(scroll);
 }
 

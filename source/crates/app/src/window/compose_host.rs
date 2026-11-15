@@ -369,6 +369,9 @@ pub(crate) fn show_composer_in_reading_pane_full(
             // identities-refresh hook so a later Config manage-identities
             // edit doesn't poke a dead dropdown.
             st.draft_saved_tx = None;
+            // The failure relay's consumer holds the composer's status label,
+            // so it goes too.
+            st.draft_save_failed_tx = None;
             st.composer_identities_refresh = None;
         }
         // Close this composer's own pop-out window when it finishes -
