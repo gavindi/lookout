@@ -22,7 +22,7 @@ use lookout_mail::session::AccountCommand;
 use lookout_mail::SearchScope;
 
 use crate::calendar_colors;
-use crate::contacts_view::{find_contact_by_address, ContactCommand, ContactsAccountSnapshot};
+use crate::contacts_view::{ContactCommand, ContactsAccountSnapshot};
 use crate::google_tasks::{GoogleTasksCommand, TaskList};
 use crate::last_view::LastSelection;
 use crate::message_list::{SortKey, ThreadId};
@@ -496,19 +496,104 @@ pub(crate) fn update_row_display(registry: &Rc<RefCell<Vec<RowDisplayRefs>>>, di
     });
 }
 
-/// The sender's contact photo as a decoded texture, memoized per address in
-/// `cache`. `None` when there is no contact for the address, no photo on the
-/// card, or the photo can't be decoded - all of which fall back to initials.
-pub(crate) fn sender_photo_texture(state: &Rc<RefCell<UiState>>, address: &str, cache: &Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>>) -> Option<gtk::gdk::Texture> {
-    if let Some(cached) = cache.borrow().get(address) {
-        return cached.clone();
+/// How many senders the message list keeps a decoded photo (or a "no photo")
+/// for. Comfortably more than a screenful of rows, so scrolling back and forth
+/// stays a cache hit.
+pub(crate) const SENDER_PHOTO_CACHE_CAPACITY: usize = 256;
+
+/// The longest side a cached sender photo is decoded to. The list's avatar is
+/// 32 px, so this covers up to 3x display scaling; a contact photo is often
+/// hundreds of pixels across, and decoded at full size it took about 1-1.6 MB.
+pub(crate) const SENDER_PHOTO_SIZE: i32 = 96;
+
+/// The message list's decoded sender photos, keyed by address. A sender with
+/// no photo is cached too, so the address-book scan runs once per sender. It
+/// holds at most `capacity` senders, dropping the least recently used, and
+/// empties itself when the contacts change (`UiState::contacts_generation`),
+/// so an edited or newly synced photo shows on the next bind. It used to keep
+/// a full-size texture for every sender ever shown, for the whole session
+/// (MEMORY_OPTIMISATION1.md finding 5).
+pub(crate) struct SenderPhotoCache {
+    capacity: usize,
+    /// The `contacts_generation` the entries were loaded under.
+    generation: u64,
+    /// Bumped on every lookup; each entry records the value at its last use.
+    clock: u64,
+    entries: HashMap<String, (Option<gtk::gdk::Texture>, u64)>,
+}
+
+impl SenderPhotoCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        SenderPhotoCache {
+            capacity: capacity.max(1),
+            generation: 0,
+            clock: 0,
+            entries: HashMap::new(),
+        }
     }
-    let texture = find_contact_by_address(state, address, None)
-        .and_then(|(_, entry)| Rc::unwrap_or_clone(entry.record).card.photo)
-        .and_then(|photo| photo.data)
-        .and_then(|data| gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok());
-    cache.borrow_mut().insert(address.to_string(), texture.clone());
-    texture
+
+    /// The cached photo for `address`, or what `load` returns for it (then
+    /// cached). Entries from an older `generation` are dropped first.
+    pub(crate) fn get_or_load(&mut self, generation: u64, address: &str, load: impl FnOnce() -> Option<gtk::gdk::Texture>) -> Option<gtk::gdk::Texture> {
+        if generation != self.generation {
+            self.entries.clear();
+            self.generation = generation;
+        }
+        self.clock += 1;
+        if let Some((texture, used)) = self.entries.get_mut(address) {
+            *used = self.clock;
+            return texture.clone();
+        }
+        let texture = load();
+        if self.entries.len() >= self.capacity {
+            // O(capacity), but only on a miss with the cache full.
+            let oldest = self.entries.iter().min_by_key(|(_, (_, used))| *used).map(|(address, _)| address.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(address.to_string(), (texture.clone(), self.clock));
+        texture
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The sender's contact photo as a texture at most [`SENDER_PHOTO_SIZE`]
+/// across, through `cache`. `None` when there is no contact for the address,
+/// no photo on the card, or the photo can't be decoded - all of which fall
+/// back to initials. The contact is borrowed, not copied, on a miss.
+pub(crate) fn sender_photo_texture(state: &Rc<RefCell<UiState>>, address: &str, cache: &RefCell<SenderPhotoCache>) -> Option<gtk::gdk::Texture> {
+    let generation = state.borrow().contacts_generation;
+    cache.borrow_mut().get_or_load(generation, address, || {
+        let st = state.borrow();
+        let (_, _, record) = crate::contacts_view::find_contact_record(&st, address, None)?;
+        let data = record.card.photo.as_ref()?.data.as_deref()?;
+        decode_avatar_texture(data, SENDER_PHOTO_SIZE)
+    })
+}
+
+/// Decodes an image to a texture that fits in `size` x `size`, keeping its
+/// aspect ratio. Falls back to a full-size decode for a format gdk-pixbuf has
+/// no loader for, as the photo was decoded before.
+pub(crate) fn decode_avatar_texture(data: &[u8], size: i32) -> Option<gtk::gdk::Texture> {
+    let bytes = glib::Bytes::from(data);
+    let stream = gio::MemoryInputStream::from_bytes(&bytes);
+    match gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, size, size, true, gio::Cancellable::NONE) {
+        Ok(pixbuf) => {
+            let format = if pixbuf.has_alpha() {
+                gtk::gdk::MemoryFormat::R8g8b8a8
+            } else {
+                gtk::gdk::MemoryFormat::R8g8b8
+            };
+            let texture = gtk::gdk::MemoryTexture::new(pixbuf.width(), pixbuf.height(), format, &pixbuf.read_pixel_bytes(), pixbuf.rowstride() as usize);
+            Some(texture.upcast())
+        }
+        Err(_) => gtk::gdk::Texture::from_bytes(&bytes).ok(),
+    }
 }
 
 /// Per-row widgets for the folder tree rows, stored under a `set_data` key on
@@ -1245,6 +1330,9 @@ pub(crate) struct UiState {
     /// composer autocomplete). Owned by the People screen module
     /// (`contacts_view`), read by the composer/attendees here.
     pub(crate) contacts_by_account: HashMap<AccountId, ContactsAccountSnapshot>,
+    /// Bumped whenever `contacts_by_account` changes, so derived caches (the
+    /// message list's sender photos, `SenderPhotoCache`) know to start over.
+    pub(crate) contacts_generation: u64,
     /// Contacts starred via the People screen's row toggle, keyed by
     /// `(account, contact_identity)`. Local-only: never written back to the
     /// vCard or synced to the server, so it resets if the identity a contact

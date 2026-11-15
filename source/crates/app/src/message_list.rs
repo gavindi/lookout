@@ -1263,11 +1263,13 @@ pub struct MessageListModel {
     /// outlive any individual rebuild: a `TreeListRow` that survives a
     /// `splice` still holds the child model it was given, so swapping in a
     /// fresh store would leave that row pointing at a discarded one.
-    /// Rebuilds splice *into* these instead.
+    /// Rebuilds splice *into* these instead. A group that leaves the layout is
+    /// forgotten once its row is gone (`prune_sections`).
     sections: Rc<RefCell<HashMap<GroupKey, TrackedStore>>>,
     /// One child store per conversation, for the thread rows' own children -
     /// the third tree level, only populated while threading is on. Same
-    /// outlive-the-rebuild discipline and diff-target pairing as `sections`.
+    /// outlive-the-rebuild discipline and diff-target pairing as `sections`;
+    /// a conversation that leaves the layout is forgotten (`clear_threads`).
     threads: Rc<RefCell<HashMap<ThreadId, TrackedStore>>>,
     /// Sections the user has collapsed. Collapse is the exception, so an
     /// absent group means expanded and a newly-appearing section defaults
@@ -1851,6 +1853,7 @@ impl MessageListModel {
                 );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
+                self.prune_sections(&live);
                 self.apply_expansion();
             }
             ListLayout::Threaded(sections) => {
@@ -1919,6 +1922,7 @@ impl MessageListModel {
                 );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
                 splice_diff(&self.root, &old_keys, &new_keys, &rows);
+                self.prune_sections(&live_groups);
                 self.apply_expansion();
             }
         }
@@ -2046,11 +2050,17 @@ impl MessageListModel {
         }
     }
 
-    /// Empties every conversation store whose thread id isn't in `live` - the
-    /// `sections`-level counterpart for the threads map. Called whenever the
-    /// new layout holds no thread rows at all (grouped layouts pass an empty
-    /// set), so a stale thread store can never resurface its old messages
-    /// under a row the next threaded rebuild re-creates for the same id.
+    /// Empties and forgets every conversation store whose thread id isn't in
+    /// `live` (grouped layouts pass an empty set), so a stale thread store can
+    /// never resurface its old messages under a row the next threaded rebuild
+    /// re-creates for the same id.
+    ///
+    /// Unlike a section store, a stale thread store can be dropped here: both
+    /// layout arms call this after every section store has been spliced and
+    /// `clear_sections` has emptied the stale ones, so no row left in the tree
+    /// still holds it. Keeping the entries made the map grow with every
+    /// conversation ever shown, and every rebuild walk all of them
+    /// (MEMORY_OPTIMISATION1.md finding 5).
     fn clear_threads(&self, live: &HashSet<ThreadId>) {
         let stale: Vec<(ThreadId, gio::ListStore)> = self
             .threads
@@ -2064,10 +2074,18 @@ impl MessageListModel {
         }
         let mut threads = self.threads.borrow_mut();
         for (id, _) in &stale {
-            if let Some(tracked) = threads.get_mut(id) {
-                tracked.keys.clear();
-            }
+            threads.remove(id);
         }
+    }
+
+    /// Forgets the section stores whose group isn't in `live`. Only safe once
+    /// the root splice has removed those groups' rows: until then a stale
+    /// `Section` row still holds its store (see the `sections` field's note),
+    /// which is why `clear_sections` only empties them. Bounds the map to the
+    /// groups on screen; a From or Subject grouping would otherwise keep one
+    /// entry per sender or subject ever shown.
+    fn prune_sections(&self, live: &HashSet<GroupKey>) {
+        self.sections.borrow_mut().retain(|group, _| live.contains(group));
     }
 
     /// Splices the Pinned section's message rows into its own
@@ -3998,5 +4016,53 @@ mod tests {
         assert!(FocusedView::All.matches(&focused) && FocusedView::All.matches(&other));
         assert!(FocusedView::Focused.matches(&focused) && !FocusedView::Focused.matches(&other));
         assert!(!FocusedView::Other.matches(&focused) && FocusedView::Other.matches(&other));
+    }
+
+    /// The per-conversation and per-group child stores only cover what is on
+    /// screen: a conversation that leaves the list, or every conversation when
+    /// threading is switched off, is forgotten, and so is a group that empties
+    /// out. They used to stay in the maps for the life of the list, so the
+    /// maps grew with every conversation and sender ever shown and each
+    /// rebuild walked all of them (MEMORY_OPTIMISATION1.md finding 5). The
+    /// rows that stay keep working across the pruning rebuilds.
+    #[test]
+    fn child_stores_are_dropped_when_their_rows_leave_the_list() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let today = Utc::now();
+        let earlier = today - chrono::Duration::hours(1);
+        let model = MessageListModel::build();
+        model.set_threaded(true);
+        let thread = |uid: u32, key: &str, at| in_thread(summary(uid, at), key);
+        let live_threads = |model: &MessageListModel| -> HashSet<String> { model.threads.borrow().keys().map(|(_, key)| key.0.clone()).collect() };
+
+        model.repopulate(
+            vec![thread(1, "a", earlier), thread(2, "a", today), thread(3, "b", earlier), thread(4, "b", today)],
+            SortKey::Date,
+            true,
+        );
+        assert_eq!(live_threads(&model), HashSet::from(["a".to_string(), "b".to_string()]));
+
+        // "a" leaves the folder: its store goes, "b" keeps its own.
+        model.repopulate(vec![thread(3, "b", earlier), thread(4, "b", today)], SortKey::Date, true);
+        assert_eq!(live_threads(&model), HashSet::from(["b".to_string()]));
+        // Today's header + b's header + its two messages.
+        assert_eq!(model.selection.n_items(), 4, "the surviving conversation still shows its messages");
+
+        // Threading off: no conversation rows, so no conversation stores.
+        model.set_threaded(false);
+        assert!(model.threads.borrow().is_empty(), "flat layouts keep no thread stores");
+
+        // A Sender grouping, then a regroup by date: the sender groups go.
+        let mut alice = from_alice(summary(5, today));
+        alice.thread_key = ThreadKey("c".into());
+        model.repopulate(vec![alice.clone(), summary(6, today)], SortKey::Sender, true);
+        let sender_groups = model.sections.borrow().len();
+        assert!(sender_groups >= 2, "Alice and the senderless group");
+        model.repopulate(vec![alice, summary(6, today)], SortKey::Date, true);
+        let groups: Vec<GroupKey> = model.sections.borrow().keys().cloned().collect();
+        assert_eq!(groups.len(), 1, "only the Today group is left: {groups:?}");
+        assert_eq!(model.selection.n_items(), 3, "Today's header and both messages");
     }
 }

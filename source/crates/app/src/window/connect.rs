@@ -1835,6 +1835,7 @@ pub(crate) fn teardown_goa_account(
     if services.contacts {
         let mut st = state.borrow_mut();
         st.contacts_by_account.remove(account_id);
+        st.contacts_generation += 1;
         st.deleted_contacts.remove(account_id);
         st.contact_cmd_tx.remove(account_id);
         drop(st);

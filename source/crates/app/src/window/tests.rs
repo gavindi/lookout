@@ -742,6 +742,7 @@ fn test_state(accounts: Vec<(AccountId, Vec<Mailbox>)>) -> Rc<RefCell<UiState>> 
         accounts,
         pending_launcher_compose: false,
         contacts_by_account: HashMap::new(),
+        contacts_generation: 0,
         starred_contacts: HashSet::new(),
         contacts_filter: String::new(),
         contacts_refresh: None,
@@ -3448,4 +3449,54 @@ fn profile_card_triggers_do_not_keep_their_row_alive() {
     ];
     drop((hover, avatar, sender, name, row));
     crate::gtk_test::assert_freed(&watched);
+}
+
+/// The sender-photo cache holds at most its capacity, drops the least
+/// recently used sender first, caches "no photo" too, and starts over when
+/// the contacts change. It used to keep every sender ever shown, at full
+/// size, for the whole session (MEMORY_OPTIMISATION1.md finding 5).
+#[test]
+fn sender_photo_cache_is_bounded_lru_and_resets_on_contact_changes() {
+    let loads = Cell::new(0);
+    let load = || {
+        loads.set(loads.get() + 1);
+        None
+    };
+    let mut cache = SenderPhotoCache::new(2);
+    cache.get_or_load(0, "a@example.com", load);
+    cache.get_or_load(0, "b@example.com", load);
+    assert_eq!(loads.get(), 2);
+    cache.get_or_load(0, "a@example.com", load);
+    assert_eq!(loads.get(), 2, "a miss (no photo) is cached too");
+
+    // "b" is now the least recently used, so "c" evicts it and not "a".
+    cache.get_or_load(0, "c@example.com", load);
+    assert_eq!(cache.len(), 2, "never more than the capacity");
+    cache.get_or_load(0, "a@example.com", load);
+    assert_eq!(loads.get(), 3, "a stayed cached");
+    cache.get_or_load(0, "b@example.com", load);
+    assert_eq!(loads.get(), 4, "b was evicted and loads again");
+
+    // A contacts change (a new generation) empties the cache.
+    cache.get_or_load(1, "a@example.com", load);
+    assert_eq!(loads.get(), 5, "an edited contact's photo is looked up again");
+    assert_eq!(cache.len(), 1);
+}
+
+/// A large contact photo is decoded to avatar size, not kept at full size.
+#[test]
+fn avatar_textures_are_decoded_to_avatar_size() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 640, 480).expect("pixbuf");
+    pixbuf.fill(0x3584e4ff);
+    let png = pixbuf.save_to_bufferv("png", &[]).expect("png");
+    let texture = decode_avatar_texture(&png, SENDER_PHOTO_SIZE).expect("decodes");
+    assert_eq!(
+        (texture.width(), texture.height()),
+        (SENDER_PHOTO_SIZE, SENDER_PHOTO_SIZE * 3 / 4),
+        "scaled to fit, aspect kept"
+    );
+    assert!(decode_avatar_texture(b"not an image", SENDER_PHOTO_SIZE).is_none());
 }

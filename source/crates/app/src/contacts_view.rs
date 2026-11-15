@@ -758,13 +758,34 @@ pub fn show_new_contact_editor(window: &adw::ApplicationWindow, state: &Rc<RefCe
 /// Returns the owning account and a [`ContactsListEntry`] the editor flows
 /// can act on; `None` when no contact has that address.
 pub fn find_contact_by_address(state: &Rc<RefCell<UiState>>, address: &str, preferred_account: Option<&AccountId>) -> Option<(AccountId, ContactsListEntry)> {
+    let st = state.borrow();
+    let (account_id, snapshot, record) = find_contact_record(&st, address, preferred_account)?;
+    Some((
+        account_id.clone(),
+        ContactsListEntry {
+            account_id: account_id.clone(),
+            account_label: snapshot.display_name.clone(),
+            category_label: contacts_bucket_label(&ContactsBucketKind::AllContacts),
+            record: Rc::new(record.clone()),
+        },
+    ))
+}
+
+/// [`find_contact_by_address`]'s search, borrowing the match from `st`
+/// instead of copying it - for callers that only read a field or two (the
+/// message list's sender photos), where cloning the whole record, photo
+/// bytes included, on every lookup was the bulk of the cost.
+pub(crate) fn find_contact_record<'a>(
+    st: &'a UiState,
+    address: &str,
+    preferred_account: Option<&AccountId>,
+) -> Option<(&'a AccountId, &'a ContactsAccountSnapshot, &'a lookout_dav::ContactRecord)> {
     let needle = address.trim().to_lowercase();
     if needle.is_empty() {
         return None;
     }
-    let st = state.borrow();
     let mut accounts: Vec<(&AccountId, &ContactsAccountSnapshot)> = st.contacts_by_account.iter().collect();
-    accounts.sort_by_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
+    accounts.sort_by_cached_key(|(_, snapshot)| snapshot.display_name.to_lowercase());
     // The email's own account scans first - its contacts are the most likely
     // home for the sender - and the rest follow in display-name order.
     if let Some(preferred) = preferred_account {
@@ -773,23 +794,13 @@ pub fn find_contact_by_address(state: &Rc<RefCell<UiState>>, address: &str, pref
             accounts.insert(0, (id, snapshot));
         }
     }
-    for (account_id, snapshot) in accounts {
-        for record in &snapshot.contacts {
-            let matched = record.card.emails.iter().any(|email| email.address.trim().to_lowercase() == needle);
-            if matched {
-                return Some((
-                    account_id.clone(),
-                    ContactsListEntry {
-                        account_id: account_id.clone(),
-                        account_label: snapshot.display_name.clone(),
-                        category_label: contacts_bucket_label(&ContactsBucketKind::AllContacts),
-                        record: Rc::new(record.clone()),
-                    },
-                ));
-            }
-        }
-    }
-    None
+    accounts.into_iter().find_map(|(account_id, snapshot)| {
+        snapshot
+            .contacts
+            .iter()
+            .find(|record| record.card.emails.iter().any(|email| email.address.trim().to_lowercase() == needle))
+            .map(|record| (account_id, snapshot, record))
+    })
 }
 
 /// Opens the contact editor's create form prefilled with `sender` - the
@@ -2626,6 +2637,7 @@ pub fn sync_contacts_account(
                         }
                     }
                     st.contacts_by_account.insert(account_id.clone(), contacts);
+                    st.contacts_generation += 1;
                     drop(st);
                     // The local Focused Inbox classifier treats any contact as
                     // a known sender (M-03 / item 2.12); push the new union to

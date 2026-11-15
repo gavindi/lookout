@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.317" date="2026-11-15">
+      <description>
+        <p>Further reduces memory use over long sessions. The message list no longer keeps data for conversations and groups that have left the list, and sender pictures are kept at the size they are shown, for a limited number of recent senders. A contact's edited picture now appears in the message list without restarting Lookout.</p>
+      </description>
+    </release>
     <release version="0.9.316" date="2026-11-15">
       <description>
         <p>Fixes memory use that kept growing the longer Lookout ran, by about a gigabyte an hour. The calendar, folder and task lists, the message list, and menus such as attachment, flag and snooze menus now release their memory once they are replaced or closed, as do closed message windows.</p>

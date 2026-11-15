@@ -657,6 +657,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         accounts: HashMap::new(),
         pending_launcher_compose: false,
         contacts_by_account: HashMap::new(),
+        contacts_generation: 0,
         starred_contacts,
         contacts_filter: String::new(),
         contacts_refresh: None,
@@ -915,10 +916,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // widgets and won't rebind them for an unrelated setting change).
     let row_display_registry: Rc<RefCell<Vec<RowDisplayRefs>>> = Rc::new(RefCell::new(Vec::new()));
     let row_display_registry_for_setup = row_display_registry.clone();
-    // Decoded contact-photo textures, keyed by sender address. A miss (or a
-    // contact with no photo) is cached too, so the address-book lookup and
-    // the base64 decode run at most once per sender per session.
-    let sender_photo_cache: Rc<RefCell<HashMap<String, Option<gtk::gdk::Texture>>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Decoded contact photos for the rows' avatars, keyed by sender address
+    // (bounded, avatar-sized, and reset when the contacts change - see
+    // `SenderPhotoCache`).
+    let sender_photo_cache: Rc<RefCell<SenderPhotoCache>> = Rc::new(RefCell::new(SenderPhotoCache::new(SENDER_PHOTO_CACHE_CAPACITY)));
     let worker_for_rows = worker.clone();
     let message_factory = gtk::SignalListItemFactory::new();
     message_factory.connect_setup(move |_, list_item| {
@@ -1549,7 +1550,12 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // applies them, so a freshly recycled row comes out correct. Both
         // preview labels are registered: the same row widget renders either a
         // message row or a conversation header.
-        row_display_registry_for_setup.borrow_mut().push(RowDisplayRefs {
+        // Rows GTK has since freed leave dead entries behind; drop them here
+        // as well as on a setting change, or the registry would grow with
+        // every row the list ever created (one handful of live rows to scan).
+        let mut registry = row_display_registry_for_setup.borrow_mut();
+        registry.retain(|refs| refs.avatar.upgrade().is_some());
+        registry.push(RowDisplayRefs {
             avatar: avatar.downgrade(),
             checkbox: checkbox.downgrade(),
             preview_label: preview_label.downgrade(),
@@ -1560,6 +1566,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             thread_single_line: thread_single_line_wrapper.downgrade(),
             thread_expander: thread_expander.downgrade(),
         });
+        drop(registry);
 
         let row_box = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
         row_box.append(&header_box);

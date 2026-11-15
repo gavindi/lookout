@@ -18,6 +18,25 @@ So this is a steady leak on the **GTK main thread**, not a one-off load and not 
 
 The code was read, not profiled: `ptrace_scope=1` blocks reading the heap without sudo, and the app was not relaunched. Three independent passes over the code (UI caches, mail data and channels, rendering and widgets) agree on the main cause. I checked the top items myself in the code.
 
+## Status (2026-11-15)
+
+| Phase | State | Release |
+|---|---|---|
+| 0: measure | Done: a real leak, mostly the calendar sidebar | measured on 0.9.315 |
+| 1: break widget reference cycles | Done, except the composer and the event editor | 0.9.316 (memory steady at ~600 MB, user report) |
+| 2: stop rebuilding when nothing changed | Not started | |
+| 3: bound the Rust collections | Done; not yet run in the real app | 0.9.317 |
+| 4: cut duplicate copies | Not started | |
+| 5: stop tests polluting the real cache | Not started | |
+
+**Next step: the composer.**
+1. Write a GTK test that opens and closes a composer (`build_compose_view`, with a WebKit view under Broadway) and asserts that its widgets are freed. That shows which cycles really remain.
+2. Break them by disconnecting the composer's handlers when it closes (`on_done`), rather than restructuring how `AutosaveCtx` is shared.
+
+**Open side item:** this machine's clippy (1.92) flags `nonminimal_bool` at `crates/mail/src/session.rs:274`, which is older than this work. Until it is fixed, the clippy command needs `-A clippy::nonminimal_bool`.
+
+**Line numbers:** those in "Findings" and in the Phase 1 site list are from 0.9.315, before the fixes, and no longer match the code. For example, the folder row setup at `window.rs:203-363` is now `build_folder_row`.
+
 ## Phase 0 results (measured 2026-11-15)
 
 **Setup:** installed `/usr/bin/lookout` 0.9.315, on real accounts, run for 51 minutes with an `LD_PRELOAD` probe.
@@ -58,7 +77,9 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 
 **Another test leftover:** `~/.cache/lookout/calendar` also holds 1,165 `eds-mirror-test-*` caches.
 
-## Phase 1 results (2026-11-15, not yet run in the real app)
+## Phase 1 results (2026-11-15, released as 0.9.316)
+
+**In the running app (0.9.316, user report):** memory stays steady at about 600 MB, instead of the ~1 GB/hour growth Phase 0 measured. Popover instance counts were not measured.
 
 **Fixed (handler no longer holds its own widget or an ancestor):**
 - Calendar row menu swatches (finding 2) and folder row menu (finding 1): swatches hold the popover weakly; `dispatch_folder` holds the button weakly. `ContextMenu::popdown` was removed, because its only callers were these leaking closures.
@@ -84,6 +105,29 @@ With the old swatch capture put back, the checklist test fails with exactly the 
 - The composer may still leak as a whole: `AutosaveCtx` holds ~20 composer widgets and is captured by many handlers inside it. This needs an instance-count check in the running app, or a teardown that breaks the handlers.
 - The event editor (`recurrence.rs`, `room_finder.rs`) was not reviewed.
 - The ribbon's More / Move to / Quick steps popovers hold themselves too, but they are singletons whose rebuilt contents free normally, so they were left alone.
+
+## Phase 3 results (2026-11-15, released as 0.9.317, not yet run in the real app)
+
+**Done:**
+- **`MessageListModel`:**
+  - `clear_threads` now removes stale conversation stores instead of only emptying them.
+  - A new `prune_sections` removes stale group stores after the root splice. Until that splice, a stale `Section` row still holds its store, so it can't be removed earlier.
+  - Both maps now hold only what is on screen. Rebuilds no longer walk every conversation ever shown.
+- **`sender_photo_cache` → `SenderPhotoCache`** (`window/state.rs`):
+  - It holds at most 256 senders and drops the least recently used first.
+  - Photos are decoded to fit 96 px (`decode_avatar_texture`, through gdk-pixbuf, falling back to a full-size decode).
+  - It empties itself when `UiState::contacts_generation` changes. That counter is bumped where `contacts_by_account` is replaced or removed, so an edited photo now shows too.
+  - On a miss, the contact is borrowed through the new `contacts_view::find_contact_record` rather than copied. `find_contact_by_address` now uses that helper.
+- **`row_display_registry`:** dead entries are pruned each time a row registers.
+
+**Left alone:** the `pending_optimistic_*` maps already drop their entries when a sync confirms the change, and expiring them on a timer could lose the data needed to undo a failed change.
+
+**Tests:**
+- `child_stores_are_dropped_when_their_rows_leave_the_list`
+- `sender_photo_cache_is_bounded_lru_and_resets_on_contact_changes`
+- `avatar_textures_are_decoded_to_avatar_size`
+
+The full `lookout-app` run gives 835 passed and 2 failed (`display_accel_is_human_readable` and `body_cache_invalidates_a_recreated_mailbox_and_a_removed_account`, both of which already failed).
 
 ## Findings, ranked by likely impact
 
@@ -203,7 +247,7 @@ Grep the same shape elsewhere: `let X = X.clone();` followed by `X.connect_*` / 
 - **Calendar checklist** (`connect.rs:2912`) and **tasks** (`refresh_tasks_view`): skip the rebuild when the input is unchanged, as desktop contacts already do. Rebuild on `ConnectionStateChanged` only when the status text changes.
 
 ### Phase 3: bound the Rust collections
-- `MessageListModel::clear_threads`: `retain` only live ids. Also release capacity on the cleared `keys` (assign `Vec::new()`).
+- `MessageListModel::clear_threads`: `retain` only live ids. (Releasing capacity on the cleared `keys` became moot: stale entries are now removed entirely.)
 - `sender_photo_cache`:
   - scale photos to avatar size (for example 64-96 px) before caching
   - clear the cache on contacts snapshots
@@ -225,7 +269,7 @@ Grep the same shape elsewhere: `let X = X.clone();` followed by `X.connect_*` / 
 Point mail, DAV and app tests at a temporary `XDG_CACHE_HOME` (or a `cache_dir` override under `cfg(test)`). The user can delete the 22,656 leftover `_test_*` files by hand.
 
 ## Verification
-- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings -A clippy::result_large_err`.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings -A clippy::result_large_err` (plus `-A clippy::nonminimal_bool` until the side item in "Status" is fixed).
 - Tests under `dbus-run-session` (see memory note), Broadway for GTK tests.
 - Add GTK tests that rebuild the folder tree, calendar checklist and tasks list, then assert that a `WeakRef` to an old row widget, its menu popover and a swatch upgrades to `None` after the rebuild (and after `glib::MainContext` iterations).
 - Unit test: after `clear_threads` with an empty live set, `threads` is empty.
