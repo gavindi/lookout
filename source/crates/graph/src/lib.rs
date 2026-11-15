@@ -58,3 +58,6 @@ pub use todo::{
     ChecklistStep, LinkedResource, TodoList, GRAPH_TODO_PREFIX, WELL_KNOWN_DEFAULT_LIST, WELL_KNOWN_FLAGGED_EMAIL,
 };
 pub use users::{resolve_user, GraphUser};
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

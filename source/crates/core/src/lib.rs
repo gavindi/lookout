@@ -21,6 +21,7 @@ pub mod quick_step;
 pub mod rules;
 pub mod signature;
 pub mod template;
+pub mod test_support;
 pub mod text;
 pub mod thread;
 pub mod trust;

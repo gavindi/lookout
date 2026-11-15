@@ -295,7 +295,33 @@ impl CalendarUiState {
     }
 }
 
-/// Copies the current contacts snapshots into the birthdays handle
+/// The contacts the birthdays calendar keeps, per account: only the ones
+/// with a birthday, and without their photos. The occurrences read a
+/// contact's name, birthday and href, and the handle used to hold a full copy
+/// of every card, photos included - a second copy of the whole address book
+/// (MEMORY_OPTIMISATION1.md finding 7). Every account is listed even when
+/// none of its contacts has a birthday, so "any contacts at all" keeps its
+/// meaning for the caller.
+pub(crate) fn birthday_sources(contacts_by_account: &HashMap<AccountId, crate::contacts_view::ContactsAccountSnapshot>) -> Vec<(AccountId, Vec<lookout_dav::ContactRecord>)> {
+    contacts_by_account
+        .iter()
+        .map(|(account_id, snapshot)| {
+            let with_birthdays = snapshot
+                .contacts
+                .iter()
+                .filter(|contact| contact.card.birthday.is_some())
+                .map(|contact| {
+                    let mut contact = contact.clone();
+                    contact.card.photo = None;
+                    contact
+                })
+                .collect();
+            (account_id.clone(), with_birthdays)
+        })
+        .collect()
+}
+
+/// Copies the contacts with a birthday (`birthday_sources`) into the birthdays handle
 /// (creating it on the first contact, dropping it when the last contact
 /// goes away) and recomputes the displayed month plus the dashboard
 /// horizon, then feeds the reminder engine the freshly-computed
@@ -307,13 +333,7 @@ pub(crate) fn refresh_birthdays_from_contacts(
     calendar_state: &Rc<RefCell<CalendarUiState>>,
     reminders_engine: &Rc<RefCell<crate::reminders::ReminderEngine>>,
 ) -> bool {
-    let contacts: Vec<(AccountId, Vec<lookout_dav::ContactRecord>)> = {
-        let st = state.borrow();
-        st.contacts_by_account
-            .iter()
-            .map(|(account_id, snapshot)| (account_id.clone(), snapshot.contacts.clone()))
-            .collect()
-    };
+    let contacts = birthday_sources(&state.borrow().contacts_by_account);
     if contacts.is_empty() {
         // No contacts anywhere - hide the calendar (the checklist row
         // disappears with it) rather than show an empty "Birthdays" row.

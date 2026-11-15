@@ -596,7 +596,7 @@ pub(crate) fn exit_search(
         }
         let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
         let (key, descending) = current_sort(state);
-        message_list.repopulate(all, key, descending);
+        message_list.repopulate_shared(all, key, descending);
     } else if restored_view == MailView::Outbox {
         // The page is already populated from `UiState::outbox`; just bring it
         // back instead of leaving search results on screen.
@@ -673,7 +673,7 @@ pub(crate) fn enter_unified_inbox(state: &Rc<RefCell<UiState>>, message_list: &M
     }
     let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
     let (key, descending) = current_sort(state);
-    message_list.repopulate(all, key, descending);
+    message_list.repopulate_shared(all, key, descending);
     refresh_message_loading_state(state, message_list, message_list_stack);
 }
 
@@ -704,9 +704,9 @@ pub(crate) fn enter_outbox_view(state: &Rc<RefCell<UiState>>, message_list_stack
 /// list, deduplicating by `(mailbox, uid)` - a message lives in exactly one
 /// mailbox, but a mailbox can be re-synced more than once, so the same
 /// `(mailbox, uid)` must never appear twice.
-pub(crate) fn merge_unified_snapshots(snapshots: &HashMap<MailboxId, Vec<EmailSummary>>) -> Vec<EmailSummary> {
+pub(crate) fn merge_unified_snapshots(snapshots: &HashMap<MailboxId, Vec<std::sync::Arc<EmailSummary>>>) -> Vec<std::sync::Arc<EmailSummary>> {
     let mut seen: HashSet<(MailboxId, Uid)> = HashSet::new();
-    let mut merged: Vec<EmailSummary> = Vec::new();
+    let mut merged: Vec<std::sync::Arc<EmailSummary>> = Vec::new();
     for messages in snapshots.values() {
         for m in messages {
             if seen.insert((m.mailbox.clone(), m.uid)) {
@@ -714,7 +714,7 @@ pub(crate) fn merge_unified_snapshots(snapshots: &HashMap<MailboxId, Vec<EmailSu
             }
         }
     }
-    merged.sort_by(unified_merge_order);
+    merged.sort_by(|a, b| unified_merge_order(a, b));
     merged
 }
 

@@ -63,7 +63,7 @@ pub(crate) fn restore_optimistic_removals(state: &Rc<RefCell<UiState>>, message_
         return;
     }
     if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
-        snapshot.extend(restored.iter().cloned());
+        snapshot.extend(crate::message_list::share_for_list(restored.clone()));
     }
     let mut all = message_list.all_messages();
     all.extend(restored);
@@ -182,6 +182,7 @@ pub(crate) fn optimistic_toggle_read(state: &Rc<RefCell<UiState>>, message_list:
     let mut st = state.borrow_mut();
     if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
         for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
+            let m = std::sync::Arc::make_mut(m);
             if mark_read {
                 m.flags.insert(SystemFlagBit::Seen);
             } else {
@@ -220,14 +221,13 @@ pub(crate) fn restore_optimistic_flag_changes(state: &Rc<RefCell<UiState>>, mess
     if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
         for m in snapshot.iter_mut() {
             if let Some(orig) = restored.get(&m.uid) {
-                m.flags = orig.flags.clone();
+                std::sync::Arc::make_mut(m).flags = orig.flags.clone();
             }
         }
     }
     drop(st);
-    let all: Vec<EmailSummary> = message_list.all_messages().into_iter().map(|m| restored.get(&m.uid).cloned().unwrap_or(m)).collect();
     let (key, descending) = current_sort(state);
-    message_list.repopulate(all, key, descending);
+    message_list.patch_messages(|m| restored.get(&m.uid).cloned(), key, descending);
 }
 
 /// The read/unread sibling of `reconcile_optimistic_removals`: an incoming
@@ -305,6 +305,7 @@ pub(crate) fn optimistic_toggle_pinned(state: &Rc<RefCell<UiState>>, message_lis
     let mut st = state.borrow_mut();
     if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
         for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
+            let m = std::sync::Arc::make_mut(m);
             if pinned {
                 m.flags.insert(SystemFlagBit::Flagged);
             } else {
@@ -378,14 +379,13 @@ pub(crate) fn restore_optimistic_pinned_changes(state: &Rc<RefCell<UiState>>, me
     if let Some(snapshot) = st.unified_snapshots.get_mut(mailbox) {
         for m in snapshot.iter_mut() {
             if let Some(orig) = restored.get(&m.uid) {
-                m.flags = orig.flags.clone();
+                std::sync::Arc::make_mut(m).flags = orig.flags.clone();
             }
         }
     }
     drop(st);
-    let all: Vec<EmailSummary> = message_list.all_messages().into_iter().map(|m| restored.get(&m.uid).cloned().unwrap_or(m)).collect();
     let (key, descending) = current_sort(state);
-    message_list.repopulate(all, key, descending);
+    message_list.patch_messages(|m| restored.get(&m.uid).cloned(), key, descending);
 }
 
 /// The pin/unpin sibling of `reconcile_optimistic_flag_changes`: an
@@ -441,22 +441,31 @@ pub(crate) fn reconcile_optimistic_pinned_changes(state: &Rc<RefCell<UiState>>, 
 /// function even runs - a preview must persist there even for a mailbox
 /// that isn't currently on screen, whereas this function only has anything
 /// to patch when the affected mailbox is actually displayed.
+///
+/// Only the patched messages are copied; every other row keeps sharing its
+/// summary (`MessageListModel::patch_messages`).
 pub(crate) fn patch_previews(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, mailbox: &MailboxId, previews: &HashMap<Uid, String>, mentions: &HashMap<Uid, bool>) {
-    let all: Vec<EmailSummary> = message_list
-        .all_messages()
-        .into_iter()
-        .map(|mut m| {
-            if m.mailbox == *mailbox {
-                if let Some(p) = previews.get(&m.uid) {
-                    m.preview = Some(p.clone());
-                }
-                if let Some(mentions) = mentions.get(&m.uid) {
-                    m.mentions = *mentions;
-                }
-            }
-            m
-        })
-        .collect();
     let (key, descending) = current_sort(state);
-    message_list.repopulate(all, key, descending);
+    message_list.patch_messages(
+        |m| {
+            if m.mailbox != *mailbox {
+                return None;
+            }
+            let preview = previews.get(&m.uid).filter(|p| m.preview.as_deref() != Some(p.as_str()));
+            let mention = mentions.get(&m.uid).filter(|mention| m.mentions != **mention);
+            if preview.is_none() && mention.is_none() {
+                return None;
+            }
+            let mut patched = m.clone();
+            if let Some(p) = preview {
+                patched.preview = Some(p.clone());
+            }
+            if let Some(mention) = mention {
+                patched.mentions = *mention;
+            }
+            Some(patched)
+        },
+        key,
+        descending,
+    );
 }

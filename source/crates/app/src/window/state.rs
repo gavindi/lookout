@@ -303,7 +303,7 @@ pub(crate) struct MessageRowWidgets {
     pub(crate) pin_btn: gtk::Button,
     /// The message this row currently shows. Set by `bind`, read by the
     /// quick-action handlers when they fire.
-    pub(crate) bound: Rc<RefCell<Option<Rc<EmailSummary>>>>,
+    pub(crate) bound: Rc<RefCell<Option<std::sync::Arc<EmailSummary>>>>,
     /// The conversation this row heads, when it's a conversation header -
     /// what its right-click menu acts on (item 1.17).
     pub(crate) bound_thread: Rc<RefCell<Option<ThreadId>>>,
@@ -1487,7 +1487,7 @@ pub(crate) struct UiState {
     /// each account's `MessagesUpdated` events while `mail_view` is
     /// `UnifiedInbox`. The visible list is the union of these, deduplicated
     /// by `(mailbox, uid)` and sorted newest-first.
-    pub(crate) unified_snapshots: HashMap<MailboxId, Vec<EmailSummary>>,
+    pub(crate) unified_snapshots: HashMap<MailboxId, Vec<std::sync::Arc<EmailSummary>>>,
     /// Bumped for a mailbox every time an authoritative `MessagesUpdated`
     /// lands for it. `select_mailbox`/the startup restore capture a mailbox's
     /// value before spawning their off-thread disk-cache read and re-check it

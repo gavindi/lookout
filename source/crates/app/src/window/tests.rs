@@ -609,6 +609,50 @@ fn test_contact(address: &str) -> VCard {
     }
 }
 
+/// The birthdays calendar keeps only the contacts that have a birthday, and
+/// none of their photos - not a second copy of the whole address book
+/// (MEMORY_OPTIMISATION1.md Phase 4).
+#[test]
+fn birthday_sources_keep_only_birthday_contacts_without_photos() {
+    let photo = || lookout_core::vcard::Photo {
+        media_type: Some("image/jpeg".into()),
+        data: Some(vec![0u8; 4096]),
+        uri: None,
+    };
+    let record = |href: &str, card: VCard| lookout_dav::ContactRecord {
+        href: href.into(),
+        etag: None,
+        card,
+    };
+    let mut with_birthday = test_contact("ada@example.com");
+    with_birthday.photo = Some(photo());
+    with_birthday.birthday = Some(lookout_core::vcard::Birthday {
+        date: chrono::NaiveDate::from_ymd_opt(1815, 12, 10).unwrap(),
+        omit_year: false,
+    });
+    let mut without_birthday = test_contact("charles@example.com");
+    without_birthday.photo = Some(photo());
+    let contacts_by_account = HashMap::from([
+        (
+            AccountId("books".into()),
+            crate::contacts_view::test_snapshot("Books", vec![record("/ada.vcf", with_birthday), record("/charles.vcf", without_birthday)]),
+        ),
+        (
+            AccountId("empty".into()),
+            crate::contacts_view::test_snapshot("Empty", vec![record("/nobody.vcf", test_contact("nobody@example.com"))]),
+        ),
+    ]);
+
+    let mut sources = birthday_sources(&contacts_by_account);
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(sources.len(), 2, "every account is listed, even one with no birthdays");
+    let (_, books) = &sources[0];
+    assert_eq!(books.iter().map(|c| c.href.as_str()).collect::<Vec<_>>(), vec!["/ada.vcf"]);
+    assert!(books[0].card.photo.is_none(), "the photo is not copied");
+    assert!(books[0].card.birthday.is_some());
+    assert!(sources[1].1.is_empty());
+}
+
 #[test]
 fn find_contact_by_address_matches_across_accounts_case_insensitively() {
     let state = test_state(Vec::new());
@@ -669,13 +713,13 @@ fn unified_merge_dedupes_by_mailbox_and_uid_and_sorts_newest_first() {
     let snapshots = HashMap::from([
         (
             MailboxId("a:INBOX".into()),
-            vec![summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), summary(Uid(2), "a:INBOX", 2024, 1, 10, 8)],
+            crate::message_list::share_for_list(vec![summary(Uid(1), "a:INBOX", 2024, 1, 10, 9), summary(Uid(2), "a:INBOX", 2024, 1, 10, 8)]),
         ),
         (
             MailboxId("b:INBOX".into()),
             // Duplicate of a:INBOX/2 (same uid, different mailbox) is kept;
             // the doubled a:INBOX/1 in this snapshot must collapse.
-            vec![summary(Uid(2), "b:INBOX", 2024, 1, 10, 10), summary(Uid(1), "a:INBOX", 2024, 1, 10, 9)],
+            crate::message_list::share_for_list(vec![summary(Uid(2), "b:INBOX", 2024, 1, 10, 10), summary(Uid(1), "a:INBOX", 2024, 1, 10, 9)]),
         ),
     ]);
 
@@ -693,8 +737,14 @@ fn unified_merge_breaks_a_date_tie_by_mailbox_then_uid() {
     // it must hold regardless of which snapshot the map happens to
     // iterate first.
     let snapshots = HashMap::from([
-        (MailboxId("z:INBOX".into()), vec![summary(Uid(1), "z:INBOX", 2024, 1, 10, 9)]),
-        (MailboxId("a:INBOX".into()), vec![summary(Uid(5), "a:INBOX", 2024, 1, 10, 9)]),
+        (
+            MailboxId("z:INBOX".into()),
+            crate::message_list::share_for_list(vec![summary(Uid(1), "z:INBOX", 2024, 1, 10, 9)]),
+        ),
+        (
+            MailboxId("a:INBOX".into()),
+            crate::message_list::share_for_list(vec![summary(Uid(5), "a:INBOX", 2024, 1, 10, 9)]),
+        ),
     ]);
     let keys: Vec<(String, u32)> = merge_unified_snapshots(&snapshots).iter().map(|m| (m.mailbox.0.clone(), m.uid.0)).collect();
     assert_eq!(
@@ -959,7 +1009,10 @@ fn optimistic_remove_and_restore_round_trips_the_list_and_unified_snapshot() {
 
     let message_list = MessageListModel::build();
     message_list.repopulate(vec![one.clone(), two.clone(), three.clone()], SortKey::Date, true);
-    state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone(), three.clone()]);
+    state
+        .borrow_mut()
+        .unified_snapshots
+        .insert(mailbox.clone(), crate::message_list::share_for_list(vec![one.clone(), two.clone(), three.clone()]));
 
     optimistic_remove_messages(&state, &message_list, &mailbox, &[Uid(2)]);
     let uids_after_remove: HashSet<u32> = message_list.all_messages().iter().map(|m| m.uid.0).collect();
@@ -1010,7 +1063,10 @@ fn optimistic_toggle_read_and_restore_round_trips_flags_and_unified_snapshot() {
 
     let message_list = MessageListModel::build();
     message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
-    state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone()]);
+    state
+        .borrow_mut()
+        .unified_snapshots
+        .insert(mailbox.clone(), crate::message_list::share_for_list(vec![one.clone(), two.clone()]));
 
     optimistic_toggle_read(&state, &message_list, &mailbox, &[Uid(2)], true);
     let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
@@ -1062,7 +1118,10 @@ fn optimistic_toggle_pinned_and_restore_round_trips_flags_and_unified_snapshot()
 
     let message_list = MessageListModel::build();
     message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
-    state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one.clone(), two.clone()]);
+    state
+        .borrow_mut()
+        .unified_snapshots
+        .insert(mailbox.clone(), crate::message_list::share_for_list(vec![one.clone(), two.clone()]));
 
     optimistic_toggle_pinned(&state, &message_list, &mailbox, &[Uid(2)], true);
     let patched = message_list.all_messages().into_iter().find(|m| m.uid == Uid(2)).unwrap();
@@ -1284,7 +1343,10 @@ fn patch_previews_updates_the_matching_row_and_leaves_others_untouched() {
 
     let message_list = MessageListModel::build();
     message_list.repopulate(vec![one.clone(), two.clone()], SortKey::Date, true);
-    state.borrow_mut().unified_snapshots.insert(mailbox.clone(), vec![one, two]);
+    state
+        .borrow_mut()
+        .unified_snapshots
+        .insert(mailbox.clone(), crate::message_list::share_for_list(vec![one, two]));
 
     let previews = HashMap::from([(Uid(2), "new snippet".to_string())]);
     patch_previews(&state, &message_list, &mailbox, &previews, &HashMap::new());

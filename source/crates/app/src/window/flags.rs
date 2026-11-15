@@ -151,25 +151,21 @@ pub(crate) fn optimistic_set_follow_up(state: &Rc<RefCell<UiState>>, message_lis
         m.keywords.retain(|k| !lookout_core::is_flag_keyword(k));
         m.keywords.extend(keywords.iter().cloned());
     };
-    let mut changed = false;
-    let all: Vec<EmailSummary> = message_list
-        .all_messages()
-        .into_iter()
-        .map(|mut m| {
-            if m.mailbox == *mailbox && uids.contains(&m.uid) {
-                patch(&mut m);
-                changed = true;
-            }
-            m
-        })
-        .collect();
-    if changed {
-        let (key, descending) = current_sort(state);
-        message_list.repopulate(all, key, descending);
-    }
+    let (key, descending) = current_sort(state);
+    message_list.patch_messages(
+        |m| {
+            (m.mailbox == *mailbox && uids.contains(&m.uid)).then(|| {
+                let mut patched = m.clone();
+                patch(&mut patched);
+                patched
+            })
+        },
+        key,
+        descending,
+    );
     if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
         for m in snapshot.iter_mut().filter(|m| uids.contains(&m.uid)) {
-            patch(m);
+            patch(std::sync::Arc::make_mut(m));
         }
     }
 }
@@ -179,7 +175,7 @@ pub(crate) fn optimistic_set_follow_up(state: &Rc<RefCell<UiState>>, message_lis
 pub(crate) fn refresh_follow_up_banner(state: &Rc<RefCell<UiState>>, message_list: &MessageListModel, reading_stack: &gtk::Stack) {
     let rendered = state.borrow().rendered_message.clone();
     let flag = rendered.as_ref().and_then(|(mailbox, uid)| {
-        let summary = message_list.all_messages().into_iter().find(|m| m.mailbox == *mailbox && m.uid == *uid)?;
+        let summary = message_list.find_message(mailbox, *uid)?;
         summary.follow_up().map(|flag| (mailbox.clone(), *uid, flag))
     });
     show_follow_up_banner(state, reading_stack, flag);

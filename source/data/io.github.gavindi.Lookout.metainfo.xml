@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.320" date="2026-11-15">
+      <description>
+        <p>The message list uses much less memory: it now keeps one copy of each message instead of several, roughly a third of what it used before for a large folder. Running the test suite no longer leaves files in Lookout's cache folder.</p>
+      </description>
+    </release>
     <release version="0.9.319" date="2026-11-15">
       <description>
         <p>Closing the event or task editor now releases the memory it used, instead of keeping it until Lookout quits. In the event editor, the Save button again changes to Send as you add attendees when the Scheduling Assistant is available.</p>

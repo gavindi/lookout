@@ -1621,7 +1621,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         // The old per-bind connections accumulated on recycled rows (nothing
         // ever disconnected them), so a scrolled list eventually fired one
         // click at several messages at once.
-        let bound: Rc<RefCell<Option<Rc<EmailSummary>>>> = Rc::new(RefCell::new(None));
+        let bound: Rc<RefCell<Option<std::sync::Arc<EmailSummary>>>> = Rc::new(RefCell::new(None));
 
         // The conversation this row heads, when it's a conversation header.
         let bound_thread: Rc<RefCell<Option<ThreadId>>> = Rc::new(RefCell::new(None));
@@ -2258,7 +2258,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 });
                 crate::window::columns::apply_cell_visibility(&widgets.single_cells, &column_state_for_bind);
 
-                *widgets.bound.borrow_mut() = Some(Rc::clone(summary));
+                *widgets.bound.borrow_mut() = Some(std::sync::Arc::clone(summary));
                 *widgets.bound_thread.borrow_mut() = None;
             }
             MessageItem::Thread(thread) => {

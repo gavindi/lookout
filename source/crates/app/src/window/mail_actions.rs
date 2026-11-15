@@ -905,7 +905,7 @@ fn optimistic_set_importance(state: &Rc<RefCell<UiState>>, message_list: &Messag
     }
     if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
         for message in snapshot.iter_mut().filter(|message| uids.contains(&message.uid)) {
-            message.importance = importance;
+            std::sync::Arc::make_mut(message).importance = importance;
         }
     }
 }
@@ -982,7 +982,7 @@ fn optimistic_set_focused(state: &Rc<RefCell<UiState>>, message_list: &MessageLi
     }
     if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(mailbox) {
         for message in snapshot.iter_mut().filter(|message| uids.contains(&message.uid)) {
-            message.inference_classification = classification;
+            std::sync::Arc::make_mut(message).inference_classification = classification;
         }
     }
 }

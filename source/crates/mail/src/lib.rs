@@ -36,3 +36,6 @@ pub use error::{Error, Result};
 pub use search_query::{parse as parse_search_query, Cmp, ReceivedFilter, SearchQuery, SearchScope, SizeFilter};
 pub use send::{build_draft_raw_message, new_message_id, Attachment, ComposedMessage, InlineImage, OutboxMessage, ReadReceipt};
 pub use session::PrefetchPolicy;
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

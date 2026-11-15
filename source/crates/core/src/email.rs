@@ -141,7 +141,7 @@ pub fn sanitize_tag_key(name: &str) -> String {
 
 /// List-row weight projection of a message — cheap to fetch (`ENVELOPE` +
 /// `FLAGS` + `RFC822.SIZE` + `BODYSTRUCTURE`, no body) and cache in SQLite.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EmailSummary {
     pub uid: Uid,
     pub mailbox: MailboxId,

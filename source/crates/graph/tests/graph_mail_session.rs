@@ -355,3 +355,6 @@ async fn graph_mime_fixtures_keep_invites_and_authentication_results() {
     let results = auth.auth_results.as_ref().expect("Authentication-Results survives");
     assert!(results.any_failure(), "the fixture's failing verdict is readable");
 }
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

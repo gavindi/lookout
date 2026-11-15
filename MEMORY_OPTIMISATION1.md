@@ -26,16 +26,75 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 | 1: break widget reference cycles | Done, event and task editors included; not yet run in the real app | 0.9.316 (memory steady at ~600 MB, user report); composer in 0.9.318; editors in 0.9.319 |
 | 2: stop rebuilding when nothing changed | Not started | |
 | 3: bound the Rust collections | Done; not yet run in the real app | 0.9.317 |
-| 4: cut duplicate copies | Not started | |
-| 5: stop tests polluting the real cache | Code not started. This machine's leftovers were deleted on 2026-11-15: 6,735 entries, 1.2 GB; `~/.cache/lookout` went from ~2.1 GB to 901 MB | |
+| 4: cut duplicate copies | Done for the message list, All Inboxes and birthdays (about 63% less heap per listed message); not yet run in the real app | 0.9.320 |
+| 5: stop tests polluting the real cache | Done; not yet run in the real app. This machine's old leftovers were deleted on 2026-11-15: 24,865 entries (mail, message-body, attachment, calendar, EDS-mirror, webcal and Google Tasks test files); `~/.cache/lookout` went from 6.2 GB to 2.5 GB | 0.9.320 |
 
-**Next step:** Phase 4 is where most of the remaining memory is. Phase 2 is smaller and mostly saves CPU now that rebuilt rows are freed.
+**Next step:**
+- Measure the real app on 0.9.320 with the Phase 0 probe over a session.
+- Phase 2 is the only phase not started. It is smaller and mostly saves CPU now that rebuilt rows are freed.
 
 **Still worth checking in the running app:** the Phase 0 probe's per-type counts across a session that opens and closes composers and editors. Do `AdwWindow`, `WebKitWebView` and `GtkPopoverMenu` stay flat? Under Wayland, is `GtkText` retained by the input-method module the way it is under Broadway?
 
 **Open side item:** this machine's clippy (1.92) flags `nonminimal_bool` at `crates/mail/src/session.rs:274`, which is older than this work. Until it is fixed, the clippy command needs `-A clippy::nonminimal_bool`.
 
 **Line numbers:** those in "Findings" and in the Phase 1 site list are from 0.9.315, before the fixes, and no longer match the code. For example, the folder row setup at `window.rs:203-363` is now `build_folder_row`.
+
+## Phase 4 and 5 results (2026-11-15, released as 0.9.320, not yet run in the real app)
+
+**Measured first:** a new ignored test, `message_list::tests::resident_heap_per_message`, loads 20,000 realistic messages, then resyncs them unchanged, and reports the heap the list keeps. Each message has a 60-character subject, a 300-character preview, two text parts and, for every third one, an attachment.
+
+| | After load | After unchanged resync |
+|---|---|---|
+| 0.9.319 | 113.7 MB (5,959 B per message) | 113.7 MB |
+| 0.9.320 | **41.8 MB (2,191 B per message)** | 41.8 MB |
+
+**Phase 4, done:**
+- **One copy per message in the list.**
+  - `EmailSummary` now derives `PartialEq, Eq`.
+  - `MessageListModel.truth` holds `Arc<EmailSummary>`s, shared with:
+    - the row objects (`MessageItem::Message`);
+    - the row keys: `MessageRowKey` is now the `Arc`, and its equality compares the rendered fields on demand, with a pointer-equality shortcut;
+    - in All Inboxes, `UiState::unified_snapshots`.
+  - It's an `Arc` rather than an `Rc` because `compute_layout` runs on the blocking pool for a large mailbox.
+  - `ThreadRow` is shared with its key the same way.
+- **Unchanged resyncs reuse what is already shown.** `MessageListModel::intern` keeps the existing summary for every incoming message that is identical to it. The All Inboxes path interns before it stores the snapshot, so the snapshot and the list keep sharing.
+- **No throwaway rows.** `splice_diff` builds row objects only for the range it splices in.
+- **No copy-and-hand-back.**
+  - The filter, Focused, threading and refresh toggles re-render from `truth` directly.
+  - `patch_messages` replaces only the messages it edits. `patch_previews`, the follow-up flag patch and the two optimistic-restore paths use it.
+  - `find_message` replaces two whole-list copies that were made to find one message.
+  - Edits to `unified_snapshots` use `Arc::make_mut`, which copies only the edited messages.
+- **Smaller summaries in the list.** `trim_for_list` keeps only the attachment parts of `structure`, the only parts the UI reads (the conversation view's tiles and attachment menu). The account sessions read their own copy from the cache, and no list summary is written back or sent to a session.
+- **Birthdays.** `birthday_sources` copies only contacts that have a birthday, and without their photos.
+
+**Phase 4, not changed, and why:**
+- **`MailboxId` stays a `String`.** Making it `Arc<str>` would touch every crate, and with sharing it is now stored once per message.
+- **`references` stays.** Threading (`core/src/thread.rs`) and search (`cache.rs`) read it, and an empty `Vec` costs no heap.
+- **The flags `BTreeSet` and the 500-character preview stay.** Both are small next to what sharing saved, and the preview cap would change stored data.
+- **Contacts keep two copies.** One is in `contacts_by_account`, the other in the People list's `ContactMember`s (built only when the list is rebuilt).
+- **No `malloc_trim` or allocator tuning.** Phase 0 measured only 4% of the heap as free-but-retained.
+
+**Phase 5, done:** `lookout_core::isolate_test_cache!()` (`crates/core/src/test_support.rs`) is invoked at each crate root and in the mail and Graph integration tests.
+- Before a test binary's `main` runs, it points `XDG_CACHE_HOME` at `<temp>/lookout-test-cache-<pid>`. It does this from an ELF `.init_array` constructor, while the process is still single-threaded.
+- It removes that directory at exit.
+- Every cache path already resolves through `XDG_CACHE_HOME`, and the tests that set it themselves (`ui_state_db`, `reminders`) work as before.
+- It expands to nothing outside `cfg(test)`.
+- After full `lookout-core`, `lookout-mail`, `lookout-dav`, `lookout-graph` and `lookout-app` runs, nothing new appeared under `~/.cache/lookout`, and no `lookout-test-cache-*` directory was left in `/tmp`.
+
+**Tests:**
+- `rows_and_keys_share_the_truth_and_an_unchanged_resync_reuses_it`. With interning disabled, it fails at "an unchanged resync reuses the existing summaries".
+- `patch_messages_copies_only_the_patched_messages`
+- `list_summaries_keep_only_attachment_parts`
+- `birthday_sources_keep_only_birthday_contacts_without_photos`
+- `test_support::tests::test_binaries_get_a_private_cache_home`
+
+**Full runs** under `dbus-run-session` on Broadway:
+- **`lookout-app`:** 842 passed, 3 failed, 6 ignored.
+  - `display_accel_is_human_readable` and `body_cache_invalidates_a_recreated_mailbox_and_a_removed_account` already failed.
+  - `google_tasks::tests::offline_session_paints_cache_without_authorizing` is intermittent and passes on its own.
+- **`lookout-mail`:** 286 passed, 1 failed (`ehlo_capability_scan_finds_the_dsn_keyword`, already failing).
+- **`lookout-dav`:** 174 passed, 1 failed (`ical::tests::a_room_is_cutype_resource_and_round_trips`, which fails the same way on 0.9.319).
+- **`lookout-core` and `lookout-graph`:** all passed.
 
 ## Phase 0 results (measured 2026-11-15)
 
@@ -101,10 +160,10 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 
 With the old swatch capture put back, the checklist test fails with exactly the Phase 0 signature: the `GtkPopoverMenu`s and their 10 `GtkButton` swatches stay alive while the `MenuButton`s are freed. The folder-row test fails likewise with the old `dispatch_folder`.
 
-**Left open:**
-- The composer may still leak as a whole: `AutosaveCtx` holds ~20 composer widgets and is captured by many handlers inside it. This needs an instance-count check in the running app, or a teardown that breaks the handlers.
-- The event editor (`recurrence.rs`, `room_finder.rs`) was not reviewed.
-- The ribbon's More / Move to / Quick steps popovers hold themselves too, but they are singletons whose rebuilt contents free normally, so they were left alone.
+**Left open at 0.9.316:**
+- The composer leaked as a whole. Fixed in 0.9.318 (see "Composer results").
+- The event editor (`recurrence.rs`, `room_finder.rs`) was not reviewed. Reviewed and fixed in 0.9.319 (see "Event and task editor results").
+- Still open: the ribbon's More / Move to / Quick steps popovers hold themselves too, but they are singletons whose rebuilt contents free normally, so they were left alone.
 
 ## Event and task editor results (2026-11-15, released as 0.9.319, not yet run in the real app)
 

@@ -155,3 +155,6 @@ async fn syncs_a_live_mailbox_read_only() {
     assert!(!cache.load_mailboxes(&account.0).unwrap().is_empty());
     assert_eq!(cache.load_messages(&inbox).unwrap().len(), messages.len(), "the Inbox cache matches the sync event");
 }
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

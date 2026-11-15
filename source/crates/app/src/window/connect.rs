@@ -720,7 +720,7 @@ pub(crate) fn spawn_account_event_loop(
                                 .values()
                                 .any(|h| h.folders.iter().any(|m| m.id == mailbox && matches!(m.role, MailboxRole::Inbox)));
                             if in_unified_set {
-                                st.unified_snapshots.insert(mailbox, messages);
+                                st.unified_snapshots.insert(mailbox, crate::message_list::share_for_list(messages));
                             }
                             continue;
                         }
@@ -751,8 +751,13 @@ pub(crate) fn spawn_account_event_loop(
                                 // are O(this account's messages), not O(every
                                 // account's).
                                 let unified_slice = if in_unified_set {
-                                    st.unified_snapshots.insert(mailbox.clone(), messages.clone());
-                                    Some(messages)
+                                    // Interned against what the list already
+                                    // shows, so the snapshot and the list keep
+                                    // sharing one copy of every unchanged
+                                    // message.
+                                    let shared = message_list.intern(crate::message_list::share_for_list(messages));
+                                    st.unified_snapshots.insert(mailbox.clone(), shared.clone());
+                                    Some(shared)
                                 } else {
                                     None
                                 };
@@ -843,10 +848,10 @@ pub(crate) fn spawn_account_event_loop(
                         if let Some(snapshot) = state.borrow_mut().unified_snapshots.get_mut(&mailbox) {
                             for m in snapshot.iter_mut() {
                                 if let Some(p) = previews.get(&m.uid) {
-                                    m.preview = Some(p.clone());
+                                    std::sync::Arc::make_mut(m).preview = Some(p.clone());
                                 }
                                 if let Some(mentions) = mentions.get(&m.uid) {
-                                    m.mentions = *mentions;
+                                    std::sync::Arc::make_mut(m).mentions = *mentions;
                                 }
                             }
                         }
@@ -1179,7 +1184,7 @@ pub(crate) fn spawn_account_event_loop(
                             }
                         };
                         if pending_report {
-                            let summary = message_list.all_messages().into_iter().find(|m| m.mailbox == mailbox && m.uid == uid);
+                            let summary = message_list.find_message(&mailbox, uid);
                             if let Some(summary) = summary {
                                 match report_phishing_message(&state, &summary, &bytes) {
                                     Some(message) => {
@@ -1750,7 +1755,7 @@ pub(crate) fn teardown_mail_account(
     if matches!(state.borrow().mail_view, MailView::UnifiedInbox) {
         let all = merge_unified_snapshots(&state.borrow().unified_snapshots);
         let (key, descending) = current_sort(state);
-        message_list.repopulate(all, key, descending);
+        message_list.repopulate_shared(all, key, descending);
         refresh_message_loading_state(state, message_list, message_list_stack);
     }
     rebuild_folder_tree(state, folder_selection, folder_scroller);

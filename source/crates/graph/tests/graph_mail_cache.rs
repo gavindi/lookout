@@ -210,3 +210,6 @@ fn a_graph_move_keeps_the_uid_and_a_body_round_trips() {
     // The map entry survives the move, since a message still uses the Uid.
     assert_eq!(cache.prune_graph_uids().unwrap(), 0);
 }
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

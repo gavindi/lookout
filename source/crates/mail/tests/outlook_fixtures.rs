@@ -155,3 +155,6 @@ fn dsn_fixtures_expose_their_delivery_reports() {
     // A read receipt is a report too, but never a delivery report.
     assert_eq!(parse("auth-results.eml").dsn, None);
 }
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

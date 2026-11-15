@@ -60,7 +60,7 @@ pub(crate) fn summary_is_draft(state: &UiState, summary: &EmailSummary) -> bool 
 
 /// Which summaries a message-row drag carries: the whole current selection
 /// when the dragged row is part of one, otherwise just that row's message.
-pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<Rc<EmailSummary>>>>) -> Vec<EmailSummary> {
+pub(crate) fn dragged_summaries(message_list: &MessageListModel, bound: &Rc<RefCell<Option<std::sync::Arc<EmailSummary>>>>) -> Vec<EmailSummary> {
     let Some(row_summary) = bound.borrow().clone() else {
         return Vec::new();
     };

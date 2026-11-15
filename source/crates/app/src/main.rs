@@ -233,3 +233,6 @@ fn main() -> glib::ExitCode {
 
     app.run()
 }
+
+// Test binaries get a private `XDG_CACHE_HOME` (MEMORY_OPTIMISATION1.md Phase 5).
+lookout_core::isolate_test_cache!();

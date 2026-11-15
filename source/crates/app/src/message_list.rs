@@ -14,6 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use gtk::prelude::*;
@@ -597,12 +598,17 @@ pub enum MessageItem {
     /// A collapsible date-bucket header.
     Section(SectionRow),
     /// A collapsible conversation header - the date section's children when
-    /// threading is on, itself the parent of its messages' rows.
-    Thread(ThreadRow),
+    /// threading is on, itself the parent of its messages' rows. Shared with
+    /// the row's key, like `Message`.
+    Thread(Arc<ThreadRow>),
     /// One message. Behind a pointer because `EmailSummary` is large, and an
-    /// unboxed variant would size every section row to it too; an `Rc` so a
-    /// row's bind can keep the summary it shows without copying it.
-    Message(Rc<EmailSummary>),
+    /// unboxed variant would size every section row to it too. An `Arc`
+    /// shared with the model's `truth`, its row keys and (in All Inboxes)
+    /// `UiState::unified_snapshots`, so a message is held once however many
+    /// of those see it, and a row's bind can keep the summary it shows
+    /// without copying it. `Arc` rather than `Rc` because `compute_layout`
+    /// runs on the blocking pool for a large mailbox.
+    Message(Arc<EmailSummary>),
 }
 
 pub struct SectionRow {
@@ -621,7 +627,10 @@ pub type ThreadId = (MailboxId, ThreadKey);
 /// The header row of one collapsible conversation, derived from the thread's
 /// newest message (the one its section placement and the row's date column
 /// follow) plus the aggregate state of its whole message set.
-#[derive(Clone, Debug)]
+///
+/// Its equality is the header's row key: every field is something the header
+/// renders, plus its identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadRow {
     pub id: ThreadId,
     /// The newest message's sender, rendered like a message row's sender.
@@ -675,26 +684,26 @@ pub struct ThreadRow {
 #[derive(Debug)]
 enum ThreadEntry {
     Thread(ThreadLayout),
-    Single(EmailSummary),
+    Single(Arc<EmailSummary>),
 }
 
 /// A conversation in the display layout: the header row that goes in the
 /// section's store, plus the messages that fill its child store.
 #[derive(Debug)]
 struct ThreadLayout {
-    row: ThreadRow,
+    row: Arc<ThreadRow>,
     /// The thread's messages, oldest-first (natural reading order for a
     /// conversation). Kept here rather than in `ThreadRow` because the boxed
     /// row object never needs the messages themselves - only the splice that
     /// builds the child store does.
-    messages: Vec<EmailSummary>,
+    messages: Vec<Arc<EmailSummary>>,
 }
 
 /// How the list is arranged for a given sort: grouped under headers, or
 /// headers over collapsible conversations.
 #[derive(Debug)]
 enum ListLayout {
-    Grouped(Vec<(GroupKey, String, Vec<EmailSummary>)>),
+    Grouped(Vec<(GroupKey, String, Vec<Arc<EmailSummary>>)>),
     Threaded(Vec<(GroupKey, String, Vec<ThreadEntry>)>),
 }
 
@@ -703,7 +712,7 @@ enum ListLayout {
 /// everything else's layout, and the fingerprint `apply_layout`'s no-op
 /// check compares against what's already displayed.
 struct ComputedLayout {
-    pinned: Vec<EmailSummary>,
+    pinned: Vec<Arc<EmailSummary>>,
     layout: ListLayout,
     keys: Vec<MessageRowKey>,
 }
@@ -728,7 +737,8 @@ struct ComputedLayout {
 /// thread's newest message is the first of its members in the newest-first
 /// scan, so the per-thread latest values the cuts follow are monotone in the
 /// same way single messages' values were.
-fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>, threaded: bool, descending: bool) -> ListLayout {
+fn build_layout<M: Into<Arc<EmailSummary>>>(sorted: Vec<M>, key: SortKey, now: DateTime<Local>, threaded: bool, descending: bool) -> ListLayout {
+    let sorted: Vec<Arc<EmailSummary>> = sorted.into_iter().map(Into::into).collect();
     let sections: Vec<(GroupKey, String, Vec<ThreadEntry>)> = if threaded {
         // `group_threads` scans newest-first (it needs each thread's newest
         // member to place it), so an ascending sort is mirrored by reversing
@@ -801,8 +811,8 @@ fn build_layout(sorted: Vec<EmailSummary>, key: SortKey, now: DateTime<Local>, t
 /// the same pair) survive the constant rebuilds. A thread of one renders as
 /// its message, not a header: a header whose only child is itself adds a row
 /// to every conversation without earning its keep.
-fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
-    let mut threads: HashMap<ThreadId, Vec<EmailSummary>> = HashMap::new();
+fn group_threads(messages: &[Arc<EmailSummary>]) -> Vec<ThreadEntry> {
+    let mut threads: HashMap<ThreadId, Vec<Arc<EmailSummary>>> = HashMap::new();
     let mut order: Vec<ThreadId> = Vec::new();
     for message in messages {
         let id = (message.mailbox.clone(), message.thread_key.clone());
@@ -861,23 +871,26 @@ fn group_threads(messages: &[EmailSummary]) -> Vec<ThreadEntry> {
             has_calendar: latest.has_calendar || emails.iter().any(|m| m.has_calendar),
             importance: thread_importance(&emails),
         };
-        entries.push(ThreadEntry::Thread(ThreadLayout { row, messages: emails }));
+        entries.push(ThreadEntry::Thread(ThreadLayout {
+            row: Arc::new(row),
+            messages: emails,
+        }));
     }
     entries
 }
 
 /// A thread's most urgent open follow-up flag, for its header icon.
-fn thread_follow_up(messages: &[EmailSummary]) -> Option<lookout_core::FollowUpFlag> {
+fn thread_follow_up(messages: &[Arc<EmailSummary>]) -> Option<lookout_core::FollowUpFlag> {
     messages
         .iter()
-        .filter_map(EmailSummary::follow_up)
+        .filter_map(|message| message.follow_up())
         .filter(|flag| flag.status == lookout_core::FlagStatus::Flagged)
         .min_by_key(|flag| (flag.due.is_none(), flag.due))
 }
 
 /// A thread's aggregate importance, for its header glyph: `High` if any
 /// message is high, else `Low` if any is low, else `Normal`.
-fn thread_importance(messages: &[EmailSummary]) -> lookout_core::Importance {
+fn thread_importance(messages: &[Arc<EmailSummary>]) -> lookout_core::Importance {
     if messages.iter().any(|m| m.importance == lookout_core::Importance::High) {
         lookout_core::Importance::High
     } else if messages.iter().any(|m| m.importance == lookout_core::Importance::Low) {
@@ -887,77 +900,99 @@ fn thread_importance(messages: &[EmailSummary]) -> lookout_core::Importance {
     }
 }
 
-/// Message identity, the two flag-derived styles (unread, flagged), the four
-/// text fields a row renders, the color-tag keywords it carries, its thread
-/// key, and the mention verdict. A named struct rather than a tuple so it can
-/// grow past Rust's 12-element tuple trait impls.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct MessageRowKey {
-    mailbox: MailboxId,
-    uid: Uid,
-    unread: bool,
-    pinned: bool,
-    date: DateTime<Utc>,
-    subject: Option<String>,
-    from: String,
-    preview: Option<String>,
-    tags: Vec<String>,
-    thread_key: ThreadKey,
-    importance: lookout_core::Importance,
-    follow_up: Option<lookout_core::FollowUpFlag>,
-    mentions: bool,
+/// The fingerprint of what one message-list row displays: message identity,
+/// the two flag-derived styles (unread, flagged), the four text fields a row
+/// renders, the color-tag keywords it carries, its thread key, importance,
+/// follow-up flag and the mention verdict.
+///
+/// Holds the row's shared summary rather than copies of those fields, so a
+/// key costs one pointer instead of a second copy of the subject, sender,
+/// preview and tags (`displayed`, `root_keys` and every child store's `keys`
+/// each keep one per row - MEMORY_OPTIMISATION1.md finding 7). Equality is
+/// computed over the displayed fields on demand; two keys for the same `Arc`
+/// are equal without looking further, which is the common case once
+/// `MessageListModel::intern` has reused the summaries an unchanged sync
+/// re-delivers.
+///
+/// Every field the row renders has to be compared here, or a change to it
+/// will be mistaken for no change at all: `preview` in particular arrives
+/// after the envelope emit, patched in separately by
+/// `AccountEvent::PreviewsFetched` (see `window::patch_previews`), so
+/// omitting it would silently discard every snippet.
+#[derive(Clone)]
+struct MessageRowKey(Arc<EmailSummary>);
+
+impl PartialEq for MessageRowKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || same_rendered_row(&self.0, &other.0)
+    }
+}
+
+impl Eq for MessageRowKey {}
+
+impl std::fmt::Debug for MessageRowKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageRowKey")
+            .field("mailbox", &self.0.mailbox)
+            .field("uid", &self.0.uid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `$Lookout-tag-*` keywords of `m`, in keyword order - the row's tag dots.
+fn row_tags(m: &EmailSummary) -> impl Iterator<Item = &String> {
+    m.keywords.iter().filter(|k| lookout_core::tag_key_from_keyword(k).is_some())
+}
+
+/// The sender label a row shows.
+fn row_sender(m: &EmailSummary) -> &str {
+    m.from.first().map(|a| a.display_label()).unwrap_or("(unknown)")
+}
+
+/// Whether `a` and `b` render as the same row - `MessageRowKey`'s equality.
+fn same_rendered_row(a: &EmailSummary, b: &EmailSummary) -> bool {
+    // Identity and the cheap scalar fields first, so most differences are
+    // found without touching a string.
+    a.uid == b.uid
+        && a.date == b.date
+        && a.mentions == b.mentions
+        && a.importance == b.importance
+        && a.mailbox == b.mailbox
+        // Read *and* flagged state are both part of the key: each drives how
+        // the row is drawn, so a `STORE` that only changes a flag must still
+        // count as a change - otherwise `repopulate`'s no-op check would
+        // swallow the rebuild and the row would keep its old accent bar / pin
+        // icon.
+        && a.is_unread() == b.is_unread()
+        && a.is_pinned() == b.is_pinned()
+        && a.subject == b.subject
+        && row_sender(a) == row_sender(b)
+        && a.preview == b.preview
+        // A tag toggle changes only the message's keywords, and the row's tag
+        // dots are drawn from them. (A tag *recolor/rename* changes no
+        // keyword, so it can't be detected here - `MessageListModel::refresh`
+        // exists for that.)
+        && row_tags(a).eq(row_tags(b))
+        // `thread_key` decides which conversation a row belongs to when the
+        // list is threaded, so a re-sync that re-groups messages must count
+        // as a change even when every rendered field is identical.
+        && a.thread_key == b.thread_key
+        // The follow-up flag drives the row's flag icon and due label.
+        && a.follow_up() == b.follow_up()
 }
 
 /// A compact fingerprint of the fields one message-list row displays, keyed
 /// to keep the row distinct from any other. Used to detect "nothing changed"
-/// and skip a rebuild.
-///
-/// Every field the row renders has to appear here, or a change to it will be
-/// mistaken for no change at all: `preview` in particular arrives after the
-/// envelope emit, patched in separately by `AccountEvent::PreviewsFetched`
-/// (see `window::patch_previews`), so omitting it would silently discard
-/// every snippet.
-fn message_row_key(m: &EmailSummary) -> MessageRowKey {
-    let from = m.from.first().map(|a| a.display_label().to_string()).unwrap_or_else(|| "(unknown)".into());
-    // Read *and* flagged state are both part of the key: each drives how the
-    // row is drawn, so a `STORE` that only changes a flag must still count as
-    // a change - otherwise `repopulate`'s no-op check would swallow the
-    // rebuild and the row would keep its old accent bar / pin icon.
-    // The `$Lookout-tag-*` keyword subset is here for the same reason: a tag
-    // toggle changes only the message's keywords, and the row's tag dots are
-    // drawn from them, so without it the rebuild that drops/adds a dot would
-    // be skipped. (A tag *recolor/rename* changes no keyword, so it can't be
-    // detected here - `MessageListModel::refresh` exists for that.)
-    let tags: Vec<String> = m.keywords.iter().filter(|k| lookout_core::tag_key_from_keyword(k).is_some()).cloned().collect();
-    // `thread_key` decides which conversation a row belongs to when the list
-    // is threaded, so a re-sync that re-groups messages must count as a
-    // change even when every rendered field is identical.
-    MessageRowKey {
-        mailbox: m.mailbox.clone(),
-        uid: m.uid,
-        unread: m.is_unread(),
-        pinned: m.is_pinned(),
-        date: m.date,
-        subject: m.subject.clone(),
-        from,
-        preview: m.preview.clone(),
-        tags,
-        thread_key: m.thread_key.clone(),
-        importance: m.importance,
-        // The follow-up flag drives the row's flag icon and due label.
-        follow_up: m.follow_up(),
-        // The mention verdict drives the row's `@` glyph and the Mentions
-        // filter; it arrives with `PreviewsFetched`, so a late patch must
-        // count as a change.
-        mentions: m.mentions,
-    }
+/// and skip a rebuild. Takes anything convertible to a shared summary so
+/// tests can pass a plain `EmailSummary`; the app always passes an `Arc`,
+/// which this only clones.
+fn message_row_key<M: Clone + Into<Arc<EmailSummary>>>(m: &M) -> MessageRowKey {
+    MessageRowKey(m.clone().into())
 }
 
 /// The `message_row_key` fingerprint of every message in `messages`, in
-/// order - the precomputed form `repopulate` compares against `displayed`,
-/// so the no-op check is one `Vec` equality instead of rebuilding both
-/// sides' keys (≈6 allocations per message) on every event.
-fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
+/// order - the precomputed form `repopulate` compares against `displayed`.
+fn message_row_keys<M: Clone + Into<Arc<EmailSummary>>>(messages: &[M]) -> Vec<MessageRowKey> {
     messages.iter().map(message_row_key).collect()
 }
 
@@ -981,8 +1016,8 @@ fn message_row_keys(messages: &[EmailSummary]) -> Vec<MessageRowKey> {
 /// `splice_pinned_section` renders them as their own leading section,
 /// independent of `sort_key`/`threaded`.
 #[allow(clippy::too_many_arguments)]
-fn compute_layout(
-    truth: Vec<EmailSummary>,
+fn compute_layout<M: Into<Arc<EmailSummary>>>(
+    truth: Vec<M>,
     filter: FilterSet,
     focused: FocusedView,
     viewer: &HashSet<String>,
@@ -991,14 +1026,14 @@ fn compute_layout(
     threaded: bool,
     now: DateTime<Local>,
 ) -> ComputedLayout {
-    let mut messages: Vec<EmailSummary> = truth.into_iter().filter(|m| filter.matches(m, viewer) && focused.matches(m)).collect();
+    let mut messages: Vec<Arc<EmailSummary>> = truth.into_iter().map(Into::into).filter(|m| filter.matches(m, viewer) && focused.matches(m)).collect();
     sort_messages(&mut messages, sort_key, sort_descending);
     let pinned = if filter.contains(Filter::Pinned) {
         Vec::new()
     } else {
         // `partition` preserves each output's relative order, so both halves
         // stay sorted without a second `sort_messages` pass.
-        let (pinned, rest): (Vec<EmailSummary>, Vec<EmailSummary>) = messages.into_iter().partition(|m| m.is_pinned());
+        let (pinned, rest): (Vec<Arc<EmailSummary>>, Vec<Arc<EmailSummary>>) = messages.into_iter().partition(|m| m.is_pinned());
         messages = rest;
         pinned
     };
@@ -1016,51 +1051,12 @@ fn section_row_key(group: GroupKey, label: &str) -> SectionRowKey {
     (group, label.to_string())
 }
 
-/// A `ThreadRow` header fingerprint - every field the header renders, plus
-/// its identity. Does not cover the thread's own messages; those are a
-/// separate diff against the thread's child store. A named struct rather than
-/// a tuple so it can grow past Rust's 12-element tuple trait impls, and must
-/// be kept in sync by hand with `ThreadRow`'s fields.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct ThreadRowKey {
-    id: ThreadId,
-    sender: String,
-    participants: Vec<String>,
-    subject: Option<String>,
-    preview: Option<String>,
-    tags: BTreeSet<String>,
-    count: usize,
-    latest: DateTime<Utc>,
-    size: u32,
-    has_unread: bool,
-    has_pinned: bool,
-    has_attachment: bool,
-    has_calendar: bool,
-    has_mentions: bool,
-    importance: lookout_core::Importance,
-    follow_up: Option<lookout_core::FollowUpFlag>,
-}
-
-fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
-    ThreadRowKey {
-        id: row.id.clone(),
-        sender: row.sender.clone(),
-        participants: row.participants.clone(),
-        subject: row.subject.clone(),
-        preview: row.preview.clone(),
-        tags: row.tags.clone(),
-        count: row.count,
-        latest: row.latest,
-        size: row.size,
-        has_unread: row.has_unread,
-        has_pinned: row.has_pinned,
-        has_attachment: row.has_attachment,
-        has_calendar: row.has_calendar,
-        has_mentions: row.has_mentions,
-        importance: row.importance,
-        follow_up: row.follow_up.clone(),
-    }
-}
+/// A `ThreadRow` header fingerprint: the header itself, shared with its row
+/// object. `ThreadRow`'s derived equality covers every field the header
+/// renders plus its identity, so a key needs no copy of them. Does not cover
+/// the thread's own messages; those are a separate diff against the thread's
+/// child store.
+type ThreadRowKey = Arc<ThreadRow>;
 
 /// The uniform per-row fingerprint every store's incremental diff runs on -
 /// whichever of the three row kinds `MessageItem` can hold in that store.
@@ -1113,14 +1109,56 @@ fn diff_range<K: PartialEq>(old: &[K], new: &[K]) -> RowDiff {
 }
 
 /// Splices `store`'s stale middle range (per `diff_range(old_keys, new_keys)`)
-/// with the corresponding slice of `new_rows` - the incremental counterpart
-/// of `store.splice(0, store.n_items(), &rows)`. `new_rows` must already hold
-/// the *entire* new content in the same order as `new_keys`.
-fn splice_diff(store: &gio::ListStore, old_keys: &[RowKey], new_keys: &[RowKey], new_rows: &[glib::Object]) {
+/// with freshly built rows for the matching range of the new content - the
+/// incremental counterpart of `store.splice(0, store.n_items(), &rows)`.
+/// `row_at(i)` builds the row for `new_keys[i]`; it is only called for the
+/// range that actually changed, so an event that touches one message no
+/// longer allocates a row object for every message in the store just to
+/// throw all but one away (MEMORY_OPTIMISATION1.md finding 7).
+fn splice_diff(store: &gio::ListStore, old_keys: &[RowKey], new_keys: &[RowKey], row_at: impl Fn(usize) -> glib::Object) {
     let diff = diff_range(old_keys, new_keys);
     let removed = diff.old_removed(old_keys.len());
-    let inserted = diff.new_inserted(new_keys.len());
-    store.splice(removed.start as u32, removed.len() as u32, &new_rows[inserted]);
+    let inserted: Vec<glib::Object> = diff.new_inserted(new_keys.len()).map(row_at).collect();
+    store.splice(removed.start as u32, removed.len() as u32, &inserted);
+}
+
+/// A message row object for `message`, sharing its summary.
+fn message_row(message: &Arc<EmailSummary>) -> glib::Object {
+    glib::BoxedAnyObject::new(MessageItem::Message(message.clone())).upcast()
+}
+
+/// A section header row object.
+fn section_row(group: &GroupKey, label: &str) -> glib::Object {
+    glib::BoxedAnyObject::new(MessageItem::Section(SectionRow {
+        group: group.clone(),
+        label: label.to_string(),
+    }))
+    .upcast()
+}
+
+/// Keeps only the parts of `message.structure` the UI reads - attachments
+/// (`window::conversation`'s attachment tiles and menu) - before the summary
+/// joins the list. The text and inline parts are only needed by the account
+/// session, which reads its own copy from the cache, so the list doesn't have
+/// to carry them for every message it shows (MEMORY_OPTIMISATION1.md
+/// finding 7). No summary in the list is ever written back to the cache or
+/// sent to a session.
+pub(crate) fn trim_for_list(mut message: EmailSummary) -> EmailSummary {
+    if let Some(parts) = &mut message.structure {
+        parts.retain(|part| part.is_attachment);
+        if parts.is_empty() {
+            message.structure = None;
+        } else {
+            parts.shrink_to_fit();
+        }
+    }
+    message
+}
+
+/// `trim_for_list`s every message and wraps it for sharing - the form the
+/// list and `UiState::unified_snapshots` hold.
+pub(crate) fn share_for_list(messages: Vec<EmailSummary>) -> Vec<Arc<EmailSummary>> {
+    messages.into_iter().map(|message| Arc::new(trim_for_list(message))).collect()
 }
 
 /// The list's contents as last rendered, plus the sort, filter, and threading
@@ -1303,7 +1341,11 @@ pub struct MessageListModel {
     /// of truth a filter change re-renders from. `displayed` is derived from
     /// this (filtered, then sorted), so toggling the filter off can bring
     /// back messages the filtered subset no longer contains.
-    truth: Rc<RefCell<Vec<EmailSummary>>>,
+    ///
+    /// Shared with the row objects and row keys (see `MessageItem::Message`),
+    /// so the list holds one copy of each message rather than one per place
+    /// that looks at it.
+    truth: Rc<RefCell<Vec<Arc<EmailSummary>>>>,
     /// The active filters, applied inside `repopulate` to every incoming
     /// message set. Owned by the model rather than `UiState` (unlike the
     /// sort), so every caller that rebuilds the list gets the same subset
@@ -1477,8 +1519,62 @@ impl MessageListModel {
     /// re-subset the visible list without re-fetching: single-mailbox views
     /// keep no snapshot in `UiState` (only the unified view does), so this is
     /// the only copy of what's being shown.
+    ///
+    /// An owned copy, for callers that edit it and hand it back to
+    /// `repopulate`; `shared_messages` and `find_message` are cheaper when
+    /// only reading.
     pub fn all_messages(&self) -> Vec<EmailSummary> {
-        self.truth.borrow().clone()
+        self.truth.borrow().iter().map(|message| (**message).clone()).collect()
+    }
+
+    /// The message `(mailbox, uid)` the list is backed by, if any - filtered
+    /// out or not.
+    pub fn find_message(&self, mailbox: &MailboxId, uid: Uid) -> Option<EmailSummary> {
+        self.truth.borrow().iter().find(|m| m.mailbox == *mailbox && m.uid == uid).map(|m| (**m).clone())
+    }
+
+    /// Replaces each message `edit` returns a new version of and re-renders,
+    /// leaving every other message shared as it was - the copy-free form of
+    /// `all_messages` → edit → `repopulate` for a patch that touches a few
+    /// messages (a preview or flag change). Returns whether anything changed;
+    /// nothing is re-rendered when nothing did.
+    pub fn patch_messages(&self, mut edit: impl FnMut(&EmailSummary) -> Option<EmailSummary>, sort_key: SortKey, sort_descending: bool) -> bool {
+        let changed = {
+            let mut truth = self.truth.borrow_mut();
+            let mut changed = false;
+            for message in truth.iter_mut() {
+                if let Some(updated) = edit(message) {
+                    *message = Arc::new(trim_for_list(updated));
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed {
+            self.recompute_and_apply(sort_key, sort_descending);
+        }
+        changed
+    }
+
+    /// Reuses the summaries already in `truth` for every incoming message
+    /// that is identical to one of them, so a sync that re-delivers an
+    /// unchanged folder (most IDLE wakes, every cache replay) doesn't leave
+    /// the list holding the old copy in its rows and keys and a new, equal
+    /// copy in `truth`. It also lets the row-key comparisons take their
+    /// pointer-equality shortcut for every unchanged row.
+    pub(crate) fn intern(&self, incoming: Vec<Arc<EmailSummary>>) -> Vec<Arc<EmailSummary>> {
+        let truth = self.truth.borrow();
+        if truth.is_empty() {
+            return incoming;
+        }
+        let existing: HashMap<(&str, Uid), &Arc<EmailSummary>> = truth.iter().map(|m| ((m.mailbox.0.as_str(), m.uid), m)).collect();
+        incoming
+            .into_iter()
+            .map(|message| match existing.get(&(message.mailbox.0.as_str(), message.uid)) {
+                Some(current) if Arc::ptr_eq(current, &message) || **current == message => (*current).clone(),
+                _ => message,
+            })
+            .collect()
     }
 
     /// The active filter set, for the window's filter-menu actions to toggle.
@@ -1668,12 +1764,19 @@ impl MessageListModel {
     /// whatever the newer call already rendered (same idiom as
     /// `RecipientEntry::suggestion_generation`).
     pub fn repopulate(&self, messages: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
+        self.repopulate_shared(share_for_list(messages), sort_key, sort_descending);
+    }
+
+    /// `repopulate` for messages already wrapped by `share_for_list` - the
+    /// All Inboxes rebuilds, which share the summaries with
+    /// `UiState::unified_snapshots` instead of copying them.
+    pub fn repopulate_shared(&self, messages: Vec<Arc<EmailSummary>>, sort_key: SortKey, sort_descending: bool) {
         // Remember the full, unfiltered set first - a filter toggle
         // re-renders from this, so messages hidden by the filter aren't lost.
-        // Moved in rather than cloned: `compute_layout` only ever sees the
-        // filtered subset, but `truth` must still see every incoming change -
-        // including one the filter hides - or a later filter toggle would
-        // render stale data.
+        // `compute_layout` only ever sees the filtered subset, but `truth`
+        // must still see every incoming change - including one the filter
+        // hides - or a later filter toggle would render stale data.
+        let messages = self.intern(messages);
         *self.truth.borrow_mut() = messages;
         self.recompute_and_apply(sort_key, sort_descending);
     }
@@ -1688,15 +1791,19 @@ impl MessageListModel {
     /// always satisfies this (it's scoped to one mailbox at the source), so a
     /// violation is a logic bug worth catching in debug builds rather than a
     /// runtime condition to handle.
-    pub fn repopulate_unified_slice(&self, mailbox: &MailboxId, mut new_slice: Vec<EmailSummary>, sort_key: SortKey, sort_descending: bool) {
+    ///
+    /// `new_slice` comes from `share_for_list`, shared with the mailbox's
+    /// `UiState::unified_snapshots` entry.
+    pub fn repopulate_unified_slice(&self, mailbox: &MailboxId, new_slice: Vec<Arc<EmailSummary>>, sort_key: SortKey, sort_descending: bool) {
         debug_assert!(
             new_slice.iter().all(|m| &m.mailbox == mailbox),
             "repopulate_unified_slice: new_slice must belong to `mailbox`"
         );
+        let mut new_slice = self.intern(new_slice);
         {
             let mut truth = self.truth.borrow_mut();
             let rest = std::mem::take(&mut *truth).into_iter().filter(|m| &m.mailbox != mailbox);
-            new_slice.sort_by(unified_merge_order);
+            new_slice.sort_by(|a, b| unified_merge_order(a, b));
             new_slice.dedup_by(|a, b| a.mailbox == b.mailbox && a.uid == b.uid);
             *truth = merge_by_order(rest, new_slice.into_iter());
         }
@@ -1718,9 +1825,9 @@ impl MessageListModel {
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
 
-        // One clone of the full (unfiltered) truth to hand to `compute_layout`
-        // - inline or on the blocking pool, either way `compute_layout` needs
-        // an owned `Vec` to filter/sort/consume.
+        // The full (unfiltered) truth to hand to `compute_layout` - inline or
+        // on the blocking pool, either way it needs an owned `Vec` to
+        // filter/sort/consume. Only the `Arc`s are cloned, not the messages.
         let truth_snapshot = self.truth.borrow().clone();
 
         let worker = if truth_snapshot.len() > BACKGROUND_REPOPULATE_THRESHOLD {
@@ -1820,10 +1927,6 @@ impl MessageListModel {
                 live.extend(sections.iter().map(|(group, _, _)| group.clone()));
                 for (group, _, messages) in &sections {
                     let new_keys: Vec<RowKey> = messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
-                    let rows: Vec<glib::Object> = messages
-                        .iter()
-                        .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(m.clone()))).upcast())
-                        .collect();
                     // Store handle cloned and the borrow dropped *before*
                     // splicing: `items-changed` re-enters synchronously, and
                     // a held `RefCell` borrow across it would panic on the
@@ -1835,7 +1938,7 @@ impl MessageListModel {
                         let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
                         (tracked.store.clone(), old_keys)
                     };
-                    splice_diff(&store, &old_keys, &new_keys, &rows);
+                    splice_diff(&store, &old_keys, &new_keys, |i| message_row(&messages[i]));
                 }
                 self.clear_sections(&live);
                 // A grouped layout holds no thread rows, so every thread store
@@ -1843,16 +1946,14 @@ impl MessageListModel {
                 // that re-threads and finds the same id again.
                 self.clear_threads(&HashSet::new());
 
+                let pinned_rows = pinned_root_rows.len();
                 let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(sections.iter().map(|(group, label, _)| RowKey::Section(section_row_key(group.clone(), label))));
-                let mut rows: Vec<glib::Object> = pinned_root_rows;
-                rows.extend(
-                    sections
-                        .into_iter()
-                        .map(|(group, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { group, label })).upcast()),
-                );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
-                splice_diff(&self.root, &old_keys, &new_keys, &rows);
+                splice_diff(&self.root, &old_keys, &new_keys, |i| match i.checked_sub(pinned_rows) {
+                    None => pinned_root_rows[i].clone(),
+                    Some(i) => section_row(&sections[i].0, &sections[i].1),
+                });
                 self.prune_sections(&live);
                 self.apply_expansion();
             }
@@ -1867,15 +1968,8 @@ impl MessageListModel {
                     let new_keys: Vec<RowKey> = entries
                         .iter()
                         .map(|entry| match entry {
-                            ThreadEntry::Thread(thread) => RowKey::Thread(thread_row_key(&thread.row)),
+                            ThreadEntry::Thread(thread) => RowKey::Thread(thread.row.clone()),
                             ThreadEntry::Single(message) => RowKey::Message(message_row_key(message)),
-                        })
-                        .collect();
-                    let rows: Vec<glib::Object> = entries
-                        .iter()
-                        .map(|entry| match entry {
-                            ThreadEntry::Thread(thread) => glib::BoxedAnyObject::new(MessageItem::Thread(thread.row.clone())).upcast(),
-                            ThreadEntry::Single(message) => glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(message.clone()))).upcast(),
                         })
                         .collect();
                     // See the `Grouped` arm's comment: store handle cloned
@@ -1886,7 +1980,10 @@ impl MessageListModel {
                         let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
                         (tracked.store.clone(), old_keys)
                     };
-                    splice_diff(&store, &old_keys, &new_keys, &rows);
+                    splice_diff(&store, &old_keys, &new_keys, |i| match &entries[i] {
+                        ThreadEntry::Thread(thread) => glib::BoxedAnyObject::new(MessageItem::Thread(thread.row.clone())).upcast(),
+                        ThreadEntry::Single(message) => message_row(message),
+                    });
 
                     for entry in entries {
                         let ThreadEntry::Thread(thread) = entry else { continue };
@@ -1895,33 +1992,26 @@ impl MessageListModel {
                         // left them in) - the natural reading order of a
                         // conversation regardless of the list's sort.
                         let new_message_keys: Vec<RowKey> = thread.messages.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
-                        let message_rows: Vec<glib::Object> = thread
-                            .messages
-                            .iter()
-                            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(m.clone()))).upcast())
-                            .collect();
                         let (thread_store, old_message_keys) = {
                             let mut threads = self.threads.borrow_mut();
                             let tracked = threads.entry(thread.row.id.clone()).or_insert_with(TrackedStore::new);
                             let old_keys = std::mem::replace(&mut tracked.keys, new_message_keys.clone());
                             (tracked.store.clone(), old_keys)
                         };
-                        splice_diff(&thread_store, &old_message_keys, &new_message_keys, &message_rows);
+                        splice_diff(&thread_store, &old_message_keys, &new_message_keys, |i| message_row(&thread.messages[i]));
                     }
                 }
                 self.clear_sections(&live_groups);
                 self.clear_threads(&live_threads);
 
+                let pinned_rows = pinned_root_rows.len();
                 let mut new_keys: Vec<RowKey> = pinned_root_keys;
                 new_keys.extend(sections.iter().map(|(group, label, _)| RowKey::Section(section_row_key(group.clone(), label))));
-                let mut rows: Vec<glib::Object> = pinned_root_rows;
-                rows.extend(
-                    sections
-                        .into_iter()
-                        .map(|(group, label, _)| glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { group, label })).upcast()),
-                );
                 let old_keys = std::mem::replace(&mut *self.root_keys.borrow_mut(), new_keys.clone());
-                splice_diff(&self.root, &old_keys, &new_keys, &rows);
+                splice_diff(&self.root, &old_keys, &new_keys, |i| match i.checked_sub(pinned_rows) {
+                    None => pinned_root_rows[i].clone(),
+                    Some(i) => section_row(&sections[i].0, &sections[i].1),
+                });
                 self.prune_sections(&live_groups);
                 self.apply_expansion();
             }
@@ -1950,8 +2040,7 @@ impl MessageListModel {
             // repopulate would use anyway.
             None => (SortKey::Date, true),
         };
-        let truth = self.all_messages();
-        self.repopulate(truth, sort_key, sort_descending);
+        self.recompute_and_apply(sort_key, sort_descending);
     }
 
     /// Switches which Focused Inbox bucket the list shows (M-03 / item 5.4) -
@@ -1967,8 +2056,7 @@ impl MessageListModel {
             Some((key, descending, ..)) => (key, descending),
             None => (SortKey::Date, true),
         };
-        let truth = self.all_messages();
-        self.repopulate(truth, sort_key, sort_descending);
+        self.recompute_and_apply(sort_key, sort_descending);
     }
 
     /// Replaces the viewer's own addresses used to evaluate [`Filter::ToMe`],
@@ -2001,8 +2089,7 @@ impl MessageListModel {
             Some((key, descending, ..)) => (key, descending),
             None => (SortKey::Date, true),
         };
-        let truth = self.all_messages();
-        self.repopulate(truth, sort_key, sort_descending);
+        self.recompute_and_apply(sort_key, sort_descending);
     }
 
     /// Re-renders from the unfiltered source of truth under the current sort
@@ -2020,7 +2107,7 @@ impl MessageListModel {
         // Clearing `displayed` first makes the no-op check see "nothing
         // rendered yet" and rebuild unconditionally.
         *self.displayed.borrow_mut() = None;
-        self.repopulate(self.all_messages(), sort_key, sort_descending);
+        self.recompute_and_apply(sort_key, sort_descending);
     }
 
     /// Empties every section store whose group isn't in `live`, so a group
@@ -2097,25 +2184,21 @@ impl MessageListModel {
     /// unconditionally, in every `apply_layout` arm - the pinned section
     /// exists independent of the active grouping (`compute_layout` already
     /// pulled pinned messages out of `build_layout`'s input).
-    fn splice_pinned_section(&self, pinned: &[EmailSummary], now: DateTime<Local>) -> (HashSet<GroupKey>, Vec<RowKey>, Vec<glib::Object>) {
+    fn splice_pinned_section(&self, pinned: &[Arc<EmailSummary>], now: DateTime<Local>) -> (HashSet<GroupKey>, Vec<RowKey>, Vec<glib::Object>) {
         if pinned.is_empty() {
             return (HashSet::new(), Vec::new(), Vec::new());
         }
         let new_keys: Vec<RowKey> = pinned.iter().map(|m| RowKey::Message(message_row_key(m))).collect();
-        let rows: Vec<glib::Object> = pinned
-            .iter()
-            .map(|m| glib::BoxedAnyObject::new(MessageItem::Message(Rc::new(m.clone()))).upcast())
-            .collect();
         let (store, old_keys) = {
             let mut sections = self.sections.borrow_mut();
             let tracked = sections.entry(GroupKey::Pinned).or_insert_with(TrackedStore::new);
             let old_keys = std::mem::replace(&mut tracked.keys, new_keys.clone());
             (tracked.store.clone(), old_keys)
         };
-        splice_diff(&store, &old_keys, &new_keys, &rows);
+        splice_diff(&store, &old_keys, &new_keys, |i| message_row(&pinned[i]));
         let label = group_label(&GroupKey::Pinned, now);
         let root_keys = vec![RowKey::Section(section_row_key(GroupKey::Pinned, &label))];
-        let root_rows: Vec<glib::Object> = vec![glib::BoxedAnyObject::new(MessageItem::Section(SectionRow { group: GroupKey::Pinned, label })).upcast()];
+        let root_rows: Vec<glib::Object> = vec![section_row(&GroupKey::Pinned, &label)];
         (HashSet::from([GroupKey::Pinned]), root_keys, root_rows)
     }
 
@@ -2458,7 +2541,7 @@ fn thread_id(row: &gtk::TreeListRow) -> Option<ThreadId> {
 /// Comparators are written in the "descending" direction (newest/largest/
 /// High/Z-A first); an ascending request is the exact mirror, produced by
 /// reversing - which also flips the date tie-break, as intended.
-pub fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bool) {
+pub fn sort_messages<M: std::borrow::Borrow<EmailSummary>>(messages: &mut [M], key: SortKey, descending: bool) {
     // A missing text value sorts after every real value in the descending
     // order (so blanks land last, as Outlook's "None" groups do).
     const NO_KEY: &str = "\u{10FFFF}";
@@ -2467,16 +2550,21 @@ pub fn sort_messages(messages: &mut [EmailSummary], key: SortKey, descending: bo
     let to_of = |m: &EmailSummary| m.to.first().map(|a| a.display_label().to_lowercase()).unwrap_or_else(|| NO_KEY.to_string());
     let category_of = |m: &EmailSummary| tag_sort_key(m).unwrap_or_else(|| NO_KEY.to_string());
     let date_tie = |a: &EmailSummary, b: &EmailSummary| b.date.cmp(&a.date);
+    // Every comparator below reads through `Borrow`, so the same sort serves
+    // a plain `[EmailSummary]` and the list's shared `[Arc<EmailSummary>]`.
+    fn by<M: std::borrow::Borrow<EmailSummary>>(cmp: impl Fn(&EmailSummary, &EmailSummary) -> std::cmp::Ordering) -> impl Fn(&M, &M) -> std::cmp::Ordering {
+        move |a, b| cmp(a.borrow(), b.borrow())
+    }
     match key {
-        SortKey::Date => messages.sort_by_key(|m| std::cmp::Reverse(m.date)),
-        SortKey::Sender => messages.sort_by(|a, b| sender_of(a).cmp(&sender_of(b)).then_with(|| date_tie(a, b))),
-        SortKey::Subject => messages.sort_by(|a, b| subject_of(a).cmp(&subject_of(b)).then_with(|| date_tie(a, b))),
-        SortKey::To => messages.sort_by(|a, b| to_of(a).cmp(&to_of(b)).then_with(|| date_tie(a, b))),
-        SortKey::Category => messages.sort_by(|a, b| category_of(a).cmp(&category_of(b)).then_with(|| date_tie(a, b))),
-        SortKey::Size => messages.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| date_tie(a, b))),
-        SortKey::Importance => messages.sort_by(|a, b| importance_rank(a.importance).cmp(&importance_rank(b.importance)).then_with(|| date_tie(a, b))),
-        SortKey::Flag => messages.sort_by(|a, b| flag_rank(a).cmp(&flag_rank(b)).then_with(|| date_tie(a, b))),
-        SortKey::Attachments => messages.sort_by(|a, b| b.has_attachment.cmp(&a.has_attachment).then_with(|| date_tie(a, b))),
+        SortKey::Date => messages.sort_by_key(|m| std::cmp::Reverse(m.borrow().date)),
+        SortKey::Sender => messages.sort_by(by(|a, b| sender_of(a).cmp(&sender_of(b)).then_with(|| date_tie(a, b)))),
+        SortKey::Subject => messages.sort_by(by(|a, b| subject_of(a).cmp(&subject_of(b)).then_with(|| date_tie(a, b)))),
+        SortKey::To => messages.sort_by(by(|a, b| to_of(a).cmp(&to_of(b)).then_with(|| date_tie(a, b)))),
+        SortKey::Category => messages.sort_by(by(|a, b| category_of(a).cmp(&category_of(b)).then_with(|| date_tie(a, b)))),
+        SortKey::Size => messages.sort_by(by(|a, b| b.size.cmp(&a.size).then_with(|| date_tie(a, b)))),
+        SortKey::Importance => messages.sort_by(by(|a, b| importance_rank(a.importance).cmp(&importance_rank(b.importance)).then_with(|| date_tie(a, b)))),
+        SortKey::Flag => messages.sort_by(by(|a, b| flag_rank(a).cmp(&flag_rank(b)).then_with(|| date_tie(a, b)))),
+        SortKey::Attachments => messages.sort_by(by(|a, b| b.has_attachment.cmp(&a.has_attachment).then_with(|| date_tie(a, b)))),
     }
     // Ascending is the descending order reversed rather than a second set of
     // comparators - which also flips the date tie-break, so "oldest first"
@@ -2515,7 +2603,7 @@ pub(crate) fn unified_merge_order(a: &EmailSummary, b: &EmailSummary) -> std::cm
 /// the same way by the caller), producing one `Vec` in that same order. A
 /// plain two-pointer mergesort merge step - every element is moved, never
 /// cloned.
-fn merge_by_order(rest: impl Iterator<Item = EmailSummary>, new_slice: impl Iterator<Item = EmailSummary>) -> Vec<EmailSummary> {
+fn merge_by_order(rest: impl Iterator<Item = Arc<EmailSummary>>, new_slice: impl Iterator<Item = Arc<EmailSummary>>) -> Vec<Arc<EmailSummary>> {
     let mut rest = rest.peekable();
     let mut new_slice = new_slice.peekable();
     let mut merged = Vec::with_capacity(rest.size_hint().0 + new_slice.size_hint().0);
@@ -2914,7 +3002,7 @@ mod tests {
         // Account "b" resyncs: uid 1 unchanged, uid 2 dropped (expunged), a
         // new uid 3 arrives. "a" and "c" are untouched by this call.
         let b_new = vec![summary_in(1, "b:INBOX", d2), summary_in(3, "b:INBOX", d_newest)];
-        unified.repopulate_unified_slice(&MailboxId("b:INBOX".into()), b_new, SortKey::Date, true);
+        unified.repopulate_unified_slice(&MailboxId("b:INBOX".into()), share_for_list(b_new), SortKey::Date, true);
 
         let mut expected = vec![
             summary_in(1, "a:INBOX", d1),
@@ -2934,20 +3022,20 @@ mod tests {
         tied_initial.sort_by(unified_merge_order);
         tied.repopulate(tied_initial, SortKey::Date, true);
         let tie_b = vec![summary_in(1, "b:INBOX", tie)];
-        tied.repopulate_unified_slice(&MailboxId("b:INBOX".into()), tie_b, SortKey::Date, true);
+        tied.repopulate_unified_slice(&MailboxId("b:INBOX".into()), share_for_list(tie_b), SortKey::Date, true);
         let mut tie_expected = vec![summary_in(1, "a:INBOX", tie), summary_in(1, "b:INBOX", tie)];
         tie_expected.sort_by(unified_merge_order);
         let tie_expected_keys = merge_keys(&tie_expected);
         assert_eq!(merge_keys(&tied.all_messages()), tie_expected_keys, "date tie did not break deterministically");
         let tie_b_again = vec![summary_in(1, "b:INBOX", tie)];
-        tied.repopulate_unified_slice(&MailboxId("b:INBOX".into()), tie_b_again, SortKey::Date, true);
+        tied.repopulate_unified_slice(&MailboxId("b:INBOX".into()), share_for_list(tie_b_again), SortKey::Date, true);
         assert_eq!(merge_keys(&tied.all_messages()), tie_expected_keys, "repeat call produced a different tie order");
 
         // --- The mailbox-mismatch guard fires in debug builds ---
         let guarded = MessageListModel::build();
         let wrong_mailbox = vec![summary_in(1, "other:INBOX", today)];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            guarded.repopulate_unified_slice(&MailboxId("b:INBOX".into()), wrong_mailbox, SortKey::Date, true)
+            guarded.repopulate_unified_slice(&MailboxId("b:INBOX".into()), share_for_list(wrong_mailbox), SortKey::Date, true)
         }));
         assert!(result.is_err(), "repopulate_unified_slice accepted a message from the wrong mailbox");
 
@@ -3594,9 +3682,14 @@ mod tests {
         }
     }
 
-    /// Every field `ThreadRow`'s header renders has to appear in
-    /// `thread_row_key`, or a change to it would be mistaken for no change -
-    /// same contract `message_row_key`'s doc comment demands for
+    /// A header's row key, as `apply_layout` builds it.
+    fn thread_row_key(row: &ThreadRow) -> ThreadRowKey {
+        Arc::new(row.clone())
+    }
+
+    /// Every field `ThreadRow`'s header renders has to count in its row key
+    /// (`ThreadRow`'s equality), or a change to it would be mistaken for no
+    /// change - same contract `message_row_key`'s doc comment demands for
     /// `EmailSummary`.
     #[test]
     fn thread_row_key_covers_every_rendered_field() {
@@ -4064,5 +4157,233 @@ mod tests {
         let groups: Vec<GroupKey> = model.sections.borrow().keys().cloned().collect();
         assert_eq!(groups.len(), 1, "only the Today group is left: {groups:?}");
         assert_eq!(model.selection.n_items(), 3, "Today's header and both messages");
+    }
+
+    /// Every message row object in the model's section stores, in order.
+    fn row_summaries(model: &MessageListModel) -> Vec<Arc<EmailSummary>> {
+        let mut out = Vec::new();
+        for i in 0..model.root.n_items() {
+            let Some(boxed) = model.root.item(i).and_downcast::<glib::BoxedAnyObject>() else {
+                continue;
+            };
+            let item = boxed.borrow::<MessageItem>();
+            let MessageItem::Section(section) = &*item else { continue };
+            let sections = model.sections.borrow();
+            let Some(tracked) = sections.get(&section.group) else { continue };
+            for j in 0..tracked.store.n_items() {
+                let Some(row) = tracked.store.item(j).and_downcast::<glib::BoxedAnyObject>() else {
+                    continue;
+                };
+                let item = row.borrow::<MessageItem>();
+                if let MessageItem::Message(message) = &*item {
+                    out.push(message.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The list holds one copy of each message: its row objects and row keys
+    /// share the summaries in `truth`, and a sync that re-delivers the same
+    /// messages reuses them instead of keeping an equal second copy
+    /// (MEMORY_OPTIMISATION1.md Phase 4).
+    #[test]
+    fn rows_and_keys_share_the_truth_and_an_unchanged_resync_reuses_it() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let today = Utc::now();
+        let model = MessageListModel::build();
+        model.set_threaded(false);
+        model.repopulate(vec![summary(1, today), summary(2, today - chrono::Duration::minutes(5))], SortKey::Date, true);
+        let truth = model.truth.borrow().clone();
+        let rows = row_summaries(&model);
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert!(truth.iter().any(|m| Arc::ptr_eq(m, row)), "row {:?} shares its summary with truth", row.uid);
+        }
+        let displayed_keys: Vec<MessageRowKey> = model.displayed.borrow().as_ref().expect("rendered").5.clone();
+        for key in &displayed_keys {
+            assert!(truth.iter().any(|m| Arc::ptr_eq(m, &key.0)), "the row key shares its summary too");
+        }
+
+        // The same messages again, as fresh copies: nothing is re-rendered
+        // and `truth` keeps the summaries it already had.
+        model.repopulate(vec![summary(1, today), summary(2, today - chrono::Duration::minutes(5))], SortKey::Date, true);
+        let after = model.truth.borrow().clone();
+        assert!(
+            after.iter().zip(&truth).all(|(a, b)| Arc::ptr_eq(a, b)),
+            "an unchanged resync reuses the existing summaries"
+        );
+        assert!(row_summaries(&model).iter().zip(&rows).all(|(a, b)| Arc::ptr_eq(a, b)), "and leaves the rows alone");
+
+        // A changed message gets a new summary; the unchanged one stays shared.
+        let mut read = summary(2, today - chrono::Duration::minutes(5));
+        read.flags.insert(lookout_core::SystemFlagBit::Seen);
+        model.repopulate(vec![summary(1, today), read], SortKey::Date, true);
+        let changed = model.truth.borrow().clone();
+        let one = |list: &[Arc<EmailSummary>]| list.iter().find(|m| m.uid == Uid(1)).cloned().unwrap();
+        let two = |list: &[Arc<EmailSummary>]| list.iter().find(|m| m.uid == Uid(2)).cloned().unwrap();
+        assert!(Arc::ptr_eq(&one(&changed), &one(&truth)), "the unchanged message is still shared");
+        assert!(!Arc::ptr_eq(&two(&changed), &two(&truth)), "the read message is a new summary");
+        assert!(!two(&row_summaries(&model)).is_unread(), "and its row shows it read");
+    }
+
+    /// `patch_messages` replaces only the messages it edits and leaves every
+    /// other summary shared, rows included.
+    #[test]
+    fn patch_messages_copies_only_the_patched_messages() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let today = Utc::now();
+        let model = MessageListModel::build();
+        model.set_threaded(false);
+        model.repopulate(vec![summary(1, today), summary(2, today - chrono::Duration::minutes(5))], SortKey::Date, true);
+        let before = model.truth.borrow().clone();
+        let changed = model.patch_messages(
+            |m| {
+                (m.uid == Uid(2)).then(|| {
+                    let mut patched = m.clone();
+                    patched.preview = Some("hello".into());
+                    patched
+                })
+            },
+            SortKey::Date,
+            true,
+        );
+        assert!(changed);
+        let after = model.truth.borrow().clone();
+        assert!(Arc::ptr_eq(&after[0], &before[0]), "uid 1 is untouched and still shared");
+        assert_eq!(after[1].preview.as_deref(), Some("hello"));
+        let rows = row_summaries(&model);
+        assert_eq!(rows[1].preview.as_deref(), Some("hello"), "the patched row shows the preview");
+        assert!(Arc::ptr_eq(&rows[0], &before[0]), "the untouched row was not rebuilt");
+        assert!(!model.patch_messages(|_| None, SortKey::Date, true), "nothing to patch reports no change");
+    }
+
+    /// The list keeps only the attachment parts of a message's structure,
+    /// the only ones the UI reads.
+    #[test]
+    fn list_summaries_keep_only_attachment_parts() {
+        let part = |number: &str, content_type: &str, is_attachment: bool| lookout_core::BodyPart {
+            part_number: number.into(),
+            content_type: content_type.into(),
+            charset: None,
+            transfer_encoding: None,
+            filename: is_attachment.then(|| "report.pdf".into()),
+            cid: None,
+            size: 10,
+            is_attachment,
+        };
+        let mut with_attachment = summary(1, Utc::now());
+        with_attachment.structure = Some(vec![part("1", "text/plain", false), part("2", "text/html", false), part("3", "application/pdf", true)]);
+        let trimmed = trim_for_list(with_attachment);
+        let parts = trimmed.structure.expect("the attachment part stays");
+        assert_eq!(parts.iter().map(|p| p.part_number.as_str()).collect::<Vec<_>>(), vec!["3"]);
+
+        let mut text_only = summary(2, Utc::now());
+        text_only.structure = Some(vec![part("1", "text/plain", false)]);
+        assert!(trim_for_list(text_only).structure.is_none(), "a message without attachments keeps no parts");
+    }
+
+    /// Manual measurement (not a regression test) for MEMORY_OPTIMISATION1.md
+    /// Phase 4: the heap the message list keeps for 20,000 realistic
+    /// messages after an initial load and one unchanged resync. Run with:
+    /// `cargo test -p lookout-app --release message_list::tests::resident_heap_per_message -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn resident_heap_per_message() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        #[repr(C)]
+        struct MallInfo2 {
+            arena: usize,
+            ordblks: usize,
+            smblks: usize,
+            hblks: usize,
+            hblkhd: usize,
+            usmblks: usize,
+            fsmblks: usize,
+            uordblks: usize,
+            fordblks: usize,
+            keepcost: usize,
+        }
+        extern "C" {
+            fn mallinfo2() -> MallInfo2;
+        }
+        let in_use = || {
+            let info = unsafe { mallinfo2() };
+            info.uordblks + info.hblkhd
+        };
+        const N: u32 = 20_000;
+        let now = Utc::now();
+        let make = || -> Vec<EmailSummary> {
+            (0..N)
+                .map(|i| {
+                    let part = |number: &str, content_type: &str, is_attachment: bool| lookout_core::BodyPart {
+                        part_number: number.into(),
+                        content_type: content_type.into(),
+                        charset: Some("utf-8".into()),
+                        transfer_encoding: Some("quoted-printable".into()),
+                        filename: is_attachment.then(|| format!("attachment-{i}.pdf")),
+                        cid: None,
+                        size: 2048,
+                        is_attachment,
+                    };
+                    let mut structure = vec![part("1", "text/plain", false), part("2", "text/html", false)];
+                    if i % 3 == 0 {
+                        structure.push(part("3", "application/pdf", true));
+                    }
+                    EmailSummary {
+                        inference_classification: Default::default(),
+                        uid: Uid(i + 1),
+                        mailbox: MailboxId("_org_gnome_OnlineAccounts_Accounts_account_1676251201_0:INBOX".into()),
+                        message_id: Some(format!("<message-{i}@mail.example.com>")),
+                        in_reply_to: None,
+                        references: Vec::new(),
+                        thread_key: lookout_core::ThreadKey(format!("<message-{i}@mail.example.com>")),
+                        subject: Some(format!("Quarterly planning notes and the follow-up actions, part {i}")),
+                        from: vec![lookout_core::EmailAddress {
+                            name: Some(format!("Sender Person {}", i % 200)),
+                            address: format!("sender{}@example.com", i % 200),
+                        }],
+                        to: vec![lookout_core::EmailAddress {
+                            name: Some("Me".into()),
+                            address: "me@example.com".into(),
+                        }],
+                        cc: Vec::new(),
+                        date: now - chrono::Duration::minutes(i64::from(i) * 7),
+                        flags: [lookout_core::SystemFlagBit::Seen].into_iter().collect(),
+                        keywords: Default::default(),
+                        size: 40_000,
+                        has_attachment: i % 3 == 0,
+                        has_calendar: false,
+                        preview: Some("Hi all, following on from the meeting earlier today here are the notes we took and the list of actions each team agreed to pick up before next week. Please reply with corrections by Friday so the final version can go out to everyone on Monday morning as planned, thanks again.".into()),
+                        mentions: false,
+                        importance: Default::default(),
+                        sensitivity: Default::default(),
+                        list_id: None,
+                        structure: Some(structure),
+                    }
+                })
+                .collect()
+        };
+        let before = in_use();
+        let model = MessageListModel::build();
+        model.set_threaded(false);
+        model.repopulate(make(), SortKey::Date, true);
+        let after_load = in_use();
+        model.repopulate(make(), SortKey::Date, true);
+        let after_resync = in_use();
+        eprintln!(
+            "MEASURE after load: {:.1} MB ({} B/message); after unchanged resync: {:.1} MB ({} B/message)",
+            (after_load - before) as f64 / 1048576.0,
+            (after_load - before) / N as usize,
+            (after_resync - before) as f64 / 1048576.0,
+            (after_resync - before) / N as usize
+        );
+        drop(model);
     }
 }
