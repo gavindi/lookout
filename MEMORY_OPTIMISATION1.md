@@ -23,17 +23,15 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 | Phase | State | Release |
 |---|---|---|
 | 0: measure | Done: a real leak, mostly the calendar sidebar | measured on 0.9.315 |
-| 1: break widget reference cycles | Done, except the event editor | 0.9.316 (memory steady at ~600 MB, user report); composer done after 0.9.317, not yet released |
+| 1: break widget reference cycles | Done, event and task editors included; not yet run in the real app | 0.9.316 (memory steady at ~600 MB, user report); composer in 0.9.318; editors in 0.9.319 |
 | 2: stop rebuilding when nothing changed | Not started | |
 | 3: bound the Rust collections | Done; not yet run in the real app | 0.9.317 |
 | 4: cut duplicate copies | Not started | |
 | 5: stop tests polluting the real cache | Code not started. This machine's leftovers were deleted on 2026-11-15: 6,735 entries, 1.2 GB; `~/.cache/lookout` went from ~2.1 GB to 901 MB | |
 
-**Next step:** review the event editor (`event_editor.rs`, `recurrence.rs`, `room_finder.rs`), with a "closed editor is freed" test like the composer's. Two cycles are already known there:
-- `event_editor.rs:689` and `:1237`: the attendees field's `connect_addresses_changed` callbacks capture the field itself. That is a plain `Rc` cycle, because the callback is stored inside the field.
-- `recurrence.rs:934` and `room_finder.rs:297`, `:496`, `:553`, `:586`: handlers that capture their own popover.
+**Next step:** Phase 4 is where most of the remaining memory is. Phase 2 is smaller and mostly saves CPU now that rebuilt rows are freed.
 
-After that, Phase 4 is where most of the remaining memory is.
+**Still worth checking in the running app:** the Phase 0 probe's per-type counts across a session that opens and closes composers and editors. Do `AdwWindow`, `WebKitWebView` and `GtkPopoverMenu` stay flat? Under Wayland, is `GtkText` retained by the input-method module the way it is under Broadway?
 
 **Open side item:** this machine's clippy (1.92) flags `nonminimal_bool` at `crates/mail/src/session.rs:274`, which is older than this work. Until it is fixed, the clippy command needs `-A clippy::nonminimal_bool`.
 
@@ -108,7 +106,36 @@ With the old swatch capture put back, the checklist test fails with exactly the 
 - The event editor (`recurrence.rs`, `room_finder.rs`) was not reviewed.
 - The ribbon's More / Move to / Quick steps popovers hold themselves too, but they are singletons whose rebuilt contents free normally, so they were left alone.
 
-## Composer results (2026-11-15, after 0.9.317; not yet released or run in the real app)
+## Event and task editor results (2026-11-15, released as 0.9.319, not yet run in the real app)
+
+**Measured first:** new tests open each editor, close it with Cancel and assert that every widget in it is freed.
+- `event_editor::tests::closed_event_editor_is_freed`: a new event.
+- `closed_editor_for_an_existing_meeting_with_scheduling_is_freed`: a recurring meeting with the Scheduling Assistant and the room finder.
+- `task_editor::tests::closed_task_editor_is_freed`.
+
+Before the fix, the whole event editor survived (about 2,000 widgets, `AdwWindow` included), and so did the task editor. GTK's `gtk_window_destroy` only drops the window's own reference, so a single handler that holds the dialog (Cancel's `dialog.close()`) keeps the whole window alive.
+
+**Fixed:**
+- **`util::HandlerSet`:** the composer's handler tracker, made shared. It adds `on_teardown` clean-ups for app-level callback slots, and `track` drops entries whose objects are gone. Both editors record their handlers in one and run it on the window's `close-request`. The editors have no other `close-request` handlers.
+- **Helpers that connect on the editor's widgets** take the editor's set, so their handlers are disconnected with the editor's own:
+  - `recurrence::build_series_control` (its done button held the Series button and its popover; its field handlers held sibling fields)
+  - `room_finder::attach` (`RoomFinderInputs::handlers`)
+  - the attachments group and its rows (whose buttons held the group, while the `rows` list held the rows and is now emptied at teardown)
+- **App-level callback slots cleared at teardown:**
+  - `RecipientEntry::clear_addresses_changed`
+  - `ScheduleGrid::clear_callbacks`
+  - `calendar_view::clear_day_selected` (the preview mini-calendar)
+  - the Scheduling refresh-hook holder
+  - the room finder's availability-refresh holder
+  - `SchedulingHandle::clear_listener`: the handle outlives the editor, and its listener held the last editor's Scheduling page until the next editor opened.
+- **Controllers that held their own widget:** the time grid's hover, click and context controllers (`attach_hover`, `attach_click`, `attach_time_grid_context`) now hold their canvas weakly, and the schedule grid's click gesture uses `gesture.widget()`. The main calendar's grids are long-lived, so this mattered for the editor's preview grid and the Scheduling grid.
+- **Popovers attached with `set_parent`:** the room finder's popover is now unparented on its button's `destroy`, like the recipient suggestion popover.
+- **An existing bug, fixed along the way:** `RecipientEntry` kept a single change callback, so with the Scheduling Assistant available (`event_editor.rs`, the Scheduling block), its callback replaced the footer's Save/Send label updater. Callbacks now add up.
+- **Forward-invitation dialog (`window/imip.rs`):** its response handler clears the To field's change callback, which held the dialog and the field.
+
+**Check:** with the `close-request` teardown disabled, `closed_event_editor_is_freed` fails again (the whole window survives).
+
+## Composer results (2026-11-15, released as 0.9.318, not yet run in the real app)
 
 **Measured first:** a new test, `compose::tests::closed_composer_is_freed`, opens a composer in a window with pop-out enabled, clicks Close and lets `on_done` remove it, as the compose host does. Before the fix, about 500 widgets and the WebView survived. A temporary reference-count probe then showed which widgets the closures were holding.
 

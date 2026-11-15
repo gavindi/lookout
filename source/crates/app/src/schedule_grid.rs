@@ -139,6 +139,15 @@ impl ScheduleGrid {
         *self.on_refresh.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Drops the three callbacks - for a form closing down. They usually
+    /// capture the grid itself, which stores them: an `Rc` cycle that would
+    /// keep the grid and its form alive otherwise.
+    pub fn clear_callbacks(&self) {
+        self.on_time_picked.borrow_mut().take();
+        self.on_date_changed.borrow_mut().take();
+        self.on_refresh.borrow_mut().take();
+    }
+
     fn resize_canvas(&self) {
         let rows = self.state.borrow().rows.len().max(1);
         let height = (HEADER_HEIGHT + rows as f64 * ROW_HEIGHT + PAD).round() as i32;
@@ -210,12 +219,15 @@ pub fn build_schedule_grid(prefs: &CalendarPreferences, date: NaiveDate, zone: D
             paint_grid(cr, width as f64, height as f64, &draw_state.borrow());
         });
         let on_time_picked = on_time_picked.clone();
-        let canvas_clone = canvas.clone();
         let click_state = state.clone();
         let click = gtk::GestureClick::new();
         click.set_button(1);
-        click.connect_pressed(move |_, _n, x, y| {
-            let width = canvas_clone.width() as f64;
+        // The canvas comes from the gesture: it owns the gesture, so a
+        // captured clone would be a cycle that keeps the grid (and the editor
+        // window it sits in) alive.
+        click.connect_pressed(move |gesture, _n, x, y| {
+            let Some(canvas) = gesture.widget() else { return };
+            let width = canvas.width() as f64;
             if y < HEADER_HEIGHT {
                 return;
             }

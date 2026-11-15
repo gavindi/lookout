@@ -634,7 +634,9 @@ fn weekday_order(week_start: Weekday) -> Vec<Weekday> {
 /// existing raw `rrule` string, if any (`None` for a brand-new event);
 /// `week_start` orders the weekly day toggles; `start_date` is the series
 /// anchor, used to resolve RFC defaults and seed a fresh monthly/yearly rule.
-pub fn build_series_control(initial_raw: Option<&str>, week_start: Weekday, start_date: NaiveDate) -> SeriesControl {
+/// The control's handlers hold its fields and popover, so they are recorded in
+/// the owning window's `handlers`, to be disconnected when it closes.
+pub fn build_series_control(initial_raw: Option<&str>, week_start: Weekday, start_date: NaiveDate, handlers: &crate::util::HandlerSet) -> SeriesControl {
     let parsed = initial_raw.map(|raw| parse_rrule_string(raw, start_date));
     let unrepresentable_raw = matches!(parsed, Some(None)).then(|| initial_raw.unwrap_or_default().to_string());
     let initial = parsed.flatten();
@@ -875,50 +877,62 @@ pub fn build_series_control(initial_raw: Option<&str>, week_start: Weekday, star
     {
         let update_visibility = update_visibility.clone();
         let refresh_preview = refresh_preview.clone();
-        freq_dropdown.connect_selected_notify(move |_| {
-            update_visibility();
-            refresh_preview();
-        });
+        handlers.track(
+            &freq_dropdown,
+            freq_dropdown.connect_selected_notify(move |_| {
+                update_visibility();
+                refresh_preview();
+            }),
+        );
     }
     {
         let update_visibility = update_visibility.clone();
         let refresh_preview = refresh_preview.clone();
-        mode_dropdown.connect_selected_notify(move |_| {
-            update_visibility();
-            refresh_preview();
-        });
+        handlers.track(
+            &mode_dropdown,
+            mode_dropdown.connect_selected_notify(move |_| {
+                update_visibility();
+                refresh_preview();
+            }),
+        );
     }
     {
         let update_visibility = update_visibility.clone();
         let refresh_preview = refresh_preview.clone();
-        end_dropdown.connect_selected_notify(move |_| {
-            update_visibility();
-            refresh_preview();
-        });
+        handlers.track(
+            &end_dropdown,
+            end_dropdown.connect_selected_notify(move |_| {
+                update_visibility();
+                refresh_preview();
+            }),
+        );
     }
     {
         let update_visibility = update_visibility.clone();
         let refresh_preview = refresh_preview.clone();
-        interval_spin.connect_value_changed(move |_| {
-            update_visibility();
-            refresh_preview();
-        });
+        handlers.track(
+            &interval_spin,
+            interval_spin.connect_value_changed(move |_| {
+                update_visibility();
+                refresh_preview();
+            }),
+        );
     }
     {
         let refresh_preview = refresh_preview.clone();
-        end_count_spin.connect_value_changed(move |_| refresh_preview());
+        handlers.track(&end_count_spin, end_count_spin.connect_value_changed(move |_| refresh_preview()));
     }
     for (_, toggle) in &weekday_toggles {
         let refresh_preview = refresh_preview.clone();
-        toggle.connect_toggled(move |_| refresh_preview());
+        handlers.track(toggle, toggle.connect_toggled(move |_| refresh_preview()));
     }
     for dropdown in [&day_dropdown, &pattern_weekday_dropdown, &month_dropdown] {
         let refresh_preview = refresh_preview.clone();
-        dropdown.connect_selected_notify(move |_| refresh_preview());
+        handlers.track(dropdown, dropdown.connect_selected_notify(move |_| refresh_preview()));
     }
     {
         let refresh_preview = refresh_preview.clone();
-        end_date_calendar.connect_day_selected(move |_| refresh_preview());
+        handlers.track(&end_date_calendar, end_date_calendar.connect_day_selected(move |_| refresh_preview()));
     }
 
     let done_button = gtk::Button::with_label("Done");
@@ -934,17 +948,20 @@ pub fn build_series_control(initial_raw: Option<&str>, week_start: Weekday, star
         let popover = popover.clone();
         let draft = draft.clone();
         let initial = initial.clone();
-        done_button.connect_clicked(move |_| {
-            let rule = draft();
-            // An untouched rule stays byte-for-byte as the server wrote it;
-            // only a real change marks the control dirty.
-            if rule != initial {
-                dirty.set(true);
-            }
-            *current.borrow_mut() = rule.clone();
-            update_button_label(&button, rule.as_ref(), None);
-            popover.popdown();
-        });
+        handlers.track(
+            &done_button,
+            done_button.connect_clicked(move |_| {
+                let rule = draft();
+                // An untouched rule stays byte-for-byte as the server wrote it;
+                // only a real change marks the control dirty.
+                if rule != initial {
+                    dirty.set(true);
+                }
+                *current.borrow_mut() = rule.clone();
+                update_button_label(&button, rule.as_ref(), None);
+                popover.popdown();
+            }),
+        );
     }
 
     SeriesControl {

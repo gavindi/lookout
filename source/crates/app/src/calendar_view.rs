@@ -1258,11 +1258,15 @@ fn secondary_gutter_label(hour: u32, date: NaiveDate, primary: crate::calendar_t
 /// across the two canvases as a unit.
 fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hover: &Rc<Cell<Option<usize>>>) {
     let motion = gtk::EventControllerMotion::new();
+    // The grid's controllers hold their canvas weakly: it owns them, so a
+    // strong handle would be a cycle, and a time grid built for a transient
+    // window (the event editor's preview) would never be freed.
     {
-        let canvas_widget = canvas.clone();
+        let canvas_widget = canvas.downgrade();
         let data = data.clone();
         let hover = hover.clone();
         motion.connect_motion(move |_, x, y| {
+            let Some(canvas_widget) = canvas_widget.upgrade() else { return };
             // While a drag is in flight the ghost chip owns the pointer: no
             // hover ring or tooltip for the chip under it.
             if data.drag.borrow().is_some() {
@@ -1287,9 +1291,10 @@ fn attach_hover(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, hove
         });
     }
     {
-        let canvas_widget = canvas.clone();
+        let canvas_widget = canvas.downgrade();
         let hover = hover.clone();
         motion.connect_leave(move |_| {
+            let Some(canvas_widget) = canvas_widget.upgrade() else { return };
             if hover.take().is_some() {
                 canvas_widget.queue_draw();
             }
@@ -1324,7 +1329,8 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
     // `attach_time_grid_context`).
     gesture.set_button(gtk::gdk::BUTTON_PRIMARY);
     {
-        let canvas_widget = canvas.clone();
+        // Weak, as in `attach_hover`.
+        let canvas_widget = canvas.downgrade();
         let data = data.clone();
         let on_activate = on_activate.clone();
         let on_slot_activate = on_slot_activate.clone();
@@ -1335,6 +1341,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             let data = data.clone();
             let canvas_widget = canvas_widget.clone();
             move |x: f64, y: f64| -> Option<(NaiveDate, i64)> {
+                let canvas_widget = canvas_widget.upgrade()?;
                 let dates_guard = data.dates.borrow();
                 let chips_guard = data.chips.borrow();
                 if band || hovered_chip(data.gutter.get(), &chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band).is_some() {
@@ -1349,6 +1356,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             let data = data.clone();
             let canvas_widget = canvas_widget.clone();
             move |x: f64, y: f64| -> Option<usize> {
+                let canvas_widget = canvas_widget.upgrade()?;
                 let dates_guard = data.dates.borrow();
                 let chips_guard = data.chips.borrow();
                 hovered_chip(data.gutter.get(), &chips_guard, canvas_widget.width() as f64, dates_guard.len(), x, y, band)
@@ -1363,6 +1371,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
         let release_data = data.clone();
         let release_canvas = canvas_widget.clone();
         gesture.connect_pressed(move |gesture, _, x, y| {
+            let Some(pressed_canvas) = pressed_canvas.upgrade() else { return };
             // Ctrl at press turns a chip drop into a copy (CAL-30).
             pressed_data.drag_copy.set(gesture.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK));
             if let Some(hit) = chip_at(x, y) {
@@ -1406,6 +1415,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             pressed_canvas.queue_draw();
         });
         gesture.connect_update(move |gesture, sequence| {
+            let Some(update_canvas) = update_canvas.upgrade() else { return };
             let Some((x, y)) = gesture.point(sequence) else { return };
             // A press that started on a chip: once the pointer moves beyond
             // the threshold the press becomes a drag (a release before that
@@ -1485,6 +1495,7 @@ fn attach_click(canvas: &gtk::DrawingArea, band: bool, data: &TimeGridData, on_a
             update_canvas.queue_draw();
         });
         gesture.connect_released(move |_, _, x, y| {
+            let Some(release_canvas) = release_canvas.upgrade() else { return };
             // A chip press released without ever crossing the drag threshold:
             // a plain click - activate the event. The press is copied out
             // first, as in the update handler above.
@@ -1558,9 +1569,11 @@ fn attach_time_grid_context(canvas: &gtk::DrawingArea, band: bool, data: &TimeGr
     gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
     {
         let data = data.clone();
-        let canvas_widget = canvas.clone();
+        // Weak, as in `attach_hover`.
+        let canvas_widget = canvas.downgrade();
         let on_context = on_context.clone();
         gesture.connect_pressed(move |_, _, x, y| {
+            let Some(canvas_widget) = canvas_widget.upgrade() else { return };
             // Resolve the chip first (its own borrows end with the block) so
             // the callback can re-render without a borrow conflict.
             let occ = {
@@ -4305,6 +4318,13 @@ fn relabel_mini(
 /// nothing here assumes a single subscriber).
 pub fn connect_day_selected(mc: &MiniCalendar, f: impl Fn(NaiveDate) + 'static) {
     mc.on_day_selected.borrow_mut().push(Rc::new(f));
+}
+
+/// Drops every [`connect_day_selected`] callback - for a form closing down,
+/// whose callbacks usually capture this mini-calendar (it stores them: an `Rc`
+/// cycle that would keep the calendar and its form alive otherwise).
+pub fn clear_day_selected(mc: &MiniCalendar) {
+    mc.on_day_selected.borrow_mut().clear();
 }
 
 /// One section of the sidebar's "My calendars" checklist: a header row (the

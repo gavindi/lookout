@@ -133,6 +133,12 @@ impl SchedulingHandle {
         *self.listener.borrow_mut() = Some(Rc::new(listener));
     }
 
+    /// Drops the editor's listener when it closes. The handle outlives the
+    /// editor, and the listener holds the editor's Scheduling page.
+    pub fn clear_listener(&self) {
+        self.listener.borrow_mut().take();
+    }
+
     /// Delivers a free/busy answer for `generation`.
     pub fn deliver(&self, generation: u64, availabilities: Vec<AttendeeAvailability>) {
         let listener = self.listener.borrow().clone();
@@ -279,6 +285,13 @@ pub fn show_event_editor(
         .default_width(920)
         .default_height(640)
         .build();
+    // Every handler connected on the editor's widgets is recorded here and
+    // disconnected when the window closes. Many of them hold the dialog or
+    // the form's fields, which hold widgets of the same window; GTK's
+    // `gtk_window_destroy` drops only the window's own reference, so without
+    // this a closed editor stayed in memory for the rest of the session
+    // (MEMORY_OPTIMISATION1.md, event editor).
+    let handlers = crate::util::HandlerSet::default();
 
     // --- Calendar picker: a `StringList` of labels plus a parallel id vector,
     // so the selected index maps straight back to a `CalendarId`.
@@ -402,28 +415,31 @@ pub fn show_event_editor(
         let end_minute = end_minute.clone();
         let end_calendar = end_calendar.clone();
         let zone_dropdown = zone_dropdown.clone();
-        all_day_switch.connect_active_notify(move |switch| {
-            let on = switch.is_active();
-            zone_dropdown.set_sensitive(!on);
-            for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
-                spin.set_sensitive(!on);
-            }
-            if !on {
-                // Coming off all-day, the times may no longer form a valid
-                // span - a same-day all-day event prefills both ends at 00:00.
-                // Nudge the end forward an hour rather than letting Save fail.
-                let start = start_date.get().and_hms_opt(start_hour.value() as u32, start_minute.value() as u32, 0).unwrap();
-                let end = end_date.get().and_hms_opt(end_hour.value() as u32, end_minute.value() as u32, 0).unwrap();
-                if end <= start {
-                    let bumped = start + chrono::Duration::hours(1);
-                    end_hour.set_value(f64::from(bumped.hour()));
-                    end_minute.set_value(f64::from(bumped.minute()));
-                    if bumped.date() != end_date.get() {
-                        set_calendar_date(&end_calendar, &end_date, bumped.date());
+        handlers.track(
+            &all_day_switch,
+            all_day_switch.connect_active_notify(move |switch| {
+                let on = switch.is_active();
+                zone_dropdown.set_sensitive(!on);
+                for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
+                    spin.set_sensitive(!on);
+                }
+                if !on {
+                    // Coming off all-day, the times may no longer form a valid
+                    // span - a same-day all-day event prefills both ends at 00:00.
+                    // Nudge the end forward an hour rather than letting Save fail.
+                    let start = start_date.get().and_hms_opt(start_hour.value() as u32, start_minute.value() as u32, 0).unwrap();
+                    let end = end_date.get().and_hms_opt(end_hour.value() as u32, end_minute.value() as u32, 0).unwrap();
+                    if end <= start {
+                        let bumped = start + chrono::Duration::hours(1);
+                        end_hour.set_value(f64::from(bumped.hour()));
+                        end_minute.set_value(f64::from(bumped.minute()));
+                        if bumped.date() != end_date.get() {
+                            set_calendar_date(&end_calendar, &end_date, bumped.date());
+                        }
                     }
                 }
-            }
-        });
+            }),
+        );
     }
 
     let datetime_row = gtk::Box::builder()
@@ -480,6 +496,7 @@ pub fn show_event_editor(
             all_day_switch: &all_day_switch,
             zone_dropdown: &zone_dropdown,
             finder: finder.clone(),
+            handlers: handlers.clone(),
         })
     });
     let resource_attendees = room_finder.as_ref().map(|widgets| widgets.resource_attendees.clone()).unwrap_or_default();
@@ -523,15 +540,15 @@ pub fn show_event_editor(
     };
     {
         let sync_video_row = sync_video_row.clone();
-        video_toggle.connect_active_notify(move |_| sync_video_row());
+        handlers.track(&video_toggle, video_toggle.connect_active_notify(move |_| sync_video_row()));
     }
     {
         let sync_video_row = sync_video_row.clone();
-        video_url_row.connect_changed(move |_| sync_video_row());
+        handlers.track(&video_url_row, video_url_row.connect_changed(move |_| sync_video_row()));
     }
     {
         let sync_video_row = sync_video_row.clone();
-        calendar_dropdown.connect_selected_notify(move |_| sync_video_row());
+        handlers.track(&calendar_dropdown, calendar_dropdown.connect_selected_notify(move |_| sync_video_row()));
     }
 
     let description_buffer = gtk::TextBuffer::new(None);
@@ -565,6 +582,7 @@ pub fn show_event_editor(
         attachment_calendar,
         existing.as_ref().and_then(|occ| occ.href.clone()),
         attachment_fetch,
+        &handlers,
     );
 
     let recurring_note = gtk::Label::builder()
@@ -695,6 +713,7 @@ pub fn show_event_editor(
         existing.as_ref().and_then(|occ| occ.rrule.as_deref()),
         prefill.calendar_prefs.week_start,
         initial_start.date(),
+        &handlers,
     );
     series.button.set_tooltip_text(Some("Series"));
 
@@ -734,9 +753,12 @@ pub fn show_event_editor(
     tracking_button.set_visible(has_tracking);
     {
         let editor_stack = editor_stack.clone();
-        tracking_button.connect_toggled(move |button| {
-            editor_stack.set_visible_child_name(if button.is_active() { "tracking" } else { "form" });
-        });
+        handlers.track(
+            &tracking_button,
+            tracking_button.connect_toggled(move |button| {
+                editor_stack.set_visible_child_name(if button.is_active() { "tracking" } else { "form" });
+            }),
+        );
     }
 
     let delete_button = gtk::Button::from_icon_name(themed_icon("user-trash-symbolic", &["edit-delete-symbolic"]));
@@ -759,7 +781,7 @@ pub fn show_event_editor(
     let forward_button = gtk::Button::builder().label("Forward").tooltip_text("Forward meeting").valign(gtk::Align::Center).build();
     forward_button.set_visible(forward_visible && on_forward.is_some());
     if let Some(on_forward) = on_forward {
-        forward_button.connect_clicked(move |_| on_forward());
+        handlers.track(&forward_button, forward_button.connect_clicked(move |_| on_forward()));
     }
 
     let top_bar = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).css_classes(["toolbar"]).build();
@@ -882,36 +904,39 @@ pub fn show_event_editor(
     {
         let refresh_preview = refresh_preview.clone();
         let displayed_day = displayed_day.clone();
-        start_calendar.connect_day_selected(move |cal| {
-            if let Some(date) = NaiveDate::from_ymd_opt(cal.year(), cal.month() as u32 + 1, cal.day() as u32) {
-                displayed_day.set(date);
-            }
-            refresh_preview();
-        });
+        handlers.track(
+            &start_calendar,
+            start_calendar.connect_day_selected(move |cal| {
+                if let Some(date) = NaiveDate::from_ymd_opt(cal.year(), cal.month() as u32 + 1, cal.day() as u32) {
+                    displayed_day.set(date);
+                }
+                refresh_preview();
+            }),
+        );
     }
     {
         let refresh_preview = refresh_preview.clone();
-        end_calendar.connect_day_selected(move |_| refresh_preview());
+        handlers.track(&end_calendar, end_calendar.connect_day_selected(move |_| refresh_preview()));
     }
     for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
         let refresh_preview = refresh_preview.clone();
-        spin.connect_value_changed(move |_| refresh_preview());
+        handlers.track(spin, spin.connect_value_changed(move |_| refresh_preview()));
     }
     {
         let refresh_preview = refresh_preview.clone();
-        all_day_switch.connect_active_notify(move |_| refresh_preview());
+        handlers.track(&all_day_switch, all_day_switch.connect_active_notify(move |_| refresh_preview()));
     }
     {
         let refresh_preview = refresh_preview.clone();
-        title_row.connect_changed(move |_| refresh_preview());
+        handlers.track(&title_row, title_row.connect_changed(move |_| refresh_preview()));
     }
     {
         let refresh_preview = refresh_preview.clone();
-        calendar_dropdown.connect_selected_notify(move |_| refresh_preview());
+        handlers.track(&calendar_dropdown, calendar_dropdown.connect_selected_notify(move |_| refresh_preview()));
     }
     {
         let refresh_preview = refresh_preview.clone();
-        zone_dropdown.connect_selected_notify(move |_| refresh_preview());
+        handlers.track(&zone_dropdown, zone_dropdown.connect_selected_notify(move |_| refresh_preview()));
     }
     {
         let refresh_preview = refresh_preview.clone();
@@ -920,6 +945,11 @@ pub fn show_event_editor(
             displayed_day.set(date);
             refresh_preview();
         });
+    }
+    // `refresh_preview` holds the mini-calendar that stores this callback.
+    {
+        let preview_mini = preview_mini.clone();
+        handlers.on_teardown(move || crate::calendar_view::clear_day_selected(&preview_mini));
     }
     refresh_preview();
 
@@ -940,10 +970,20 @@ pub fn show_event_editor(
             start_date.get(),
             zone_from_dropdown(&zone_dropdown),
         ));
+        // Its callbacks capture the grid (an `Rc` cycle through its slots).
+        {
+            let grid = grid.clone();
+            handlers.on_teardown(move || grid.clear_callbacks());
+        }
         let availability: Rc<RefCell<Vec<AttendeeAvailability>>> = Rc::new(RefCell::new(Vec::new()));
         let loading = Rc::new(Cell::new(false));
         let generation = Rc::new(Cell::new(0u64));
         let refresh_rows_holder: Rc<RefCell<Option<RefreshHook>>> = Rc::new(RefCell::new(None));
+        // The hook it ends up holding captures the holder itself.
+        {
+            let refresh_rows_holder = refresh_rows_holder.clone();
+            handlers.on_teardown(move || drop(refresh_rows_holder.borrow_mut().take()));
+        }
 
         let suggestions_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -1020,6 +1060,9 @@ pub fn show_event_editor(
             let month_occurrences = month_occurrences.clone();
             let suggestions_box = suggestions_box.clone();
             let apply_time = apply_time.clone();
+            // The suggestion buttons are rebuilt on every refresh; theirs
+            // are recorded like the rest.
+            let handlers = handlers.clone();
             Rc::new(move || {
                 let date = grid.date();
                 let zone = zone_from_dropdown(&zone_dropdown);
@@ -1074,7 +1117,7 @@ pub fn show_event_editor(
                     crate::privacy::mark_content(&button);
                     button.set_tooltip_text(Some("Set the meeting to this time"));
                     let apply = apply_time.clone();
-                    button.connect_clicked(move |_| apply(slot, slot + chrono::Duration::minutes(duration)));
+                    handlers.track(&button, button.connect_clicked(move |_| apply(slot, slot + chrono::Duration::minutes(duration))));
                     suggestions_box.append(&button);
                 }
             })
@@ -1136,6 +1179,10 @@ pub fn show_event_editor(
             let loading = loading.clone();
             let generation = generation.clone();
             let refresh_rows = refresh_rows.clone();
+            {
+                let handle = scheduling.handle.clone();
+                handlers.on_teardown(move || handle.clear_listener());
+            }
             scheduling.handle.set_listener(move |answered, availabilities, error| {
                 if answered != generation.get() {
                     return;
@@ -1191,13 +1238,16 @@ pub fn show_event_editor(
             let request = request.clone();
             let grid_for_cb = grid.clone();
             let start_date = start_date.clone();
-            start_calendar.connect_day_selected(move |_| {
-                let date = start_date.get();
-                if grid_for_cb.date() != date {
-                    grid_for_cb.set_date(date);
-                    request();
-                }
-            });
+            handlers.track(
+                &start_calendar,
+                start_calendar.connect_day_selected(move |_| {
+                    let date = start_date.get();
+                    if grid_for_cb.date() != date {
+                        grid_for_cb.set_date(date);
+                        request();
+                    }
+                }),
+            );
         }
 
         let button = gtk::ToggleButton::builder()
@@ -1212,24 +1262,30 @@ pub fn show_event_editor(
             let request = request.clone();
             let tracking_button = tracking_button.clone();
             let refresh_rows = refresh_rows.clone();
-            button.connect_toggled(move |button| {
-                if button.is_active() {
-                    tracking_button.set_active(false);
-                    editor_stack.set_visible_child_name("scheduling");
-                    request();
-                } else if !tracking_button.is_active() {
-                    editor_stack.set_visible_child_name("form");
-                }
-                refresh_rows();
-            });
+            handlers.track(
+                &button,
+                button.connect_toggled(move |button| {
+                    if button.is_active() {
+                        tracking_button.set_active(false);
+                        editor_stack.set_visible_child_name("scheduling");
+                        request();
+                    } else if !tracking_button.is_active() {
+                        editor_stack.set_visible_child_name("form");
+                    }
+                    refresh_rows();
+                }),
+            );
         }
         {
             let button = button.clone();
-            tracking_button.connect_toggled(move |tracking| {
-                if tracking.is_active() {
-                    button.set_active(false);
-                }
-            });
+            handlers.track(
+                &tracking_button,
+                tracking_button.connect_toggled(move |tracking| {
+                    if tracking.is_active() {
+                        button.set_active(false);
+                    }
+                }),
+            );
         }
         {
             let button = button.clone();
@@ -1243,11 +1299,14 @@ pub fn show_event_editor(
         {
             let button = button.clone();
             let request = request.clone();
-            zone_dropdown.connect_selected_notify(move |_| {
-                if button.is_active() {
-                    request();
-                }
-            });
+            handlers.track(
+                &zone_dropdown,
+                zone_dropdown.connect_selected_notify(move |_| {
+                    if button.is_active() {
+                        request();
+                    }
+                }),
+            );
         }
         {
             let request = request.clone();
@@ -1399,11 +1458,11 @@ pub fn show_event_editor(
             }
         }
     };
-    save_button.connect_clicked(save_handler);
+    handlers.track(&save_button, save_button.connect_clicked(save_handler));
 
     {
         let dialog = dialog.clone();
-        cancel_button.connect_clicked(move |_| dialog.close());
+        handlers.track(&cancel_button, cancel_button.connect_clicked(move |_| dialog.close()));
     }
 
     if has_existing {
@@ -1414,25 +1473,28 @@ pub fn show_event_editor(
         let error_label = error_label.clone();
         let is_offline = is_offline.clone();
         let existing = existing_for_delete;
-        delete_button.connect_clicked(move |_| {
-            if is_offline() {
-                error_label.set_label("You're working offline — reconnect to save");
-                error_label.set_visible(true);
-                return;
-            }
-            let selected = calendar_dropdown.selected() as usize;
-            let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
-                error_label.set_label("No calendar selected.");
-                error_label.set_visible(true);
-                return;
-            };
-            // Delete doesn't validate the form's times - the user may have
-            // left the fields in a broken state and still want the event gone.
-            if let Some(occ) = &existing {
-                on_delete(calendar_id, occ.clone());
-                dialog.close();
-            }
-        });
+        handlers.track(
+            &delete_button,
+            delete_button.connect_clicked(move |_| {
+                if is_offline() {
+                    error_label.set_label("You're working offline — reconnect to save");
+                    error_label.set_visible(true);
+                    return;
+                }
+                let selected = calendar_dropdown.selected() as usize;
+                let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
+                    error_label.set_label("No calendar selected.");
+                    error_label.set_visible(true);
+                    return;
+                };
+                // Delete doesn't validate the form's times - the user may have
+                // left the fields in a broken state and still want the event gone.
+                if let Some(occ) = &existing {
+                    on_delete(calendar_id, occ.clone());
+                    dialog.close();
+                }
+            }),
+        );
     }
 
     // Print: snapshot the live form state (title, when, series, attendees,
@@ -1459,33 +1521,36 @@ pub fn show_event_editor(
         let reminder_dropdown = reminder_dropdown.clone();
         let description_buffer = description_buffer.clone();
         let series = series.clone();
-        print_button.connect_clicked(move |_| {
-            let categories = selected_categories.borrow().clone();
-            let html = printable_event_html(
-                &calendar_labels,
-                &calendar_dropdown,
-                &title_row,
-                &attendees_field,
-                &location_row,
-                &all_day_switch,
-                &start_date,
-                &start_hour,
-                &start_minute,
-                &end_date,
-                &end_hour,
-                &end_minute,
-                &video_toggle,
-                &video_url_row,
-                &categories,
-                &busy_dropdown,
-                &sensitivity_dropdown,
-                &reminder_dropdown,
-                reminder_choices,
-                &description_buffer,
-                &series,
-            );
-            crate::window::print_html_once(&html, &dialog);
-        });
+        handlers.track(
+            &print_button,
+            print_button.connect_clicked(move |_| {
+                let categories = selected_categories.borrow().clone();
+                let html = printable_event_html(
+                    &calendar_labels,
+                    &calendar_dropdown,
+                    &title_row,
+                    &attendees_field,
+                    &location_row,
+                    &all_day_switch,
+                    &start_date,
+                    &start_hour,
+                    &start_minute,
+                    &end_date,
+                    &end_hour,
+                    &end_minute,
+                    &video_toggle,
+                    &video_url_row,
+                    &categories,
+                    &busy_dropdown,
+                    &sensitivity_dropdown,
+                    &reminder_dropdown,
+                    reminder_choices,
+                    &description_buffer,
+                    &series,
+                );
+                crate::window::print_html_once(&html, &dialog);
+            }),
+        );
     }
 
     // Read-only (webcal subscription) mode: lock every input and hide the
@@ -1526,6 +1591,17 @@ pub fn show_event_editor(
         }
     }
 
+    // The attendees field's change callbacks capture the field itself and
+    // the footer button, so they are dropped on close too.
+    {
+        let attendees_field = attendees_field.clone();
+        handlers.on_teardown(move || attendees_field.clear_addresses_changed());
+    }
+    dialog.connect_close_request(move |_| {
+        handlers.disconnect_all();
+        glib::Propagation::Proceed
+    });
+
     dialog.present();
 }
 
@@ -1541,9 +1617,17 @@ fn build_event_attachments_group(
     calendar_id: CalendarId,
     event_href: Option<String>,
     attachment_fetch: Option<AttachmentFetchCallback>,
+    handlers: &crate::util::HandlerSet,
 ) -> (adw::PreferencesGroup, Rc<RefCell<Vec<EventAttachment>>>) {
     let attachments = Rc::new(RefCell::new(initial));
     let rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    // The rows' buttons hold this list (and the group), and the list holds
+    // the rows: emptied when the editor closes, with the handlers recorded in
+    // `handlers` disconnected.
+    {
+        let rows = rows.clone();
+        handlers.on_teardown(move || rows.borrow_mut().clear());
+    }
     let group = adw::PreferencesGroup::builder().title("Attachments").build();
 
     if !read_only {
@@ -1563,56 +1647,63 @@ fn build_event_attachments_group(
         let calendar_id_for_add = calendar_id.clone();
         let event_href_for_add = event_href.clone();
         let attachment_fetch_for_add = attachment_fetch.clone();
-        add_button.connect_clicked(move |button| {
-            let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
-            let group = group_for_add.clone();
-            let attachments = attachments_for_add.clone();
-            let rows = rows_for_add.clone();
-            let calendar_id = calendar_id_for_add.clone();
-            let event_href = event_href_for_add.clone();
-            let attachment_fetch = attachment_fetch_for_add.clone();
-            glib::spawn_future_local(async move {
-                let dialog = gtk::FileDialog::builder().title("Attach files").build();
-                let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
-                let mut too_large = Vec::new();
-                for i in 0..files.n_items() {
-                    let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
-                    let Ok(info) = file
-                        .query_info_future("standard::display-name,standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
-                        .await
-                    else {
-                        continue;
-                    };
-                    let display_name = info.display_name().to_string();
-                    let mime_type = info
-                        .content_type()
-                        .and_then(|content_type| gio::functions::content_type_get_mime_type(&content_type))
-                        .map(|mime| mime.to_string());
-                    let Ok((bytes, _etag)) = file.load_contents_future().await else { continue };
-                    match EventAttachment::from_bytes(display_name.clone(), mime_type, &bytes) {
-                        Some(attachment) => attachments.borrow_mut().push(attachment),
-                        None => too_large.push(display_name),
+        let handlers_for_add = handlers.clone();
+        handlers.track(
+            &add_button,
+            add_button.connect_clicked(move |button| {
+                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                let handlers = handlers_for_add.clone();
+                let group = group_for_add.clone();
+                let attachments = attachments_for_add.clone();
+                let rows = rows_for_add.clone();
+                let calendar_id = calendar_id_for_add.clone();
+                let event_href = event_href_for_add.clone();
+                let attachment_fetch = attachment_fetch_for_add.clone();
+                glib::spawn_future_local(async move {
+                    let dialog = gtk::FileDialog::builder().title("Attach files").build();
+                    let Ok(files) = dialog.open_multiple_future(Some(&window)).await else { return };
+                    let mut too_large = Vec::new();
+                    for i in 0..files.n_items() {
+                        let Some(file) = files.item(i).and_downcast::<gio::File>() else { continue };
+                        let Ok(info) = file
+                            .query_info_future("standard::display-name,standard::content-type", gio::FileQueryInfoFlags::NONE, glib::Priority::DEFAULT)
+                            .await
+                        else {
+                            continue;
+                        };
+                        let display_name = info.display_name().to_string();
+                        let mime_type = info
+                            .content_type()
+                            .and_then(|content_type| gio::functions::content_type_get_mime_type(&content_type))
+                            .map(|mime| mime.to_string());
+                        let Ok((bytes, _etag)) = file.load_contents_future().await else { continue };
+                        match EventAttachment::from_bytes(display_name.clone(), mime_type, &bytes) {
+                            Some(attachment) => attachments.borrow_mut().push(attachment),
+                            None => too_large.push(display_name),
+                        }
                     }
-                }
-                rebuild_attachment_rows(&group, &attachments, &rows, false, &calendar_id, &event_href, &attachment_fetch);
-                if !too_large.is_empty() {
-                    group.set_description(Some(&format!(
-                        "{} couldn't be attached: the limit is {} MB per file.",
-                        too_large.join(", "),
-                        MAX_INLINE_EVENT_ATTACHMENT_BYTES / (1024 * 1024)
-                    )));
-                }
-            });
-        });
+                    rebuild_attachment_rows(&group, &attachments, &rows, false, &calendar_id, &event_href, &attachment_fetch, &handlers);
+                    if !too_large.is_empty() {
+                        group.set_description(Some(&format!(
+                            "{} couldn't be attached: the limit is {} MB per file.",
+                            too_large.join(", "),
+                            MAX_INLINE_EVENT_ATTACHMENT_BYTES / (1024 * 1024)
+                        )));
+                    }
+                });
+            }),
+        );
     }
 
-    rebuild_attachment_rows(&group, &attachments, &rows, read_only, &calendar_id, &event_href, &attachment_fetch);
+    rebuild_attachment_rows(&group, &attachments, &rows, read_only, &calendar_id, &event_href, &attachment_fetch, handlers);
     (group, attachments)
 }
 
 /// Recreates the per-attachment rows under the group. The "Add attachment"
 /// row (when writable) stays first; everything after it is rebuilt from
 /// `attachments`, so indexes in the Remove handlers always match the list.
+// The row state the rows' own handlers share, positional as in the caller.
+#[allow(clippy::too_many_arguments)]
 fn rebuild_attachment_rows(
     group: &adw::PreferencesGroup,
     attachments: &Rc<RefCell<Vec<EventAttachment>>>,
@@ -1621,6 +1712,7 @@ fn rebuild_attachment_rows(
     calendar_id: &CalendarId,
     event_href: &Option<String>,
     attachment_fetch: &Option<AttachmentFetchCallback>,
+    handlers: &crate::util::HandlerSet,
 ) {
     let existing_rows = std::mem::take(&mut *rows.borrow_mut());
     for row in existing_rows {
@@ -1635,10 +1727,13 @@ fn rebuild_attachment_rows(
             save.set_tooltip_text(Some("Save attachment"));
             save.set_valign(gtk::Align::Center);
             let name = attachment.name.clone();
-            save.connect_clicked(move |button| {
-                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
-                save_event_attachment(&window, &name, bytes.clone());
-            });
+            handlers.track(
+                &save,
+                save.connect_clicked(move |button| {
+                    let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                    save_event_attachment(&window, &name, bytes.clone());
+                }),
+            );
             row.add_suffix(&save);
         } else if let (Some(fetch), Some(_)) = (attachment_fetch, attachment.url.as_deref()) {
             // A server-managed CalDAV attachment or a Graph child resource:
@@ -1653,21 +1748,24 @@ fn rebuild_attachment_rows(
             let calendar_id = calendar_id.clone();
             let event_href = event_href.clone();
             let error_group = group.clone();
-            save.connect_clicked(move |button| {
-                let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
-                let window = std::rc::Rc::new(window);
-                let success_window = window.clone();
-                let on_success: Rc<dyn Fn(String, Vec<u8>)> = Rc::new(move |name, data| {
-                    save_event_attachment(&success_window, &name, data);
-                });
-                let on_error: Rc<dyn Fn(String)> = {
-                    let error_group = error_group.clone();
-                    Rc::new(move |message| {
-                        error_group.set_description(Some(&message));
-                    })
-                };
-                fetch(calendar_id.clone(), event_href.clone(), attachment.clone(), on_success, on_error);
-            });
+            handlers.track(
+                &save,
+                save.connect_clicked(move |button| {
+                    let Some(window) = button.root().and_downcast::<gtk::Window>() else { return };
+                    let window = std::rc::Rc::new(window);
+                    let success_window = window.clone();
+                    let on_success: Rc<dyn Fn(String, Vec<u8>)> = Rc::new(move |name, data| {
+                        save_event_attachment(&success_window, &name, data);
+                    });
+                    let on_error: Rc<dyn Fn(String)> = {
+                        let error_group = error_group.clone();
+                        Rc::new(move |message| {
+                            error_group.set_description(Some(&message));
+                        })
+                    };
+                    fetch(calendar_id.clone(), event_href.clone(), attachment.clone(), on_success, on_error);
+                }),
+            );
             row.add_suffix(&save);
         }
         if !read_only {
@@ -1681,12 +1779,17 @@ fn rebuild_attachment_rows(
             let calendar_id = calendar_id.clone();
             let event_href = event_href.clone();
             let attachment_fetch = attachment_fetch.clone();
-            remove.connect_clicked(move |_| {
-                if index < attachments.borrow().len() {
-                    attachments.borrow_mut().remove(index);
-                }
-                rebuild_attachment_rows(&group, &attachments, &rows, false, &calendar_id, &event_href, &attachment_fetch);
-            });
+            let handlers_for_remove = handlers.clone();
+            handlers.track(
+                &remove,
+                remove.connect_clicked(move |_| {
+                    let handlers = &handlers_for_remove;
+                    if index < attachments.borrow().len() {
+                        attachments.borrow_mut().remove(index);
+                    }
+                    rebuild_attachment_rows(&group, &attachments, &rows, false, &calendar_id, &event_href, &attachment_fetch, handlers);
+                }),
+            );
             row.add_suffix(&remove);
         }
         group.add(&row);
@@ -3164,5 +3267,131 @@ mod tests {
         assert_eq!(calls.get(), 1);
         handle.fail(2, "offline".to_string());
         assert_eq!(calls.get(), 11, "the replacement listener receives the next answer");
+    }
+
+    fn collect_widget_tree(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        out.push(root.clone());
+        let mut child = root.first_child();
+        while let Some(current) = child {
+            collect_widget_tree(&current, out);
+            child = current.next_sibling();
+        }
+    }
+
+    /// Opens the editor - for a new event, or for `existing` - and returns its
+    /// window.
+    fn open_event_editor(
+        parent: &adw::ApplicationWindow,
+        existing: Option<&EventOccurrence>,
+        scheduling: Option<&SchedulingContext>,
+        rooms: Option<&crate::room_finder::RoomFinder>,
+    ) -> gtk::Window {
+        let before: Vec<gtk::Widget> = gtk::Window::list_toplevels();
+        let calendars = vec![("Work".to_string(), CalendarId("work".to_string()))];
+        let event_days = HashSet::new();
+        let colors = CalendarColorMap::new();
+        let prefs = crate::settings::CalendarPreferences::default();
+        // A Graph calendar, so the room finder (when given) is offered.
+        let graph_calendars: HashSet<CalendarId> = HashSet::from([CalendarId("work".to_string())]);
+        show_event_editor(
+            parent,
+            EventEditorPrefill {
+                calendars: &calendars,
+                default_calendar: CalendarId("work".to_string()),
+                existing,
+                suggested_start: None,
+                suggested_end: None,
+                suggested_subject: None,
+                month_occurrences: &[],
+                month_event_days: &event_days,
+                calendar_colors: &colors,
+                owner_email: None,
+                read_only: false,
+                read_only_note: "",
+                calendar_prefs: &prefs,
+                graph_calendars: &graph_calendars,
+                categories: &[],
+                suggested_attendees: &[EmailAddress::new("alice@example.com")],
+                scheduling,
+                attachment_fetch: None,
+                rooms,
+            },
+            Rc::new(|_, _| {}),
+            Rc::new(|| None),
+            Rc::new(|| false),
+            |_, _| {},
+            |_, _| {},
+            None,
+        );
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .find(|window| !before.contains(window))
+            .and_then(|window| window.downcast::<gtk::Window>().ok())
+            .expect("the editor opened a window")
+    }
+
+    /// A closed event editor is freed with everything in it. Its handlers
+    /// hold the dialog and the form's fields, and the attendees field's own
+    /// handlers held the field, so a closed editor could stay in memory for
+    /// the rest of the session (MEMORY_OPTIMISATION1.md, event editor).
+    #[test]
+    fn closed_event_editor_is_freed() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let parent = adw::ApplicationWindow::builder().build();
+        let editor = open_event_editor(&parent, None, None, None);
+        assert_closed_editor_is_freed(editor, "Cancel");
+        parent.destroy();
+    }
+
+    /// The same for an existing recurring meeting with the Scheduling
+    /// Assistant and the room finder available: Delete, the edit-scope
+    /// picker, the series control, the Scheduling page's grid, listener and
+    /// refresh hook, and the room finder's popover.
+    #[test]
+    fn closed_editor_for_an_existing_meeting_with_scheduling_is_freed() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let parent = adw::ApplicationWindow::builder().build();
+        let start = chrono::Utc::now();
+        let mut existing = synthetic_occurrence(CalendarId("work".to_string()), "Standup", start, start + chrono::Duration::minutes(30), false);
+        existing.uid = lookout_core::EventUid("standup".to_string());
+        existing.rrule = Some("FREQ=WEEKLY;BYDAY=MO".to_string());
+        let handle = SchedulingHandle::new();
+        let scheduling = SchedulingContext {
+            handle: handle.clone(),
+            request: Rc::new(|_| {}),
+        };
+        let rooms = crate::room_finder::RoomFinder {
+            load: Rc::new(|_, _| {}),
+            grant: Rc::new(|_, _| {}),
+            availability: Rc::new(|_, _, _, _, _, _| {}),
+        };
+        let editor = open_event_editor(&parent, Some(&existing), Some(&scheduling), Some(&rooms));
+        assert_closed_editor_is_freed(editor, "Cancel");
+        assert!(handle.listener.borrow().is_none(), "the closed editor's listener is dropped");
+        parent.destroy();
+    }
+
+    /// Records every widget in `editor`, closes it with its `button` and
+    /// asserts they are all freed.
+    fn assert_closed_editor_is_freed(editor: gtk::Window, button: &str) {
+        let mut widgets = Vec::new();
+        collect_widget_tree(editor.upcast_ref::<gtk::Widget>(), &mut widgets);
+        assert!(widgets.iter().any(|w| w.has_css_class("recipient-field")), "the attendees field is in the editor");
+        let cancel = widgets
+            .iter()
+            .find(|w| w.downcast_ref::<gtk::Button>().and_then(|b| b.label()).as_deref() == Some(button))
+            .and_then(|w| w.clone().downcast::<gtk::Button>().ok())
+            .unwrap_or_else(|| panic!("the editor has a {button} button"));
+        let watched: Vec<(&str, glib::WeakRef<glib::Object>)> = widgets.iter().map(|w| (w.type_().name(), crate::gtk_test::weak(w))).collect();
+        drop(widgets);
+        drop(editor);
+
+        cancel.emit_clicked();
+        drop(cancel);
+        crate::gtk_test::assert_freed(&watched);
     }
 }

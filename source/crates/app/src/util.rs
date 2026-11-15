@@ -7,7 +7,11 @@
 
 /// Copyright (C) <2026>  <Gavin Graham & Contributors>
 /// Software released under the GPL3 license
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
+use gtk::glib;
 
 use lookout_core::AccountId;
 
@@ -53,6 +57,76 @@ pub fn clear_box(container: &gtk::Box) {
 pub fn popdown_enclosing_popover(widget: &impl IsA<gtk::Widget>) {
     if let Some(popover) = widget.ancestor(gtk::Popover::static_type()).and_downcast::<gtk::Popover>() {
         popover.popdown();
+    }
+}
+
+/// One recorded handler: the object it is connected on, and its id.
+type TrackedHandler = (glib::WeakRef<glib::Object>, glib::SignalHandlerId);
+/// A clean-up [`HandlerSet::on_teardown`] runs once.
+type Cleanup = Box<dyn FnOnce()>;
+
+/// Signal handlers (and long-running tasks) that belong to one transient piece
+/// of UI - a composer, an editor window - and are disconnected together when
+/// it ends.
+///
+/// A handler connected on a widget that captures that widget, an ancestor of
+/// it, or a struct holding either, is a reference cycle: GTK frees a widget
+/// only when its last reference goes, and the handler only goes with the
+/// widget. A form with dozens of such handlers would otherwise need weak
+/// references threaded through each of them; recording them here and calling
+/// [`HandlerSet::disconnect_all`] when the UI ends breaks every cycle at once
+/// (MEMORY_OPTIMISATION1.md). Wrap each `connect_*` call in [`HandlerSet::track`].
+#[derive(Clone, Default)]
+pub(crate) struct HandlerSet {
+    handlers: Rc<RefCell<Vec<TrackedHandler>>>,
+    /// Long-running tasks to cancel too (an autosave tick, say, which would
+    /// otherwise hold the form's fields until it next wakes).
+    tasks: Rc<RefCell<Vec<glib::JoinHandle<()>>>>,
+    /// Other clean-ups, run once: clearing app-level callback slots (not
+    /// GObject signals) whose closures capture the UI's widgets.
+    cleanups: Rc<RefCell<Vec<Cleanup>>>,
+}
+
+impl HandlerSet {
+    /// Records a handler `object` connected, returning nothing so a
+    /// `connect_*` call can be wrapped in place.
+    pub(crate) fn track(&self, object: &impl IsA<glib::Object>, id: glib::SignalHandlerId) {
+        let mut handlers = self.handlers.borrow_mut();
+        // Widgets rebuilt while the UI is open (a list's rows) leave entries
+        // whose object is gone; drop those rather than growing for good.
+        handlers.retain(|(object, _)| object.upgrade().is_some());
+        handlers.push((object.upcast_ref::<glib::Object>().downgrade(), id));
+    }
+
+    /// Records a task to cancel when the UI ends.
+    pub(crate) fn track_task(&self, task: glib::JoinHandle<()>) {
+        self.tasks.borrow_mut().push(task);
+    }
+
+    /// Records a clean-up to run when the UI ends.
+    pub(crate) fn on_teardown(&self, cleanup: impl FnOnce() + 'static) {
+        self.cleanups.borrow_mut().push(Box::new(cleanup));
+    }
+
+    /// Disconnects every recorded handler whose object is still alive, cancels
+    /// the recorded tasks and runs the clean-ups. Safe to call more than once, and from
+    /// inside one of the handlers (GLib keeps a running handler's closure
+    /// until it returns). A handler must not also disconnect itself, or this
+    /// would disconnect a stale id.
+    pub(crate) fn disconnect_all(&self) {
+        let handlers = std::mem::take(&mut *self.handlers.borrow_mut());
+        for (object, id) in handlers {
+            if let Some(object) = object.upgrade() {
+                object.disconnect(id);
+            }
+        }
+        for task in std::mem::take(&mut *self.tasks.borrow_mut()) {
+            task.abort();
+        }
+        let cleanups = std::mem::take(&mut *self.cleanups.borrow_mut());
+        for cleanup in cleanups {
+            cleanup();
+        }
     }
 }
 

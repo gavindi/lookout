@@ -63,6 +63,12 @@ pub fn show_task_editor(
         .default_width(760)
         .default_height(660)
         .build();
+    // The editor's handlers hold the dialog and its fields, which hold
+    // widgets of the same window, and GTK's `gtk_window_destroy` drops only
+    // the window's own reference: they are recorded here and disconnected
+    // when it closes, or every closed editor would stay in memory
+    // (MEMORY_OPTIMISATION1.md, event editor).
+    let handlers = crate::util::HandlerSet::default();
 
     // --- Calendar picker (same StringList + parallel id vector convention
     // as the event editor).
@@ -149,13 +155,16 @@ pub fn show_task_editor(
         let due_date = due_date.clone();
         let due_date_label = due_date_label.clone();
         let due_popover = due_popover.clone();
-        due_calendar.connect_day_selected(move |cal| {
-            if let Some(date) = NaiveDate::from_ymd_opt(cal.year(), cal.month() as u32 + 1, cal.day() as u32) {
-                due_date.set(date);
-                due_date_label.set_label(&format!("{}", date.format("%a, %b %-d")));
-            }
-            due_popover.popdown();
-        });
+        handlers.track(
+            &due_calendar,
+            due_calendar.connect_day_selected(move |cal| {
+                if let Some(date) = NaiveDate::from_ymd_opt(cal.year(), cal.month() as u32 + 1, cal.day() as u32) {
+                    due_date.set(date);
+                    due_date_label.set_label(&format!("{}", date.format("%a, %b %-d")));
+                }
+                due_popover.popdown();
+            }),
+        );
     }
     let due_date_button = gtk::MenuButton::builder().popover(&due_popover).child(&due_date_label).build();
 
@@ -220,7 +229,12 @@ pub fn show_task_editor(
         .and_then(|t| t.due)
         .map(|due| due.with_timezone(&Local).date_naive())
         .unwrap_or_else(|| Local::now().date_naive());
-    let series = crate::recurrence::build_series_control(seed.as_ref().and_then(|t| t.rrule.as_deref()), crate::message_list::current_week_start(), series_start);
+    let series = crate::recurrence::build_series_control(
+        seed.as_ref().and_then(|t| t.rrule.as_deref()),
+        crate::message_list::current_week_start(),
+        series_start,
+        &handlers,
+    );
     crate::privacy::mark_content(&series.button);
     series.button.set_tooltip_text(Some(&series.summary()));
     let repeat_row = adw::ActionRow::builder().title("Repeat").build();
@@ -247,11 +261,11 @@ pub fn show_task_editor(
     };
     {
         let apply = apply_schedule_state.clone();
-        due_switch_row.connect_active_notify(move |_| apply());
+        handlers.track(&due_switch_row, due_switch_row.connect_active_notify(move |_| apply()));
     }
     {
         let apply = apply_schedule_state.clone();
-        calendar_dropdown.connect_selected_notify(move |_| apply());
+        handlers.track(&calendar_dropdown, calendar_dropdown.connect_selected_notify(move |_| apply()));
     }
     apply_schedule_state();
 
@@ -450,11 +464,11 @@ pub fn show_task_editor(
             dialog.close();
         }
     };
-    save_button.connect_clicked(save_handler);
+    handlers.track(&save_button, save_button.connect_clicked(save_handler));
 
     {
         let dialog = dialog.clone();
-        cancel_button.connect_clicked(move |_| dialog.close());
+        handlers.track(&cancel_button, cancel_button.connect_clicked(move |_| dialog.close()));
     }
 
     if has_existing {
@@ -465,24 +479,32 @@ pub fn show_task_editor(
         let existing_meta = existing_meta.clone();
         let is_offline = is_offline.clone();
         let on_delete = on_delete;
-        delete_button.connect_clicked(move |_| {
-            if is_offline() {
-                error_label.set_label("You're working offline — reconnect to save");
-                error_label.set_visible(true);
-                return;
-            }
-            let selected = calendar_dropdown.selected() as usize;
-            let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
-                error_label.set_label("No calendar selected.");
-                error_label.set_visible(true);
-                return;
-            };
-            if let Some((uid, href, etag)) = &existing_meta {
-                on_delete(calendar_id, uid.clone(), href.clone(), etag.clone());
-                dialog.close();
-            }
-        });
+        handlers.track(
+            &delete_button,
+            delete_button.connect_clicked(move |_| {
+                if is_offline() {
+                    error_label.set_label("You're working offline — reconnect to save");
+                    error_label.set_visible(true);
+                    return;
+                }
+                let selected = calendar_dropdown.selected() as usize;
+                let Some(calendar_id) = calendar_ids.get(selected).cloned() else {
+                    error_label.set_label("No calendar selected.");
+                    error_label.set_visible(true);
+                    return;
+                };
+                if let Some((uid, href, etag)) = &existing_meta {
+                    on_delete(calendar_id, uid.clone(), href.clone(), etag.clone());
+                    dialog.close();
+                }
+            }),
+        );
     }
+
+    dialog.connect_close_request(move |_| {
+        handlers.disconnect_all();
+        gtk::glib::Propagation::Proceed
+    });
 
     dialog.present();
 }
@@ -516,6 +538,7 @@ fn task_reminder_choices(existing: Option<i64>) -> (Vec<String>, Vec<Option<i64>
 #[cfg(test)]
 mod tests {
     use super::task_reminder_choices;
+    use adw::prelude::*;
 
     #[test]
     fn task_reminder_choices_use_task_wording_and_default_to_none() {
@@ -535,5 +558,59 @@ mod tests {
         let (labels, values, index) = task_reminder_choices(Some(-10));
         assert_eq!(values[index as usize], Some(-10));
         assert_eq!(labels[index as usize], "10 minutes after");
+    }
+
+    fn collect_widget_tree(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        out.push(root.clone());
+        let mut child = root.first_child();
+        while let Some(current) = child {
+            collect_widget_tree(&current, out);
+            child = current.next_sibling();
+        }
+    }
+
+    /// A closed task editor is freed with everything in it, its Repeat
+    /// control and due-date popover included. Its handlers hold the dialog
+    /// and its fields, which kept every closed editor in memory
+    /// (MEMORY_OPTIMISATION1.md, event editor).
+    #[test]
+    fn closed_task_editor_is_freed() {
+        use std::rc::Rc;
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let parent = adw::ApplicationWindow::builder().build();
+        let calendars = vec![("Tasks".to_string(), lookout_core::CalendarId("tasks".to_string()))];
+        let before = gtk::Window::list_toplevels();
+        super::show_task_editor(
+            &parent,
+            super::TaskEditorPrefill {
+                calendars: &calendars,
+                default_calendar: lookout_core::CalendarId("tasks".to_string()),
+                existing: None,
+                prefill: None,
+                categories: &[],
+            },
+            Rc::new(|| false),
+            |_, _| {},
+            |_, _, _, _| {},
+        );
+        let editor = gtk::Window::list_toplevels()
+            .into_iter()
+            .find(|window| !before.contains(window))
+            .expect("the editor opened a window");
+        let mut widgets = Vec::new();
+        collect_widget_tree(&editor, &mut widgets);
+        let cancel = widgets
+            .iter()
+            .find(|w| w.downcast_ref::<gtk::Button>().and_then(|b| b.label()).as_deref() == Some("Cancel"))
+            .and_then(|w| w.clone().downcast::<gtk::Button>().ok())
+            .expect("the editor has a Cancel button");
+        let watched: Vec<(&str, gtk::glib::WeakRef<gtk::glib::Object>)> = widgets.iter().map(|w| (w.type_().name(), crate::gtk_test::weak(w))).collect();
+        drop((widgets, editor));
+        cancel.emit_clicked();
+        drop(cancel);
+        crate::gtk_test::assert_freed(&watched);
+        parent.destroy();
     }
 }

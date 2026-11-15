@@ -159,6 +159,10 @@ pub struct RoomFinderInputs<'a> {
     pub all_day_switch: &'a gtk::Switch,
     pub zone_dropdown: &'a gtk::DropDown,
     pub finder: RoomFinder,
+    /// The editor window's handler set: the finder's handlers hold its
+    /// popover and the editor's fields, so they are disconnected with the
+    /// editor's own when it closes.
+    pub handlers: crate::util::HandlerSet,
 }
 
 /// Adds the **Find a room** suffix button and its popover to the Location row.
@@ -180,6 +184,7 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
         all_day_switch,
         zone_dropdown,
         finder,
+        handlers,
     } = inputs;
     let location_row = location_row.clone();
     let attendees_field = attendees_field.clone();
@@ -209,6 +214,17 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
 
     let popover = gtk::Popover::builder().autohide(true).has_arrow(true).build();
     popover.set_parent(&button);
+    // GTK only unparents a widget's own children when it is disposed, so the
+    // popover (a child we added) is detached with the button, or it outlives
+    // the editor.
+    {
+        let popover = popover.downgrade();
+        button.connect_destroy(move |_| {
+            if let Some(popover) = popover.upgrade() {
+                popover.unparent();
+            }
+        });
+    }
     let heading = gtk::Label::builder().label("Rooms").xalign(0.0).css_classes(["heading"]).build();
     crate::privacy::mark_ui(&heading);
     let search = gtk::SearchEntry::builder().placeholder_text("Search rooms").build();
@@ -321,6 +337,8 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
         let checking = checking.clone();
         let current_window = current_window.clone();
         let pick = pick.clone();
+        // The room rows are rebuilt on every search; theirs are recorded too.
+        let handlers = handlers.clone();
         Rc::new(move || {
             while let Some(child) = list.first_child() {
                 list.remove(&child);
@@ -366,7 +384,7 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
                 row.add_suffix(&availability_label);
                 let pick = pick.clone();
                 let room = room.clone();
-                row.connect_activated(move |_| pick(&room));
+                handlers.track(&row, row.connect_activated(move |_| pick(&room)));
                 list.append(&row);
             }
         })
@@ -375,6 +393,11 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
     // Set once availability can be asked for; a room load refreshes it, so the
     // first open can load and then fill the rows in one pass.
     let availability_refresh: AvailabilityRefresh = Rc::new(RefCell::new(None));
+    // The hook it ends up holding leads back to it (an `Rc` cycle).
+    {
+        let availability_refresh = availability_refresh.clone();
+        handlers.on_teardown(move || drop(availability_refresh.borrow_mut().take()));
+    }
 
     let load_rooms: Rc<dyn Fn()> = {
         let finder = finder.clone();
@@ -497,14 +520,17 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
         let load_rooms = load_rooms.clone();
         let fetch_availability = fetch_availability.clone();
         let rooms = rooms.clone();
-        button.connect_clicked(move |_| {
-            popover.popup();
-            if rooms.borrow().is_empty() {
-                load_rooms();
-            } else {
-                fetch_availability();
-            }
-        });
+        handlers.track(
+            &button,
+            button.connect_clicked(move |_| {
+                popover.popup();
+                if rooms.borrow().is_empty() {
+                    load_rooms();
+                } else {
+                    fetch_availability();
+                }
+            }),
+        );
     }
     {
         let finder = finder.clone();
@@ -514,37 +540,40 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
         let failure = failure.clone();
         let load_rooms = load_rooms.clone();
         let rebuild = rebuild.clone();
-        allow_button.connect_clicked(move |_| {
-            let Some(calendar_id) = selected_calendar() else {
-                return;
-            };
-            let load_rooms = load_rooms.clone();
-            let consent_attempted = consent_attempted.clone();
-            let consent_needed = consent_needed.clone();
-            let failure = failure.clone();
-            let rebuild = rebuild.clone();
-            (finder.grant)(
-                calendar_id,
-                Rc::new(move |result| match result {
-                    Ok(()) => {
-                        consent_attempted.set(true);
-                        load_rooms();
-                    }
-                    Err(message) => {
-                        // Surface the failure rather than leaving the Allow
-                        // prompt up; closing and reopening the popover asks for
-                        // consent again.
-                        consent_needed.set(false);
-                        *failure.borrow_mut() = Some(format!("Couldn't enable room suggestions: {message}"));
-                        rebuild();
-                    }
-                }),
-            );
-        });
+        handlers.track(
+            &allow_button,
+            allow_button.connect_clicked(move |_| {
+                let Some(calendar_id) = selected_calendar() else {
+                    return;
+                };
+                let load_rooms = load_rooms.clone();
+                let consent_attempted = consent_attempted.clone();
+                let consent_needed = consent_needed.clone();
+                let failure = failure.clone();
+                let rebuild = rebuild.clone();
+                (finder.grant)(
+                    calendar_id,
+                    Rc::new(move |result| match result {
+                        Ok(()) => {
+                            consent_attempted.set(true);
+                            load_rooms();
+                        }
+                        Err(message) => {
+                            // Surface the failure rather than leaving the Allow
+                            // prompt up; closing and reopening the popover asks for
+                            // consent again.
+                            consent_needed.set(false);
+                            *failure.borrow_mut() = Some(format!("Couldn't enable room suggestions: {message}"));
+                            rebuild();
+                        }
+                    }),
+                );
+            }),
+        );
     }
     {
         let rebuild = rebuild.clone();
-        search.connect_search_changed(move |_| rebuild());
+        handlers.track(&search, search.connect_search_changed(move |_| rebuild()));
     }
 
     // A changed span refreshes the rows' free/busy while the popover is open;
@@ -560,23 +589,23 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
     };
     for spin in [&start_hour, &start_minute, &end_hour, &end_minute] {
         let refresh = refresh_if_open.clone();
-        spin.connect_value_changed(move |_| refresh());
+        handlers.track(spin, spin.connect_value_changed(move |_| refresh()));
     }
     {
         let refresh = refresh_if_open.clone();
-        start_calendar.connect_day_selected(move |_| refresh());
+        handlers.track(&start_calendar, start_calendar.connect_day_selected(move |_| refresh()));
     }
     {
         let refresh = refresh_if_open.clone();
-        end_calendar.connect_day_selected(move |_| refresh());
+        handlers.track(&end_calendar, end_calendar.connect_day_selected(move |_| refresh()));
     }
     {
         let refresh = refresh_if_open.clone();
-        all_day_switch.connect_active_notify(move |_| refresh());
+        handlers.track(&all_day_switch, all_day_switch.connect_active_notify(move |_| refresh()));
     }
     {
         let refresh = refresh_if_open.clone();
-        zone_dropdown.connect_selected_notify(move |_| refresh());
+        handlers.track(&zone_dropdown, zone_dropdown.connect_selected_notify(move |_| refresh()));
     }
 
     // The room directory belongs to the selected calendar's account: a switch
@@ -623,7 +652,7 @@ pub fn attach(inputs: RoomFinderInputs<'_>) -> RoomFinderWidgets {
     sync_room_button();
     {
         let sync = sync_room_button.clone();
-        calendar_dropdown.connect_selected_notify(move |_| sync());
+        handlers.track(&calendar_dropdown, calendar_dropdown.connect_selected_notify(move |_| sync()));
     }
 
     RoomFinderWidgets { button, resource_attendees }

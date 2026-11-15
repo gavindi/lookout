@@ -75,6 +75,11 @@
     <color type="primary" scheme_preference="dark">#006cb7</color>
   </branding>
   <releases>
+    <release version="0.9.319" date="2026-11-15">
+      <description>
+        <p>Closing the event or task editor now releases the memory it used, instead of keeping it until Lookout quits. In the event editor, the Save button again changes to Send as you add attendees when the Scheduling Assistant is available.</p>
+      </description>
+    </release>
     <release version="0.9.318" date="2026-11-15">
       <description>
         <p>Closing a message you were writing now releases the memory it used, including its editor and any attachments, instead of keeping it until Lookout quits. Message windows opened on their own release their memory when closed, too.</p>

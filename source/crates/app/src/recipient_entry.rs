@@ -209,8 +209,10 @@ pub struct RecipientEntry {
     /// Fired whenever the recipient set may have changed - a chip committed
     /// or removed, or the entry text edited. The event editor uses it to keep
     /// its footer action label ("Save" / "Send") in step with whether the
-    /// event has attendees; one slot is enough for its single consumer.
-    changed: Rc<RefCell<Option<AddressesChangedCallback>>>,
+    /// event has attendees, and its Scheduling Assistant to refresh. Every
+    /// registered callback runs; a single slot let the second registration
+    /// silently replace the first.
+    changed: Rc<RefCell<Vec<AddressesChangedCallback>>>,
     /// Optional per-chip person hook (Phase 4.2 / UX-67): called with each
     /// chip's name label and address so the caller can attach the profile-card
     /// trigger. Unset by default (chip mode is otherwise inert).
@@ -236,7 +238,7 @@ struct WeakRecipientEntry {
     suggestions: Rc<RefCell<Vec<Suggestion>>>,
     source: Rc<RefCell<Option<SuggestionSource>>>,
     suggestion_generation: Rc<Cell<u64>>,
-    changed: Rc<RefCell<Option<AddressesChangedCallback>>>,
+    changed: Rc<RefCell<Vec<AddressesChangedCallback>>>,
     person_card: Rc<RefCell<Option<PersonCardHook>>>,
 }
 
@@ -380,7 +382,7 @@ impl RecipientEntry {
             suggestions: Rc::new(RefCell::new(Vec::new())),
             source: Rc::new(RefCell::new(None)),
             suggestion_generation: Rc::new(Cell::new(0)),
-            changed: Rc::new(RefCell::new(None)),
+            changed: Rc::new(RefCell::new(Vec::new())),
             person_card: Rc::new(RefCell::new(None)),
         };
         this.connect_handlers();
@@ -452,14 +454,25 @@ impl RecipientEntry {
 
     /// Registers the callback fired whenever the recipient set may have
     /// changed: a keystroke in the entry, a token committed to a chip, a chip
-    /// removed, or the contents replaced programmatically.
+    /// removed, or the contents replaced programmatically. Callbacks add up:
+    /// each one registered runs, until [`clear_addresses_changed`](Self::clear_addresses_changed).
     pub fn connect_addresses_changed<F: Fn() + 'static>(&self, f: F) {
-        *self.changed.borrow_mut() = Some(Rc::new(f));
+        self.changed.borrow_mut().push(Rc::new(f));
+    }
+
+    /// Drops every callback registered with
+    /// [`connect_addresses_changed`](Self::connect_addresses_changed) - for a
+    /// form closing down, whose callbacks capture its own widgets (often this
+    /// very field, which stores them: an `Rc` cycle nothing else breaks).
+    pub fn clear_addresses_changed(&self) {
+        self.changed.borrow_mut().clear();
     }
 
     fn notify_changed(&self) {
+        // Cloned out first: a callback may read the field, or register or
+        // clear callbacks, while they run.
         let changed = self.changed.borrow().clone();
-        if let Some(changed) = changed {
+        for changed in changed {
             changed();
         }
     }

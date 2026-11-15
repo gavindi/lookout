@@ -998,11 +998,8 @@ fn sensitivity_index(sensitivity: MessageSensitivity) -> u32 {
     }
 }
 
-/// One recorded handler: the object it is connected on, and its id.
-type TrackedHandler = (glib::WeakRef<glib::Object>, glib::SignalHandlerId);
-
 /// The signal handlers a composer connects on its own widgets, disconnected
-/// together when the composer ends (see [`ComposerHandlers::disconnect_all`]).
+/// together when the composer ends (see [`crate::util::HandlerSet`]).
 ///
 /// Many of them hold `AutosaveCtx`, the send closure or clones of the
 /// composer's fields, and those hold widgets of the composer, including the
@@ -1011,42 +1008,7 @@ type TrackedHandler = (glib::WeakRef<glib::Object>, glib::SignalHandlerId);
 /// editor's WebView and the attachment bytes (MEMORY_OPTIMISATION1.md finding
 /// 6). Disconnecting them when the composer ends breaks every cycle at once,
 /// so the handlers can keep their plain strong captures.
-#[derive(Clone, Default)]
-struct ComposerHandlers {
-    handlers: Rc<RefCell<Vec<TrackedHandler>>>,
-    /// Long-running tasks to cancel too (the autosave tick, which would
-    /// otherwise hold the composer's fields until its next 30 s wake-up).
-    tasks: Rc<RefCell<Vec<glib::JoinHandle<()>>>>,
-}
-
-impl ComposerHandlers {
-    /// Records a handler `object` connected, returning nothing so a
-    /// `connect_*` call can be wrapped in place.
-    fn track(&self, object: &impl IsA<glib::Object>, id: glib::SignalHandlerId) {
-        self.handlers.borrow_mut().push((object.upcast_ref::<glib::Object>().downgrade(), id));
-    }
-
-    /// Records a task to cancel when the composer ends.
-    fn track_task(&self, task: glib::JoinHandle<()>) {
-        self.tasks.borrow_mut().push(task);
-    }
-
-    /// Disconnects every recorded handler whose object is still alive and
-    /// cancels the recorded tasks. Safe to call more than once, and from
-    /// inside one of the handlers (GLib keeps a running handler's closure
-    /// until it returns).
-    fn disconnect_all(&self) {
-        let handlers = std::mem::take(&mut *self.handlers.borrow_mut());
-        for (object, id) in handlers {
-            if let Some(object) = object.upgrade() {
-                object.disconnect(id);
-            }
-        }
-        for task in std::mem::take(&mut *self.tasks.borrow_mut()) {
-            task.abort();
-        }
-    }
-}
+type ComposerHandlers = crate::util::HandlerSet;
 
 /// Everything the draft autosave touches, in one clonable bundle. This exists
 /// because reading the rich editor is `async` (see `read_content`) and an

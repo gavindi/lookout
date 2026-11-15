@@ -839,6 +839,10 @@ pub(crate) fn show_forward_meeting_dialog(
         let event = event.clone();
         let toast_overlay = toast_overlay.clone();
         dialog.connect_response(None, move |_dialog, response| {
+            // Every response closes the dialog (Cancel and Escape included):
+            // drop the field's change callback, which holds the dialog and
+            // the field itself (an `Rc` cycle that would keep both alive).
+            to_field.clear_addresses_changed();
             if response != "forward" {
                 return;
             }
