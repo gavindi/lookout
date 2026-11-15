@@ -18,6 +18,46 @@ So this is a steady leak on the **GTK main thread**, not a one-off load and not 
 
 The code was read, not profiled: `ptrace_scope=1` blocks reading the heap without sudo, and the app was not relaunched. Three independent passes over the code (UI caches, mail data and channels, rendering and widgets) agree on the main cause. I checked the top items myself in the code.
 
+## Phase 0 results (measured 2026-11-15)
+
+**Setup:** installed `/usr/bin/lookout` 0.9.315, on real accounts, run for 51 minutes with an `LD_PRELOAD` probe.
+- The probe wraps `g_object_new`, `g_object_new_valist` and `g_object_new_with_properties`, and adds a weak ref to each new object so its live count drops when the object is disposed.
+- Every 60 s it logs RSS, `mallinfo2` and live/created counts per type.
+- `GOBJECT_DEBUG=instance-count` does nothing here, because Ubuntu's GLib is built without `G_ENABLE_DEBUG`.
+- The mail folder list was never on screen in this run (0 `GtkTreeExpander`s created), so finding 1 was not exercised.
+
+### Growth from 10:49 to 11:40
+
+| Counter | Start | End | Change |
+|---|---|---|---|
+| RSS | 808 MB | 1,653 MB | **+844 MB (~1 GB/hour)** |
+| malloc in use | 497 MB | 1,251 MB | +754 MB |
+| malloc free (kept by glibc) | 36 MB | 82 MB | +46 MB |
+| `GtkPopoverMenu` live/created | 305/305 | 2,398/2,398 | **+2,093, none ever freed** |
+| `GtkMenuButton` live/created | 43/320 | 43/2,443 | buttons rebuilt and freed |
+| `GtkModelButton` live | | | +23,023 (~11 per leaked menu) |
+| `GtkButton` live | | | +21,050 (10 swatches per leaked menu) |
+| `GtkBox` live | | | +21,020 |
+| `GMenu` live | | | +20,930 |
+| `GSimpleAction` live | | | +16,744 |
+| `GSimpleActionGroup` live | | | +2,093 (one per leaked menu) |
+| `GtkWidget` live | 21,167 | 107,460 | +86,293 |
+| `GObject` live | 79,343 | 314,653 | +235,310 |
+
+**Flat over the run:** `GtkPicture`, `GdkTexture`, `GtkListItem`, `GtkListBoxRow`, `WebKitWebView` (3), `GtkLabel` (+120), `GtkCheckButton` and `GtkGestureClick` (+60 each; probably the tasks rows, finding 3).
+
+**`malloc_trim(0)` at the end:** RSS went from 1,653 MB to 1,584 MB (−69 MB, about 4%). The growth is live leaked objects, not fragmentation, so allocator tuning would not fix it.
+
+**Conclusion:**
+- During this run the calendar sidebar (finding 2) accounts for nearly all of the growth.
+- `rebuild_calendar_checklist` rebuilds one `MenuButton` + `ContextMenu` per calendar (~40 here) several times per 5-minute poll.
+- Each popover leaks through the swatch → `menu` capture, at about 360 KB each (754 MB / 2,093).
+- Leaks arrive in bursts of 161-276 menus (+58 to +100 MB) about every 5 minutes.
+- The folder sidebar (finding 1) is not measured yet and would add to this whenever the mail view is visible.
+- So Phase 1 should start with `calendar_view.rs:4693-4702`, then the folder row menu, which has the same swatch pattern (`folder_menu.rs:304-311`).
+
+**Another test leftover:** `~/.cache/lookout/calendar` also holds 1,165 `eds-mirror-test-*` caches.
+
 ## Findings, ranked by likely impact
 
 ### 1. Folder sidebar rows are never freed (main suspect, confirmed in code)
