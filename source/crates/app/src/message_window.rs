@@ -333,11 +333,16 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
     // Reveal the message page only once WebKit has finished painting the
     // body, so the window never flashes a half-loaded document (text bodies
     // set the page directly in `render_data`).
+    // Weak: the entry owns this WebView, and the registry (dropped on close)
+    // is what keeps the entry alive - a strong handle here would keep the
+    // closed window, its WebView and `last_raw` alive for good.
     {
-        let entry = entry.clone();
+        let entry = Rc::downgrade(&entry);
         web_view.connect_load_changed(move |_view, event| {
             if event == webkit::LoadEvent::Finished {
-                entry.borrow().page_stack.set_visible_child_name("message");
+                if let Some(entry) = entry.upgrade() {
+                    entry.borrow().page_stack.set_visible_child_name("message");
+                }
             }
         });
     }
@@ -352,30 +357,33 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
             glib::Propagation::Proceed
         });
     }
-    {
-        let window = window.clone();
-        close_button.connect_clicked(move |_| window.close());
-    }
+    // Both reach the window from the widget they fire on: the window owns
+    // them, so capturing it would be a cycle.
+    close_button.connect_clicked(|button| {
+        if let Some(window) = button.root().and_downcast::<gtk::Window>() {
+            window.close();
+        }
+    });
     {
         // Esc closes the message window (parity for Outlook's popped-out
         // item); the reading pane's own Escape behaviour is unchanged.
         let keys = gtk::EventControllerKey::new();
-        {
-            let window = window.clone();
-            keys.connect_key_pressed(move |_, key, _, _| {
-                if key == gtk::gdk::Key::Escape {
-                    window.close();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            });
-        }
+        keys.connect_key_pressed(|controller, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(window) = controller.widget().and_downcast::<gtk::Window>() {
+                window.close();
+            }
+            glib::Propagation::Stop
+        });
         window.add_controller(keys);
     }
 
     // --- Header actions, resolved against this window's own message (not
-    // the list selection, which may have moved on). ---
+    // the list selection, which may have moved on). Every handler inside the
+    // window holds the entry weakly: the entry owns the window, and only the
+    // `message_windows` registry (cleared on close) may keep it alive. ---
     for (button, mode, title) in [
         (&header.reply_button, crate::compose::ReplyMode::Reply, "Reply"),
         (&header.reply_all_button, crate::compose::ReplyMode::ReplyAll, "Reply All"),
@@ -387,11 +395,12 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
         wire_forward_button(button, &entry, state, worker, main_reading_stack);
     }
     {
-        let entry = entry.clone();
+        let entry = Rc::downgrade(&entry);
         let state = state.clone();
         let parent = parent.clone();
         let toast_overlay = toast_overlay.clone();
         header.contact_button.clone().connect_clicked(move |_| {
+            let Some(entry) = entry.upgrade() else { return };
             let summary = entry.borrow().summary.clone();
             let Some(sender) = summary.from.first() else { return };
             let account_id = crate::window::mailbox_account_id(&summary.mailbox);
@@ -402,7 +411,7 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
         });
     }
     {
-        let entry = entry.clone();
+        let entry = Rc::downgrade(&entry);
         let state = state.clone();
         let web_view = web_view.clone();
         let user_content_manager = user_content_manager.clone();
@@ -415,26 +424,30 @@ pub(crate) fn open_message_window(parent: &adw::ApplicationWindow, state: &Rc<Re
             });
             button.set_tooltip_text(Some(if button.is_active() { "View in Light Mode" } else { "View in Dark Mode" }));
             crate::window::set_message_theme_armed(button.is_active(), &web_view, &user_content_manager, &theme_override_sheet);
-            rerender(&state, &entry);
+            if let Some(entry) = entry.upgrade() {
+                rerender(&state, &entry);
+            }
         });
     }
     {
         // The remote-content banner is this window's "load once" affordance;
         // the trust settings it consults are the same the reading pane uses.
-        let entry = entry.clone();
+        let entry = Rc::downgrade(&entry);
         let state = state.clone();
         remote_banner.connect_button_clicked(move |banner| {
+            let Some(entry) = entry.upgrade() else { return };
             banner.set_revealed(false);
             entry.borrow_mut().load_images_once = true;
             rerender(&state, &entry);
         });
     }
     {
-        let entry = entry.clone();
+        let entry = Rc::downgrade(&entry);
         let state = state.clone();
         let page_stack = page_stack.clone();
         let error_label = error_label.clone();
         retry_button.connect_clicked(move |_| {
+            let Some(entry) = entry.upgrade() else { return };
             let (mailbox, uid) = {
                 let e = entry.borrow();
                 (e.mailbox.clone(), e.uid)
@@ -687,11 +700,12 @@ fn wire_reply_button(
     worker: &Rc<Worker>,
     main_reading_stack: &gtk::Stack,
 ) {
-    let entry = entry.clone();
+    let entry = Rc::downgrade(entry);
     let state = state.clone();
     let worker = worker.clone();
     let main_reading_stack = main_reading_stack.clone();
     button.connect_clicked(move |_| {
+        let Some(entry) = entry.upgrade() else { return };
         let summary = entry.borrow().summary.clone();
         let Some((own_email, cmd_tx)) = crate::window::reply_send_context(&state, &summary) else {
             return;
@@ -719,11 +733,12 @@ fn wire_reply_button(
 /// The Forward sibling of `wire_reply_button`: opens the forward composer
 /// straight into its own window too.
 fn wire_forward_button(button: &gtk::Button, entry: &Rc<RefCell<MessageWindowState>>, state: &Rc<RefCell<UiState>>, worker: &Rc<Worker>, main_reading_stack: &gtk::Stack) {
-    let entry = entry.clone();
+    let entry = Rc::downgrade(entry);
     let state = state.clone();
     let worker = worker.clone();
     let main_reading_stack = main_reading_stack.clone();
     button.connect_clicked(move |_| {
+        let Some(entry) = entry.upgrade() else { return };
         let summary = entry.borrow().summary.clone();
         if crate::window::reply_send_context(&state, &summary).is_none() {
             return;

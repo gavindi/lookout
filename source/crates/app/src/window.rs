@@ -80,6 +80,185 @@ pub(crate) use state::*;
 pub(crate) use support::*;
 pub(crate) use undo::*;
 
+/// One folder-pane row, as the folder list's factory `setup` builds it: the
+/// tree expander (icon, name, sync spinner, count) with its message drop
+/// target, under an overlay carrying the hover quick actions (Empty and the
+/// "⋯" menu). `bind` points it at a folder through the slots stored on the
+/// expander. Nothing in it holds a strong reference to the row's own widgets
+/// from a handler they own, so a row GTK discards is freed (the folder tree is
+/// rebuilt on every count change; MEMORY_OPTIMISATION1.md finding 1).
+fn build_folder_row(
+    state_slot: &Rc<RefCell<Option<Rc<RefCell<UiState>>>>>,
+    message_list_slot: &Rc<RefCell<Option<MessageListModel>>>,
+    menu_handler: &crate::folder_menu::FolderMenuHandler,
+) -> gtk::Overlay {
+    let expander = gtk::TreeExpander::new();
+    let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
+    // `hexpand` on the name, not the box, is what pushes the count to the
+    // trailing edge: the name takes all the slack (and ellipsizes into it
+    // when the pane is narrow) and the count keeps its natural width.
+    let label = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["folder-row-label"])
+        .build();
+    // Shown only while this row's mailbox is syncing or being
+    // prefetched (see `UiState::syncing`/`prefetching` and
+    // `refresh_folder_spinner`); sits right of the name and left of
+    // the unread count, both of which trail behind it since `label`
+    // is the box's only hexpanding child.
+    let spinner = gtk::Spinner::builder()
+        .visible(false)
+        .valign(gtk::Align::Center)
+        .width_request(14)
+        .height_request(14)
+        .build();
+    let count = gtk::Label::builder().xalign(1.0).css_classes(["folder-unread-count"]).build();
+    let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
+    row_box.append(&icon);
+    row_box.append(&label);
+    row_box.append(&spinner);
+    row_box.append(&count);
+    expander.set_child(Some(&row_box));
+    // Drop target: a folder row accepts the internal message-drag
+    // payload and moves the messages into that folder. The target
+    // identity (which folder this row shows) is written by `bind`
+    // into `drop_data`, since the drop can't read the model itself.
+    let drop_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+    let drop_target = gtk::DropTarget::builder()
+        .formats(&gtk::gdk::ContentFormats::for_type(glib::Bytes::static_type()))
+        .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
+        .build();
+    {
+        let drop_data = drop_data.clone();
+        let state_slot = state_slot.clone();
+        let message_list_slot = message_list_slot.clone();
+        drop_target.connect_drop(move |_target, value, _x, _y| {
+            let Some(mailbox) = drop_data.borrow().clone() else {
+                return false;
+            };
+            let Some(state) = state_slot.borrow().clone() else {
+                return false;
+            };
+            let message_list = message_list_slot.borrow().clone();
+            handle_message_drag_drop(&state, message_list.as_ref(), &mailbox, value)
+        });
+    }
+    // The highlight goes on the controller's own widget (the
+    // expander): capturing the expander here would be a cycle through
+    // the controller it owns, and the row would never be freed.
+    drop_target.connect_enter(|target, _x, _y| {
+        if let Some(widget) = target.widget() {
+            widget.add_css_class("lookout-drop-target");
+        }
+        gtk::gdk::DragAction::MOVE
+    });
+    drop_target.connect_leave(|target| {
+        if let Some(widget) = target.widget() {
+            widget.remove_css_class("lookout-drop-target");
+        }
+    });
+    expander.add_controller(drop_target);
+    // Quick actions (initially hidden), mirroring the message rows'
+    // hover quick actions: on Trash/Junk a button that empties the
+    // folder, and on every folder row the "⋯" menu (see
+    // `folder_menu`). `bind` writes which folder the row shows into
+    // `menu_data` (and whether it can be emptied into
+    // `expunge_enabled`), read at click time - the same slot pattern
+    // as the drop target above. Both route through `menu_handler`,
+    // installed once the window state exists.
+    let expunge_btn = gtk::Button::from_icon_name("user-trash-full-symbolic");
+    expunge_btn.add_css_class("hover-quick-action");
+    expunge_btn.set_tooltip_text(Some("Empty folder"));
+    expunge_btn.set_visible(false);
+    let menu_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+    let menu = crate::folder_menu::build_row_menu(menu_data.clone(), menu_handler.clone());
+    let action_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(2)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .margin_end(8)
+        .build();
+    action_box.add_css_class("hover-quick-actions");
+    action_box.append(&expunge_btn);
+    action_box.append(&menu.button);
+    action_box.set_visible(false);
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&expander));
+    overlay.add_overlay(&action_box);
+    let expunge_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+    let expunge_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    {
+        let expunge_data = expunge_data.clone();
+        let menu_handler = menu_handler.clone();
+        expunge_btn.connect_clicked(move |button| {
+            let mailbox = expunge_data.borrow().clone();
+            let handler = menu_handler.borrow().clone();
+            if let (Some(mailbox), Some(handler)) = (mailbox, handler) {
+                handler(crate::folder_menu::FolderMenuAction::Empty, mailbox, button.clone().upcast());
+            }
+        });
+    }
+    // The action box shows on a folder row only while the pointer is
+    // over it - or while its menu is open, so that moving the pointer
+    // from the row into the menu doesn't hide the button the menu
+    // hangs off (closing it). Selecting a row doesn't show it.
+    let hovered = Rc::new(Cell::new(false));
+    // Weak widget handles: the menu popover's `closed` handler (below)
+    // holds this closure, and the popover is a descendant of both.
+    let refresh_actions: Rc<dyn Fn()> = {
+        let action_box = action_box.downgrade();
+        let menu_data = menu_data.clone();
+        let hovered = hovered.clone();
+        let menu_button = menu.button.downgrade();
+        Rc::new(move || {
+            let (Some(action_box), Some(menu_button)) = (action_box.upgrade(), menu_button.upgrade()) else {
+                return;
+            };
+            let menu_open = menu_button.popover().is_some_and(|popover| popover.is_visible());
+            action_box.set_visible(menu_data.borrow().is_some() && (hovered.get() || menu_open));
+        })
+    };
+    {
+        let hovered_enter = hovered.clone();
+        let refresh_enter = refresh_actions.clone();
+        let refresh_leave = refresh_actions.clone();
+        let hover_controller = gtk::EventControllerMotion::new();
+        hover_controller.connect_enter(move |_, _, _| {
+            hovered_enter.set(true);
+            refresh_enter();
+        });
+        hover_controller.connect_leave(move |_| {
+            hovered.set(false);
+            refresh_leave();
+        });
+        overlay.add_controller(hover_controller);
+    }
+    if let Some(popover) = menu.button.popover() {
+        let refresh = refresh_actions.clone();
+        popover.connect_closed(move |_| refresh());
+    }
+    unsafe {
+        expander.set_data(
+            "lookout-expunge-widgets",
+            FolderRowWidgets {
+                expunge_btn,
+                expunge_data,
+                expunge_enabled,
+                menu,
+                menu_data,
+                refresh_actions,
+            },
+        );
+    }
+    unsafe {
+        expander.set_data("lookout-drop-target", drop_data);
+    }
+    overlay
+}
+
 pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::ApplicationWindow {
     // The theme stack (base palette + bundled flat-token theme + custom
     // accent) registers before any other CSS provider so the app's rules can
@@ -201,164 +380,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let message_list_slot = message_list_slot.clone();
         let menu_handler = menu_handler.clone();
         folder_factory.connect_setup(move |_, list_item| {
-            let expander = gtk::TreeExpander::new();
-            let icon = gtk::Image::builder().icon_size(gtk::IconSize::Normal).build();
-            // `hexpand` on the name, not the box, is what pushes the count to the
-            // trailing edge: the name takes all the slack (and ellipsizes into it
-            // when the pane is narrow) and the count keeps its natural width.
-            let label = gtk::Label::builder()
-                .xalign(0.0)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["folder-row-label"])
-                .build();
-            // Shown only while this row's mailbox is syncing or being
-            // prefetched (see `UiState::syncing`/`prefetching` and
-            // `refresh_folder_spinner`); sits right of the name and left of
-            // the unread count, both of which trail behind it since `label`
-            // is the box's only hexpanding child.
-            let spinner = gtk::Spinner::builder()
-                .visible(false)
-                .valign(gtk::Align::Center)
-                .width_request(14)
-                .height_request(14)
-                .build();
-            let count = gtk::Label::builder().xalign(1.0).css_classes(["folder-unread-count"]).build();
-            let row_box = gtk::Box::builder().orientation(gtk::Orientation::Horizontal).spacing(6).build();
-            row_box.append(&icon);
-            row_box.append(&label);
-            row_box.append(&spinner);
-            row_box.append(&count);
-            expander.set_child(Some(&row_box));
-            // Drop target: a folder row accepts the internal message-drag
-            // payload and moves the messages into that folder. The target
-            // identity (which folder this row shows) is written by `bind`
-            // into `drop_data`, since the drop can't read the model itself.
-            let drop_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
-            let drop_target = gtk::DropTarget::builder()
-                .formats(&gtk::gdk::ContentFormats::for_type(glib::Bytes::static_type()))
-                .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
-                .build();
-            {
-                let drop_data = drop_data.clone();
-                let state_slot = state_slot.clone();
-                let message_list_slot = message_list_slot.clone();
-                drop_target.connect_drop(move |_target, value, _x, _y| {
-                    let Some(mailbox) = drop_data.borrow().clone() else {
-                        return false;
-                    };
-                    let Some(state) = state_slot.borrow().clone() else {
-                        return false;
-                    };
-                    let message_list = message_list_slot.borrow().clone();
-                    handle_message_drag_drop(&state, message_list.as_ref(), &mailbox, value)
-                });
-            }
-            {
-                let expander = expander.clone();
-                drop_target.connect_enter(move |_target, _x, _y| {
-                    expander.add_css_class("lookout-drop-target");
-                    gtk::gdk::DragAction::MOVE
-                });
-            }
-            {
-                let expander = expander.clone();
-                drop_target.connect_leave(move |_target| {
-                    expander.remove_css_class("lookout-drop-target");
-                });
-            }
-            expander.add_controller(drop_target);
-            // Quick actions (initially hidden), mirroring the message rows'
-            // hover quick actions: on Trash/Junk a button that empties the
-            // folder, and on every folder row the "⋯" menu (see
-            // `folder_menu`). `bind` writes which folder the row shows into
-            // `menu_data` (and whether it can be emptied into
-            // `expunge_enabled`), read at click time - the same slot pattern
-            // as the drop target above. Both route through `menu_handler`,
-            // installed once the window state exists.
-            let expunge_btn = gtk::Button::from_icon_name("user-trash-full-symbolic");
-            expunge_btn.add_css_class("hover-quick-action");
-            expunge_btn.set_tooltip_text(Some("Empty folder"));
-            expunge_btn.set_visible(false);
-            let menu_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
-            let menu = crate::folder_menu::build_row_menu(menu_data.clone(), menu_handler.clone());
-            let action_box = gtk::Box::builder()
-                .orientation(gtk::Orientation::Horizontal)
-                .spacing(2)
-                .halign(gtk::Align::End)
-                .valign(gtk::Align::Center)
-                .margin_end(8)
-                .build();
-            action_box.add_css_class("hover-quick-actions");
-            action_box.append(&expunge_btn);
-            action_box.append(&menu.button);
-            action_box.set_visible(false);
-            let overlay = gtk::Overlay::new();
-            overlay.set_child(Some(&expander));
-            overlay.add_overlay(&action_box);
-            let expunge_data: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
-            let expunge_enabled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            {
-                let expunge_data = expunge_data.clone();
-                let menu_handler = menu_handler.clone();
-                expunge_btn.connect_clicked(move |button| {
-                    let mailbox = expunge_data.borrow().clone();
-                    let handler = menu_handler.borrow().clone();
-                    if let (Some(mailbox), Some(handler)) = (mailbox, handler) {
-                        handler(crate::folder_menu::FolderMenuAction::Empty, mailbox, button.clone().upcast());
-                    }
-                });
-            }
-            // The action box shows on a folder row only while the pointer is
-            // over it - or while its menu is open, so that moving the pointer
-            // from the row into the menu doesn't hide the button the menu
-            // hangs off (closing it). Selecting a row doesn't show it.
-            let hovered = Rc::new(Cell::new(false));
-            let refresh_actions: Rc<dyn Fn()> = {
-                let action_box = action_box.clone();
-                let menu_data = menu_data.clone();
-                let hovered = hovered.clone();
-                let menu_button = menu.button.clone();
-                Rc::new(move || {
-                    let menu_open = menu_button.popover().is_some_and(|popover| popover.is_visible());
-                    action_box.set_visible(menu_data.borrow().is_some() && (hovered.get() || menu_open));
-                })
-            };
-            {
-                let hovered_enter = hovered.clone();
-                let refresh_enter = refresh_actions.clone();
-                let refresh_leave = refresh_actions.clone();
-                let hover_controller = gtk::EventControllerMotion::new();
-                hover_controller.connect_enter(move |_, _, _| {
-                    hovered_enter.set(true);
-                    refresh_enter();
-                });
-                hover_controller.connect_leave(move |_| {
-                    hovered.set(false);
-                    refresh_leave();
-                });
-                overlay.add_controller(hover_controller);
-            }
-            if let Some(popover) = menu.button.popover() {
-                let refresh = refresh_actions.clone();
-                popover.connect_closed(move |_| refresh());
-            }
-            unsafe {
-                expander.set_data(
-                    "lookout-expunge-widgets",
-                    FolderRowWidgets {
-                        expunge_btn,
-                        expunge_data,
-                        expunge_enabled,
-                        menu,
-                        menu_data,
-                        refresh_actions,
-                    },
-                );
-            }
-            unsafe {
-                expander.set_data("lookout-drop-target", drop_data);
-            }
+            let overlay = build_folder_row(&state_slot, &message_list_slot, &menu_handler);
             list_item.downcast_ref::<gtk::ListItem>().unwrap().set_child(Some(&overlay));
         });
     }
@@ -1386,9 +1408,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let thread_row: Rc<RefCell<Option<gtk::TreeListRow>>> = Rc::new(RefCell::new(None));
         thread_single_toggle.update_property(&[gtk::accessible::Property::Label("Expand or collapse conversation")]);
         {
+            // The button comes from the signal: capturing it would be a
+            // cycle that keeps every destroyed header row alive.
             let thread_row = thread_row.clone();
-            let toggle = thread_single_toggle.clone();
-            thread_single_toggle.connect_clicked(move |_| {
+            thread_single_toggle.connect_clicked(move |toggle| {
                 let Some(row) = thread_row.borrow().as_ref().cloned() else { return };
                 let expanded = !row.is_expanded();
                 row.set_expanded(expanded);

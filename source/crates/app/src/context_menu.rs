@@ -305,10 +305,6 @@ impl ContextMenu {
     pub fn add_child(&self, widget: &impl IsA<gtk::Widget>, id: &str) {
         self.popover.add_child(widget, id);
     }
-
-    pub fn popdown(&self) {
-        self.popover.popdown();
-    }
 }
 
 #[cfg(test)]

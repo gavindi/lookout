@@ -124,6 +124,10 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
     let active: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
     let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
+    // The handlers below reach the trigger through their controller's own
+    // widget (or a weak handle), never a strong capture: `widget` owns those
+    // controllers, so a strong handle would keep it alive forever.
+
     // Click opens straight away. On the reading-pane header the press is
     // claimed (there's nothing beneath to select); on list rows it is left
     // unclaimed so the row still selects and drags as usual.
@@ -131,7 +135,6 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
     click.set_button(gtk::gdk::BUTTON_PRIMARY);
     {
         let context = context.clone();
-        let widget = widget.clone();
         let resolve = resolve.clone();
         let active = active.clone();
         let timer = timer.clone();
@@ -140,7 +143,9 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
                 gesture.set_state(gtk::EventSequenceState::Claimed);
             }
             cancel_timer(&timer);
-            show_card(&context, &widget, &resolve, &active, true);
+            if let Some(widget) = gesture.widget() {
+                show_card(&context, &widget, &resolve, &active, true);
+            }
         });
     }
     widget.add_controller(click);
@@ -149,20 +154,22 @@ pub fn attach_person_trigger<W: IsA<gtk::Widget>>(context: ContextProvider, widg
     let motion = gtk::EventControllerMotion::new();
     {
         let context = context.clone();
-        let widget = widget.clone();
         let resolve = resolve.clone();
         let active = active.clone();
         let timer = timer.clone();
-        motion.connect_enter(move |_, _x, _y| {
+        motion.connect_enter(move |motion, _x, _y| {
             if active.borrow().is_some() {
                 return;
             }
+            let Some(widget) = motion.widget() else { return };
+            let widget = widget.downgrade();
             let context = context.clone();
-            let widget = widget.clone();
             let resolve = resolve.clone();
             let active = active.clone();
             arm_timer(&timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
-                show_card(&context, &widget, &resolve, &active, true);
+                if let Some(widget) = widget.upgrade() {
+                    show_card(&context, &widget, &resolve, &active, true);
+                }
             });
         });
     }
@@ -235,17 +242,24 @@ impl PersonHover {
         let widget = widget.clone().upcast::<gtk::Widget>();
         let motion = gtk::EventControllerMotion::new();
         {
+            // The trigger comes from the controller, not a capture: `widget`
+            // owns this controller, so a strong handle would be a cycle that
+            // keeps every destroyed message row alive.
             let hover = self.clone();
-            let widget = widget.clone();
-            motion.connect_enter(move |_, _x, _y| {
+            motion.connect_enter(move |motion, _x, _y| {
                 // Returning to a trigger cancels a pending close.
                 cancel_timer(&hover.timer);
                 if hover.active.borrow().is_some() || !enabled() {
                     return;
                 }
+                let Some(widget) = motion.widget() else { return };
+                let widget = widget.downgrade();
                 let opener = hover.clone();
-                let widget = widget.clone();
-                arm_timer(&hover.timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || opener.open(&widget));
+                arm_timer(&hover.timer, std::time::Duration::from_millis(HOVER_DELAY_MS), move || {
+                    if let Some(widget) = widget.upgrade() {
+                        opener.open(&widget);
+                    }
+                });
             });
         }
         {

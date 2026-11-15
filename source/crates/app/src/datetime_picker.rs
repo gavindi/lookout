@@ -48,11 +48,15 @@ pub(crate) fn time_cluster(label: &str, calendar: &gtk::Calendar, hour: &gtk::Sp
     let date_label = gtk::Label::new(Some(&format_calendar_date(calendar)));
     let popover = gtk::Popover::builder().child(calendar).build();
     {
-        let date_label = date_label.clone();
-        let popover = popover.clone();
+        // Weak label, and the popover found from the calendar it holds: both
+        // own (or contain) the calendar, so strong captures would be a cycle
+        // that outlives the editor or dialog.
+        let date_label = date_label.downgrade();
         calendar.connect_day_selected(move |cal| {
-            date_label.set_label(&format_calendar_date(cal));
-            popover.popdown();
+            if let Some(date_label) = date_label.upgrade() {
+                date_label.set_label(&format_calendar_date(cal));
+            }
+            crate::util::popdown_enclosing_popover(cal);
         });
     }
     let date_button = gtk::MenuButton::builder().popover(&popover).child(&date_label).build();
@@ -101,10 +105,12 @@ pub(crate) fn build_time_preset_popover(
     let popover = gtk::Popover::builder().child(&list).build();
     popover.add_css_class("menu");
     let dialog = Rc::new(dialog);
+    // `fill` runs on the popover's own `show`, so it holds the list weakly
+    // and the items reach the popover from themselves (no cycle).
     let fill = {
-        let list = list.clone();
-        let popover = popover.clone();
+        let list = list.downgrade();
         move || {
+            let Some(list) = list.upgrade() else { return };
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
@@ -125,10 +131,9 @@ pub(crate) fn build_time_preset_popover(
                 row.append(&gtk::Label::builder().label(format_short_time(&choice.at, &now)).css_classes(["dim-label"]).build());
                 let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
                 let on_pick = on_pick.clone();
-                let popover = popover.clone();
                 let at = choice.at.with_timezone(&Utc);
-                button.connect_clicked(move |_| {
-                    popover.popdown();
+                button.connect_clicked(move |button| {
+                    crate::util::popdown_enclosing_popover(button);
                     on_pick(at);
                 });
                 list.append(&button);
@@ -139,11 +144,13 @@ pub(crate) fn build_time_preset_popover(
                 .css_classes(["flat"])
                 .build();
             let on_pick = on_pick.clone();
-            let popover_for_custom = popover.clone();
             let dialog = dialog.clone();
-            custom.connect_clicked(move |_| {
-                popover_for_custom.popdown();
-                let parent = popover_for_custom.parent();
+            custom.connect_clicked(move |button| {
+                let popover = button.ancestor(gtk::Popover::static_type()).and_downcast::<gtk::Popover>();
+                let parent = popover.as_ref().and_then(|popover| popover.parent());
+                if let Some(popover) = &popover {
+                    popover.popdown();
+                }
                 present_time_dialog(parent.as_ref(), &dialog, on_pick.clone());
             });
             list.append(&custom);

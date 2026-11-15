@@ -1359,19 +1359,23 @@ pub(crate) fn build_tag_menu(
             {
                 let drop_state = state.clone();
                 let drop_key = tag.key.clone();
-                let row_for_enter = row.clone();
-                let row_for_leave = row.clone();
                 let drop_target = gtk::DropTarget::builder()
                     .formats(&gtk::gdk::ContentFormats::for_type(glib::Bytes::static_type()))
                     .actions(gtk::gdk::DragAction::COPY | gtk::gdk::DragAction::MOVE)
                     .build();
                 drop_target.connect_drop(move |_target, value, _x, _y| handle_keyword_drag_drop(&drop_state, &drop_key, value));
-                drop_target.connect_enter(move |_target, _x, _y| {
-                    row_for_enter.add_css_class("lookout-drop-target");
+                // The highlight goes on the controller's own widget: the row
+                // owns this controller, so capturing it would be a cycle.
+                drop_target.connect_enter(|target, _x, _y| {
+                    if let Some(row) = target.widget() {
+                        row.add_css_class("lookout-drop-target");
+                    }
                     gtk::gdk::DragAction::COPY
                 });
-                drop_target.connect_leave(move |_target| {
-                    row_for_leave.remove_css_class("lookout-drop-target");
+                drop_target.connect_leave(|target| {
+                    if let Some(row) = target.widget() {
+                        row.remove_css_class("lookout-drop-target");
+                    }
                 });
                 row.add_controller(drop_target);
             }
@@ -1384,8 +1388,7 @@ pub(crate) fn build_tag_menu(
         let tags = tags.clone();
         let state = state.clone();
         let message_list = message_list.clone();
-        let manage_button = manage.clone();
-        manage.connect_clicked(move |_| {
+        manage.connect_clicked(move |manage_button| {
             show_manage_categories_dialog(manage_button.upcast_ref::<gtk::Widget>(), state.clone(), tags.clone(), message_list.clone());
         });
     }

@@ -1639,6 +1639,13 @@ pub(crate) fn show_event_peek(
     });
     let popover = calendar_view::build_event_peek(occ, &colors, on_edit, on_delete);
     popover.set_parent(anchor);
+    // Built per opening, so it's dropped once closed (after any clicked
+    // button has run, hence the idle) - otherwise every peek stays
+    // parented to its anchor for good.
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
+    });
     popover.popup();
 }
 

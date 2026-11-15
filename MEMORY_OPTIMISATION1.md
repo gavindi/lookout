@@ -58,6 +58,33 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 
 **Another test leftover:** `~/.cache/lookout/calendar` also holds 1,165 `eds-mirror-test-*` caches.
 
+## Phase 1 results (2026-11-15, not yet run in the real app)
+
+**Fixed (handler no longer holds its own widget or an ancestor):**
+- Calendar row menu swatches (finding 2) and folder row menu (finding 1): swatches hold the popover weakly; `dispatch_folder` holds the button weakly. `ContextMenu::popdown` was removed, because its only callers were these leaking closures.
+- Folder row (`window.rs`): drop-target enter/leave use `target.widget()`; `refresh_actions` holds the action box and button weakly. The factory's setup body moved unchanged into `build_folder_row` so it can be tested.
+- Tasks (finding 3): `set_nav` Rename/Delete, the `attach_my_day_menu` gesture (uses `gesture.widget()`, keeps only the task's key) and its item.
+- Message rows (finding 4): `PersonHover::add_trigger` and `attach_person_trigger` use the controller's widget; `thread_single_toggle` uses the signal's button.
+- Finding 6: attachment strip items (weak button); category menu rows (drop target and Manage button); conversation attachment menu; event peek (buttons, plus unparent on close); pop-out message window (every handler inside it holds the entry weakly; the close button and Esc find the window from the widget).
+- Per-open popovers: the flag menu, the time-preset menu (Schedule send, Snooze) and `time_cluster`'s date popover.
+- Composer, partly: cc/bcc buttons, the From dropdown hint, and the baseline `load_changed` handler, which now disconnects itself after it fires. `compose.rs:1293`/`:1355` were not cycles: the cloned `web_view` is only the receiver.
+- New helper `util::popdown_enclosing_popover(widget)` closes the popover from the clicked item itself.
+
+**Tests:** `gtk_test::assert_freed` plus 6 GTK tests:
+- `checklist_rebuild_frees_the_previous_rows_and_menus`
+- `dropped_row_menu_is_freed`
+- `dropped_folder_row_is_freed`
+- `nav_rebuild_frees_the_previous_rows_and_menus`
+- `my_day_row_is_freed_when_dropped`
+- `profile_card_triggers_do_not_keep_their_row_alive`
+
+With the old swatch capture put back, the checklist test fails with exactly the Phase 0 signature: the `GtkPopoverMenu`s and their 10 `GtkButton` swatches stay alive while the `MenuButton`s are freed. The folder-row test fails likewise with the old `dispatch_folder`.
+
+**Left open:**
+- The composer may still leak as a whole: `AutosaveCtx` holds ~20 composer widgets and is captured by many handlers inside it. This needs an instance-count check in the running app, or a teardown that breaks the handlers.
+- The event editor (`recurrence.rs`, `room_finder.rs`) was not reviewed.
+- The ribbon's More / Move to / Quick steps popovers hold themselves too, but they are singletons whose rebuilt contents free normally, so they were left alone.
+
 ## Findings, ranked by likely impact
 
 ### 1. Folder sidebar rows are never freed (main suspect, confirmed in code)

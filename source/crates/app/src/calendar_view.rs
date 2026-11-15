@@ -883,13 +883,12 @@ pub fn build_event_peek(occ: &EventOccurrence, colors: &HashMap<CalendarId, Stri
         .margin_top(6)
         .build();
     let edit_button = gtk::Button::builder().label("Edit").css_classes(["suggested-action"]).build();
-    {
-        let popover = popover.clone();
-        edit_button.connect_clicked(move |_| {
-            popover.popdown();
-            on_edit();
-        });
-    }
+    // The buttons close the peek from themselves: the popover owns them, so
+    // capturing it would keep every closed peek alive.
+    edit_button.connect_clicked(move |button| {
+        crate::util::popdown_enclosing_popover(button);
+        on_edit();
+    });
     buttons.append(&edit_button);
     // CAL-20 / 3.17: a Join button for an online meeting, labelled by provider.
     if let Some(meeting) = lookout_core::interop::onlinemeeting::detect(occ.conference_url.as_deref(), occ.location.as_deref(), occ.description.as_deref()) {
@@ -899,13 +898,10 @@ pub fn build_event_peek(occ: &EventOccurrence, colors: &HashMap<CalendarId, Stri
     }
     if let Some(on_delete) = on_delete {
         let delete_button = gtk::Button::builder().label("Delete").css_classes(["destructive-action"]).build();
-        {
-            let popover = popover.clone();
-            delete_button.connect_clicked(move |_| {
-                popover.popdown();
-                on_delete();
-            });
-        }
+        delete_button.connect_clicked(move |button| {
+            crate::util::popdown_enclosing_popover(button);
+            on_delete();
+        });
         buttons.append(&delete_button);
     }
     content.append(&buttons);
@@ -4691,12 +4687,17 @@ fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoic
             .tooltip_text(*hex)
             .build();
         {
-            let menu = menu.clone();
+            // Weak: the swatch sits inside this popover, so a strong handle
+            // would be a cycle that keeps the whole menu alive after the
+            // checklist is rebuilt (MEMORY_OPTIMISATION1.md finding 2).
+            let popover = menu.popover.downgrade();
             let on_action = on_action.clone();
             let id = calendar.id.clone();
             let hex = hex.to_string();
             swatch.connect_clicked(move |_| {
-                menu.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 on_action(CalendarSidebarAction::SetColor(id.clone(), hex.clone()));
             });
         }
@@ -6204,6 +6205,51 @@ mod tests {
         click("+ New group");
         click("Show all");
         assert_eq!(fired.borrow().as_slice(), &["new-group".to_string(), "show-all".to_string()]);
+    }
+
+    /// Every widget a checklist rebuild replaces is freed: the rows, their ⋯
+    /// menus, popovers and colour swatches. The swatches used to hold their own
+    /// popover, so each rebuild (several per poll, on every connection-state
+    /// change) leaked one menu per calendar - Phase 0 measured ~360 KB each and
+    /// about 1 GB an hour (MEMORY_OPTIMISATION1.md finding 2).
+    #[test]
+    fn checklist_rebuild_frees_the_previous_rows_and_menus() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let sections = vec![
+            CalendarSection {
+                id: Some("group:1".to_string()),
+                title: "Favourites".to_string(),
+                calendars: vec![calendar("a"), calendar("b")],
+                status: None,
+            },
+            CalendarSection {
+                id: None,
+                title: "Work account".to_string(),
+                calendars: vec![calendar("c")],
+                status: None,
+            },
+        ];
+        let checked: HashSet<CalendarId> = sections.iter().flat_map(|s| s.calendars.iter().map(|c| c.id.clone())).collect();
+        let colors: HashMap<CalendarId, String> = checked.iter().map(|id| (id.clone(), "#3584e4".to_string())).collect();
+        let groups = vec![group("group:1", "Favourites", &["a", "b"])];
+        let provider = gtk::CssProvider::new();
+        let on_action: CalendarSidebarActionHandler = Rc::new(|_| {});
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let rebuild = || rebuild_calendar_checklist(&container, &sections, &checked, &colors, &provider, |_, _| {}, on_action.clone(), &groups, 0);
+
+        rebuild();
+        let mut first = Vec::new();
+        collect_widgets(container.upcast_ref::<gtk::Widget>(), &mut first);
+        first.remove(0); // the container itself stays
+        assert!(first.iter().any(|w| w.is::<gtk::PopoverMenu>()), "the row menus' popovers are in the tree");
+        assert!(first.iter().any(|w| w.has_css_class("calendar-color-swatch")), "the swatches are in the tree");
+        let watched: Vec<(&str, gtk::glib::WeakRef<gtk::glib::Object>)> = first.iter().map(|w| (w.type_().name(), crate::gtk_test::weak(w))).collect();
+        drop(first);
+
+        rebuild();
+        crate::gtk_test::assert_freed(&watched);
     }
 
     #[test]

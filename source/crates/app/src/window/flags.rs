@@ -216,10 +216,12 @@ pub(crate) fn build_flag_popover(state: &Rc<RefCell<UiState>>, on_pick: Rc<dyn F
     let popover = gtk::Popover::builder().child(&list).build();
     popover.add_css_class("menu");
     let state = state.clone();
+    // `fill` runs on the popover's own `show`, so it holds the list weakly
+    // and the items reach the popover from themselves (no cycle).
     let fill = {
-        let list = list.clone();
-        let popover = popover.clone();
+        let list = list.downgrade();
         move || {
+            let Some(list) = list.upgrade() else { return };
             while let Some(child) = list.first_child() {
                 list.remove(&child);
             }
@@ -241,9 +243,8 @@ pub(crate) fn build_flag_popover(state: &Rc<RefCell<UiState>>, on_pick: Rc<dyn F
                 }
                 let button = gtk::Button::builder().child(&row).css_classes(["flat"]).build();
                 let on_pick = on_pick.clone();
-                let popover = popover.clone();
-                button.connect_clicked(move |_| {
-                    popover.popdown();
+                button.connect_clicked(move |button| {
+                    crate::util::popdown_enclosing_popover(button);
                     on_pick(flag.clone());
                 });
                 button
@@ -260,12 +261,15 @@ pub(crate) fn build_flag_popover(state: &Rc<RefCell<UiState>>, on_pick: Rc<dyn F
                 .build();
             {
                 let on_pick = on_pick.clone();
-                let popover = popover.clone();
-                custom.connect_clicked(move |_| {
-                    popover.popdown();
+                custom.connect_clicked(move |button| {
+                    let popover = button.ancestor(gtk::Popover::static_type()).and_downcast::<gtk::Popover>();
+                    let parent = popover.as_ref().and_then(|popover| popover.parent());
+                    if let Some(popover) = &popover {
+                        popover.popdown();
+                    }
                     let on_pick = on_pick.clone();
                     crate::datetime_picker::present_date_dialog(
-                        popover.parent().as_ref(),
+                        parent.as_ref(),
                         "Flag for follow-up",
                         "Due date",
                         "Flag",

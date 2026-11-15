@@ -579,21 +579,22 @@ pub fn set_nav(view: &TasksView, rows: &[TasksNavRow], selected: &TasksFilter) {
             menu_box.append(&delete);
             popover.set_child(Some(&menu_box));
             menu.set_popover(Some(&popover));
+            // The items close their popover from the clicked button rather
+            // than capturing it (a cycle: the sidebar is rebuilt on every
+            // task refresh and each old row would stay alive).
             {
                 let handler = handler.clone();
                 let list_id = list_id.clone();
-                let popover = popover.clone();
-                rename.connect_clicked(move |_| {
-                    popover.popdown();
+                rename.connect_clicked(move |button| {
+                    crate::util::popdown_enclosing_popover(button);
                     handler(TasksNavAction::RenameList(list_id.clone()));
                 });
             }
             {
                 let handler = handler.clone();
                 let list_id = list_id.clone();
-                let popover = popover.clone();
-                delete.connect_clicked(move |_| {
-                    popover.popdown();
+                delete.connect_clicked(move |button| {
+                    crate::util::popdown_enclosing_popover(button);
                     handler(TasksNavAction::DeleteList(list_id.clone()));
                 });
             }
@@ -920,16 +921,18 @@ fn attach_my_day_menu(row: &gtk::Button, task: &CalendarTask, pins: &Rc<RefCell<
     }
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
-    let row_for_gesture = row.clone();
-    let task = task.clone();
+    // Only the task's key is kept, and the row comes from the gesture: the
+    // row owns this gesture, so capturing it would keep every row of every
+    // past task refresh alive (MEMORY_OPTIMISATION1.md finding 3).
+    let key = crate::my_day::key_for(task);
     let pins = pins.clone();
     let toggle = toggle.clone();
-    gesture.connect_pressed(move |_gesture, _n_press, x, y| {
+    gesture.connect_pressed(move |gesture, _n_press, x, y| {
         let Some(handler) = toggle.borrow().clone() else { return };
-        let key = crate::my_day::key_for(&task);
+        let Some(row) = gesture.widget() else { return };
         let pinned = crate::my_day::is_pinned(&pins.borrow(), &key);
         let popover = gtk::Popover::new();
-        popover.set_parent(&row_for_gesture);
+        popover.set_parent(&row);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         popover.set_has_arrow(false);
         let menu = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).build();
@@ -937,10 +940,9 @@ fn attach_my_day_menu(row: &gtk::Button, task: &CalendarTask, pins: &Rc<RefCell<
         item.add_css_class("flat");
         item.set_halign(gtk::Align::Start);
         {
-            let popover = popover.clone();
             let key = key.clone();
-            item.connect_clicked(move |_| {
-                popover.popdown();
+            item.connect_clicked(move |item| {
+                crate::util::popdown_enclosing_popover(item);
                 handler(key.clone());
             });
         }
@@ -1333,5 +1335,67 @@ mod tests {
         ];
         let order: Vec<u32> = flagged_mail_rows(&messages, today, Weekday::Mon).iter().map(|m| m.uid.0).collect();
         assert_eq!(order, vec![4, 5, 3, 1], "overdue, today, next week, undated; the completed one is left out");
+    }
+
+    fn collect_widgets(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+        out.push(root.clone());
+        let mut child = root.first_child();
+        while let Some(current) = child {
+            collect_widgets(&current, out);
+            child = current.next_sibling();
+        }
+    }
+
+    /// Rebuilding the navigation pane frees the previous rows, including a
+    /// user list's ⋯ menu, whose Rename/Delete items used to hold their own
+    /// popover - and the sidebar is rebuilt on every task poll
+    /// (MEMORY_OPTIMISATION1.md finding 3).
+    #[test]
+    fn nav_rebuild_frees_the_previous_rows_and_menus() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let view = build_tasks_view(Rc::new(RefCell::new(CategorySet::default())));
+        let rows = vec![
+            TasksNavRow {
+                label: "My Day".to_string(),
+                filter: TasksFilter::MyDay,
+                color: None,
+                list_id: None,
+            },
+            TasksNavRow {
+                label: "Groceries".to_string(),
+                filter: TasksFilter::List(cal()),
+                color: Some("#3584e4".to_string()),
+                list_id: Some(cal()),
+            },
+        ];
+        set_nav(&view, &rows, &TasksFilter::All);
+        let mut first = Vec::new();
+        collect_widgets(view.sidebar.upcast_ref::<gtk::Widget>(), &mut first);
+        first.remove(0); // the sidebar itself stays
+        assert!(first.iter().any(|w| w.is::<gtk::Popover>()), "the list's ⋯ popover is in the tree");
+        let watched: Vec<(&str, gtk::glib::WeakRef<gtk::glib::Object>)> = first.iter().map(|w| (w.type_().name(), crate::gtk_test::weak(w))).collect();
+        drop(first);
+
+        set_nav(&view, &rows, &TasksFilter::All);
+        crate::gtk_test::assert_freed(&watched);
+    }
+
+    /// A task row with the My Day context action is freed once dropped: its
+    /// right-click gesture used to hold the row itself.
+    #[test]
+    fn my_day_row_is_freed_when_dropped() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let view = build_tasks_view(Rc::new(RefCell::new(CategorySet::default())));
+        *view.my_day_toggle.borrow_mut() = Some(Rc::new(|_| {}));
+        let task = task("pin-me", None, TaskStatus::NeedsAction, None, 0);
+        let row = task_row(&task, &CalendarColorMap::new(), Rc::new(|_, _, _| {}), Rc::new(|_| {}), &[], true, &[]);
+        attach_my_day_menu(&row, &task, &view.my_day_pins, &view.my_day_toggle);
+        let watched = [("row", crate::gtk_test::weak(&row))];
+        drop(row);
+        crate::gtk_test::assert_freed(&watched);
     }
 }

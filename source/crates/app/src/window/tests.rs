@@ -3379,3 +3379,73 @@ fn message_row_hover_card_is_non_modal_and_closes_and_reopens() {
     window.destroy();
     wait(50);
 }
+
+/// Every widget under `root`, `root` first (popovers included: they are
+/// children of the widget they hang off).
+fn collect_widget_tree(root: &gtk::Widget, out: &mut Vec<gtk::Widget>) {
+    out.push(root.clone());
+    let mut child = root.first_child();
+    while let Some(current) = child {
+        collect_widget_tree(&current, out);
+        child = current.next_sibling();
+    }
+}
+
+/// A folder-pane row GTK discards is freed with everything in it: the
+/// expander and its drop target, the quick actions, and the ⋯ menu's button,
+/// popover and swatches. The drop target's highlight handlers, the popover's
+/// `closed` handler and the menu's own actions used to hold widgets of the
+/// row strongly, and the folder tree is rebuilt on every unread-count change
+/// (MEMORY_OPTIMISATION1.md finding 1).
+#[test]
+fn dropped_folder_row_is_freed() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let state_slot: Rc<RefCell<Option<Rc<RefCell<UiState>>>>> = Rc::new(RefCell::new(None));
+    let message_list_slot: Rc<RefCell<Option<MessageListModel>>> = Rc::new(RefCell::new(None));
+    let menu_handler: crate::folder_menu::FolderMenuHandler = Rc::new(RefCell::new(None));
+    let row = build_folder_row(&state_slot, &message_list_slot, &menu_handler);
+    let mut widgets = Vec::new();
+    collect_widget_tree(row.upcast_ref::<gtk::Widget>(), &mut widgets);
+    assert!(widgets.iter().any(|w| w.is::<gtk::TreeExpander>()), "the expander is in the row");
+    assert!(widgets.iter().any(|w| w.is::<gtk::PopoverMenu>()), "the ⋯ menu's popover is in the row");
+    assert!(widgets.iter().any(|w| w.has_css_class("folder-color-swatch")), "the swatches are in the row");
+    let watched: Vec<(&str, glib::WeakRef<glib::Object>)> = widgets.iter().map(|w| (w.type_().name(), crate::gtk_test::weak(w))).collect();
+    drop(widgets);
+    drop(row);
+    crate::gtk_test::assert_freed(&watched);
+}
+
+/// A message row's profile-card triggers don't keep the row alive: the
+/// hover controllers used to hold the very widget they were attached to, so
+/// every row the message list replaced leaked (MEMORY_OPTIMISATION1.md
+/// finding 4). The click-and-hover trigger the reading pane uses is covered
+/// too.
+#[test]
+fn profile_card_triggers_do_not_keep_their_row_alive() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    let provider: crate::profile_card::ContextProvider = Rc::new(|| None);
+    let resolve: crate::profile_card::PersonResolver = Rc::new(|| Some((EmailAddress::new("alice@example.com"), None)));
+    let avatar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let sender = gtk::Label::new(Some("Alice"));
+    let name = gtk::Label::new(Some("Alice"));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.append(&avatar);
+    row.append(&sender);
+    row.append(&name);
+    let hover = crate::profile_card::PersonHover::new(provider.clone(), &row, resolve.clone());
+    hover.add_trigger(&avatar, Rc::new(|| true));
+    hover.add_trigger(&sender, Rc::new(|| true));
+    crate::profile_card::attach_person_trigger(provider, &name, false, resolve);
+    let watched = [
+        ("row", crate::gtk_test::weak(&row)),
+        ("avatar", crate::gtk_test::weak(&avatar)),
+        ("sender", crate::gtk_test::weak(&sender)),
+        ("name", crate::gtk_test::weak(&name)),
+    ];
+    drop((hover, avatar, sender, name, row));
+    crate::gtk_test::assert_freed(&watched);
+}

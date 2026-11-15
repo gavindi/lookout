@@ -37,3 +37,25 @@ pub fn gtk_ready() -> bool {
     }
     gtk::init().is_ok()
 }
+
+/// Asserts that every object in `weak` has been finalized, after letting the
+/// main context run any pending idles (an unparent queued from `closed`, say).
+///
+/// For the leak tests (MEMORY_OPTIMISATION1.md, Phase 1): take a weak ref to a
+/// widget, drop or replace whatever owned it, then call this. A reference
+/// cycle through a signal handler - a handler that holds its own widget or an
+/// ancestor of it - keeps the object alive and fails the assertion.
+pub fn assert_freed(weak: &[(&str, gtk::glib::WeakRef<gtk::glib::Object>)]) {
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..10 {
+        while context.iteration(false) {}
+    }
+    let alive: Vec<&str> = weak.iter().filter(|(_, weak)| weak.upgrade().is_some()).map(|(name, _)| *name).collect();
+    assert!(alive.is_empty(), "still alive after their owner went away (a reference cycle?): {alive:?}");
+}
+
+/// A weak ref to `object` as a plain `GObject`, for [`assert_freed`].
+pub fn weak<O: gtk::glib::prelude::IsA<gtk::glib::Object>>(object: &O) -> gtk::glib::WeakRef<gtk::glib::Object> {
+    use gtk::glib::prelude::*;
+    object.upcast_ref::<gtk::glib::Object>().downgrade()
+}

@@ -208,13 +208,17 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         .css_classes(["hover-quick-action"])
         .valign(gtk::Align::Center)
         .build();
+    // Weak: the button owns the action group (and the popover) whose closures
+    // hold this dispatcher, so a strong handle would keep every rebuilt row's
+    // menu alive (MEMORY_OPTIMISATION1.md finding 1).
     let dispatch_folder: Rc<dyn Fn(FolderMenuAction)> = {
-        let button = button.clone();
+        let button = button.downgrade();
         Rc::new(move |action| {
+            let Some(button) = button.upgrade() else { return };
             let mailbox = target.borrow().clone();
             let run = handler.borrow().clone();
             if let (Some(mailbox), Some(run)) = (mailbox, run) {
-                run(action, mailbox, button.clone().upcast());
+                run(action, mailbox, button.upcast());
             }
         })
     };
@@ -302,11 +306,14 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
             .tooltip_text(*hex)
             .build();
         {
+            // Weak: the swatch sits inside this popover (see `dispatch_folder`).
             let dispatch_folder = dispatch_folder.clone();
-            let menu = menu.clone();
+            let popover = menu.popover.downgrade();
             let hex = hex.to_string();
             swatch.connect_clicked(move |_| {
-                menu.popdown();
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
                 dispatch_folder(FolderMenuAction::SetColor(Some(hex.clone())));
             });
         }
@@ -701,5 +708,30 @@ mod tests {
         let folder = folder("Work", MailboxRole::Custom, 4, &[]);
         menu.refresh(&folder, folder_menu_state(&folder, None, true), Some("#3584e4"), FolderCountMode::Total);
         menu.refresh(&folder, folder_menu_state(&folder, None, true), None, FolderCountMode::Unread);
+    }
+
+    /// A dropped row menu is freed with everything in it: the button, its
+    /// popover and a colour swatch. The swatches' and the action group's
+    /// handlers used to hold the popover and button strongly, so every
+    /// folder-tree rebuild leaked one whole menu per row.
+    #[test]
+    fn dropped_row_menu_is_freed() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        use crate::gtk_test::weak;
+        let handler: FolderMenuHandler = Rc::new(RefCell::new(None));
+        let target: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+        let menu = build_row_menu(target, handler);
+        let folder = folder("Work", MailboxRole::Custom, 4, &[]);
+        menu.refresh(&folder, folder_menu_state(&folder, None, true), Some("#3584e4"), FolderCountMode::Total);
+        let watched = [
+            ("button", weak(&menu.button)),
+            ("popover", weak(&menu.menu.popover)),
+            ("actions", weak(&menu.menu.actions)),
+            ("swatch", weak(&menu.swatches[0].1)),
+        ];
+        drop(menu);
+        crate::gtk_test::assert_freed(&watched);
     }
 }

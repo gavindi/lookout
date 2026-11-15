@@ -43,6 +43,19 @@ pub fn clear_box(container: &gtk::Box) {
     }
 }
 
+/// Closes the popover `widget` sits inside (the nearest one, so a menu item
+/// in a submenu or a nested popover closes its own).
+///
+/// For an item's click handler to call on the widget the signal hands it,
+/// instead of capturing the popover: the popover owns the item, so a captured
+/// strong handle is a reference cycle that keeps the whole menu alive after
+/// its owner is destroyed (MEMORY_OPTIMISATION1.md, Phase 1).
+pub fn popdown_enclosing_popover(widget: &impl IsA<gtk::Widget>) {
+    if let Some(popover) = widget.ancestor(gtk::Popover::static_type()).and_downcast::<gtk::Popover>() {
+        popover.popdown();
+    }
+}
+
 /// A flat button with a themed icon and a label, as the reading pane's
 /// header actions and the profile card use.
 pub fn action_button(icon: &str, label: &str) -> gtk::Button {

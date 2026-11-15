@@ -156,12 +156,17 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
         row.append(&label);
         row.append(&menu_button);
 
-        let button_for_open = menu_button.clone();
+        // The menu items hold the button weakly: they sit in its popover, so a
+        // strong handle would keep every viewed message's strip alive. (The
+        // row's double-click gesture may hold it strongly, as the button is
+        // the row's own descendant.)
+        let button_for_open = menu_button.downgrade();
         let state_for_open = state.clone();
         let mailbox_for_open = mailbox.clone();
         let part_for_open = part.clone();
         open_item.connect_clicked(move |_| {
-            start_attachment_fetch(&state_for_open, &mailbox_for_open, uid, &part_for_open, &button_for_open, PendingAttachmentAction::Open);
+            let Some(button) = button_for_open.upgrade() else { return };
+            start_attachment_fetch(&state_for_open, &mailbox_for_open, uid, &part_for_open, &button, PendingAttachmentAction::Open);
         });
         // Double-clicking the row is the same as choosing "Open".
         let gesture_open = gtk::GestureClick::new();
@@ -183,26 +188,28 @@ pub(crate) fn rebuild_attachment_strip(state: &Rc<RefCell<UiState>>, reading_sta
             }
         });
         row.add_controller(gesture_open);
-        let button_for_open_with = menu_button.clone();
+        let button_for_open_with = menu_button.downgrade();
         let state_for_open_with = state.clone();
         let mailbox_for_open_with = mailbox.clone();
         let part_for_open_with = part.clone();
         open_with_item.connect_clicked(move |_| {
+            let Some(button) = button_for_open_with.upgrade() else { return };
             start_attachment_fetch(
                 &state_for_open_with,
                 &mailbox_for_open_with,
                 uid,
                 &part_for_open_with,
-                &button_for_open_with,
+                &button,
                 PendingAttachmentAction::OpenWith,
             );
         });
-        let button_for_save = menu_button.clone();
+        let button_for_save = menu_button.downgrade();
         let state_for_save = state.clone();
         let mailbox_for_save = mailbox.clone();
         let part_for_save = part.clone();
         save_item.connect_clicked(move |_| {
-            start_attachment_fetch(&state_for_save, &mailbox_for_save, uid, &part_for_save, &button_for_save, PendingAttachmentAction::Save);
+            let Some(button) = button_for_save.upgrade() else { return };
+            start_attachment_fetch(&state_for_save, &mailbox_for_save, uid, &part_for_save, &button, PendingAttachmentAction::Save);
         });
 
         strip.append(&row);

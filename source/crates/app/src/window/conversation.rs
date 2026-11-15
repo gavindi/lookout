@@ -763,9 +763,10 @@ pub(crate) fn present_conversation_attachment_menu(state: &Rc<RefCell<UiState>>,
         let uid = summary.uid;
         let part = part.clone();
         let stand_in = stand_in.clone();
-        let popover_for_item = popover.clone();
-        item.connect_clicked(move |_| {
-            popover_for_item.popdown();
+        // The items close the popover from themselves: it owns them, so a
+        // captured handle would keep every opened menu alive.
+        item.connect_clicked(move |item| {
+            crate::util::popdown_enclosing_popover(item);
             start_attachment_fetch(&state, &mailbox, uid, &part, &stand_in, action);
         });
         items.append(&item);
@@ -783,10 +784,9 @@ pub(crate) fn present_conversation_attachment_menu(state: &Rc<RefCell<UiState>>,
             let mailbox = summary.mailbox.clone();
             let uid = summary.uid;
             let parts = batch_parts.clone();
-            let popover_for_item = popover.clone();
             let anchor = ui.web_view.clone();
-            item.connect_clicked(move |_| {
-                popover_for_item.popdown();
+            item.connect_clicked(move |item| {
+                crate::util::popdown_enclosing_popover(item);
                 let state = state.clone();
                 let mailbox = mailbox.clone();
                 let parts = parts.clone();

@@ -1860,20 +1860,20 @@ pub fn build_compose_view(
     cc_button.set_visible(!cc_prefilled);
     bcc_row.widget().set_visible(bcc_prefilled);
     bcc_button.set_visible(!bcc_prefilled);
+    // The buttons hide themselves through the signal's own argument; a
+    // captured clone would be a cycle that keeps the closed composer alive.
     {
         let cc_row = cc_row.clone();
-        let cc_button_self = cc_button.clone();
-        cc_button.connect_clicked(move |_| {
+        cc_button.connect_clicked(move |button| {
             cc_row.widget().set_visible(true);
-            cc_button_self.set_visible(false);
+            button.set_visible(false);
         });
     }
     {
         let bcc_row = bcc_row.clone();
-        let bcc_button_self = bcc_button.clone();
-        bcc_button.connect_clicked(move |_| {
+        bcc_button.connect_clicked(move |button| {
             bcc_row.widget().set_visible(true);
-            bcc_button_self.set_visible(false);
+            button.set_visible(false);
         });
     }
     let subject_row = adw::EntryRow::builder().title("Subject").build();
@@ -1903,11 +1903,14 @@ pub fn build_compose_view(
         "Sending as an alternate address. Make sure it's registered and verified as a \"send as\"/alias address with your mail provider, or recipients may see your account's own address instead.",
     ));
     identity_hint_icon.set_visible(false);
+    // Weak dropdown: this runs from the dropdown's own `selected` notify.
     let update_identity_hint: Rc<dyn Fn()> = {
-        let from_dropdown = from_dropdown.clone();
+        let from_dropdown = from_dropdown.downgrade();
         let identity_hint_icon = identity_hint_icon.clone();
         Rc::new(move || {
-            identity_hint_icon.set_visible(from_dropdown.selected() != 0);
+            if let Some(from_dropdown) = from_dropdown.upgrade() {
+                identity_hint_icon.set_visible(from_dropdown.selected() != 0);
+            }
         })
     };
     {
@@ -2627,15 +2630,26 @@ pub fn build_compose_view(
     // queued behind their scripts and sees the finished document. Nothing
     // can be typed into the editor before it loads, so no edit is absorbed.
     if rich_toggle.is_active() {
+        // A one-shot: the handler disconnects itself once it has fired. It
+        // holds `autosave`, which holds this very WebView, so leaving it
+        // connected would keep the closed composer (WebView, fields and
+        // attachment bytes) alive for good.
         let autosave = autosave.clone();
-        let captured = Cell::new(false);
-        rich_web_view.connect_load_changed(move |_, event| {
-            if event != webkit::LoadEvent::Finished || captured.replace(true) {
-                return;
-            }
-            let autosave = autosave.clone();
-            glib::spawn_future_local(async move { autosave.capture_baseline().await });
-        });
+        let handler: Rc<Cell<Option<glib::SignalHandlerId>>> = Rc::new(Cell::new(None));
+        let id = {
+            let handler = handler.clone();
+            rich_web_view.connect_load_changed(move |view, event| {
+                if event != webkit::LoadEvent::Finished {
+                    return;
+                }
+                if let Some(id) = handler.take() {
+                    view.disconnect(id);
+                }
+                let autosave = autosave.clone();
+                glib::spawn_future_local(async move { autosave.capture_baseline().await });
+            })
+        };
+        handler.set(Some(id));
     } else {
         let autosave = autosave.clone();
         glib::spawn_future_local(async move { autosave.capture_baseline().await });
