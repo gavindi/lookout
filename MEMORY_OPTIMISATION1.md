@@ -26,11 +26,15 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 | 1: break widget reference cycles | Done, event and task editors included; not yet run in the real app | 0.9.316 (memory steady at ~600 MB, user report); composer in 0.9.318; editors in 0.9.319 |
 | 2: stop rebuilding when nothing changed | Not started | |
 | 3: bound the Rust collections | Done; not yet run in the real app | 0.9.317 |
-| 4: cut duplicate copies | Done for the message list, All Inboxes and birthdays (about 63% less heap per listed message); not yet run in the real app | 0.9.320 |
+| 4: cut duplicate copies | Done for the message list, All Inboxes and birthdays (about 63% less heap per listed message). In the real app (user report, 2026-11-19): steady at about 700 MB with 7 accounts on one machine and 400 MB with 4 on another | 0.9.320 |
 | 5: stop tests polluting the real cache | Done; not yet run in the real app. This machine's old leftovers were deleted on 2026-11-15: 24,865 entries (mail, message-body, attachment, calendar, EDS-mirror, webcal and Google Tasks test files); `~/.cache/lookout` went from 6.2 GB to 2.5 GB | 0.9.320 |
 
 **Next step:**
-- Measure the real app on 0.9.320 with the Phase 0 probe over a session.
+- The leak is fixed: 0.9.320 holds steady in real use (about 700 MB with 7 accounts, 400 MB with 4).
+- The per-account breakdown is done (see "Per-account breakdown"). The cost follows what each account shows, not a fixed amount per account. The three biggest reducible items, about 60-70 MB together, are:
+  - the full-size background image;
+  - the folder and calendar row menus built up front;
+  - the full-size People-list photos.
 - Phase 2 is the only phase not started. It is smaller and mostly saves CPU now that rebuilt rows are freed.
 
 **Still worth checking in the running app:** the Phase 0 probe's per-type counts across a session that opens and closes composers and editors. Do `AdwWindow`, `WebKitWebView` and `GtkPopoverMenu` stay flat? Under Wayland, is `GtkText` retained by the input-method module the way it is under Broadway?
@@ -38,6 +42,53 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 **Open side item:** this machine's clippy (1.92) flags `nonminimal_bool` at `crates/mail/src/session.rs:274`, which is older than this work. Until it is fixed, the clippy command needs `-A clippy::nonminimal_bool`.
 
 **Line numbers:** those in "Findings" and in the Phase 1 site list are from 0.9.315, before the fixes, and no longer match the code. For example, the folder row setup at `window.rs:203-363` is now `build_folder_row`.
+
+## Per-account breakdown (measured 2026-11-19 on 0.9.320)
+
+**Setup:**
+- **Runs:** the installed 0.9.320, run nine times for 3.5 minutes each with the Phase 0 probe: no accounts, all 7, then each account alone.
+- **Settings:** each run used a temporary `XDG_CONFIG_HOME` with GLib's keyfile settings backend, seeded with a copy of the user's Lookout settings plus that run's `accounts-disabled` list. The real settings were not touched.
+- **Caches:** the runs used the real caches.
+- **Heap profile:** the largest account was then profiled with a sampling heap profiler (`LD_PRELOAD`, one sample per ~32 KB allocated per thread, with backtraces). It ran on a release build of the same commit with line tables.
+
+**RSS after 3.5 minutes:**
+
+| Run | RSS | Above baseline | malloc in use |
+|---|---|---|---|
+| No accounts | 301 MB | — | 47 MB |
+| All 7 | 548 MB | +247 MB | 214 MB |
+| Google `…1676251201_0` (28,591 messages in 61 folders, 212 contacts) | 447 MB | **+146 MB** | 136 MB |
+| Google `…1749327634_1` | 332 MB | +31 MB | 66 MB |
+| Google `…1676261544_5` | 329 MB | +28 MB | 66 MB |
+| Microsoft 365 `…1774040807_0` | 319 MB | +17 MB | 59 MB |
+| IMAP `…1788988877_0` | 318 MB | +17 MB | 56 MB |
+| IMAP `…1788990354_1` | 312 MB | +11 MB | 55 MB |
+| ownCloud, contacts only | 312 MB | +11 MB | 56 MB |
+
+**What the table shows:**
+- **The costs add up.** The seven single-account increases total 261 MB, against 247 MB measured with all seven on.
+- **There is no fixed 100 MB per account.** The cost follows what an account shows; one account accounts for 60% of it.
+- **Nothing grows.** Every count is flat across each run.
+- **The baseline is mostly libraries.** About 170 MB of RSS is shared libraries and the binary: Mesa's `libLLVM` 48 MB, WebKit 24 MB, `lookout` 29 MB.
+
+**Where the heap goes:** glibc's main arena (the GTK thread) holds about 126 MB in use for the large account. The account sessions' thread arenas hold a few MB in all. The sampled live heap is 165 MB, 144 MB of it on the GTK thread:
+
+| Live | Allocated at | What it is |
+|---|---|---|
+| 37.2 MB | `window.rs:315` `Texture::from_bytes` | The bundled background `background2.jpg` (4000 × 3250 px), decoded at full size on every start whatever the window size. This is most of the no-account baseline heap. A custom background (`window.rs:326`, `:9821`) is decoded the same way. |
+| 15.5 MB | `folder_menu::build_row_menu` → `ContextMenu::new` | A complete "⋯" `PopoverMenu` (about 16 items, 2 submenus, 10 swatches, 13 actions) built up front for every folder row the sidebar creates, open or not. |
+| ~20 MB | `contacts_view::rebuild_contacts_list_ui` | The People list. **15.1 MB** of it is `contact_photo_texture` (`contacts_view.rs:372`) decoding each contact photo at full size (about 370 KB each) for a small avatar. The rest is the per-contact rows of a non-virtualized `ListBox`, built whether or not People is open. |
+| 12.0 MB | `libglycin` (other threads) | Image decoding (GTK's glycin loaders) for the textures above. |
+| 9.8 MB | `main.rs:234` (`app.run()`) | GTK internals: CSS, rendering, accessibility. |
+| 5.0 MB | `calendar_view::rebuild_calendar_checklist` → `ContextMenu::new` | The calendar rows' "⋯" menus, likewise built up front. |
+| < 2 MB each | others | Flagged-mail and search query results, the IMAP compression stream, the Config view, column cells. |
+
+The message data itself does not show up near the top. The open folder is small, and Phase 4 made list summaries cheap.
+
+**Fixes this points to, largest first:**
+1. **Decode the background at display size.** Cap the longest side at about 2,560 px, or the monitor's size, via gdk-pixbuf's scaled loader, as `decode_avatar_texture` already does. This applies to the bundled and custom backgrounds alike. Expected saving: about 25-30 MB for every user, regardless of accounts.
+2. **Build the folder row menu on first open** (`MenuButton::set_create_popup_func`), as Phase 2 already planned, and the same for the calendar rows. Expected saving: about 20 MB with the large account alone, and more with several.
+3. **Decode People-list photos at avatar size** with `decode_avatar_texture`, and build the People list only when it's first shown. Expected saving: about 15-20 MB for an account with many contact photos, plus the glycin buffers.
 
 ## Phase 4 and 5 results (2026-11-15, released as 0.9.320, not yet run in the real app)
 
