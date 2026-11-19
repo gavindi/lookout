@@ -3471,6 +3471,16 @@ fn dropped_folder_row_is_freed() {
     let row = build_folder_row(&state_slot, &message_list_slot, &menu_handler);
     let mut widgets = Vec::new();
     collect_widget_tree(row.upcast_ref::<gtk::Widget>(), &mut widgets);
+    // The ⋯ menu is built on first open; build it so it is watched too.
+    assert!(!widgets.iter().any(|w| w.is::<gtk::PopoverMenu>()), "the ⋯ menu isn't built with the row");
+    let menu_button = widgets
+        .iter()
+        .find_map(|w| w.downcast_ref::<gtk::MenuButton>().cloned())
+        .expect("the ⋯ button is in the row");
+    crate::context_menu::build_lazy_menu_now(&menu_button);
+    drop(menu_button);
+    widgets.clear();
+    collect_widget_tree(row.upcast_ref::<gtk::Widget>(), &mut widgets);
     assert!(widgets.iter().any(|w| w.is::<gtk::TreeExpander>()), "the expander is in the row");
     assert!(widgets.iter().any(|w| w.is::<gtk::PopoverMenu>()), "the ⋯ menu's popover is in the row");
     assert!(widgets.iter().any(|w| w.has_css_class("folder-color-swatch")), "the swatches are in the row");
@@ -3561,4 +3571,34 @@ fn avatar_textures_are_decoded_to_avatar_size() {
         "scaled to fit, aspect kept"
     );
     assert!(decode_avatar_texture(b"not an image", SENDER_PHOTO_SIZE).is_none());
+}
+
+/// Contact photos (People list, details dialog, profile card) are decoded to
+/// fit `CONTACT_PHOTO_SIZE`, not kept at full size.
+#[test]
+fn contact_photos_are_decoded_to_avatar_size() {
+    if !crate::gtk_test::gtk_ready() {
+        return;
+    }
+    use crate::contacts_view::{contact_photo_texture, CONTACT_PHOTO_SIZE};
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 480, 640).expect("pixbuf");
+    pixbuf.fill(0x3584e4ff);
+    let jpeg = pixbuf.save_to_bufferv("jpeg", &[]).expect("jpeg");
+    let photo = lookout_core::Photo {
+        media_type: Some("image/jpeg".to_string()),
+        data: Some(jpeg),
+        uri: None,
+    };
+    let texture = contact_photo_texture(&photo).expect("decodes");
+    assert_eq!(
+        (texture.width(), texture.height()),
+        (CONTACT_PHOTO_SIZE * 3 / 4, CONTACT_PHOTO_SIZE),
+        "scaled to fit, aspect kept"
+    );
+    let remote = lookout_core::Photo {
+        media_type: None,
+        data: None,
+        uri: Some("https://example.com/me.jpg".to_string()),
+    };
+    assert!(contact_photo_texture(&remote).is_none(), "a URI-only photo isn't fetched");
 }

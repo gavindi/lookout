@@ -18,7 +18,7 @@ So this is a steady leak on the **GTK main thread**, not a one-off load and not 
 
 The code was read, not profiled: `ptrace_scope=1` blocks reading the heap without sudo, and the app was not relaunched. Three independent passes over the code (UI caches, mail data and channels, rendering and widgets) agree on the main cause. I checked the top items myself in the code.
 
-## Status (2026-11-15)
+## Status (2026-11-19)
 
 | Phase | State | Release |
 |---|---|---|
@@ -28,14 +28,13 @@ The code was read, not profiled: `ptrace_scope=1` blocks reading the heap withou
 | 3: bound the Rust collections | Done; not yet run in the real app | 0.9.317 |
 | 4: cut duplicate copies | Done for the message list, All Inboxes and birthdays (about 63% less heap per listed message). In the real app (user report, 2026-11-19): steady at about 700 MB with 7 accounts on one machine and 400 MB with 4 on another | 0.9.320 |
 | 5: stop tests polluting the real cache | Done; not yet run in the real app. This machine's old leftovers were deleted on 2026-11-15: 24,865 entries (mail, message-body, attachment, calendar, EDS-mirror, webcal and Google Tasks test files); `~/.cache/lookout` went from 6.2 GB to 2.5 GB | 0.9.320 |
+| Per-account fixes: background, row menus, People list | Done; not yet run in the real app (see "Per-account fixes results") | 0.9.321 |
 
 **Next step:**
 - The leak is fixed: 0.9.320 holds steady in real use (about 700 MB with 7 accounts, 400 MB with 4).
-- The per-account breakdown is done (see "Per-account breakdown"). The cost follows what each account shows, not a fixed amount per account. The three biggest reducible items, about 60-70 MB together, are:
-  - the full-size background image;
-  - the folder and calendar row menus built up front;
-  - the full-size People-list photos.
-- Phase 2 is the only phase not started. It is smaller and mostly saves CPU now that rebuilt rows are freed.
+- The per-account breakdown is done (see "Per-account breakdown"). The cost follows what each account shows, not a fixed amount per account.
+- Its three biggest reducible items (the full-size background, the row menus built up front, the full-size People photos and the hidden People list) are fixed in 0.9.321. Next: re-run the no-accounts and large-account probe runs on 0.9.321 to measure the saving.
+- Phase 2 is the only phase not started. It is smaller and mostly saves CPU now that rebuilt rows are freed. Building the folder row menu on first open, one of its items, is done.
 
 **Still worth checking in the running app:** the Phase 0 probe's per-type counts across a session that opens and closes composers and editors. Do `AdwWindow`, `WebKitWebView` and `GtkPopoverMenu` stay flat? Under Wayland, is `GtkText` retained by the input-method module the way it is under Broadway?
 
@@ -89,6 +88,36 @@ The message data itself does not show up near the top. The open folder is small,
 1. **Decode the background at display size.** Cap the longest side at about 2,560 px, or the monitor's size, via gdk-pixbuf's scaled loader, as `decode_avatar_texture` already does. This applies to the bundled and custom backgrounds alike. Expected saving: about 25-30 MB for every user, regardless of accounts.
 2. **Build the folder row menu on first open** (`MenuButton::set_create_popup_func`), as Phase 2 already planned, and the same for the calendar rows. Expected saving: about 20 MB with the large account alone, and more with several.
 3. **Decode People-list photos at avatar size** with `decode_avatar_texture`, and build the People list only when it's first shown. Expected saving: about 15-20 MB for an account with many contact photos, plus the glycin buffers.
+
+## Per-account fixes results (2026-11-19, released as 0.9.321, not yet run in the real app)
+
+**Background (37.2 MB):**
+- `background_image::decode_for_display` decodes through a gdk-pixbuf loader. In `size-prepared` it scales the image down to the smallest size that still covers the target the way `ContentFit::Cover` draws it (`cover_size`). It never scales up.
+- The target is the largest connected monitor in device pixels (`display_target`), or 2560 × 1600 when GDK reports none.
+- The bundled image, a custom background at startup and a newly picked one all go through it. A format gdk-pixbuf can't read falls back to the old full-size decode.
+- On a 1920 × 1080 screen the bundled image is now 1920 × 1560 (about 9 MB instead of 37 MB). A 4K screen saves little, since it needs about 3840 px.
+- A monitor plugged in later that is larger than any at startup gets a slightly soft background until the next start.
+
+**Row menus (15.5 MB folders, 5.0 MB calendars):**
+- New `context_menu::attach_lazily` installs the menu builder as the button's create-popup function. It runs only while the button has no popover, so the menu is built once, on first open. The builder gets the button as an argument and does not capture it.
+- The folder row's `RowMenu` keeps the last `refresh` until the build and then applies it. `RowMenu::connect_closed` replaces the eager popover `closed` hookup in `build_folder_row`.
+- The calendar row and group menus are built the same way. A calendar row's builder keeps only the groups' ids and names.
+
+**People (about 20 MB):**
+- `contact_photo_texture` decodes through `decode_avatar_texture` to fit `CONTACT_PHOTO_SIZE` (128 px, 2× the largest 64 px avatar). This covers the People list, the details dialog and the profile card.
+- The People rail and list repaint only while the People pane is mapped, in the main window or its own. New `util::DeferUntilMapped` holds the latest request while the pane is hidden and runs it on the next map. A background `None` doesn't replace an explicit bucket that is already waiting. The birthdays calendar still refreshes on every contacts snapshot.
+- After People has been shown once, its rows stay until the next repaint, as before.
+
+**Tests:**
+- New: `lazy_menu_is_built_once_on_demand`, `row_menu_is_built_on_first_open_with_the_last_refresh`, `cover_size_scales_down_to_cover_and_never_up`, `background_is_decoded_to_cover_the_display_target`, `contact_photos_are_decoded_to_avatar_size` and `defer_until_mapped_runs_on_map_and_merges_while_hidden`.
+- Updated so they build the menus before watching them: `checklist_rebuild_frees_the_previous_rows_and_menus` (which now also asserts that no `PopoverMenu` exists before an open), `dropped_row_menu_is_freed` and `dropped_folder_row_is_freed`.
+- **Full run** of `lookout-app` under `dbus-run-session` on Broadway: 848 passed, 3 failed, 6 ignored. The three failures are the known ones; the intermittent `google_tasks` test passes on its own.
+
+**Not yet tried in the running app:**
+- the ⋯ menus opening with the right checked colour and count mode, and the folder action box staying visible while its menu is open;
+- People on first open and in its detached window;
+- how sharp the background looks;
+- memory on the no-accounts and large-account runs, against 301 MB and 447 MB.
 
 ## Phase 4 and 5 results (2026-11-15, released as 0.9.320, not yet run in the real app)
 

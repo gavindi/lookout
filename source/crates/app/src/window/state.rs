@@ -583,17 +583,20 @@ pub(crate) fn decode_avatar_texture(data: &[u8], size: i32) -> Option<gtk::gdk::
     let bytes = glib::Bytes::from(data);
     let stream = gio::MemoryInputStream::from_bytes(&bytes);
     match gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, size, size, true, gio::Cancellable::NONE) {
-        Ok(pixbuf) => {
-            let format = if pixbuf.has_alpha() {
-                gtk::gdk::MemoryFormat::R8g8b8a8
-            } else {
-                gtk::gdk::MemoryFormat::R8g8b8
-            };
-            let texture = gtk::gdk::MemoryTexture::new(pixbuf.width(), pixbuf.height(), format, &pixbuf.read_pixel_bytes(), pixbuf.rowstride() as usize);
-            Some(texture.upcast())
-        }
+        Ok(pixbuf) => Some(pixbuf_to_texture(&pixbuf)),
         Err(_) => gtk::gdk::Texture::from_bytes(&bytes).ok(),
     }
+}
+
+/// A decoded pixbuf as a texture holding exactly its pixels (no second
+/// decode, no scaling).
+pub(crate) fn pixbuf_to_texture(pixbuf: &gtk::gdk_pixbuf::Pixbuf) -> gtk::gdk::Texture {
+    let format = if pixbuf.has_alpha() {
+        gtk::gdk::MemoryFormat::R8g8b8a8
+    } else {
+        gtk::gdk::MemoryFormat::R8g8b8
+    };
+    gtk::gdk::MemoryTexture::new(pixbuf.width(), pixbuf.height(), format, &pixbuf.read_pixel_bytes(), pixbuf.rowstride() as usize).upcast()
 }
 
 /// Per-row widgets for the folder tree rows, stored under a `set_data` key on

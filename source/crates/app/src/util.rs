@@ -179,9 +179,128 @@ pub fn account_label(account: &AccountId, display_name: &str, email: &str) -> St
     }
 }
 
+/// Runs a repaint at once while `widget` is on screen, and otherwise holds the
+/// latest request until the widget is next mapped. For views whose content is
+/// rebuilt on every sync but only matters while shown: the People list built
+/// a row, avatar and contact copies per contact while People was hidden
+/// (MEMORY_OPTIMISATION1.md, "Per-account breakdown").
+pub struct DeferUntilMapped<T: 'static> {
+    inner: Rc<DeferInner<T>>,
+}
+
+struct DeferInner<T> {
+    widget: glib::WeakRef<gtk::Widget>,
+    pending: RefCell<Option<T>>,
+    /// Folds a new request into a pending one.
+    merge: fn(Option<T>, T) -> T,
+    run: Box<dyn Fn(T)>,
+}
+
+impl<T: 'static> DeferUntilMapped<T> {
+    /// `run` does the repaint; `merge` folds a request made while the widget
+    /// is hidden into the one already pending.
+    pub fn new(widget: &impl IsA<gtk::Widget>, merge: fn(Option<T>, T) -> T, run: impl Fn(T) + 'static) -> Self {
+        let inner = Rc::new(DeferInner {
+            widget: widget.upcast_ref::<gtk::Widget>().downgrade(),
+            pending: RefCell::new(None),
+            merge,
+            run: Box::new(run),
+        });
+        // Weak: `run` usually holds widgets inside `widget`.
+        let weak = Rc::downgrade(&inner);
+        widget.connect_map(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.flush();
+            }
+        });
+        DeferUntilMapped { inner }
+    }
+
+    /// Repaints now if the widget is mapped, else remembers `value` for when
+    /// it is.
+    pub fn request(&self, value: T) {
+        let Some(widget) = self.inner.widget.upgrade() else { return };
+        if widget.is_mapped() {
+            self.inner.pending.borrow_mut().take();
+            (self.inner.run)(value);
+        } else {
+            let previous = self.inner.pending.borrow_mut().take();
+            let merged = (self.inner.merge)(previous, value);
+            *self.inner.pending.borrow_mut() = Some(merged);
+        }
+    }
+
+    /// Whether a request is waiting for the widget to be mapped.
+    #[cfg(test)]
+    pub fn is_pending(&self) -> bool {
+        self.inner.pending.borrow().is_some()
+    }
+}
+
+impl<T> DeferInner<T> {
+    fn flush(&self) {
+        let pending = self.pending.borrow_mut().take();
+        if let Some(value) = pending {
+            (self.run)(value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While the widget is hidden, requests are held (merged) and run once
+    /// it is mapped; while it is shown they run at once.
+    #[test]
+    fn defer_until_mapped_runs_on_map_and_merges_while_hidden() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        fn settle(until: impl Fn() -> bool) {
+            let context = glib::MainContext::default();
+            for _ in 0..200 {
+                while context.iteration(false) {}
+                if until() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let runs: Rc<RefCell<Vec<Option<i32>>>> = Rc::new(RefCell::new(Vec::new()));
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let window = gtk::Window::builder().child(&widget).build();
+        // The People rule: a background `None` doesn't replace an explicit index.
+        let keep_explicit = |previous: Option<Option<i32>>, new: Option<i32>| match (previous, new) {
+            (Some(Some(index)), None) => Some(index),
+            (_, new) => new,
+        };
+        let defer = {
+            let runs = runs.clone();
+            DeferUntilMapped::new(&widget, keep_explicit, move |value| runs.borrow_mut().push(value))
+        };
+        defer.request(Some(3));
+        defer.request(None);
+        assert!(runs.borrow().is_empty(), "nothing runs while hidden");
+        assert!(defer.is_pending());
+
+        window.present();
+        settle(|| widget.is_mapped());
+        assert!(widget.is_mapped(), "the window maps");
+        assert_eq!(*runs.borrow(), [Some(3)], "the held request runs on map, its explicit index kept");
+        assert!(!defer.is_pending());
+        defer.request(Some(5));
+        assert_eq!(*runs.borrow(), [Some(3), Some(5)], "runs at once while shown");
+
+        window.set_visible(false);
+        settle(|| !widget.is_mapped());
+        defer.request(None);
+        assert_eq!(runs.borrow().len(), 2, "held again once hidden");
+        window.present();
+        settle(|| widget.is_mapped());
+        assert_eq!(*runs.borrow(), [Some(3), Some(5), None]);
+        window.destroy();
+    }
 
     #[test]
     fn escape_html_covers_text_and_attribute_metacharacters() {

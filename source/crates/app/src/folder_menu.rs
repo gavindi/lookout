@@ -162,15 +162,44 @@ pub fn palette_css() -> String {
         .collect()
 }
 
-/// One row's menu: the button, its built context menu (action group + gio
-/// model), the heading label and the colour swatches - everything `bind`
-/// refreshes for whichever folder the row shows now.
+/// One row's menu: the "⋯" button and, once the menu has first been opened,
+/// its built context menu - everything `bind` refreshes for whichever folder
+/// the row shows now. The menu is built on first open
+/// ([`crate::context_menu::attach_lazily`]): a full menu per row cost about
+/// 15 MB across one large account's folders (MEMORY_OPTIMISATION1.md,
+/// "Per-account breakdown"), and few rows' menus are ever opened.
 #[derive(Clone)]
 pub struct RowMenu {
     pub button: gtk::MenuButton,
+    /// The menu, once built.
+    built: Rc<RefCell<Option<BuiltRowMenu>>>,
+    /// The last [`RowMenu::refresh`] made before the menu was built, applied
+    /// when it is.
+    pending: Rc<RefCell<Option<RowMenuView>>>,
+    /// The [`RowMenu::connect_closed`] callback, connected when the menu is
+    /// built.
+    on_closed: ClosedSlot,
+}
+
+/// Where [`RowMenu::connect_closed`] keeps its callback until the build.
+type ClosedSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// A built row menu: its context menu (action group + gio model), the
+/// heading label and the colour swatches.
+#[derive(Clone)]
+struct BuiltRowMenu {
     menu: ContextMenu,
     info: gtk::Label,
     swatches: Vec<(String, gtk::Button)>,
+}
+
+/// What [`RowMenu::refresh`] points the menu at.
+#[derive(Clone)]
+struct RowMenuView {
+    mailbox: Mailbox,
+    state: FolderMenuState,
+    color: Option<String>,
+    count_mode: FolderCountMode,
 }
 
 /// Maps a menu action's bare name and parameter (from the shared
@@ -198,8 +227,9 @@ fn folder_action_for(name: &str, param: Option<&glib::Variant>) -> Option<Folder
     })
 }
 
-/// Builds a row's menu through the shared [`ContextMenu`] builder. `target` is
-/// read at activation time (the row slot `bind` writes), and every action goes
+/// Builds a row's "⋯" button; its menu is built through the shared
+/// [`ContextMenu`] builder when it is first opened. `target` is read at
+/// activation time (the row slot `bind` writes), and every action goes
 /// through `handler`.
 pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuHandler) -> RowMenu {
     let button = gtk::MenuButton::builder()
@@ -208,6 +238,34 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         .css_classes(["hover-quick-action"])
         .valign(gtk::Align::Center)
         .build();
+    let built: Rc<RefCell<Option<BuiltRowMenu>>> = Rc::new(RefCell::new(None));
+    let pending: Rc<RefCell<Option<RowMenuView>>> = Rc::new(RefCell::new(None));
+    let on_closed: ClosedSlot = Rc::new(RefCell::new(None));
+    {
+        let built = built.clone();
+        let pending = pending.clone();
+        let on_closed = on_closed.clone();
+        crate::context_menu::attach_lazily(&button, move |button| {
+            let menu = build_row_menu_now(button, target.clone(), handler.clone());
+            if let Some(view) = pending.borrow_mut().take() {
+                menu.show(&view);
+            }
+            if let Some(callback) = on_closed.borrow().clone() {
+                menu.menu.popover.connect_closed(move |_| callback());
+            }
+            *built.borrow_mut() = Some(menu);
+        });
+    }
+    RowMenu {
+        button,
+        built,
+        pending,
+        on_closed,
+    }
+}
+
+/// Builds the menu [`build_row_menu`] deferred and attaches it to `button`.
+fn build_row_menu_now(button: &gtk::MenuButton, target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuHandler) -> BuiltRowMenu {
     // Weak: the button owns the action group (and the popover) whose closures
     // hold this dispatcher, so a strong handle would keep every rebuilt row's
     // menu alive (MEMORY_OPTIMISATION1.md finding 1).
@@ -280,7 +338,7 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
         ActionSpec::stateful("count", glib::VariantTy::STRING, &"unread".to_variant()),
     ];
     let menu = ContextMenu::new(&description, &specs, dispatch);
-    menu.attach_button(&button, "folder");
+    menu.attach_button(button, "folder");
 
     let info = gtk::Label::builder()
         .xalign(0.0)
@@ -322,13 +380,45 @@ pub fn build_row_menu(target: Rc<RefCell<Option<Mailbox>>>, handler: FolderMenuH
     }
     menu.add_child(&swatch_grid, "colors");
 
-    RowMenu { button, menu, info, swatches }
+    BuiltRowMenu { menu, info, swatches }
 }
 
 impl RowMenu {
     /// Points the menu at `mailbox`: its heading, which items are enabled,
-    /// and the checked colour and count mode.
+    /// and the checked colour and count mode. Before the menu is built this
+    /// only remembers what to show; the build applies the last one.
     pub fn refresh(&self, mailbox: &Mailbox, state: FolderMenuState, color: Option<&str>, count_mode: FolderCountMode) {
+        let view = RowMenuView {
+            mailbox: mailbox.clone(),
+            state,
+            color: color.map(str::to_string),
+            count_mode,
+        };
+        match &*self.built.borrow() {
+            Some(menu) => menu.show(&view),
+            None => *self.pending.borrow_mut() = Some(view),
+        }
+    }
+
+    /// Runs `callback` whenever the menu's popover closes (once it is built).
+    pub fn connect_closed(&self, callback: Rc<dyn Fn()>) {
+        if let Some(menu) = &*self.built.borrow() {
+            let callback = callback.clone();
+            menu.menu.popover.connect_closed(move |_| callback());
+        }
+        *self.on_closed.borrow_mut() = Some(callback);
+    }
+}
+
+impl BuiltRowMenu {
+    fn show(&self, view: &RowMenuView) {
+        let RowMenuView {
+            mailbox,
+            state,
+            color,
+            count_mode,
+        } = view;
+        let (state, color, count_mode) = (*state, color.as_deref(), *count_mode);
         self.info.set_label(&folder_info_text(mailbox));
         self.menu.set_enabled("create", state.create);
         self.menu.set_enabled("rename", state.rename);
@@ -725,13 +815,70 @@ mod tests {
         let menu = build_row_menu(target, handler);
         let folder = folder("Work", MailboxRole::Custom, 4, &[]);
         menu.refresh(&folder, folder_menu_state(&folder, None, true), Some("#3584e4"), FolderCountMode::Total);
-        let watched = [
-            ("button", weak(&menu.button)),
-            ("popover", weak(&menu.menu.popover)),
-            ("actions", weak(&menu.menu.actions)),
-            ("swatch", weak(&menu.swatches[0].1)),
-        ];
+        menu.connect_closed(Rc::new(|| {}));
+        crate::context_menu::build_lazy_menu_now(&menu.button);
+        let watched = {
+            let built = menu.built.borrow();
+            let built = built.as_ref().expect("built");
+            [
+                ("button", weak(&menu.button)),
+                ("popover", weak(&built.menu.popover)),
+                ("actions", weak(&built.menu.actions)),
+                ("swatch", weak(&built.swatches[0].1)),
+            ]
+        };
         drop(menu);
         crate::gtk_test::assert_freed(&watched);
+    }
+
+    /// The menu isn't built with its row, only when it is first opened, and
+    /// it then shows what the last `refresh` asked for and runs the
+    /// `connect_closed` callback. Later refreshes go straight to it.
+    #[test]
+    fn row_menu_is_built_on_first_open_with_the_last_refresh() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let handler: FolderMenuHandler = Rc::new(RefCell::new(None));
+        let target: Rc<RefCell<Option<Mailbox>>> = Rc::new(RefCell::new(None));
+        let menu = build_row_menu(target, handler);
+        let closed = Rc::new(std::cell::Cell::new(0));
+        {
+            let closed = closed.clone();
+            menu.connect_closed(Rc::new(move || closed.set(closed.get() + 1)));
+        }
+        let work = folder("Work", MailboxRole::Custom, 4, &[]);
+        let home = folder("Home", MailboxRole::Custom, 2, &[]);
+        menu.refresh(&work, folder_menu_state(&work, None, true), Some("#3584e4"), FolderCountMode::Unread);
+        menu.refresh(&home, folder_menu_state(&home, None, true), Some(CALENDAR_PALETTE[1]), FolderCountMode::Total);
+        assert!(menu.button.popover().is_none(), "nothing is built up front");
+        assert!(menu.built.borrow().is_none());
+
+        crate::context_menu::build_lazy_menu_now(&menu.button);
+        let popover = menu.button.popover().expect("built on open");
+        crate::context_menu::build_lazy_menu_now(&menu.button);
+        assert_eq!(menu.button.popover().as_ref(), Some(&popover), "built once");
+        {
+            let built = menu.built.borrow();
+            let built = built.as_ref().expect("built");
+            assert_eq!(built.info.label(), folder_info_text(&home), "the last refresh is shown");
+            let selected: Vec<&str> = built
+                .swatches
+                .iter()
+                .filter(|(_, swatch)| swatch.has_css_class("selected"))
+                .map(|(hex, _)| hex.as_str())
+                .collect();
+            assert_eq!(selected, [CALENDAR_PALETTE[1]]);
+            let count = built.menu.actions.action_state("count").and_then(|state| state.get::<String>());
+            assert_eq!(count.as_deref(), Some("total"));
+        }
+        popover.emit_by_name::<()>("closed", &[]);
+        assert_eq!(closed.get(), 1, "the closed callback is connected on build");
+
+        menu.refresh(&work, folder_menu_state(&work, None, true), None, FolderCountMode::Unread);
+        let built = menu.built.borrow();
+        let built = built.as_ref().expect("built");
+        assert_eq!(built.info.label(), folder_info_text(&work), "a refresh after the build goes to the menu");
+        assert!(!built.swatches.iter().any(|(_, swatch)| swatch.has_css_class("selected")));
     }
 }

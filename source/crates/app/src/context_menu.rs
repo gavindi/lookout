@@ -307,9 +307,76 @@ impl ContextMenu {
     }
 }
 
+/// The `set_data` key under which [`attach_lazily`] keeps a button's builder.
+const LAZY_MENU_KEY: &str = "lookout-lazy-menu";
+
+/// A [`attach_lazily`] builder: given the button, it builds the menu and
+/// attaches it (usually with [`ContextMenu::attach_button`]).
+type LazyMenuBuild = Rc<dyn Fn(&gtk::MenuButton)>;
+
+/// Builds `button`'s menu the first time it is opened instead of now. A
+/// sidebar builds one "⋯" button per row, and a full menu up front cost about
+/// 15 MB across one large account's folder rows (MEMORY_OPTIMISATION1.md,
+/// "Per-account breakdown"), though few rows' menus are ever opened.
+///
+/// `build` gets the button as an argument; it must not capture the button
+/// (or anything holding it) strongly, since the button owns `build`. GTK
+/// calls the create-popup function on every open, so `build` runs only
+/// while the button has no popover yet. The button stays sensitive without
+/// a popover, as GTK treats a create-popup function as a menu to come.
+pub fn attach_lazily(button: &gtk::MenuButton, build: impl Fn(&gtk::MenuButton) + 'static) {
+    let build: LazyMenuBuild = Rc::new(build);
+    unsafe {
+        button.set_data(LAZY_MENU_KEY, build);
+    }
+    button.set_create_popup_func(build_lazy_menu_now);
+}
+
+/// Builds the menu [`attach_lazily`] deferred, if it isn't built yet. The
+/// create-popup function runs this on open; tests call it to look inside a
+/// menu without popping it up.
+pub(crate) fn build_lazy_menu_now(button: &gtk::MenuButton) {
+    if button.popover().is_some() {
+        return;
+    }
+    let build = unsafe { button.data::<LazyMenuBuild>(LAZY_MENU_KEY) }.map(|build| unsafe { build.as_ref() }.clone());
+    if let Some(build) = build {
+        build(button);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lazily attached menu isn't built until asked for, is built once,
+    /// and is then the button's popover with its actions inserted.
+    #[test]
+    fn lazy_menu_is_built_once_on_demand() {
+        if !crate::gtk_test::gtk_ready() {
+            return;
+        }
+        let builds = Rc::new(std::cell::Cell::new(0));
+        let button = gtk::MenuButton::new();
+        {
+            let builds = builds.clone();
+            attach_lazily(&button, move |button| {
+                builds.set(builds.get() + 1);
+                let dispatch: Dispatch = Rc::new(|_, _| {});
+                let menu = ContextMenu::new(&MenuDescription::new().section().action("Rename", "row.rename"), &[ActionSpec::simple("rename")], dispatch);
+                menu.attach_button(button, "row");
+            });
+        }
+        assert!(button.popover().is_none(), "nothing is built up front");
+        assert!(button.is_sensitive(), "the button can still be opened");
+        build_lazy_menu_now(&button);
+        build_lazy_menu_now(&button);
+        assert_eq!(builds.get(), 1, "built once");
+        assert!(button.popover().is_some_and(|popover| popover.is::<gtk::PopoverMenu>()));
+        let watched = [("button", crate::gtk_test::weak(&button)), ("popover", crate::gtk_test::weak(&button.popover().unwrap()))];
+        drop(button);
+        crate::gtk_test::assert_freed(&watched);
+    }
 
     // Pure `gio` construction (no `gtk::init`), so no `gtk_ready` gate.
     #[test]

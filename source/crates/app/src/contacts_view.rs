@@ -363,13 +363,19 @@ pub(crate) fn vcard_primary_email(card: &VCard) -> String {
     card.emails.first().map(|email| email.address.clone()).unwrap_or_else(|| "No email address".to_string())
 }
 
-/// The contact's `PHOTO` as a decoded texture, when it carries embedded bytes
-/// the image loader can decode. A URI-only photo yields `None` (remote images
-/// aren't fetched here), as does a decode failure - the caller falls back to
-/// coloured initials.
+/// The size contact photos are decoded to fit: the largest avatar showing one
+/// is the details dialog's 64 px, so this covers 2x scaling. The People list
+/// (32 px) and the profile card (48 px) use the same texture size.
+pub(crate) const CONTACT_PHOTO_SIZE: i32 = 128;
+
+/// The contact's `PHOTO` as a decoded texture at most [`CONTACT_PHOTO_SIZE`]
+/// across, when it carries embedded bytes the image loader can decode. A
+/// full-size decode cost about 370 KB per photo for a 32 px avatar
+/// (MEMORY_OPTIMISATION1.md, "Per-account breakdown"). A URI-only photo
+/// yields `None` (remote images aren't fetched here), as does a decode
+/// failure - the caller falls back to coloured initials.
 pub(crate) fn contact_photo_texture(photo: &lookout_core::Photo) -> Option<gtk::gdk::Texture> {
-    let data = photo.data.clone()?;
-    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(data)).ok()
+    crate::window::decode_avatar_texture(photo.data.as_deref()?, CONTACT_PHOTO_SIZE)
 }
 
 /// Renders a birthday/anniversary for the details dialog: the yearless form

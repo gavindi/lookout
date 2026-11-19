@@ -4624,7 +4624,9 @@ fn calendar_toggle_row(name: &str, color: &str, active: bool, on_toggle: impl Fn
 /// [`ContextMenu`] builder (item 0.5), like the folder row menu, so the
 /// swatches and action wiring match the rest of the app. The menu is rebuilt
 /// with its row on every checklist refresh, so it captures its calendar
-/// directly rather than sharing a mutable cursor slot.
+/// directly rather than sharing a mutable cursor slot. The menu itself is
+/// built on first open ([`context_menu::attach_lazily`]): the checklist
+/// rebuilds every row on each refresh, and few menus are ever opened.
 fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoice], on_action: &CalendarSidebarActionHandler) -> gtk::MenuButton {
     let button = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
@@ -4632,9 +4634,20 @@ fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoic
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
         .build();
+    let id = calendar.id.clone();
+    // Only what "Move to group" shows, not each group's calendar list.
+    let groups: Vec<(String, String)> = groups.iter().map(|group| (group.id.clone(), group.name.clone())).collect();
+    let on_action = on_action.clone();
+    crate::context_menu::attach_lazily(&button, move |button| attach_calendar_row_menu(button, &id, &groups, &on_action));
+    button
+}
+
+/// Builds [`build_calendar_row_menu`]'s menu and attaches it to `button`.
+/// `groups` are the user-defined groups' `(id, name)`s.
+fn attach_calendar_row_menu(button: &gtk::MenuButton, id: &CalendarId, groups: &[(String, String)], on_action: &CalendarSidebarActionHandler) {
     let dispatch: Dispatch = {
         let on_action = on_action.clone();
-        let id = calendar.id.clone();
+        let id = id.clone();
         Rc::new(move |name, param| {
             let text = param.and_then(|p| p.get::<String>());
             let action = match name {
@@ -4653,8 +4666,8 @@ fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoic
     };
 
     let mut move_menu = MenuDescription::new().section().action_with_target("No group", "calendar.move-group", String::new());
-    for group in groups {
-        move_menu = move_menu.action_with_target(group.name.clone(), "calendar.move-group", group.id.clone());
+    for (group_id, group_name) in groups {
+        move_menu = move_menu.action_with_target(group_name.clone(), "calendar.move-group", group_id.clone());
     }
     move_menu = move_menu.section().action("New group…", "calendar.new-group");
 
@@ -4687,7 +4700,7 @@ fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoic
         ActionSpec::simple("new-group"),
     ];
     let menu = ContextMenu::new(&description, &specs, dispatch);
-    menu.attach_button(&button, "calendar");
+    menu.attach_button(button, "calendar");
 
     // The palette swatches are the "Change colour" submenu's custom child (the
     // folder menu's pattern); clicking one applies the colour and closes the
@@ -4712,7 +4725,7 @@ fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoic
             // checklist is rebuilt (MEMORY_OPTIMISATION1.md finding 2).
             let popover = menu.popover.downgrade();
             let on_action = on_action.clone();
-            let id = calendar.id.clone();
+            let id = id.clone();
             let hex = hex.to_string();
             swatch.connect_clicked(move |_| {
                 if let Some(popover) = popover.upgrade() {
@@ -4724,7 +4737,6 @@ fn build_calendar_row_menu(calendar: &CalendarInfo, groups: &[CalendarGroupChoic
         swatch_grid.attach(&swatch, (index % 5) as i32, (index / 5) as i32, 1, 1);
     }
     menu.add_child(&swatch_grid, "colors");
-    button
 }
 
 /// A user-defined group header's ⋯ menu (item 3.13 / CAL-33): Rename and
@@ -4738,22 +4750,26 @@ fn build_group_menu(group_id: &str, on_action: &CalendarSidebarActionHandler) ->
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
         .build();
-    let dispatch: Dispatch = {
-        let on_action = on_action.clone();
-        let group_id = group_id.to_string();
-        Rc::new(move |name, _| match name {
-            "group-rename" => on_action(CalendarSidebarAction::RenameGroup(group_id.clone())),
-            "group-delete" => on_action(CalendarSidebarAction::DeleteGroup(group_id.clone())),
-            _ => {}
-        })
-    };
-    let description = MenuDescription::new()
-        .section()
-        .action("Rename group…", "calendar.group-rename")
-        .action("Delete group", "calendar.group-delete");
-    let specs = [ActionSpec::simple("group-rename"), ActionSpec::simple("group-delete")];
-    let menu = ContextMenu::new(&description, &specs, dispatch);
-    menu.attach_button(&button, "calendar");
+    let on_action = on_action.clone();
+    let group_id = group_id.to_string();
+    crate::context_menu::attach_lazily(&button, move |button| {
+        let dispatch: Dispatch = {
+            let on_action = on_action.clone();
+            let group_id = group_id.clone();
+            Rc::new(move |name, _| match name {
+                "group-rename" => on_action(CalendarSidebarAction::RenameGroup(group_id.clone())),
+                "group-delete" => on_action(CalendarSidebarAction::DeleteGroup(group_id.clone())),
+                _ => {}
+            })
+        };
+        let description = MenuDescription::new()
+            .section()
+            .action("Rename group…", "calendar.group-rename")
+            .action("Delete group", "calendar.group-delete");
+        let specs = [ActionSpec::simple("group-rename"), ActionSpec::simple("group-delete")];
+        let menu = ContextMenu::new(&description, &specs, dispatch);
+        menu.attach_button(button, "calendar");
+    });
     button
 }
 
@@ -6261,6 +6277,16 @@ mod tests {
 
         rebuild();
         let mut first = Vec::new();
+        collect_widgets(container.upcast_ref::<gtk::Widget>(), &mut first);
+        // The row and group menus are built on first open, not with the row.
+        assert!(!first.iter().any(|w| w.is::<gtk::PopoverMenu>()), "no menu is built before it is opened");
+        let buttons: Vec<gtk::MenuButton> = first.iter().filter_map(|w| w.downcast_ref::<gtk::MenuButton>().cloned()).collect();
+        assert!(buttons.len() >= 4, "three calendar menus and a group menu");
+        for button in &buttons {
+            crate::context_menu::build_lazy_menu_now(button);
+        }
+        drop(buttons);
+        first.clear();
         collect_widgets(container.upcast_ref::<gtk::Widget>(), &mut first);
         first.remove(0); // the container itself stays
         assert!(first.iter().any(|w| w.is::<gtk::PopoverMenu>()), "the row menus' popovers are in the tree");

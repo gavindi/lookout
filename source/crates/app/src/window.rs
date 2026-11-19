@@ -236,10 +236,8 @@ fn build_folder_row(
         });
         overlay.add_controller(hover_controller);
     }
-    if let Some(popover) = menu.button.popover() {
-        let refresh = refresh_actions.clone();
-        popover.connect_closed(move |_| refresh());
-    }
+    // The menu is built on first open; its `closed` handler is connected then.
+    menu.connect_closed(refresh_actions.clone());
     unsafe {
         expander.set_data(
             "lookout-expunge-widgets",
@@ -312,7 +310,10 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
 
     let bg_bytes = crate::resources::bytes("/io/github/gavindi/Lookout/backgrounds/background2.jpg")
         .unwrap_or_else(|| glib::Bytes::from_static(include_bytes!("../../../data/resources/backgrounds/background2.jpg")));
-    let default_bg_texture = gtk::gdk::Texture::from_bytes(&bg_bytes).expect("bundled background image should decode");
+    // Decoded only as large as the biggest monitor needs (the artwork is
+    // 4000 x 3250, 37 MB at full size), bundled and custom images alike.
+    let background_target = crate::background_image::display_target();
+    let default_bg_texture = crate::background_image::decode_for_display(&bg_bytes, background_target).expect("bundled background image should decode");
     let background = gtk::Picture::for_paintable(&default_bg_texture);
     background.set_content_fit(gtk::ContentFit::Cover);
     background.set_can_shrink(true);
@@ -321,7 +322,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
     // A custom background chosen under Config → Appearance → "Window
     // background" wins over the bundled artwork when it's still around and
     // still decodes; the Config view rows are told about it further down.
-    let custom_background_name = crate::background_image::load(&settings).and_then(|path| match gtk::gdk::Texture::from_filename(&path) {
+    let custom_background_name = crate::background_image::load(&settings).and_then(|path| match crate::background_image::decode_file_for_display(&path, background_target) {
         Ok(texture) => {
             background.set_paintable(Some(&texture));
             path.file_name().map(|name| name.to_string_lossy().into_owned())
@@ -8225,15 +8226,57 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
             );
         });
     }
+    // The People rail and list repaint only while the People pane is on
+    // screen (attached or in its own window); a sync while it is hidden is
+    // held and painted when it is next shown. Building them for every
+    // snapshot cost a row, an avatar and a copy of every contact while
+    // nobody was looking (MEMORY_OPTIMISATION1.md, "Per-account breakdown").
+    // A background `None` doesn't replace an explicit bucket held before it.
+    let refresh_people_lists: Rc<crate::util::DeferUntilMapped<Option<i32>>> = Rc::new(crate::util::DeferUntilMapped::new(
+        &contacts_paned,
+        |previous, new| match (previous, new) {
+            (Some(Some(index)), None) => Some(index),
+            (_, new) => new,
+        },
+        {
+            let state = state.clone();
+            let contacts_category_list = contacts_category_list.clone();
+            let contacts_list = contacts_list.clone();
+            let contacts_categories = contacts_categories.clone();
+            let contacts_entries = contacts_entries.clone();
+            let contacts_selected = contacts_selected.clone();
+            let refresh_contacts_actions = refresh_contacts_actions.clone();
+            let contacts_details_refresh = contacts_details_refresh.clone();
+            move |selected_index: Option<i32>| {
+                // A background sync calls this with `None`, which normally
+                // resets to "Your Contacts". Keep the live Directory row
+                // instead (4.7.8), so a poll can't kick the user out of an
+                // open search; the title-bar path clears the mode before
+                // asking for `None`.
+                let selected_index = selected_index.or_else(|| {
+                    if state.borrow().contacts_directory_active {
+                        contacts_categories.borrow().iter().position(ContactsCategoryChoice::is_directory).map(|index| index as i32)
+                    } else {
+                        None
+                    }
+                });
+                refresh_contacts_category_ui(
+                    &state,
+                    &contacts_category_list,
+                    &contacts_list,
+                    &contacts_categories,
+                    &contacts_entries,
+                    selected_index,
+                    &contacts_selected,
+                    &refresh_contacts_actions,
+                    &contacts_details_refresh,
+                );
+            }
+        },
+    ));
     let refresh_contacts_ui: Rc<dyn Fn(Option<i32>)> = Rc::new({
         let state = state.clone();
-        let contacts_category_list = contacts_category_list.clone();
-        let contacts_list = contacts_list.clone();
-        let contacts_categories = contacts_categories.clone();
-        let contacts_entries = contacts_entries.clone();
-        let contacts_selected = contacts_selected.clone();
-        let refresh_contacts_actions = refresh_contacts_actions.clone();
-        let contacts_details_refresh = contacts_details_refresh.clone();
+        let refresh_people_lists = refresh_people_lists.clone();
         let calendar_state = calendar_state.clone();
         let calendar_main = calendar_main.clone();
         let calendar_list_box = calendar_sidebar.calendar_list_box.clone();
@@ -8242,28 +8285,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let mail_overview_day_list = mail_overview_day_list.clone();
         let reminders_engine = reminders_engine.clone();
         move |selected_index: Option<i32>| {
-            // A background sync calls this with `None`, which normally resets
-            // to "Your Contacts". Keep the live Directory row instead
-            // (4.7.8), so a poll can't kick the user out of an open search;
-            // the title-bar path clears the mode before asking for `None`.
-            let selected_index = selected_index.or_else(|| {
-                if state.borrow().contacts_directory_active {
-                    contacts_categories.borrow().iter().position(ContactsCategoryChoice::is_directory).map(|index| index as i32)
-                } else {
-                    None
-                }
-            });
-            refresh_contacts_category_ui(
-                &state,
-                &contacts_category_list,
-                &contacts_list,
-                &contacts_categories,
-                &contacts_entries,
-                selected_index,
-                &contacts_selected,
-                &refresh_contacts_actions,
-                &contacts_details_refresh,
-            );
+            refresh_people_lists.request(selected_index);
             // Contacts are the birthdays calendar's only data source, so
             // every snapshot (startup cache paint, poll tick, post-write
             // resync) refreshes the synthesized calendar and everything that
@@ -8314,11 +8336,18 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
         let refresh_contacts_actions = refresh_contacts_actions.clone();
         let contacts_details_refresh = contacts_details_refresh.clone();
         let refresh_contacts_ui = refresh_contacts_ui.clone();
+        let refresh_people_lists = refresh_people_lists.clone();
+        let contacts_paned = contacts_paned.clone();
         state_for_hook.borrow_mut().contacts_list_refresh = Some(Rc::new(move || {
             let idx = contacts_category_list
                 .selected_row()
                 .and_then(|row| unsafe { row.data::<usize>("contacts-choice-index") })
                 .map(|idx| unsafe { *idx.as_ref() } as i32);
+            // Hidden: hold a full repaint for when People is next shown.
+            if !contacts_paned.is_mapped() {
+                refresh_people_lists.request(idx);
+                return;
+            }
             match idx {
                 Some(idx) => rebuild_contacts_list_ui(
                     &contacts_list,
@@ -9816,7 +9845,7 @@ pub fn build_window(app: &adw::Application, worker: Rc<Worker>) -> adw::Applicat
                 let dialog = gtk::FileDialog::builder().title("Choose a background image").filters(&filters).build();
                 let Ok(file) = dialog.open_future(Some(&window)).await else { return };
                 let Some(path) = file.path() else { return };
-                match gtk::gdk::Texture::from_filename(&path) {
+                match crate::background_image::decode_file_for_display(&path, crate::background_image::display_target()) {
                     Ok(texture) => {
                         background.set_paintable(Some(&texture));
                         crate::background_image::save(&settings, &path);
